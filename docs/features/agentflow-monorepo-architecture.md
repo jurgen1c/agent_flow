@@ -1,0 +1,162 @@
+# Agentflow Monorepo Architecture
+
+Status: proposed
+Ticket: AM-6
+
+## Intent
+
+This document defines the package boundaries for bringing Agentflow into the
+Agent Memory repository without weakening the existing Agent Memory contract.
+The monorepo should make shared code easier to version, but Agent Memory must
+remain usable as a standalone repository-local memory CLI.
+
+Agentflow is the workflow runtime. Agent Memory is the durable repository
+knowledge system. They can integrate, but they should not collapse into one
+runtime.
+
+## Package Boundaries
+
+| Boundary | Workspace path | Public package name | Responsibility |
+| --- | --- | --- | --- |
+| Agent Memory CLI | root `package.json` publishes the package; `packages/cli` remains the private CLI workspace | `@jurgen1c/agent-memory-cli`; current workspace name is private `@agent-memory/cli` | Published `agent-memory` executable, CLI routing, command parsing, help text, and Node-compatible bundle entrypoint. |
+| Agent Memory core | `packages/core` | `@jurgen1c/agent-memory-core` when public; current workspace name is private `@agent-memory/core` | Repository root detection, config loading, Markdown/YAML parsing, validation, compilation, retrieval, audit, coverage, recipes, plans, profiles, hooks, and UI server APIs. |
+| Agent Memory schemas | `packages/schemas` | `@jurgen1c/agent-memory-schemas` when public; current workspace name is private `@agent-memory/schemas` | JSON schemas for committed memory files, config, plans, recipes, profiles, graphs, and generated metadata contracts. |
+| Agent Memory web UI | `packages/web` | Bundled inside `@jurgen1c/agent-memory-cli` by default; `@jurgen1c/agent-memory-web` only if a separate package is needed | Local browser UI for inspecting committed memory and generated read models. It should consume core API shapes and static assets, not own repository memory semantics. |
+| Agentflow CLI and runtime | `packages/agentflow` | `@jurgen1c/agentflow` | Workflow definition validation, run creation, resumable execution, step scheduling, event logs, artifact management, policies, approvals, retries, and cleanup. |
+| Agentflow examples | `packages/agentflow-examples` or `examples/agentflow` | `@jurgen1c/agentflow-examples` if published; otherwise examples only | Reviewable workflow, prompt, and template examples for pipeline, recovery, and collaborative workflow styles. Examples must not be required at runtime. |
+| Shared agent tools | `packages/agent-tools` | `@jurgen1c/agent-tools` | Stable cross-package types, schema helpers, file-safe utilities, command execution envelopes, artifact metadata, and adapter contracts that are not specific to Agent Memory or Agentflow. |
+
+The first public compatibility promise stays on
+`@jurgen1c/agent-memory-cli`. Other package names can remain private workspace
+names until their APIs are intentionally documented and versioned.
+
+## Dependency Direction
+
+Agent Memory owns durable knowledge APIs. Agentflow may call those APIs through
+documented adapters:
+
+```text
+@jurgen1c/agentflow -> @jurgen1c/agent-memory-core
+@jurgen1c/agentflow -> @jurgen1c/agent-tools
+@jurgen1c/agent-memory-core -> @jurgen1c/agent-tools
+@jurgen1c/agent-tools -> no Agent Memory or Agentflow runtime dependency
+```
+
+Agent Memory must not import Agentflow runtime code:
+
+```text
+@jurgen1c/agent-memory-cli
+  -> @jurgen1c/agent-memory-core
+  -> @jurgen1c/agent-memory-schemas
+  -> @jurgen1c/agent-tools
+```
+
+This keeps `agent-memory` installable in repositories that do not use
+Agentflow. Agentflow integration should be additive: workflow steps can ask
+Agent Memory for context, claims, recipes, or plan templates, but Agent Memory
+commands must not require an Agentflow run database, scheduler, session store,
+or workflow runtime.
+
+## Source of Truth and Generated State
+
+Agent Memory source of truth is committed repository data:
+
+```text
+docs/agent-memory/
+  claims/**/*.md
+  graph/**/*.yaml
+  indexes/**/*.yaml
+  recipes/**/*.yaml
+  plans/**/*.yaml
+  profiles/**/*.yaml
+  waivers/**/*.yaml
+```
+
+Agent Memory generated cache is rebuildable local data:
+
+```text
+.agent-memory/
+  memory.sqlite
+  plans/**/*.yaml
+  locks/
+```
+
+`.agent-memory/memory.sqlite` is a compiled read model. Local plan runs under
+`.agent-memory/plans` are generated task state unless they are explicitly
+promoted into committed plan templates under `docs/agent-memory/plans`.
+
+Agentflow authored project files and mutable run state share the `.agentflow`
+root, but only `runs/` is generated output:
+
+```text
+.agentflow/
+  config.yml                 # committed project configuration
+  workflows/**/*.yml         # committed workflow definitions
+  prompts/**/*.md            # committed prompt templates
+  templates/**/*.md          # committed notification/output templates
+  runs/<run-id>/
+    state.json
+    events.jsonl
+    artifacts/
+    failures/
+    sessions/
+```
+
+Agentflow run state under `.agentflow/runs/` is authoritative for one workflow
+execution and should not be committed. It can record which Agent Memory context
+was read, but it must not become the canonical store for claims, recipes,
+profile traits, or memory waivers. If a workflow discovers durable repository
+knowledge, the workflow should create a reviewable change in
+`docs/agent-memory`, not mutate generated cache files.
+
+## Adapter Contracts
+
+Agentflow should integrate with Agent Memory through explicit adapter surfaces:
+
+- Context retrieval: call core APIs equivalent to `agent-memory context`.
+- Memory validation: call validation and compile APIs before using generated
+  read models.
+- Recipe and plan lookup: read committed recipes and plan templates through
+  Agent Memory APIs, then copy selected workflow state into Agentflow artifacts.
+- Coverage and audit: run Agent Memory checks as workflow steps, with results
+  stored as Agentflow artifacts.
+
+Adapters should pass plain JSON-compatible data. They should not pass live
+database handles, shell-specific CLI output, or process-global state between
+packages.
+
+## Implementation Order
+
+1. Document the target boundaries and compatibility promises.
+2. Keep the current Agent Memory workspace layout green while adding any
+   package metadata needed for future boundaries.
+3. Extract shared schema and utility code only when at least two packages use
+   it.
+4. Add Agentflow schemas and validation before adding the runtime scheduler.
+5. Add Agentflow run-state persistence and artifact storage.
+6. Add adapters from Agentflow steps to Agent Memory context, validation,
+   coverage, and audit APIs.
+7. Add example workflows after the runtime can validate or simulate them.
+8. Publish new packages only after their APIs have tests, docs, and release
+   notes.
+
+Do not move existing Agent Memory command behavior behind an Agentflow workflow
+as part of the initial split. The existing CLI remains the compatibility anchor.
+
+## Release Compatibility
+
+The published `agent-memory` executable must keep working for existing users:
+
+- `@jurgen1c/agent-memory-cli` remains the package users install.
+- The `agent-memory` binary name remains stable.
+- `bin/memory` wrappers generated by `agent-memory init` continue to resolve the
+  installed CLI, global CLI, or package-manager fallback.
+- Existing config defaults continue to point at `docs/agent-memory` for source
+  data and `.agent-memory/memory.sqlite` for generated cache.
+- New Agentflow packages must be optional dependencies or separate installs
+  until Agentflow is part of the documented Agent Memory contract.
+- Package version sync must keep workspace versions aligned when packages are
+  released together.
+
+Breaking changes to Agent Memory file formats, command output, or generated
+wrapper behavior require a documented migration path before a release.
