@@ -35,6 +35,8 @@ describe("Agentflow monorepo architecture doc", () => {
 
     expect(doc).toContain("Agent Memory must not import Agentflow runtime code");
     expect(doc).toContain("@jurgen1c/agent-tools -> no Agent Memory or Agentflow runtime dependency");
+    expect(doc).toContain("@jurgen1c/agentflow-cli");
+    expect(doc).toContain("does not provide replacement binaries");
     expect(doc).toContain("intentionally limited to help and");
     expect(doc).toContain(".agent-memory/memory.sqlite");
     expect(doc).toContain(".agentflow/");

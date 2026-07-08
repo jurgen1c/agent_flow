@@ -1,7 +1,7 @@
 # Agentflow Monorepo Architecture
 
 Status: implemented workspace shell
-Ticket: AM-6, AM-7
+Ticket: AM-6, AM-7, AM-9
 
 ## Intent
 
@@ -28,7 +28,7 @@ runtime.
 | Agentflow schemas | `packages/agentflow-schemas` | Private workspace shell named `@jurgen1c/agentflow-schemas` until schemas are intentionally published | JSON schemas for Agentflow project config and workflow definitions. |
 | Agentflow Agent Memory adapter | `packages/agentflow-agent-memory-adapter` | Private workspace shell named `@jurgen1c/agentflow-agent-memory-adapter` until adapter APIs are intentionally published | Typed adapter contract for Agentflow steps that need Agent Memory context. |
 | Agentflow examples | `packages/agentflow-examples` or `examples/agentflow` | `@jurgen1c/agentflow-examples` if published; otherwise examples only | Reviewable workflow, prompt, and template examples for pipeline, recovery, and collaborative workflow styles. Examples must not be required at runtime. |
-| Shared agent tools | `packages/agent-tools` | `@jurgen1c/agent-tools` | Stable cross-package types, schema helpers, file-safe utilities, command execution envelopes, artifact metadata, and adapter contracts that are not specific to Agent Memory or Agentflow. |
+| Agent tools meta package | `packages/agent-tools` | `@jurgen1c/agent-tools` | Lightweight discovery package that documents the Agent Memory and Agentflow CLI packages and exports package metadata without replacing either CLI. |
 
 The first public compatibility promise stays on
 `@jurgen1c/agent-memory-cli`. Other package names remain private workspace
@@ -45,8 +45,7 @@ documented adapters:
 @jurgen1c/agentflow-agent-memory-adapter -> @jurgen1c/agentflow-core
 @jurgen1c/agentflow-agent-memory-adapter -> @jurgen1c/agent-memory-core
 @jurgen1c/agentflow-core -> @jurgen1c/agentflow-schemas
-@jurgen1c/agentflow-core -> @jurgen1c/agent-tools
-@jurgen1c/agent-memory-core -> @jurgen1c/agent-tools
+@jurgen1c/agentflow-core -> @jurgen1c/agent-tools types only
 @jurgen1c/agent-tools -> no Agent Memory or Agentflow runtime dependency
 ```
 
@@ -56,7 +55,6 @@ Agent Memory must not import Agentflow runtime code:
 @jurgen1c/agent-memory-cli
   -> @jurgen1c/agent-memory-core
   -> @jurgen1c/agent-memory-schemas
-  -> @jurgen1c/agent-tools
 ```
 
 This keeps `agent-memory` installable in repositories that do not use
@@ -132,6 +130,23 @@ Agentflow should integrate with Agent Memory through explicit adapter surfaces:
 Adapters should pass plain JSON-compatible data. They should not pass live
 database handles, shell-specific CLI output, or process-global state between
 packages.
+
+## Agent Tools Meta Package
+
+`@jurgen1c/agent-tools` is the discovery package for users who are looking for
+the available Agent Memory and Agentflow command-line packages. It points users
+to the concrete packages and command names:
+
+| CLI package | Binary | Role |
+| --- | --- | --- |
+| `@jurgen1c/agent-memory-cli` | `agent-memory` | Repository-local memory CLI. |
+| `@jurgen1c/agentflow-cli` | `agentflow` | Workflow runtime CLI. |
+
+The package intentionally has no runtime dependency on either CLI package. It
+does not provide replacement binaries, and installing it must not make
+`agent-memory` require Agentflow or make `agentflow` require Agent Memory.
+Until `@jurgen1c/agentflow-cli` is published independently, the current
+installable `agentflow` binary remains bundled in `@jurgen1c/agent-memory-cli`.
 
 ## Initial Skeleton Constraint
 
