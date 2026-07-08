@@ -1,0 +1,12 @@
+{
+  "name": "@jurgen1c/agentflow",
+  "version": "0.2.0",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@jurgen1c/agent-tools": "workspace:*"
+  }
+}

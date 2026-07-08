@@ -1,7 +1,7 @@
 # Agentflow Monorepo Architecture
 
-Status: proposed
-Ticket: AM-6
+Status: implemented workspace shell
+Ticket: AM-6, AM-7
 
 ## Intent
 
@@ -18,17 +18,17 @@ runtime.
 
 | Boundary | Workspace path | Public package name | Responsibility |
 | --- | --- | --- | --- |
-| Agent Memory CLI | root `package.json` publishes the package; `packages/cli` remains the private CLI workspace | `@jurgen1c/agent-memory-cli`; current workspace name is private `@agent-memory/cli` | Published `agent-memory` executable, CLI routing, command parsing, help text, and Node-compatible bundle entrypoint. |
-| Agent Memory core | `packages/core` | `@jurgen1c/agent-memory-core` when public; current workspace name is private `@agent-memory/core` | Repository root detection, config loading, Markdown/YAML parsing, validation, compilation, retrieval, audit, coverage, recipes, plans, profiles, hooks, and UI server APIs. |
-| Agent Memory schemas | `packages/schemas` | `@jurgen1c/agent-memory-schemas` when public; current workspace name is private `@agent-memory/schemas` | JSON schemas for committed memory files, config, plans, recipes, profiles, graphs, and generated metadata contracts. |
-| Agent Memory web UI | `packages/web` | Bundled inside `@jurgen1c/agent-memory-cli` by default; `@jurgen1c/agent-memory-web` only if a separate package is needed | Local browser UI for inspecting committed memory and generated read models. It should consume core API shapes and static assets, not own repository memory semantics. |
+| Agent Memory CLI | root `package.json` publishes the package; `packages/cli` remains the private CLI workspace | `@jurgen1c/agent-memory-cli`; workspace name is private `@jurgen1c/agent-memory-cli-workspace` | Published `agent-memory` executable, CLI routing, command parsing, help text, and Node-compatible bundle entrypoint. |
+| Agent Memory core | `packages/core` | Private workspace shell named `@jurgen1c/agent-memory-core` until its API is intentionally published | Repository root detection, config loading, Markdown/YAML parsing, validation, compilation, retrieval, audit, coverage, recipes, plans, profiles, hooks, and UI server APIs. |
+| Agent Memory schemas | `packages/schemas` | Private workspace shell named `@jurgen1c/agent-memory-schemas` until schemas are intentionally published | JSON schemas for committed memory files, config, plans, recipes, profiles, graphs, and generated metadata contracts. |
+| Agent Memory web UI | `packages/web` | Private workspace shell named `@jurgen1c/agent-memory-web`; bundled inside `@jurgen1c/agent-memory-cli` by default | Local browser UI for inspecting committed memory and generated read models. It should consume core API shapes and static assets, not own repository memory semantics. |
 | Agentflow CLI and runtime | `packages/agentflow` | `@jurgen1c/agentflow` | Workflow definition validation, run creation, resumable execution, step scheduling, event logs, artifact management, policies, approvals, retries, and cleanup. |
 | Agentflow examples | `packages/agentflow-examples` or `examples/agentflow` | `@jurgen1c/agentflow-examples` if published; otherwise examples only | Reviewable workflow, prompt, and template examples for pipeline, recovery, and collaborative workflow styles. Examples must not be required at runtime. |
 | Shared agent tools | `packages/agent-tools` | `@jurgen1c/agent-tools` | Stable cross-package types, schema helpers, file-safe utilities, command execution envelopes, artifact metadata, and adapter contracts that are not specific to Agent Memory or Agentflow. |
 
 The first public compatibility promise stays on
-`@jurgen1c/agent-memory-cli`. Other package names can remain private workspace
-names until their APIs are intentionally documented and versioned.
+`@jurgen1c/agent-memory-cli`. Other package names remain private workspace
+shells until their APIs are intentionally documented and versioned.
 
 ## Dependency Direction
 

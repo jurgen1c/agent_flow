@@ -17,7 +17,7 @@ describe("Agentflow monorepo architecture doc", () => {
       "@jurgen1c/agentflow",
       "@jurgen1c/agentflow-examples",
       "@jurgen1c/agent-tools",
-      "@agent-memory/cli",
+      "@jurgen1c/agent-memory-cli-workspace",
       "root `package.json` publishes the package",
       "packages/agent-tools",
       "packages/web"
