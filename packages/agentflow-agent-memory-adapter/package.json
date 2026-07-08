@@ -1,5 +1,5 @@
 {
-  "name": "@jurgen1c/agentflow",
+  "name": "@jurgen1c/agentflow-agent-memory-adapter",
   "version": "0.2.0",
   "type": "module",
   "private": true,
@@ -7,6 +7,7 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
+    "@jurgen1c/agent-memory-core": "workspace:*",
     "@jurgen1c/agentflow-core": "workspace:*"
   }
 }

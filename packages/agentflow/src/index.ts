@@ -1,13 +1,17 @@
-import type { AgentToolPackageBoundary } from "@jurgen1c/agent-tools";
+import type { AgentflowCorePackageBoundary } from "@jurgen1c/agentflow-core";
+
+export { agentflowCorePackageBoundary, plannedAgentflowRuntimeCommands } from "@jurgen1c/agentflow-core";
 
 export interface AgentflowPackageBoundary {
   packageName: "@jurgen1c/agentflow";
   role: "workflow-runtime";
-  sharedToolsPackage: AgentToolPackageBoundary["packageName"];
+  corePackage: AgentflowCorePackageBoundary["packageName"];
+  status: "skeleton";
 }
 
 export const agentflowPackageBoundary: AgentflowPackageBoundary = {
   packageName: "@jurgen1c/agentflow",
   role: "workflow-runtime",
-  sharedToolsPackage: "@jurgen1c/agent-tools"
+  corePackage: "@jurgen1c/agentflow-core",
+  status: "skeleton"
 };

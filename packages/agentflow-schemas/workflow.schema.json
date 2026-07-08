@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Agentflow Workflow",
+  "type": "object",
+  "required": ["name", "version", "style", "maturity", "steps"],
+  "properties": {
+    "name": { "type": "string", "minLength": 1 },
+    "version": { "type": "integer", "minimum": 1 },
+    "style": { "enum": ["pipeline", "recovery_pipeline", "collaborative"] },
+    "maturity": { "enum": ["draft", "experimental", "stable", "trusted"] },
+    "inputs": { "type": "object" },
+    "sessions": { "type": "object" },
+    "artifacts": { "type": "object" },
+    "steps": { "type": "array", "items": { "type": "object" } },
+    "policies": { "type": "object" },
+    "notify": { "type": "array" },
+    "retention": { "type": "object" }
+  },
+  "additionalProperties": true
+}

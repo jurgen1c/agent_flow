@@ -15,11 +15,19 @@ describe("Agentflow monorepo architecture doc", () => {
       "@jurgen1c/agent-memory-core",
       "@jurgen1c/agent-memory-schemas",
       "@jurgen1c/agentflow",
+      "@jurgen1c/agentflow-core",
+      "@jurgen1c/agentflow-cli",
+      "@jurgen1c/agentflow-schemas",
+      "@jurgen1c/agentflow-agent-memory-adapter",
       "@jurgen1c/agentflow-examples",
       "@jurgen1c/agent-tools",
       "@jurgen1c/agent-memory-cli-workspace",
       "root `package.json` publishes the package",
       "packages/agent-tools",
+      "packages/agentflow-core",
+      "packages/agentflow-cli",
+      "packages/agentflow-schemas",
+      "packages/agentflow-agent-memory-adapter",
       "packages/web"
     ]) {
       expect(doc).toContain(required);
@@ -27,6 +35,7 @@ describe("Agentflow monorepo architecture doc", () => {
 
     expect(doc).toContain("Agent Memory must not import Agentflow runtime code");
     expect(doc).toContain("@jurgen1c/agent-tools -> no Agent Memory or Agentflow runtime dependency");
+    expect(doc).toContain("intentionally limited to help and");
     expect(doc).toContain(".agent-memory/memory.sqlite");
     expect(doc).toContain(".agentflow/");
     expect(doc).toContain("The existing CLI remains the compatibility anchor");

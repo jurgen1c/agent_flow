@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Agentflow Config",
+  "type": "object",
+  "required": ["version"],
+  "properties": {
+    "version": { "type": "integer", "minimum": 1 },
+    "workflows": { "type": "string" },
+    "prompts": { "type": "string" },
+    "templates": { "type": "string" },
+    "runs": { "type": "string" }
+  },
+  "additionalProperties": true
+}

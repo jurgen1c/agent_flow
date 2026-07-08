@@ -1,0 +1,11 @@
+{
+  "name": "@jurgen1c/agentflow-schemas",
+  "version": "0.2.0",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": "./src/index.ts",
+    "./config": "./config.schema.json",
+    "./workflow": "./workflow.schema.json"
+  }
+}

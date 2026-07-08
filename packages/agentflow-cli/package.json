@@ -1,10 +1,11 @@
 {
-  "name": "@jurgen1c/agentflow",
+  "name": "@jurgen1c/agentflow-cli",
   "version": "0.2.0",
   "type": "module",
   "private": true,
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./router": "./src/router.ts"
   },
   "dependencies": {
     "@jurgen1c/agentflow-core": "workspace:*"
