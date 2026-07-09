@@ -98,7 +98,9 @@ function readRootPackageVersion(): string {
     try {
       const packageJson = JSON.parse(fs.readFileSync(packageUrl, "utf8")) as { name?: unknown; version?: unknown };
 
-      if (packageJson.name === "@jurgen1c/agent-memory-cli" && typeof packageJson.version === "string" && packageJson.version.length > 0) {
+      const packageNames = ["@jurgen1c/agentflow-cli", "@jurgen1c/agent-memory-cli"];
+
+      if (packageNames.includes(String(packageJson.name)) && typeof packageJson.version === "string" && packageJson.version.length > 0) {
         return packageJson.version;
       }
     } catch {

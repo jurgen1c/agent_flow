@@ -1,13 +1,44 @@
 {
   "name": "@jurgen1c/agentflow-cli",
   "version": "0.2.0",
-  "type": "module",
-  "private": true,
-  "exports": {
-    ".": "./src/index.ts",
-    "./router": "./src/router.ts"
+  "description": "Agentflow workflow command-line interface.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jurgen1c/agent_memory.git",
+    "directory": "packages/agentflow-cli"
   },
-  "dependencies": {
-    "@jurgen1c/agentflow-core": "workspace:*"
+  "keywords": [
+    "agent",
+    "agentflow",
+    "cli",
+    "workflow"
+  ],
+  "type": "module",
+  "main": "./dist/router.js",
+  "types": "./src/router.d.ts",
+  "bin": {
+    "agentflow": "dist/index.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/router.d.ts",
+      "default": "./dist/router.js"
+    },
+    "./router": {
+      "types": "./src/router.d.ts",
+      "default": "./dist/router.js"
+    }
+  },
+  "files": [
+    "dist/",
+    "src/router.d.ts"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "bun build src/index.ts src/router.ts --target=node --outdir=dist",
+    "prepack": "bun run build"
   }
 }

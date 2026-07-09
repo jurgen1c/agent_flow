@@ -24,15 +24,16 @@ runtime.
 | Agent Memory web UI | `packages/web` | Private workspace shell named `@jurgen1c/agent-memory-web`; bundled inside `@jurgen1c/agent-memory-cli` by default | Local browser UI for inspecting committed memory and generated read models. It should consume core API shapes and static assets, not own repository memory semantics. |
 | Agentflow CLI and runtime | `packages/agentflow` | `@jurgen1c/agentflow` | Workflow definition validation, run creation, resumable execution, step scheduling, event logs, artifact management, policies, approvals, retries, and cleanup. |
 | Agentflow core | `packages/agentflow-core` | Private workspace shell named `@jurgen1c/agentflow-core` until the runtime API is intentionally published | Typed workflow/run primitives, planned command names, and runtime package boundary metadata. |
-| Agentflow CLI | `packages/agentflow-cli` | Private workspace shell named `@jurgen1c/agentflow-cli` until the CLI is intentionally published | `agentflow` executable entrypoint, help text, version output, and command gating while runtime behavior is unavailable. |
+| Agentflow CLI | `packages/agentflow-cli` | Public package named `@jurgen1c/agentflow-cli` | `agentflow` executable entrypoint, help text, version output, and command gating while runtime behavior is unavailable. |
 | Agentflow schemas | `packages/agentflow-schemas` | Private workspace shell named `@jurgen1c/agentflow-schemas` until schemas are intentionally published | JSON schemas for Agentflow project config and workflow definitions. |
 | Agentflow Agent Memory adapter | `packages/agentflow-agent-memory-adapter` | Private workspace shell named `@jurgen1c/agentflow-agent-memory-adapter` until adapter APIs are intentionally published | Typed adapter contract for Agentflow steps that need Agent Memory context. |
 | Agentflow examples | `packages/agentflow-examples` or `examples/agentflow` | `@jurgen1c/agentflow-examples` if published; otherwise examples only | Reviewable workflow, prompt, and template examples for pipeline, recovery, and collaborative workflow styles. Examples must not be required at runtime. |
 | Agent tools meta package | `packages/agent-tools` | `@jurgen1c/agent-tools` | Lightweight discovery package that documents the Agent Memory and Agentflow CLI packages and exports package metadata without replacing either CLI. |
 
-The first public compatibility promise stays on
-`@jurgen1c/agent-memory-cli`. Other package names remain private workspace
-shells until their APIs are intentionally documented and versioned.
+The first public compatibility promise for repository memory stays on
+`@jurgen1c/agent-memory-cli`. Agentflow has a separate public CLI package, while
+the runtime, schema, adapter, web, and core package APIs remain private
+workspace shells until their APIs are intentionally documented and versioned.
 
 ## Dependency Direction
 
@@ -145,8 +146,9 @@ to the concrete packages and command names:
 The package intentionally has no runtime dependency on either CLI package. It
 does not provide replacement binaries, and installing it must not make
 `agent-memory` require Agentflow or make `agentflow` require Agent Memory.
-Until `@jurgen1c/agentflow-cli` is published independently, the current
-installable `agentflow` binary remains bundled in `@jurgen1c/agent-memory-cli`.
+The root `@jurgen1c/agent-memory-cli` package still includes the compatibility
+`agentflow` binary during the transition, but new install guidance points to
+`@jurgen1c/agentflow-cli` as the package that owns the Agentflow command.
 
 ## Initial Skeleton Constraint
 
