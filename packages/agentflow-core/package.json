@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "@jurgen1c/agent-tools": "workspace:*",
-    "@jurgen1c/agentflow-schemas": "workspace:*"
+    "@jurgen1c/agentflow-schemas": "workspace:*",
+    "yaml": "^2.9.0"
   }
 }

@@ -1,0 +1,47 @@
+name: simple-ci
+version: 1
+style: pipeline
+maturity: draft
+
+description: Run local checks without using a model.
+
+steps:
+  - id: install
+    type: command
+    command: bundle install
+    on_failure:
+      retry: 1
+      then: pause
+
+  - id: lint
+    type: command
+    command: bin/rubocop
+    outputs:
+      - ci/rubocop.log
+    on_failure:
+      then: fail
+
+  - id: test
+    type: command
+    command: bin/rails test
+    outputs:
+      - ci/test.log
+    on_failure:
+      then: fail
+
+notify:
+  - on: workflow.completed
+    channels: [terminal]
+  - on: workflow.failed
+    channels: [terminal, system]
+
+retention:
+  on_success:
+    keep:
+      - state.json
+      - events.jsonl
+    delete:
+      - ci/*.log
+    after_days: 7
+  on_failure:
+    keep_all_for_days: 30

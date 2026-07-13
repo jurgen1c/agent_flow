@@ -1,0 +1,13 @@
+name: example-workflow
+version: 1
+style: pipeline
+maturity: draft
+
+inputs: {}
+sessions: {}
+artifacts:
+  root: .agentflow/runs/{{ run.id }}/artifacts
+steps: []
+policies: {}
+notify: []
+retention: {}

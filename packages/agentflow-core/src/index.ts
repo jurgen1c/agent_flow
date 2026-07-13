@@ -1,8 +1,25 @@
 import type { AgentToolPackageBoundary } from "@jurgen1c/agent-tools";
 import type { AgentflowSchemaPackageBoundary } from "@jurgen1c/agentflow-schemas";
+import type { AgentflowMaturity, AgentflowWorkflowStyle } from "./workflow";
+export {
+  AgentflowWorkflowParseError,
+  formatWorkflowParseIssues,
+  parseAgentflowWorkflow,
+  parseAgentflowWorkflowOrThrow
+} from "./workflow";
+export type {
+  AgentflowWorkflow,
+  AgentflowWorkflowParseFailure,
+  AgentflowWorkflowParseIssue,
+  AgentflowWorkflowParseResult,
+  AgentflowWorkflowParseSuccess,
+  AgentflowMaturity,
+  AgentflowWorkflowStyle,
+  AgentflowWorkflowStep,
+  AgentflowYamlMapping,
+  AgentflowYamlValue
+} from "./workflow";
 
-export type AgentflowWorkflowStyle = "pipeline" | "recovery_pipeline" | "collaborative";
-export type AgentflowMaturity = "draft" | "experimental" | "stable" | "trusted";
 export type AgentflowRunStatus = "pending" | "running" | "waiting" | "paused" | "completed" | "failed" | "cancelled";
 
 export const plannedAgentflowRuntimeCommands = [
