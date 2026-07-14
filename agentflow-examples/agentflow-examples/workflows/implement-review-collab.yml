@@ -1,0 +1,94 @@
+name: implement-review-collab
+version: 1
+style: collaborative
+maturity: experimental
+
+description: FM implementer writes code, separate FM reviewer reviews, implementer addresses feedback.
+
+collaboration:
+  enabled: true
+  max_review_cycles: 3
+  on_disagreement:
+    strategy: ask_user
+
+sessions:
+  implementer:
+    provider: frontier
+    resume: true
+    role: code_implementer
+    authority:
+      can_modify_files: true
+  reviewer:
+    provider: frontier
+    resume: true
+    role: code_reviewer
+    authority:
+      can_request_changes: true
+      can_approve: true
+      can_modify_files: false
+
+steps:
+  - id: implement
+    type: session_request
+    session: implementer
+    prompt: prompts/implement-ticket.md
+    inputs:
+      - spec.md
+    outputs:
+      - implementation-summary.md
+
+  - id: review
+    type: review
+    reviewer: reviewer
+    subject: implementer
+    artifacts:
+      - implementation-summary.md
+      - git.diff
+    outputs:
+      - reviews/code-review.json
+
+  - id: route_review
+    type: condition
+    branches:
+      - if: reviews.code_review.status == "approved"
+        then: record_approval
+      - if: reviews.code_review.status == "changes_requested"
+        then: address_review
+    else: ask_user
+
+  - id: address_review
+    type: session_request
+    session: implementer
+    prompt: prompts/address-review.md
+    inputs:
+      - reviews/code-review.json
+      - implementation-summary.md
+    outputs:
+      - implementation-summary.md
+    then: review
+
+  - id: record_approval
+    type: decision_record
+    owner: reviewer
+    topic: "Implementation approved"
+    artifacts:
+      - reviews/code-review.json
+      - implementation-summary.md
+
+  - id: ask_user
+    type: input_request
+    question: "Reviewer and implementer did not reach a clear outcome. How should Agentflow proceed?"
+    save_as: user-input/review-disagreement.md
+
+approvals:
+  reviewer_approval:
+    invalidated_by:
+      - git.diff
+      - implementation-summary.md
+
+notify:
+  - on: approval.waiting
+    channels: [system, terminal]
+  - on: workflow.paused
+    channels: [email_personal, terminal]
+

@@ -1,0 +1,95 @@
+name: pr-feedback-loop
+version: 1
+style: recovery_pipeline
+maturity: experimental
+
+description: Poll a PR for actionable comments and ask FM to resolve them.
+
+inputs:
+  pr_url:
+    required: true
+
+sessions:
+  lm:
+    provider: local
+    resume: true
+    role: pr_orchestrator
+  fm:
+    provider: frontier
+    resume: true
+    role: feedback_resolver
+
+steps:
+  - id: wait_for_review
+    type: loop
+    every_seconds: 300
+    max_iterations: 24
+    max_duration_seconds: 86400
+    until: pr.checks_passed == true && pr.actionable_comments_count == 0
+    short_circuit_if:
+      - budget.frontier_calls_remaining == 0
+      - risk.high == true
+    body:
+      - id: collect_pr_state
+        type: command
+        command: gh pr view {{ inputs.pr_url }} --json reviews,comments,statusCheckRollup
+        outputs:
+          - github/pr-state.json
+
+      - id: classify_comments
+        type: session_request
+        session: lm
+        prompt: prompts/classify-pr-comments.md
+        inputs:
+          - github/pr-state.json
+        outputs:
+          - github/actionable-comments.json
+
+      - id: route_comments
+        type: condition
+        if: artifacts.github.actionable_comments.count > 0
+        then: resolve_comments
+        else: continue_loop
+
+      - id: resolve_comments
+        type: session_request
+        session: fm
+        prompt: prompts/resolve-pr-comments.md
+        inputs:
+          - github/actionable-comments.json
+          - implementation-summary.md
+        outputs:
+          - implementation-summary.md
+
+      - id: rerun_ci
+        type: command
+        command: bin/ci
+        on_failure:
+          route_to:
+            workflow: ci-triage
+            inputs:
+              failure_payload: "{{ failure.path }}"
+              failed_step: rerun_ci
+          on_remediated:
+            return_to: rerun_ci
+          on_unresolved:
+            then: pause
+
+      - id: push_fixes
+        type: command
+        command: git push
+
+      - id: continue_loop
+        type: result
+        status: continue
+
+  - id: return_complete
+    type: result
+    status: completed
+
+notify:
+  - on: loop.timeout
+    channels: [email_personal, terminal]
+  - on: workflow.paused
+    channels: [system, terminal]
+

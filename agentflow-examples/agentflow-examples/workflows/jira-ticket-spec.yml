@@ -1,0 +1,54 @@
+name: jira-ticket-spec
+version: 1
+style: pipeline
+maturity: draft
+
+description: Fetch a Jira ticket through MCP and ask a local model to create an implementation spec.
+
+inputs:
+  ticket_key:
+    required: true
+
+sessions:
+  lm:
+    provider: local
+    resume: true
+    role: spec_writer
+
+steps:
+  - id: fetch_ticket
+    type: mcp_call
+    server: atlassian-rovo-mcp
+    tool: get_issue
+    arguments:
+      key: "{{ inputs.ticket_key }}"
+    outputs:
+      - ticket.json
+    on_failure:
+      then: pause
+
+  - id: render_ticket
+    type: artifact_transform
+    input: ticket.json
+    output: ticket.md
+    transform: jira_ticket_to_markdown
+
+  - id: create_spec
+    type: session_request
+    session: lm
+    prompt: prompts/create-spec.md
+    inputs:
+      - ticket.json
+      - ticket.md
+    outputs:
+      - spec.md
+    on_failure:
+      retry: 1
+      then: pause
+
+notify:
+  - on: workflow.completed
+    channels: [terminal]
+  - on: workflow.paused
+    channels: [terminal, system]
+

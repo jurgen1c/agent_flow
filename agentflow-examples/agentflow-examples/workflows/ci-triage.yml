@@ -1,0 +1,85 @@
+name: ci-triage
+version: 1
+style: recovery_pipeline
+maturity: experimental
+
+description: Classify a CI failure, optionally ask FM to fix it, then return to the failed step.
+
+inputs:
+  failure_payload:
+    required: true
+  failed_step:
+    required: true
+
+sessions:
+  lm:
+    provider: local
+    resume: true
+    role: ci_classifier
+  fm:
+    provider: frontier
+    resume: true
+    role: ci_fixer
+
+steps:
+  - id: classify
+    type: session_request
+    session: lm
+    prompt: prompts/classify-ci-failure.md
+    inputs:
+      - "{{ inputs.failure_payload }}"
+    outputs:
+      - ci/failure-classification.json
+
+  - id: route
+    type: condition
+    branches:
+      - if: artifacts.ci.failure_classification.kind == "flake"
+        then: return_remediated
+      - if: artifacts.ci.failure_classification.kind == "formatting_error"
+        then: fix_formatting
+      - if: artifacts.ci.failure_classification.kind == "implementation_error"
+        then: fix_with_fm
+      - if: artifacts.ci.failure_classification.requires_user == true
+        then: ask_user
+    else: return_unresolved
+
+  - id: fix_formatting
+    type: command
+    command: bin/rubocop -A
+    on_failure:
+      then: return_unresolved
+    then: return_remediated
+
+  - id: fix_with_fm
+    type: session_request
+    session: fm
+    prompt: prompts/fix-ci-failure.md
+    inputs:
+      - "{{ inputs.failure_payload }}"
+      - ci/failure-classification.json
+    outputs:
+      - implementation-summary.md
+    on_failure:
+      then: return_unresolved
+    then: return_remediated
+
+  - id: ask_user
+    type: input_request
+    question: "CI failure requires product or environment judgment. How should Agentflow proceed?"
+    save_as: user-input/ci-decision.md
+    then: return_unresolved
+
+  - id: return_remediated
+    type: result
+    status: remediated
+    return_to: "{{ inputs.failed_step }}"
+
+  - id: return_unresolved
+    type: result
+    status: unresolved
+
+limits:
+  max_frontier_calls: 2
+  max_duration_minutes: 45
+

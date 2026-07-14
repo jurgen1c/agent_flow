@@ -1,0 +1,92 @@
+name: content-review-collab
+version: 1
+style: collaborative
+maturity: draft
+
+description: Marketing session drafts copy, product session reviews and approves.
+
+collaboration:
+  enabled: true
+  max_review_cycles: 2
+  on_disagreement:
+    strategy: ask_user
+
+inputs:
+  feature_name:
+    required: true
+
+sessions:
+  marketing:
+    provider: frontier
+    resume: true
+    role: copywriter
+    authority:
+      can_modify_files: true
+  product:
+    provider: local
+    resume: true
+    role: product_reviewer
+    authority:
+      can_request_changes: true
+      can_approve: true
+      can_block: true
+
+steps:
+  - id: draft_copy
+    type: session_request
+    session: marketing
+    prompt: prompts/draft-feature-copy.md
+    inputs:
+      - product/feature-brief.md
+    outputs:
+      - content/feature-copy.md
+
+  - id: product_review
+    type: review
+    reviewer: product
+    subject: marketing
+    artifacts:
+      - content/feature-copy.md
+      - product/feature-brief.md
+    outputs:
+      - reviews/product-copy-review.json
+
+  - id: route_review
+    type: condition
+    branches:
+      - if: reviews.product_copy_review.status == "approved"
+        then: record_approval
+      - if: reviews.product_copy_review.status == "changes_requested"
+        then: revise_copy
+    else: ask_user
+
+  - id: revise_copy
+    type: session_request
+    session: marketing
+    prompt: prompts/revise-feature-copy.md
+    inputs:
+      - reviews/product-copy-review.json
+      - content/feature-copy.md
+    outputs:
+      - content/feature-copy.md
+    then: product_review
+
+  - id: record_approval
+    type: decision_record
+    owner: product
+    topic: "Feature copy approved"
+    artifacts:
+      - content/feature-copy.md
+      - reviews/product-copy-review.json
+
+  - id: ask_user
+    type: input_request
+    question: "Product and marketing did not reach agreement. What should the final direction be?"
+    save_as: user-input/content-decision.md
+
+notify:
+  - on: workflow.completed
+    channels: [terminal]
+  - on: workflow.paused
+    channels: [system, terminal]
+

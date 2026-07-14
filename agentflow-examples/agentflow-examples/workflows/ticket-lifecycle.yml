@@ -1,0 +1,124 @@
+name: ticket-lifecycle
+version: 1
+style: recovery_pipeline
+maturity: experimental
+
+description: End-to-end ticket lifecycle using LM for orchestration and FM for implementation/review.
+
+inputs:
+  ticket_key:
+    required: true
+
+sessions:
+  lm:
+    provider: local
+    resume: true
+    role: orchestrator
+  fm:
+    provider: frontier
+    resume: true
+    role: implementer
+
+steps:
+  - id: fetch_ticket
+    type: mcp_call
+    server: atlassian-rovo-mcp
+    tool: get_issue
+    arguments:
+      key: "{{ inputs.ticket_key }}"
+    outputs:
+      - ticket.json
+
+  - id: create_spec
+    type: session_request
+    session: lm
+    prompt: prompts/create-spec.md
+    inputs:
+      - ticket.json
+    outputs:
+      - spec.md
+
+  - id: create_branch
+    type: command
+    command: git checkout -b ticketflow/{{ inputs.ticket_key }}
+
+  - id: implement
+    type: session_request
+    session: fm
+    prompt: prompts/implement-ticket.md
+    inputs:
+      - spec.md
+      - ticket.json
+    outputs:
+      - implementation-summary.md
+
+  - id: fm_review
+    type: session_request
+    session: fm
+    prompt: prompts/review-implementation.md
+    inputs:
+      - implementation-summary.md
+      - git.diff
+    outputs:
+      - fm-review.md
+
+  - id: local_ci
+    type: command
+    command: bin/ci
+    timeout_seconds: 1800
+    outputs:
+      - ci/latest.log
+    on_failure:
+      route_to:
+        workflow: ci-triage
+        inputs:
+          failure_payload: "{{ failure.path }}"
+          failed_step: local_ci
+      on_remediated:
+        return_to: local_ci
+      on_unresolved:
+        then: pause
+
+  - id: create_pr
+    type: command
+    command: gh pr create --fill
+    on_failure:
+      route_to:
+        session: lm
+        prompt: prompts/triage-gh-failure.md
+      on_remediated:
+        return_to: create_pr
+      on_unresolved:
+        then: pause
+
+  - id: pr_feedback_loop
+    type: workflow
+    workflow: pr-feedback-loop
+    inputs:
+      pr_url: "{{ artifacts.github.pr_url }}"
+    on_failure:
+      then: pause
+
+  - id: approve_merge
+    type: manual_gate
+    message: "Ticket {{ inputs.ticket_key }} is ready. Merge PR?"
+    options: [approve, pause, cancel]
+    on_approve: merge_pr
+
+  - id: merge_pr
+    type: command
+    command: gh pr merge --squash --delete-branch
+
+limits:
+  max_frontier_calls: 6
+  max_recovery_cycles: 3
+  max_duration_minutes: 240
+
+notify:
+  - on: workflow.completed
+    channels: [email_personal, terminal]
+  - on: workflow.failed
+    channels: [email_personal, terminal]
+  - on: workflow.paused
+    channels: [system, terminal]
+
