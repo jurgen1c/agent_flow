@@ -1,0 +1,21 @@
+name: broken-collaboration
+version: 1
+style: collaborative
+maturity: draft
+
+collaboration:
+  enabled: true
+
+sessions:
+  reviewer:
+    provider: local
+
+steps:
+  - id: review
+    type: mystery_review
+    reviewer: reviewer
+
+  - id: approve
+    type: manual_gate
+    message: Approve the result?
+    options: [approve]

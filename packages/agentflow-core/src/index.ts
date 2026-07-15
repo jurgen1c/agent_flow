@@ -7,6 +7,11 @@ export {
   parseAgentflowWorkflow,
   parseAgentflowWorkflowOrThrow
 } from "./workflow";
+export {
+  formatAgentflowWorkflowIssues,
+  lintAgentflowWorkflow,
+  validateAgentflowWorkflow
+} from "./validation";
 export type {
   AgentflowWorkflow,
   AgentflowWorkflowParseFailure,
@@ -19,6 +24,11 @@ export type {
   AgentflowYamlMapping,
   AgentflowYamlValue
 } from "./workflow";
+export type {
+  AgentflowWorkflowIssue,
+  AgentflowWorkflowLintResult,
+  AgentflowWorkflowValidationResult
+} from "./validation";
 
 export type AgentflowRunStatus = "pending" | "running" | "waiting" | "paused" | "completed" | "failed" | "cancelled";
 

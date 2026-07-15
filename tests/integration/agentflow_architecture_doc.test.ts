@@ -37,7 +37,9 @@ describe("Agentflow monorepo architecture doc", () => {
     expect(doc).toContain("@jurgen1c/agent-tools -> no Agent Memory or Agentflow runtime dependency");
     expect(doc).toContain("@jurgen1c/agentflow-cli");
     expect(doc).toContain("does not provide replacement binaries");
-    expect(doc).toContain("intentionally limited to help and");
+    expect(doc).toContain("supports help, version, deterministic");
+    expect(doc).toContain("agentflow validate <workflow>");
+    expect(doc).toContain("agentflow lint <workflow>");
     expect(doc).toContain(".agent-memory/memory.sqlite");
     expect(doc).toContain(".agentflow/");
     expect(doc).toContain("The existing CLI remains the compatibility anchor");

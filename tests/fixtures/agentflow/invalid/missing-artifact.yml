@@ -1,0 +1,10 @@
+name: missing-artifact
+version: 1
+style: pipeline
+maturity: draft
+
+steps:
+  - id: consume
+    type: command
+    command: cat never-created.txt
+    inputs: [never-created.txt]

@@ -24,7 +24,7 @@ runtime.
 | Agent Memory web UI | `packages/web` | Private workspace shell named `@jurgen1c/agent-memory-web`; bundled inside `@jurgen1c/agent-memory-cli` by default | Local browser UI for inspecting committed memory and generated read models. It should consume core API shapes and static assets, not own repository memory semantics. |
 | Agentflow CLI and runtime | `packages/agentflow` | `@jurgen1c/agentflow` | Workflow definition validation, run creation, resumable execution, step scheduling, event logs, artifact management, policies, approvals, retries, and cleanup. |
 | Agentflow core | `packages/agentflow-core` | Private workspace shell named `@jurgen1c/agentflow-core` until the runtime API is intentionally published | Typed workflow/run primitives, planned command names, and runtime package boundary metadata. |
-| Agentflow CLI | `packages/agentflow-cli` | Public package named `@jurgen1c/agentflow-cli` | `agentflow` executable entrypoint, help text, version output, and command gating while runtime behavior is unavailable. |
+| Agentflow CLI | `packages/agentflow-cli` | Public package named `@jurgen1c/agentflow-cli` | `agentflow` executable entrypoint, help and version output, workflow validation and lint adapters, and command gating while runtime behavior is unavailable. |
 | Agentflow schemas | `packages/agentflow-schemas` | Private workspace shell named `@jurgen1c/agentflow-schemas` until schemas are intentionally published | JSON schemas for Agentflow project config and workflow definitions. |
 | Agentflow Agent Memory adapter | `packages/agentflow-agent-memory-adapter` | Private workspace shell named `@jurgen1c/agentflow-agent-memory-adapter` until adapter APIs are intentionally published | Typed adapter contract for Agentflow steps that need Agent Memory context. |
 | Agentflow examples | `packages/agentflow-examples` or `examples/agentflow` | `@jurgen1c/agentflow-examples` if published; otherwise examples only | Reviewable workflow, prompt, and template examples for pipeline, recovery, and collaborative workflow styles. Examples must not be required at runtime. |
@@ -150,12 +150,19 @@ The root `@jurgen1c/agent-memory-cli` package still includes the compatibility
 `agentflow` binary during the transition, but new install guidance points to
 `@jurgen1c/agentflow-cli` as the package that owns the Agentflow command.
 
-## Initial Skeleton Constraint
+## Current Authoring Constraint
 
-The first `agentflow` built executable is intentionally limited to help and
-version output. Runtime command names such as `validate`, `run`, `resume`, and
-`cleanup` are reserved placeholders until the platform behavior is implemented
-behind schemas, validation, persistence, and tests.
+The `agentflow` built executable currently supports help, version, deterministic
+workflow validation, and read-only workflow linting. Execution command names
+such as `run`, `resume`, and `cleanup` remain reserved placeholders until the
+platform behavior is implemented behind persistence and runtime tests.
+
+The phase-1 authoring boundary exposes parsing, validation, and linting from
+`@jurgen1c/agentflow-core`. Validation returns stable issue codes for structure,
+references, safety, sessions, loops, artifacts, parallel writers, and approvals.
+Linting reports complexity, budget, overwrite, secret-input, and risky-command
+warnings without mutating workflow files. The CLI exposes these APIs through
+`agentflow validate <workflow>` and `agentflow lint <workflow>`.
 
 ## Implementation Order
 

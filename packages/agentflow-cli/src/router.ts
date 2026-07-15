@@ -1,5 +1,12 @@
 import fs from "node:fs";
-import { plannedAgentflowRuntimeCommands } from "@jurgen1c/agentflow-core";
+import {
+  formatAgentflowWorkflowIssues,
+  formatWorkflowParseIssues,
+  lintAgentflowWorkflow,
+  parseAgentflowWorkflow,
+  plannedAgentflowRuntimeCommands,
+  validateAgentflowWorkflow
+} from "@jurgen1c/agentflow-core";
 
 export interface AgentflowCliStreams {
   stdout: Pick<NodeJS.WriteStream, "write">;
@@ -29,10 +36,26 @@ export async function runCli(args: string[], streams: AgentflowCliStreams = proc
 export function dispatch(args: string[]): AgentflowCliResult {
   const [command, ...rest] = args;
 
-  if (!command || command === "help" || command === "--help" || command === "-h") {
+  if (!command || command === "--help" || command === "-h") {
     return {
       exitCode: 0,
-      stdout: renderHelp(command === "help" ? rest[0] : undefined)
+      stdout: renderHelp()
+    };
+  }
+
+  if (command === "help") {
+    const topic = rest[0];
+
+    if (topic && !["help", "version", "validate", "lint"].includes(topic) && !isPlannedRuntimeCommand(topic)) {
+      return {
+        exitCode: 7,
+        stderr: `Unknown Agentflow help topic: ${topic}\nRun \`agentflow help\` to see available commands.`
+      };
+    }
+
+    return {
+      exitCode: 0,
+      stdout: renderHelp(topic)
     };
   }
 
@@ -43,10 +66,14 @@ export function dispatch(args: string[]): AgentflowCliResult {
     };
   }
 
+  if (command === "validate" || command === "lint") {
+    return checkWorkflow(command, rest);
+  }
+
   if (isPlannedRuntimeCommand(command)) {
     return {
       exitCode: 7,
-      stderr: `Agentflow command "${command}" is reserved but not active yet.\nOnly help and version are available in this skeleton.`
+      stderr: `Agentflow command "${command}" is reserved but not active yet.\nAvailable now: help, version, validate, and lint.`
     };
   }
 
@@ -61,8 +88,9 @@ function renderHelp(topic?: string): string {
     return [
       `agentflow ${topic}`,
       "",
-      "This command name is reserved for a future Agentflow runtime surface.",
-      "Only help and version are active in this skeleton."
+      topic === "validate" || topic === "lint"
+        ? `Usage: agentflow ${topic} <workflow>`
+        : "This command name is reserved for a future Agentflow runtime surface."
     ].join("\n");
   }
 
@@ -72,16 +100,79 @@ function renderHelp(topic?: string): string {
     "Usage:",
     "  agentflow help",
     "  agentflow --version",
+    "  agentflow validate <workflow>",
+    "  agentflow lint <workflow>",
     "",
     "Available now:",
     "  help       Show this help output.",
     "  version    Print the Agentflow package version.",
+    "  validate <workflow>  Validate workflow structure, references, and safety.",
+    "  lint <workflow>      Warn about complexity and risky authoring patterns.",
     "",
     "Reserved placeholders:",
-    `  ${plannedAgentflowRuntimeCommands.join(", ")}`,
+    `  ${plannedAgentflowRuntimeCommands.filter((command) => command !== "validate" && command !== "lint").join(", ")}`,
     "",
     "No workflow execution commands are active yet."
   ].join("\n");
+}
+
+function checkWorkflow(command: "validate" | "lint", args: string[]): AgentflowCliResult {
+  const workflowPath = args[0];
+
+  if (!workflowPath || args.length !== 1) {
+    return { exitCode: 1, stderr: `Usage: agentflow ${command} <workflow>` };
+  }
+
+  let source: string;
+
+  try {
+    source = fs.readFileSync(workflowPath, "utf8");
+  } catch (error) {
+    return {
+      exitCode: 1,
+      stderr: `Could not read Agentflow workflow ${workflowPath}: ${error instanceof Error ? error.message : String(error)}`
+    };
+  }
+
+  const parsed = parseAgentflowWorkflow(source);
+
+  if (!parsed.ok) {
+    return {
+      exitCode: 2,
+      stderr: `Agentflow ${command} failed: ${workflowPath}\n${formatWorkflowParseIssues(parsed.errors)}`
+    };
+  }
+
+  const validation = validateAgentflowWorkflow(parsed.workflow);
+
+  if (!validation.valid) {
+    return {
+      exitCode: 2,
+      stderr: `Agentflow ${command} failed: ${workflowPath}\n${formatAgentflowWorkflowIssues(validation.errors)}`
+    };
+  }
+
+  if (command === "validate") {
+    const warnings = lintAgentflowWorkflow(parsed.workflow).warnings;
+
+    return warnings.length === 0
+      ? { exitCode: 0, stdout: `Agentflow validation passed: ${workflowPath}` }
+      : {
+          exitCode: 0,
+          stdout: `Agentflow validation passed with ${warnings.length} warning${warnings.length === 1 ? "" : "s"}: ${workflowPath}\n${formatAgentflowWorkflowIssues(warnings)}`
+        };
+  }
+
+  const lint = lintAgentflowWorkflow(parsed.workflow);
+
+  if (lint.warnings.length === 0) {
+    return { exitCode: 0, stdout: `Agentflow lint passed with no warnings: ${workflowPath}` };
+  }
+
+  return {
+    exitCode: 0,
+    stdout: `Agentflow lint found ${lint.warnings.length} warning${lint.warnings.length === 1 ? "" : "s"}: ${workflowPath}\n${formatAgentflowWorkflowIssues(lint.warnings)}`
+  };
 }
 
 function isPlannedRuntimeCommand(command: string): boolean {

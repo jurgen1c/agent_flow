@@ -1,0 +1,28 @@
+name: unsafe-workflow
+version: 1
+style: recovery_pipeline
+maturity: draft
+
+sessions:
+  reviewer:
+    provider: local
+    role: reviewer
+
+steps:
+  - id: erase
+    type: command
+    command: rm -rf /
+    then: missing_step
+
+  - id: ask_model
+    type: session_request
+    session: missing_session
+    prompt: prompts/review.md
+
+  - id: forever
+    type: loop
+    until: done == true
+    body:
+      - id: repeat
+        type: command
+        command: echo retry
