@@ -20,6 +20,7 @@ describe("Agentflow CLI", () => {
     expect(result.stdout).toContain("lint <workflow>");
     expect(result.stdout).toContain("explain <workflow>");
     expect(result.stdout).toContain("graph <workflow>");
+    expect(result.stdout).toContain("simulate <workflow> --fixture <file>");
     expect(result.stdout).toContain("No workflow execution commands are active yet.");
   });
 
@@ -31,12 +32,12 @@ describe("Agentflow CLI", () => {
   });
 
   test("keeps execution commands reserved but inactive", () => {
-    for (const command of plannedAgentflowRuntimeCommands.filter((candidate) => !["validate", "lint", "explain", "graph"].includes(candidate))) {
+    for (const command of plannedAgentflowRuntimeCommands.filter((candidate) => !["validate", "lint", "explain", "graph", "simulate"].includes(candidate))) {
       const result = dispatch([command]);
 
       expect(result.exitCode).toBe(7);
       expect(result.stderr).toContain("reserved but not active yet");
-      expect(result.stderr).toContain("Available now: help, version, validate, lint, explain, and graph.");
+      expect(result.stderr).toContain("Available now: help, version, validate, lint, explain, graph, and simulate.");
     }
   });
 
@@ -48,6 +49,10 @@ describe("Agentflow CLI", () => {
     expect(dispatch(["help", "explain"])).toEqual({
       exitCode: 0,
       stdout: "agentflow explain\n\nUsage: agentflow explain <workflow>"
+    });
+    expect(dispatch(["help", "simulate"])).toEqual({
+      exitCode: 0,
+      stdout: "agentflow simulate\n\nUsage: agentflow simulate <workflow> --fixture <file>"
     });
     expect(dispatch(["help", "run"])).toEqual({
       exitCode: 0,
@@ -97,6 +102,34 @@ describe("Agentflow CLI", () => {
     expect(graph.stdout).toContain("Workflow graph: pr-feedback-loop (version 1)");
     expect(graph.stdout).toContain("wait_for_review -> collect_pr_state [loop body]");
     expect(fs.readFileSync(fixturePath, "utf8")).toBe(before);
+  });
+
+  test("simulates workflows from JSON fixtures without executing or rewriting them", () => {
+    const workflowPath = path.join(repoRoot, "agentflow-examples/agentflow-examples/workflows/simple-ci.yml");
+    const fixturePath = path.join(repoRoot, "tests/fixtures/agentflow/simulation/simple-ci.json");
+    const workflowBefore = fs.readFileSync(workflowPath, "utf8");
+    const fixtureBefore = fs.readFileSync(fixturePath, "utf8");
+    const result = dispatch(["simulate", workflowPath, "--fixture", fixturePath]);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("Agentflow simulation: simple-ci (version 1)");
+    expect(result.stdout).toContain("Status: completed");
+    expect(result.stdout).toContain("install [command]: succeeded");
+    expect(fs.readFileSync(workflowPath, "utf8")).toBe(workflowBefore);
+    expect(fs.readFileSync(fixturePath, "utf8")).toBe(fixtureBefore);
+  });
+
+  test("reports invalid simulation fixtures and usage", () => {
+    const workflowPath = path.join(repoRoot, "agentflow-examples/agentflow-examples/workflows/simple-ci.yml");
+    const invalidFixture = path.join(repoRoot, "tests/fixtures/agentflow/workflows/simple-ci.yml");
+
+    expect(dispatch(["simulate", workflowPath])).toEqual({
+      exitCode: 1,
+      stderr: "Usage: agentflow simulate <workflow> --fixture <file>"
+    });
+    const invalid = dispatch(["simulate", workflowPath, "--fixture", invalidFixture]);
+    expect(invalid.exitCode).toBe(2);
+    expect(invalid.stderr).toContain("Could not parse Agentflow simulation fixture");
   });
 
   test("reports generated graph node collisions without crashing", () => {

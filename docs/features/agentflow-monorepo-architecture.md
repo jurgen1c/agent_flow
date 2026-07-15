@@ -153,8 +153,9 @@ The root `@jurgen1c/agent-memory-cli` package still includes the compatibility
 ## Current Authoring Constraint
 
 The `agentflow` built executable currently supports help, version, deterministic
-workflow validation, read-only workflow linting, workflow explanation, and
-deterministic graph inspection. Execution command names
+workflow validation, read-only workflow linting, workflow explanation,
+deterministic graph inspection, and fixture-backed workflow simulation.
+Execution command names
 such as `run`, `resume`, and `cleanup` remain reserved placeholders until the
 platform behavior is implemented behind persistence and runtime tests.
 
@@ -167,9 +168,32 @@ metadata, steps, sessions, artifacts, policies, collaboration, and lint warnings
 Graph inspection emits stable nodes and labeled edges for sequence, control-flow
 targets, loop bodies, parallel branches, nested workflows, manual gates, and
 collaboration steps. These inspection commands never execute workflow steps.
+Simulation accepts a JSON fixture containing optional initial `inputs` and
+`artifacts`, plus step records keyed by step ID. Step records can select
+outcomes, declared outputs, condition targets, manual-gate choices, loop
+iteration counts, and input-request values. The simulator traverses those
+contracts in memory and reports visited steps, available and missing artifacts,
+unresolved branches, and terminal states. It does not run commands, model
+sessions, nested workflows, or MCP calls, and it never writes workflow, fixture,
+artifact, or run-state files.
 The CLI exposes these APIs through `agentflow validate <workflow>`,
 `agentflow lint <workflow>`, `agentflow explain <workflow>`, and
-`agentflow graph <workflow>`.
+`agentflow graph <workflow>`, plus
+`agentflow simulate <workflow> --fixture <file>`.
+
+Example simulation fixture:
+
+```json
+{
+  "artifacts": { "spec.md": "fixture content" },
+  "steps": {
+    "implement": { "outputs": ["implementation-summary.md"] },
+    "route_review": { "condition": "record_approval" },
+    "approval_gate": { "choice": "approve" },
+    "review_loop": { "iterations": 1 }
+  }
+}
+```
 
 ## Implementation Order
 

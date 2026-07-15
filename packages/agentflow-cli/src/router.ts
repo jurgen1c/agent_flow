@@ -6,8 +6,11 @@ import {
   formatWorkflowParseIssues,
   lintAgentflowWorkflow,
   parseAgentflowWorkflow,
+  parseAgentflowSimulationFixture,
   plannedAgentflowRuntimeCommands,
+  renderAgentflowSimulationSummary,
   renderAgentflowWorkflowGraph,
+  simulateAgentflowWorkflow,
   validateAgentflowWorkflow
 } from "@jurgen1c/agentflow-core";
 
@@ -49,7 +52,7 @@ export function dispatch(args: string[]): AgentflowCliResult {
   if (command === "help") {
     const topic = rest[0];
 
-    if (topic && !["help", "version", "validate", "lint", "explain", "graph"].includes(topic) && !isPlannedRuntimeCommand(topic)) {
+    if (topic && !["help", "version", "validate", "lint", "explain", "graph", "simulate"].includes(topic) && !isPlannedRuntimeCommand(topic)) {
       return {
         exitCode: 7,
         stderr: `Unknown Agentflow help topic: ${topic}\nRun \`agentflow help\` to see available commands.`
@@ -73,10 +76,14 @@ export function dispatch(args: string[]): AgentflowCliResult {
     return checkWorkflow(command, rest);
   }
 
+  if (command === "simulate") {
+    return simulateWorkflow(rest);
+  }
+
   if (isPlannedRuntimeCommand(command)) {
     return {
       exitCode: 7,
-      stderr: `Agentflow command "${command}" is reserved but not active yet.\nAvailable now: help, version, validate, lint, explain, and graph.`
+      stderr: `Agentflow command "${command}" is reserved but not active yet.\nAvailable now: help, version, validate, lint, explain, graph, and simulate.`
     };
   }
 
@@ -91,8 +98,10 @@ function renderHelp(topic?: string): string {
     return [
       `agentflow ${topic}`,
       "",
-      ["validate", "lint", "explain", "graph"].includes(topic)
-        ? `Usage: agentflow ${topic} <workflow>`
+      ["validate", "lint", "explain", "graph", "simulate"].includes(topic)
+        ? topic === "simulate"
+          ? "Usage: agentflow simulate <workflow> --fixture <file>"
+          : `Usage: agentflow ${topic} <workflow>`
         : "This command name is reserved for a future Agentflow runtime surface."
     ].join("\n");
   }
@@ -107,6 +116,7 @@ function renderHelp(topic?: string): string {
     "  agentflow lint <workflow>",
     "  agentflow explain <workflow>",
     "  agentflow graph <workflow>",
+    "  agentflow simulate <workflow> --fixture <file>",
     "",
     "Available now:",
     "  help       Show this help output.",
@@ -115,12 +125,47 @@ function renderHelp(topic?: string): string {
     "  lint <workflow>      Warn about complexity and risky authoring patterns.",
     "  explain <workflow>   Explain steps, artifacts, policies, and warnings.",
     "  graph <workflow>     Print a deterministic workflow graph.",
+    "  simulate <workflow> --fixture <file>  Traverse a workflow from fixture data without executing steps.",
     "",
     "Reserved placeholders:",
-    `  ${plannedAgentflowRuntimeCommands.filter((command) => !["validate", "lint", "explain", "graph"].includes(command)).join(", ")}`,
+    `  ${plannedAgentflowRuntimeCommands.filter((command) => !["validate", "lint", "explain", "graph", "simulate"].includes(command)).join(", ")}`,
     "",
     "No workflow execution commands are active yet."
   ].join("\n");
+}
+
+function simulateWorkflow(args: string[]): AgentflowCliResult {
+  if (args.length !== 3 || args[1] !== "--fixture") {
+    return { exitCode: 1, stderr: "Usage: agentflow simulate <workflow> --fixture <file>" };
+  }
+
+  const [workflowPath, , fixturePath] = args;
+  const workflowResult = readWorkflow(workflowPath, "simulate");
+  if ("exitCode" in workflowResult) return workflowResult;
+
+  let fixtureSource: string;
+  try {
+    fixtureSource = fs.readFileSync(fixturePath, "utf8");
+  } catch (error) {
+    return {
+      exitCode: 1,
+      stderr: `Could not read Agentflow simulation fixture ${fixturePath}: ${error instanceof Error ? error.message : String(error)}`
+    };
+  }
+
+  const fixture = parseAgentflowSimulationFixture(fixtureSource);
+  if (!fixture.ok) {
+    return {
+      exitCode: 2,
+      stderr: `Could not parse Agentflow simulation fixture ${fixturePath}: ${fixture.error}`
+    };
+  }
+
+  const result = simulateAgentflowWorkflow(workflowResult.workflow, fixture.fixture);
+  return {
+    exitCode: result.status === "unresolved" ? 2 : 0,
+    stdout: renderAgentflowSimulationSummary(result)
+  };
 }
 
 function checkWorkflow(command: "validate" | "lint" | "explain" | "graph", args: string[]): AgentflowCliResult {
@@ -130,42 +175,17 @@ function checkWorkflow(command: "validate" | "lint" | "explain" | "graph", args:
     return { exitCode: 1, stderr: `Usage: agentflow ${command} <workflow>` };
   }
 
-  let source: string;
-
-  try {
-    source = fs.readFileSync(workflowPath, "utf8");
-  } catch (error) {
-    return {
-      exitCode: 1,
-      stderr: `Could not read Agentflow workflow ${workflowPath}: ${error instanceof Error ? error.message : String(error)}`
-    };
-  }
-
-  const parsed = parseAgentflowWorkflow(source);
-
-  if (!parsed.ok) {
-    return {
-      exitCode: 2,
-      stderr: `Agentflow ${command} failed: ${workflowPath}\n${formatWorkflowParseIssues(parsed.errors)}`
-    };
-  }
-
-  const validation = validateAgentflowWorkflow(parsed.workflow);
-
-  if (!validation.valid) {
-    return {
-      exitCode: 2,
-      stderr: `Agentflow ${command} failed: ${workflowPath}\n${formatAgentflowWorkflowIssues(validation.errors)}`
-    };
-  }
+  const workflowResult = readWorkflow(workflowPath, command);
+  if ("exitCode" in workflowResult) return workflowResult;
+  const workflow = workflowResult.workflow;
 
   if (command === "explain") {
-    return { exitCode: 0, stdout: explainAgentflowWorkflow(parsed.workflow) };
+    return { exitCode: 0, stdout: explainAgentflowWorkflow(workflow) };
   }
 
   if (command === "graph") {
     try {
-      return { exitCode: 0, stdout: renderAgentflowWorkflowGraph(parsed.workflow) };
+      return { exitCode: 0, stdout: renderAgentflowWorkflowGraph(workflow) };
     } catch (error) {
       if (error instanceof AgentflowWorkflowGraphError) {
         return {
@@ -181,7 +201,7 @@ function checkWorkflow(command: "validate" | "lint" | "explain" | "graph", args:
   }
 
   if (command === "validate") {
-    const warnings = lintAgentflowWorkflow(parsed.workflow).warnings;
+    const warnings = lintAgentflowWorkflow(workflow).warnings;
 
     return warnings.length === 0
       ? { exitCode: 0, stdout: `Agentflow validation passed: ${workflowPath}` }
@@ -191,7 +211,7 @@ function checkWorkflow(command: "validate" | "lint" | "explain" | "graph", args:
         };
   }
 
-  const lint = lintAgentflowWorkflow(parsed.workflow);
+  const lint = lintAgentflowWorkflow(workflow);
 
   if (lint.warnings.length === 0) {
     return { exitCode: 0, stdout: `Agentflow lint passed with no warnings: ${workflowPath}` };
@@ -201,6 +221,40 @@ function checkWorkflow(command: "validate" | "lint" | "explain" | "graph", args:
     exitCode: 0,
     stdout: `Agentflow lint found ${lint.warnings.length} warning${lint.warnings.length === 1 ? "" : "s"}: ${workflowPath}\n${formatAgentflowWorkflowIssues(lint.warnings)}`
   };
+}
+
+function readWorkflow(
+  workflowPath: string,
+  command: "validate" | "lint" | "explain" | "graph" | "simulate"
+): { workflow: import("@jurgen1c/agentflow-core").AgentflowWorkflow } | AgentflowCliResult {
+  let source: string;
+
+  try {
+    source = fs.readFileSync(workflowPath, "utf8");
+  } catch (error) {
+    return {
+      exitCode: 1,
+      stderr: `Could not read Agentflow workflow ${workflowPath}: ${error instanceof Error ? error.message : String(error)}`
+    };
+  }
+
+  const parsed = parseAgentflowWorkflow(source);
+  if (!parsed.ok) {
+    return {
+      exitCode: 2,
+      stderr: `Agentflow ${command} failed: ${workflowPath}\n${formatWorkflowParseIssues(parsed.errors)}`
+    };
+  }
+
+  const validation = validateAgentflowWorkflow(parsed.workflow);
+  if (!validation.valid) {
+    return {
+      exitCode: 2,
+      stderr: `Agentflow ${command} failed: ${workflowPath}\n${formatAgentflowWorkflowIssues(validation.errors)}`
+    };
+  }
+
+  return { workflow: parsed.workflow };
 }
 
 function isPlannedRuntimeCommand(command: string): boolean {
