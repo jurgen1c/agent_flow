@@ -2,6 +2,13 @@ import type { AgentToolPackageBoundary } from "@jurgen1c/agent-tools";
 import type { AgentflowSchemaPackageBoundary } from "@jurgen1c/agentflow-schemas";
 import type { AgentflowMaturity, AgentflowWorkflowStyle } from "./workflow";
 export {
+  AGENTFLOW_RUN_STATE_SCHEMA_VERSION,
+  AgentflowRunStateError,
+  AgentflowRunStateStore,
+  DEFAULT_AGENTFLOW_DATABASE_PATH,
+  openAgentflowRunState
+} from "./run_state";
+export {
   AgentflowWorkflowParseError,
   formatWorkflowParseIssues,
   parseAgentflowWorkflow,
@@ -58,8 +65,25 @@ export type {
   AgentflowSimulationVisitedOutcome,
   AgentflowSimulationVisitedStep
 } from "./simulation";
-
-export type AgentflowRunStatus = "pending" | "running" | "waiting" | "paused" | "completed" | "failed" | "cancelled";
+export type {
+  AgentflowApprovalStatus,
+  AgentflowRunRecord,
+  AgentflowRunStateValue,
+  AgentflowRunStatus,
+  AgentflowSessionStatus,
+  AgentflowStepStatus,
+  AppendAgentflowEventInput,
+  CreateAgentflowRunInput,
+  FindResumableAgentflowRunInput,
+  OpenAgentflowRunStateOptions,
+  RecordAgentflowFailureInput,
+  UpdateAgentflowRunInput,
+  UpsertAgentflowApprovalInput,
+  UpsertAgentflowArtifactInput,
+  UpsertAgentflowBudgetInput,
+  UpsertAgentflowSessionInput,
+  UpsertAgentflowStepInput
+} from "./run_state";
 
 export const plannedAgentflowRuntimeCommands = [
   "init",

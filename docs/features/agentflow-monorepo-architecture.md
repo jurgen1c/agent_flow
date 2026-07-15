@@ -93,7 +93,7 @@ Agent Memory generated cache is rebuildable local data:
 promoted into committed plan templates under `docs/agent-memory/plans`.
 
 Agentflow authored project files and mutable run state share the `.agentflow`
-root, but only `runs/` is generated output:
+root. The SQLite database and run artifact directories are generated output:
 
 ```text
 .agentflow/
@@ -101,20 +101,30 @@ root, but only `runs/` is generated output:
   workflows/**/*.yml         # committed workflow definitions
   prompts/**/*.md            # committed prompt templates
   templates/**/*.md          # committed notification/output templates
+  agentflow.sqlite            # authoritative mutable run-state database
   runs/<run-id>/
-    state.json
-    events.jsonl
     artifacts/
     failures/
     sessions/
 ```
 
-Agentflow run state under `.agentflow/runs/` is authoritative for one workflow
-execution and should not be committed. It can record which Agent Memory context
-was read, but it must not become the canonical store for claims, recipes,
-profile traits, or memory waivers. If a workflow discovers durable repository
-knowledge, the workflow should create a reviewable change in
-`docs/agent-memory`, not mutate generated cache files.
+`.agentflow/agentflow.sqlite` is the authoritative mutable state for resumable
+workflow executions and remains separate from `.agent-memory/memory.sqlite`.
+Its schema stores runs, step attempts, artifact metadata, ordered events,
+sessions, failures, approvals, and budgets. Run records support `pending`,
+`running`, `waiting`, `paused`, `completed`, `failed`, and `cancelled` statuses;
+terminal runs are excluded from resume lookup. Parent and recovery links model
+platform orchestration and recovery, while step, session, artifact, approval,
+and budget records model pipeline and collaboration state.
+
+Artifact content and other potentially large generated files live under
+`.agentflow/runs/<run-id>/`; the SQLite artifact rows record their repo-relative
+paths and metadata. Neither the database nor run directories should be
+committed. Run state can record which Agent Memory context was read, but it must
+not become the canonical store for claims, recipes, profile traits, or memory
+waivers. If a workflow discovers durable repository knowledge, the workflow
+should create a reviewable change in `docs/agent-memory`, not mutate generated
+cache files.
 
 ## Adapter Contracts
 
@@ -157,7 +167,10 @@ workflow validation, read-only workflow linting, workflow explanation,
 deterministic graph inspection, and fixture-backed workflow simulation.
 Execution command names
 such as `run`, `resume`, and `cleanup` remain reserved placeholders until the
-platform behavior is implemented behind persistence and runtime tests.
+execution scheduler and command adapters are implemented. The core persistence
+surface now initializes repo-local `.agentflow/agentflow.sqlite` state and
+provides typed create, update, resume-lookup, step, artifact, event, session,
+failure, approval, and budget writes for later runtime phases.
 
 The phase-1 authoring boundary exposes parsing, validation, and linting from
 `@jurgen1c/agentflow-core`. Validation returns stable issue codes for structure,
