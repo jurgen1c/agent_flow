@@ -1,10 +1,13 @@
 import fs from "node:fs";
 import {
+  AgentflowWorkflowGraphError,
+  explainAgentflowWorkflow,
   formatAgentflowWorkflowIssues,
   formatWorkflowParseIssues,
   lintAgentflowWorkflow,
   parseAgentflowWorkflow,
   plannedAgentflowRuntimeCommands,
+  renderAgentflowWorkflowGraph,
   validateAgentflowWorkflow
 } from "@jurgen1c/agentflow-core";
 
@@ -46,7 +49,7 @@ export function dispatch(args: string[]): AgentflowCliResult {
   if (command === "help") {
     const topic = rest[0];
 
-    if (topic && !["help", "version", "validate", "lint"].includes(topic) && !isPlannedRuntimeCommand(topic)) {
+    if (topic && !["help", "version", "validate", "lint", "explain", "graph"].includes(topic) && !isPlannedRuntimeCommand(topic)) {
       return {
         exitCode: 7,
         stderr: `Unknown Agentflow help topic: ${topic}\nRun \`agentflow help\` to see available commands.`
@@ -66,14 +69,14 @@ export function dispatch(args: string[]): AgentflowCliResult {
     };
   }
 
-  if (command === "validate" || command === "lint") {
+  if (command === "validate" || command === "lint" || command === "explain" || command === "graph") {
     return checkWorkflow(command, rest);
   }
 
   if (isPlannedRuntimeCommand(command)) {
     return {
       exitCode: 7,
-      stderr: `Agentflow command "${command}" is reserved but not active yet.\nAvailable now: help, version, validate, and lint.`
+      stderr: `Agentflow command "${command}" is reserved but not active yet.\nAvailable now: help, version, validate, lint, explain, and graph.`
     };
   }
 
@@ -88,7 +91,7 @@ function renderHelp(topic?: string): string {
     return [
       `agentflow ${topic}`,
       "",
-      topic === "validate" || topic === "lint"
+      ["validate", "lint", "explain", "graph"].includes(topic)
         ? `Usage: agentflow ${topic} <workflow>`
         : "This command name is reserved for a future Agentflow runtime surface."
     ].join("\n");
@@ -102,21 +105,25 @@ function renderHelp(topic?: string): string {
     "  agentflow --version",
     "  agentflow validate <workflow>",
     "  agentflow lint <workflow>",
+    "  agentflow explain <workflow>",
+    "  agentflow graph <workflow>",
     "",
     "Available now:",
     "  help       Show this help output.",
     "  version    Print the Agentflow package version.",
     "  validate <workflow>  Validate workflow structure, references, and safety.",
     "  lint <workflow>      Warn about complexity and risky authoring patterns.",
+    "  explain <workflow>   Explain steps, artifacts, policies, and warnings.",
+    "  graph <workflow>     Print a deterministic workflow graph.",
     "",
     "Reserved placeholders:",
-    `  ${plannedAgentflowRuntimeCommands.filter((command) => command !== "validate" && command !== "lint").join(", ")}`,
+    `  ${plannedAgentflowRuntimeCommands.filter((command) => !["validate", "lint", "explain", "graph"].includes(command)).join(", ")}`,
     "",
     "No workflow execution commands are active yet."
   ].join("\n");
 }
 
-function checkWorkflow(command: "validate" | "lint", args: string[]): AgentflowCliResult {
+function checkWorkflow(command: "validate" | "lint" | "explain" | "graph", args: string[]): AgentflowCliResult {
   const workflowPath = args[0];
 
   if (!workflowPath || args.length !== 1) {
@@ -150,6 +157,27 @@ function checkWorkflow(command: "validate" | "lint", args: string[]): AgentflowC
       exitCode: 2,
       stderr: `Agentflow ${command} failed: ${workflowPath}\n${formatAgentflowWorkflowIssues(validation.errors)}`
     };
+  }
+
+  if (command === "explain") {
+    return { exitCode: 0, stdout: explainAgentflowWorkflow(parsed.workflow) };
+  }
+
+  if (command === "graph") {
+    try {
+      return { exitCode: 0, stdout: renderAgentflowWorkflowGraph(parsed.workflow) };
+    } catch (error) {
+      if (error instanceof AgentflowWorkflowGraphError) {
+        return {
+          exitCode: 2,
+          stderr: `Agentflow graph failed: ${workflowPath}\n${error.code}: ${error.message}`
+        };
+      }
+      return {
+        exitCode: 2,
+        stderr: `Agentflow graph failed: ${workflowPath}\nworkflow.graph.internal: ${error instanceof Error ? error.message : String(error)}`
+      };
+    }
   }
 
   if (command === "validate") {

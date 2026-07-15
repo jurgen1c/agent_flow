@@ -1,0 +1,15 @@
+name: graph-node-collision
+version: 1
+style: pipeline
+maturity: draft
+
+steps:
+  - id: run
+    type: command
+    command: echo run
+    on_failure:
+      then: pause
+
+  - id: terminal:pause
+    type: result
+    status: completed

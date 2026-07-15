@@ -153,7 +153,8 @@ The root `@jurgen1c/agent-memory-cli` package still includes the compatibility
 ## Current Authoring Constraint
 
 The `agentflow` built executable currently supports help, version, deterministic
-workflow validation, and read-only workflow linting. Execution command names
+workflow validation, read-only workflow linting, workflow explanation, and
+deterministic graph inspection. Execution command names
 such as `run`, `resume`, and `cleanup` remain reserved placeholders until the
 platform behavior is implemented behind persistence and runtime tests.
 
@@ -161,8 +162,14 @@ The phase-1 authoring boundary exposes parsing, validation, and linting from
 `@jurgen1c/agentflow-core`. Validation returns stable issue codes for structure,
 references, safety, sessions, loops, artifacts, parallel writers, and approvals.
 Linting reports complexity, budget, overwrite, secret-input, and risky-command
-warnings without mutating workflow files. The CLI exposes these APIs through
-`agentflow validate <workflow>` and `agentflow lint <workflow>`.
+warnings without mutating workflow files. Explanation summarizes workflow
+metadata, steps, sessions, artifacts, policies, collaboration, and lint warnings.
+Graph inspection emits stable nodes and labeled edges for sequence, control-flow
+targets, loop bodies, parallel branches, nested workflows, manual gates, and
+collaboration steps. These inspection commands never execute workflow steps.
+The CLI exposes these APIs through `agentflow validate <workflow>`,
+`agentflow lint <workflow>`, `agentflow explain <workflow>`, and
+`agentflow graph <workflow>`.
 
 ## Implementation Order
 

@@ -18,6 +18,8 @@ describe("Agentflow CLI", () => {
     expect(result.stdout).toContain("Available now");
     expect(result.stdout).toContain("validate <workflow>");
     expect(result.stdout).toContain("lint <workflow>");
+    expect(result.stdout).toContain("explain <workflow>");
+    expect(result.stdout).toContain("graph <workflow>");
     expect(result.stdout).toContain("No workflow execution commands are active yet.");
   });
 
@@ -29,12 +31,12 @@ describe("Agentflow CLI", () => {
   });
 
   test("keeps execution commands reserved but inactive", () => {
-    for (const command of plannedAgentflowRuntimeCommands.filter((candidate) => !["validate", "lint"].includes(candidate))) {
+    for (const command of plannedAgentflowRuntimeCommands.filter((candidate) => !["validate", "lint", "explain", "graph"].includes(candidate))) {
       const result = dispatch([command]);
 
       expect(result.exitCode).toBe(7);
       expect(result.stderr).toContain("reserved but not active yet");
-      expect(result.stderr).toContain("Available now: help, version, validate, and lint.");
+      expect(result.stderr).toContain("Available now: help, version, validate, lint, explain, and graph.");
     }
   });
 
@@ -42,6 +44,10 @@ describe("Agentflow CLI", () => {
     expect(dispatch(["help", "validate"])).toEqual({
       exitCode: 0,
       stdout: "agentflow validate\n\nUsage: agentflow validate <workflow>"
+    });
+    expect(dispatch(["help", "explain"])).toEqual({
+      exitCode: 0,
+      stdout: "agentflow explain\n\nUsage: agentflow explain <workflow>"
     });
     expect(dispatch(["help", "run"])).toEqual({
       exitCode: 0,
@@ -77,6 +83,31 @@ describe("Agentflow CLI", () => {
     expect(fs.readFileSync(fixturePath, "utf8")).toBe(before);
   });
 
+  test("explains and graphs workflows without executing or rewriting them", () => {
+    const fixturePath = path.join(repoRoot, "tests/fixtures/agentflow/workflows/pr-feedback-loop.yml");
+    const before = fs.readFileSync(fixturePath, "utf8");
+
+    const explanation = dispatch(["explain", fixturePath]);
+    expect(explanation.exitCode).toBe(0);
+    expect(explanation.stdout).toContain("Workflow: pr-feedback-loop (version 1)");
+    expect(explanation.stdout).toContain("wait_for_review [loop]");
+
+    const graph = dispatch(["graph", fixturePath]);
+    expect(graph.exitCode).toBe(0);
+    expect(graph.stdout).toContain("Workflow graph: pr-feedback-loop (version 1)");
+    expect(graph.stdout).toContain("wait_for_review -> collect_pr_state [loop body]");
+    expect(fs.readFileSync(fixturePath, "utf8")).toBe(before);
+  });
+
+  test("reports generated graph node collisions without crashing", () => {
+    const fixturePath = path.join(repoRoot, "tests/fixtures/agentflow/workflows/graph-node-collision.yml");
+    const result = dispatch(["graph", fixturePath]);
+
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr).toContain("workflow.graph.node_id_collision");
+    expect(result.stderr).toContain('Graph node id "terminal:pause" collides');
+  });
+
   test("surfaces validation warnings while preserving a successful exit", () => {
     const fixturePath = path.join(repoRoot, "tests/fixtures/agentflow/invalid/missing-artifact.yml");
     const result = dispatch(["validate", fixturePath]);
@@ -90,6 +121,10 @@ describe("Agentflow CLI", () => {
     expect(dispatch(["validate"])).toEqual({
       exitCode: 1,
       stderr: "Usage: agentflow validate <workflow>"
+    });
+    expect(dispatch(["graph"])).toEqual({
+      exitCode: 1,
+      stderr: "Usage: agentflow graph <workflow>"
     });
     const missing = dispatch(["lint", path.join(repoRoot, "missing.yml")]);
     expect(missing.exitCode).toBe(1);
