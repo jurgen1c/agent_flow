@@ -1,7 +1,7 @@
 # Agentflow Monorepo Architecture
 
-Status: implemented workspace shell and run persistence foundation
-Ticket: AM-6, AM-7, AM-9, AM-18, AM-19
+Status: implemented workspace shell, run persistence foundation, and Agent Memory context adapter
+Ticket: AM-6, AM-7, AM-9, AM-18, AM-19, AM-21
 
 ## Intent
 
@@ -148,6 +148,22 @@ Agentflow should integrate with Agent Memory through explicit adapter surfaces:
 Adapters should pass plain JSON-compatible data. They should not pass live
 database handles, shell-specific CLI output, or process-global state between
 packages.
+
+The Agent Memory context adapter captures a versioned JSON snapshot at run start
+or a named step boundary. Each snapshot is written through the Agentflow
+artifact registry and includes the context request, memory database path,
+compile metadata, selected claim/recipe/profile-trait IDs, warnings,
+verification commands, memory-update prompts, and the complete context bundle.
+Run-start snapshots use `memory/context/run-start.json`; step snapshots use a
+readable step slug plus a digest so distinct step IDs cannot collide after
+normalization. Replacing a published boundary snapshot requires explicit
+overwrite intent.
+
+Context capture opens `.agent-memory/memory.sqlite` read-only. It does not
+compile memory, write canonical files, or copy Agentflow run state into Agent
+Memory. Callers must compile or sync Agent Memory before capture, and durable
+knowledge discovered during a run still becomes a reviewable canonical-file
+change rather than an adapter-side database mutation.
 
 ## Agent Tools Meta Package
 

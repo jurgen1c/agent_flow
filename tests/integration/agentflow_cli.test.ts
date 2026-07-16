@@ -223,6 +223,7 @@ describe("Agentflow CLI", () => {
       schemasPackage: "@jurgen1c/agentflow-schemas"
     });
     expect(agentflowSchemaPackageBoundary.exportedSchemas).toEqual(["config", "workflow"]);
+    expect(agentflowAgentMemoryAdapterPackageBoundary.status).toBe("active");
     expect(agentflowAgentMemoryAdapterPackageBoundary.agentMemoryPackage).toBe("@jurgen1c/agent-memory-core");
   });
 });
