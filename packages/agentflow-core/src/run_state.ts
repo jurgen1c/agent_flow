@@ -1,18 +1,20 @@
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import type { AgentflowMaturity, AgentflowWorkflowStyle } from "./workflow";
 import {
   AgentflowRunStateSchemaVersionError,
   initializeAgentflowRunStateSchema
 } from "./run_state_schema";
 
-export const AGENTFLOW_RUN_STATE_SCHEMA_VERSION = 1;
+export const AGENTFLOW_RUN_STATE_SCHEMA_VERSION = 2;
 export const DEFAULT_AGENTFLOW_DATABASE_PATH = ".agentflow/agentflow.sqlite";
 
 export type AgentflowRunStatus = "pending" | "running" | "waiting" | "paused" | "completed" | "failed" | "cancelled";
 export type AgentflowStepStatus = AgentflowRunStatus | "skipped";
 export type AgentflowSessionStatus = AgentflowRunStatus;
 export type AgentflowApprovalStatus = "requested" | "approved" | "rejected" | "cancelled";
+export type AgentflowArtifactStatus = "available" | "missing" | "stale" | "overwritten";
 export type AgentflowRunStateValue = null | boolean | number | string | AgentflowRunStateValue[] | { [key: string]: AgentflowRunStateValue };
 
 export interface OpenAgentflowRunStateOptions {
@@ -95,6 +97,30 @@ export interface UpsertAgentflowArtifactInput {
   metadata?: Record<string, AgentflowRunStateValue>;
 }
 
+export interface WriteAgentflowArtifactInput extends Omit<UpsertAgentflowArtifactInput, "checksum" | "sizeBytes"> {
+  content: string | Uint8Array;
+  overwrite?: boolean;
+}
+
+export interface AgentflowArtifactRecord {
+  id: string;
+  runId: string;
+  producerStepId: string | null;
+  declaredPath: string;
+  storagePath: string;
+  kind: string;
+  contentType: string;
+  status: AgentflowArtifactStatus;
+  checksum: string | null;
+  previousChecksum: string | null;
+  sizeBytes: number | null;
+  metadata: Record<string, AgentflowRunStateValue>;
+  createdAt: string;
+  updatedAt: string;
+  writtenAt: string | null;
+  checkedAt: string | null;
+}
+
 export interface AppendAgentflowEventInput {
   id: string;
   runId: string;
@@ -103,6 +129,17 @@ export interface AppendAgentflowEventInput {
   sessionId?: string;
   type: string;
   payload?: AgentflowRunStateValue;
+}
+
+export interface AgentflowEventRecord {
+  id: string;
+  runId: string;
+  sequence: number;
+  stepId: string | null;
+  sessionId: string | null;
+  type: string;
+  payload: AgentflowRunStateValue | null;
+  createdAt: string;
 }
 
 export interface UpsertAgentflowSessionInput {
@@ -157,7 +194,37 @@ interface SqliteDatabase {
   exec(sql: string): void;
   run(sql: string, params?: SqliteValue[]): void;
   get<T>(sql: string, params?: SqliteValue[]): T | null;
+  all<T>(sql: string, params?: SqliteValue[]): T[];
   close(): void;
+}
+
+interface ArtifactRow {
+  run_id: string;
+  id: string;
+  step_id: string | null;
+  path: string;
+  kind: string;
+  content_type: string;
+  checksum: string | null;
+  size_bytes: number | null;
+  status: AgentflowArtifactStatus;
+  previous_checksum: string | null;
+  metadata_json: string;
+  created_at: string;
+  updated_at: string;
+  written_at: string | null;
+  checked_at: string | null;
+}
+
+interface EventRow {
+  run_id: string;
+  id: string;
+  sequence: number;
+  step_id: string | null;
+  session_id: string | null;
+  type: string;
+  payload_json: string | null;
+  created_at: string;
 }
 
 interface RunRow {
@@ -390,35 +457,195 @@ export class AgentflowRunStateStore {
 
   upsertArtifact(input: UpsertAgentflowArtifactInput): void {
     this.assertOpen();
+    const runId = requiredString(input.runId, "Run ID");
+    this.requireRun(runId);
+    const id = requiredString(input.id, "Artifact ID");
     const artifactPath = repoRelativeArtifactPath(input.path);
     if (input.sizeBytes !== undefined && (!Number.isSafeInteger(input.sizeBytes) || input.sizeBytes < 0)) {
       throw new AgentflowRunStateError("Artifact size must be a non-negative integer.", "AGENTFLOW_ARTIFACT_INVALID");
     }
     const timestamp = currentTimestamp(this.now);
-    this.write("upsert artifact", `INSERT INTO artifacts (
-      run_id, id, step_id, path, kind, content_type, checksum, size_bytes, metadata_json, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(run_id, id) DO UPDATE SET
-      step_id = excluded.step_id,
-      path = excluded.path,
-      kind = excluded.kind,
-      content_type = excluded.content_type,
-      checksum = excluded.checksum,
-      size_bytes = excluded.size_bytes,
-      metadata_json = excluded.metadata_json,
-      updated_at = excluded.updated_at`, [
-      requiredString(input.runId, "Run ID"),
-      requiredString(input.id, "Artifact ID"),
-      optionalString(input.stepId, "Step ID"),
-      artifactPath,
-      requiredString(input.kind, "Artifact kind"),
-      requiredString(input.contentType, "Artifact content type"),
-      optionalString(input.checksum, "Artifact checksum"),
-      input.sizeBytes ?? null,
-      stableJson(input.metadata ?? {}),
-      timestamp,
-      timestamp
-    ]);
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const existing = this.database.get<ArtifactRow>("SELECT * FROM artifacts WHERE run_id = ? AND id = ?", [runId, id]);
+      const pathOwner = this.database.get<ArtifactRow>("SELECT * FROM artifacts WHERE run_id = ? AND path = ?", [runId, artifactPath]);
+      if (pathOwner !== null && pathOwner.id !== id) {
+        throw new AgentflowRunStateError(
+          `Artifact path ${artifactPath} is already registered as ${pathOwner.id} for run ${runId}.`,
+          "AGENTFLOW_ARTIFACT_COLLISION"
+        );
+      }
+      if (existing !== null && existing.path !== artifactPath) {
+        throw new AgentflowRunStateError(
+          `Artifact ${id} is already registered at ${existing.path}; artifact paths cannot be reassigned.`,
+          "AGENTFLOW_ARTIFACT_COLLISION"
+        );
+      }
+      this.database.run(`INSERT INTO artifacts (
+        run_id, id, step_id, path, kind, content_type, checksum, size_bytes, status, metadata_json, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'missing', ?, ?, ?)
+      ON CONFLICT(run_id, id) DO UPDATE SET
+        step_id = COALESCE(excluded.step_id, artifacts.step_id),
+        kind = excluded.kind,
+        content_type = excluded.content_type,
+        checksum = CASE
+          WHEN artifacts.written_at IS NULL THEN COALESCE(excluded.checksum, artifacts.checksum)
+          ELSE artifacts.checksum
+        END,
+        size_bytes = CASE
+          WHEN artifacts.written_at IS NULL THEN COALESCE(excluded.size_bytes, artifacts.size_bytes)
+          ELSE artifacts.size_bytes
+        END,
+        metadata_json = excluded.metadata_json,
+        updated_at = excluded.updated_at`, [
+        runId,
+        id,
+        optionalString(input.stepId, "Step ID"),
+        artifactPath,
+        requiredString(input.kind, "Artifact kind"),
+        requiredString(input.contentType, "Artifact content type"),
+        optionalString(input.checksum, "Artifact checksum"),
+        input.sizeBytes ?? null,
+        stableJson(input.metadata ?? {}),
+        timestamp,
+        timestamp
+      ]);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      rollback(this.database);
+      if (error instanceof AgentflowRunStateError) throw error;
+      throw runStateWriteError("upsert artifact", error);
+    }
+  }
+
+  writeArtifact(input: WriteAgentflowArtifactInput): AgentflowArtifactRecord {
+    this.assertOpen();
+    const runId = artifactRunId(input.runId);
+    this.requireRun(runId);
+    const id = requiredString(input.id, "Artifact ID");
+    const declaredPath = repoRelativeArtifactPath(input.path);
+    const kind = requiredString(input.kind, "Artifact kind");
+    const contentType = requiredString(input.contentType, "Artifact content type");
+    const stepId = optionalString(input.stepId, "Step ID");
+    const metadataJson = stableJson(input.metadata ?? {});
+    const content = typeof input.content === "string" ? Buffer.from(input.content, "utf8") : Buffer.from(input.content);
+    const checksum = `sha256:${createHash("sha256").update(content).digest("hex")}`;
+    const target = artifactStoragePath(this.repoRoot, runId, declaredPath, true);
+    const timestamp = currentTimestamp(this.now);
+    const { temporaryPath, backupPath } = artifactStagingPaths(this.repoRoot, runId, declaredPath);
+    let targetExistedBeforeWrite = false;
+    let fileMutationStarted = false;
+    let committed = false;
+
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const existing = this.database.get<ArtifactRow>("SELECT * FROM artifacts WHERE run_id = ? AND id = ?", [runId, id]);
+      const pathOwner = this.database.get<ArtifactRow>("SELECT * FROM artifacts WHERE run_id = ? AND path = ?", [runId, declaredPath]);
+      if (pathOwner !== null && pathOwner.id !== id) {
+        throw new AgentflowRunStateError(
+          `Artifact path ${declaredPath} is already registered as ${pathOwner.id} for run ${runId}.`,
+          "AGENTFLOW_ARTIFACT_COLLISION"
+        );
+      }
+      if (existing !== null && existing.path !== declaredPath) {
+        throw new AgentflowRunStateError(
+          `Artifact ${id} is already registered at ${existing.path}; artifact paths cannot be reassigned.`,
+          "AGENTFLOW_ARTIFACT_COLLISION"
+        );
+      }
+      recoverArtifactStaging(target, temporaryPath, backupPath, pathOwner?.checksum ?? null);
+
+      targetExistedBeforeWrite = fs.existsSync(target);
+      if (targetExistedBeforeWrite && !fs.statSync(target).isFile()) {
+        throw new AgentflowRunStateError(`Artifact target is not a regular file: ${target}`, "AGENTFLOW_ARTIFACT_PATH");
+      }
+      const targetChecksum = targetExistedBeforeWrite ? artifactChecksum(target) : null;
+      const retryingPublishedContent = targetChecksum === checksum
+        && (existing === null || existing.checksum === checksum || existing.written_at === null);
+      const replacingPublishedContent = existing !== null && existing.written_at !== null && existing.checksum !== checksum;
+      if (replacingPublishedContent && input.overwrite !== true) {
+        throw new AgentflowRunStateError(
+          `Artifact ${declaredPath} was already published for run ${runId}; pass overwrite: true to replace it.`,
+          "AGENTFLOW_ARTIFACT_OVERWRITE"
+        );
+      }
+      if (targetExistedBeforeWrite && input.overwrite !== true && !retryingPublishedContent) {
+        throw new AgentflowRunStateError(
+          `Artifact ${declaredPath} already exists for run ${runId}; pass overwrite: true to replace it.`,
+          "AGENTFLOW_ARTIFACT_OVERWRITE"
+        );
+      }
+
+      if (!retryingPublishedContent) {
+        fs.writeFileSync(temporaryPath, content, { flag: "wx" });
+        fileMutationStarted = true;
+        if (targetExistedBeforeWrite) fs.renameSync(target, backupPath);
+        fs.renameSync(temporaryPath, target);
+      }
+      this.database.run(`INSERT INTO artifacts (
+        run_id, id, step_id, path, kind, content_type, checksum, size_bytes, status, previous_checksum,
+        metadata_json, created_at, updated_at, written_at, checked_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(run_id, id) DO UPDATE SET
+        step_id = COALESCE(excluded.step_id, artifacts.step_id),
+        kind = excluded.kind,
+        content_type = excluded.content_type,
+        checksum = excluded.checksum,
+        size_bytes = excluded.size_bytes,
+        status = excluded.status,
+        previous_checksum = excluded.previous_checksum,
+        metadata_json = excluded.metadata_json,
+        updated_at = excluded.updated_at,
+        written_at = excluded.written_at,
+        checked_at = excluded.checked_at`, [
+        runId,
+        id,
+        stepId,
+        declaredPath,
+        kind,
+        contentType,
+        checksum,
+        content.byteLength,
+        (targetExistedBeforeWrite && !retryingPublishedContent) || replacingPublishedContent
+          ? "overwritten"
+          : existing?.status === "overwritten" ? "overwritten" : "available",
+        (targetExistedBeforeWrite && !retryingPublishedContent) || replacingPublishedContent
+          ? existing?.checksum ?? targetChecksum
+          : existing?.previous_checksum ?? null,
+        metadataJson,
+        timestamp,
+        timestamp,
+        retryingPublishedContent ? existing?.written_at ?? timestamp : timestamp,
+        timestamp
+      ]);
+      this.database.exec("COMMIT");
+      committed = true;
+    } catch (error) {
+      rollback(this.database);
+      if (!committed && fileMutationStarted) restoreArtifactWrite(target, temporaryPath, backupPath, targetExistedBeforeWrite);
+      else removeArtifactStagingEntry(temporaryPath);
+      if (error instanceof AgentflowRunStateError) throw error;
+      throw new AgentflowRunStateError(
+        `Could not write artifact ${declaredPath} for run ${runId}: ${errorMessage(error)}`,
+        "AGENTFLOW_ARTIFACT_WRITE",
+        { cause: error }
+      );
+    }
+
+    removeArtifactStagingEntry(backupPath);
+
+    return this.requireArtifact(runId, id);
+  }
+
+  listArtifacts(runId: string): AgentflowArtifactRecord[] {
+    this.assertOpen();
+    const normalizedRunId = artifactRunId(runId);
+    this.requireRun(normalizedRunId);
+    const rows = this.database.all<ArtifactRow>(
+      "SELECT * FROM artifacts WHERE run_id = ? ORDER BY path ASC, id ASC",
+      [normalizedRunId]
+    );
+    return rows.map((row) => this.inspectArtifact(row));
   }
 
   appendEvent(input: AppendAgentflowEventInput): void {
@@ -439,6 +666,16 @@ export class AgentflowRunStateStore {
       nullableJson(input.payload),
       timestamp
     ]);
+  }
+
+  listEvents(runId: string): AgentflowEventRecord[] {
+    this.assertOpen();
+    const normalizedRunId = requiredString(runId, "Run ID");
+    this.requireRun(normalizedRunId);
+    return this.database.all<EventRow>(
+      "SELECT * FROM events WHERE run_id = ? ORDER BY sequence ASC, id ASC",
+      [normalizedRunId]
+    ).map(hydrateEvent);
   }
 
   upsertSession(input: UpsertAgentflowSessionInput): void {
@@ -609,6 +846,59 @@ export class AgentflowRunStateStore {
     return hydrateRun(row);
   }
 
+  private requireArtifact(runId: string, id: string): AgentflowArtifactRecord {
+    const row = this.database.get<ArtifactRow>("SELECT * FROM artifacts WHERE run_id = ? AND id = ?", [runId, id]);
+    if (row === null) {
+      throw new AgentflowRunStateError(`Agentflow artifact ${id} was not found for run ${runId}.`, "AGENTFLOW_ARTIFACT_NOT_FOUND");
+    }
+    return hydrateArtifact(this.repoRoot, row);
+  }
+
+  private inspectArtifact(row: ArtifactRow): AgentflowArtifactRecord {
+    let status: AgentflowArtifactStatus;
+    try {
+      const target = artifactStoragePath(this.repoRoot, row.run_id, row.path, false, true);
+      if (isSymbolicLink(target)) {
+        status = "stale";
+      } else {
+        const stat = fs.statSync(target);
+        if (!stat.isFile() || row.checksum === null || (row.size_bytes !== null && stat.size !== row.size_bytes)) {
+          status = "stale";
+        } else {
+          const actualChecksum = artifactChecksum(target);
+          status = actualChecksum !== row.checksum
+            ? "stale"
+            : row.previous_checksum !== null ? "overwritten" : "available";
+        }
+      }
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code ?? "";
+      if ((error instanceof AgentflowRunStateError && error.code === "AGENTFLOW_ARTIFACT_PATH") || code === "ELOOP") {
+        status = "stale";
+      } else if (["ENOENT", "ENOTDIR"].includes(code)) {
+        status = "missing";
+      } else {
+        throw error;
+      }
+    }
+    const timestamp = currentTimestamp(this.now);
+    const original = row;
+    const updatedAt = status === row.status ? row.updated_at : timestamp;
+    const inspected = { ...row, status, checked_at: timestamp, updated_at: updatedAt };
+    try {
+      this.database.run(
+        `UPDATE artifacts SET status = ?, checked_at = ?, updated_at = ?
+        WHERE run_id = ? AND id = ? AND checksum IS ? AND status = ? AND updated_at = ?`,
+        [status, timestamp, updatedAt, row.run_id, row.id, row.checksum, row.status, row.updated_at]
+      );
+      row = this.database.get<ArtifactRow>("SELECT * FROM artifacts WHERE run_id = ? AND id = ?", [row.run_id, row.id]) ?? original;
+    } catch (error) {
+      if (!isSqliteContentionError(error)) throw error;
+      row = inspected;
+    }
+    return hydrateArtifact(this.repoRoot, row);
+  }
+
   private write(operation: string, sql: string, params: SqliteValue[]): void {
     try {
       this.database.run(sql, params);
@@ -655,6 +945,7 @@ async function openSqliteDatabase(databasePath: string, busyTimeoutMs: number): 
       exec: (sql) => database.exec(sql),
       run: (sql, params = []) => { database.query(sql).run(...params); },
       get: <T>(sql: string, params: SqliteValue[] = []) => (database.query(sql).get(...params) as T | null) ?? null,
+      all: <T>(sql: string, params: SqliteValue[] = []) => database.query(sql).all(...params) as T[],
       close: () => database.close()
     };
   }
@@ -665,6 +956,7 @@ async function openSqliteDatabase(databasePath: string, busyTimeoutMs: number): 
     exec: (sql) => database.exec(sql),
     run: (sql, params = []) => { database.prepare(sql).run(...params); },
     get: <T>(sql: string, params: SqliteValue[] = []) => (database.prepare(sql).get(...params) as T | null) ?? null,
+    all: <T>(sql: string, params: SqliteValue[] = []) => database.prepare(sql).all(...params) as T[],
     close: () => database.close()
   };
 }
@@ -711,13 +1003,15 @@ function isSymbolicLink(candidate: string): boolean {
   }
 }
 
-function assertInsideRepository(repoRoot: string, candidate: string): void {
+function assertInsideRepository(
+  repoRoot: string,
+  candidate: string,
+  message = `Agentflow database path must stay inside the repository: ${candidate}`,
+  code = "AGENTFLOW_DATABASE_PATH"
+): void {
   const relative = path.relative(repoRoot, candidate);
   if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-    throw new AgentflowRunStateError(
-      `Agentflow database path must stay inside the repository: ${candidate}`,
-      "AGENTFLOW_DATABASE_PATH"
-    );
+    throw new AgentflowRunStateError(message, code);
   }
 }
 
@@ -750,6 +1044,40 @@ function hydrateRun(row: RunRow): AgentflowRunRecord {
     updatedAt: row.updated_at,
     startedAt: row.started_at,
     finishedAt: row.finished_at
+  };
+}
+
+function hydrateArtifact(repoRoot: string, row: ArtifactRow): AgentflowArtifactRecord {
+  return {
+    id: row.id,
+    runId: row.run_id,
+    producerStepId: row.step_id,
+    declaredPath: row.path,
+    storagePath: path.relative(repoRoot, artifactStorageLocation(repoRoot, row.run_id, row.path)).replaceAll("\\", "/"),
+    kind: row.kind,
+    contentType: row.content_type,
+    status: row.status,
+    checksum: row.checksum,
+    previousChecksum: row.previous_checksum,
+    sizeBytes: row.size_bytes,
+    metadata: JSON.parse(row.metadata_json) as Record<string, AgentflowRunStateValue>,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    writtenAt: row.written_at,
+    checkedAt: row.checked_at
+  };
+}
+
+function hydrateEvent(row: EventRow): AgentflowEventRecord {
+  return {
+    id: row.id,
+    runId: row.run_id,
+    sequence: row.sequence,
+    stepId: row.step_id,
+    sessionId: row.session_id,
+    type: row.type,
+    payload: row.payload_json === null ? null : JSON.parse(row.payload_json) as AgentflowRunStateValue,
+    createdAt: row.created_at
   };
 }
 
@@ -803,11 +1131,163 @@ function repoRelativeArtifactPath(value: string): string {
   if (path.posix.isAbsolute(candidate) || path.win32.isAbsolute(candidate)) {
     throw new AgentflowRunStateError("Artifact path must be repo-relative.", "AGENTFLOW_ARTIFACT_PATH");
   }
+  if (candidate.endsWith("/")) {
+    throw new AgentflowRunStateError("Artifact path must name a file and cannot end with a separator.", "AGENTFLOW_ARTIFACT_PATH");
+  }
   const normalized = path.posix.normalize(candidate);
   if (normalized === "." || normalized === ".." || normalized.startsWith("../")) {
     throw new AgentflowRunStateError("Artifact path must be repo-relative and cannot escape the repository root.", "AGENTFLOW_ARTIFACT_PATH");
   }
   return normalized;
+}
+
+function artifactRunId(value: string): string {
+  return requiredString(value, "Run ID");
+}
+
+function artifactStoragePath(
+  repoRoot: string,
+  runId: string,
+  declaredPath: string,
+  createParent: boolean,
+  allowTargetSymlink = false
+): string {
+  const target = artifactStorageLocation(repoRoot, runId, declaredPath);
+  verifyArtifactPath(repoRoot, path.dirname(target), createParent);
+  if (!allowTargetSymlink && isSymbolicLink(target)) {
+    throw new AgentflowRunStateError(`Artifact path cannot be a symbolic link: ${target}`, "AGENTFLOW_ARTIFACT_PATH");
+  }
+  return target;
+}
+
+function artifactStorageLocation(repoRoot: string, runId: string, declaredPath: string): string {
+  const normalizedRunId = artifactRunId(runId);
+  const normalizedPath = repoRelativeArtifactPath(declaredPath);
+  const artifactRoot = path.join(repoRoot, ".agentflow", "runs", artifactRunDirectory(normalizedRunId), "artifacts");
+  const target = path.join(artifactRoot, artifactFileName(normalizedPath));
+  assertInsideRepository(
+    repoRoot,
+    target,
+    `Artifact path must stay inside the repository: ${target}`,
+    "AGENTFLOW_ARTIFACT_PATH"
+  );
+  return target;
+}
+
+function artifactRunDirectory(runId: string): string {
+  return `r-${createHash("sha256").update(runId).digest("hex")}`;
+}
+
+function artifactFileName(declaredPath: string): string {
+  return `a-${createHash("sha256").update(declaredPath).digest("hex")}`;
+}
+
+function artifactStagingPaths(repoRoot: string, runId: string, declaredPath: string): { temporaryPath: string; backupPath: string } {
+  const stagingDirectory = path.join(repoRoot, ".agentflow", "runs", artifactRunDirectory(runId), ".staging");
+  assertInsideRepository(
+    repoRoot,
+    stagingDirectory,
+    `Artifact staging path must stay inside the repository: ${stagingDirectory}`,
+    "AGENTFLOW_ARTIFACT_PATH"
+  );
+  verifyArtifactPath(repoRoot, stagingDirectory, true);
+  const key = createHash("sha256").update(declaredPath).digest("hex");
+  return {
+    temporaryPath: path.join(stagingDirectory, `${key}.new`),
+    backupPath: path.join(stagingDirectory, `${key}.old`)
+  };
+}
+
+function verifyArtifactPath(repoRoot: string, candidate: string, createDirectories: boolean): void {
+  const relative = path.relative(repoRoot, candidate);
+  const segments = relative.split(path.sep).filter(Boolean);
+  let current = repoRoot;
+  for (const segment of segments) {
+    current = path.join(current, segment);
+    if (!fs.existsSync(current)) {
+      if (!createDirectories) return;
+      try {
+        fs.mkdirSync(current);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+    }
+    const stat = fs.lstatSync(current);
+    if (stat.isSymbolicLink()) {
+      throw new AgentflowRunStateError(`Artifact storage cannot traverse a symbolic link: ${current}`, "AGENTFLOW_ARTIFACT_PATH");
+    }
+    if (!stat.isDirectory() && (createDirectories || current !== candidate)) {
+      throw new AgentflowRunStateError(`Artifact storage parent is not a directory: ${current}`, "AGENTFLOW_ARTIFACT_PATH");
+    }
+  }
+}
+
+function restoreArtifactWrite(target: string, temporaryPath: string, backupPath: string, targetExisted: boolean): void {
+  try {
+    if (fs.existsSync(temporaryPath)) fs.unlinkSync(temporaryPath);
+    if (targetExisted && fs.existsSync(backupPath)) {
+      fs.rmSync(target, { force: true, recursive: true });
+      fs.renameSync(backupPath, target);
+    } else if (!targetExisted && fs.existsSync(target)) {
+      fs.unlinkSync(target);
+    }
+  } catch {
+    // Preserve the original write or database error.
+  }
+}
+
+function recoverArtifactStaging(target: string, temporaryPath: string, backupPath: string, registeredChecksum: string | null): void {
+  if (isSymbolicLink(backupPath)) {
+    throw new AgentflowRunStateError(`Artifact recovery backup cannot be a symbolic link: ${backupPath}`, "AGENTFLOW_ARTIFACT_PATH");
+  }
+  if (fs.existsSync(backupPath)) {
+    if (!fs.statSync(backupPath).isFile()) {
+      removeArtifactStagingEntry(backupPath);
+      removeArtifactStagingEntry(temporaryPath);
+      return;
+    }
+    const targetMatchesRegistry = fs.existsSync(target)
+      && !isSymbolicLink(target)
+      && fs.statSync(target).isFile()
+      && registeredChecksum !== null
+      && artifactChecksum(target) === registeredChecksum;
+    if (targetMatchesRegistry) {
+      removeArtifactStagingEntry(backupPath);
+    } else if (registeredChecksum === null || artifactChecksum(backupPath) === registeredChecksum) {
+      fs.rmSync(target, { force: true, recursive: true });
+      fs.renameSync(backupPath, target);
+    } else {
+      removeArtifactStagingEntry(backupPath);
+    }
+  }
+  removeArtifactStagingEntry(temporaryPath);
+}
+
+function removeArtifactStagingEntry(candidate: string): void {
+  try {
+    fs.rmSync(candidate, { force: true, recursive: true });
+  } catch {
+    // Staging cleanup is best-effort; the next registry write retries recovery.
+  }
+}
+
+function artifactChecksum(candidate: string): string {
+  if (isSymbolicLink(candidate)) {
+    throw new AgentflowRunStateError(`Artifact checksum path cannot be a symbolic link: ${candidate}`, "AGENTFLOW_ARTIFACT_PATH");
+  }
+  const hash = createHash("sha256");
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  const descriptor = fs.openSync(candidate, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    let bytesRead: number;
+    do {
+      bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, null);
+      if (bytesRead > 0) hash.update(buffer.subarray(0, bytesRead));
+    } while (bytesRead > 0);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  return `sha256:${hash.digest("hex")}`;
 }
 
 function requiredString(value: unknown, label: string): string {
@@ -858,6 +1338,10 @@ function rollback(database: SqliteDatabase): void {
 
 function isConstraintError(error: unknown): boolean {
   return /constraint|unique|foreign key/i.test(errorMessage(error));
+}
+
+function isSqliteContentionError(error: unknown): boolean {
+  return /database is (?:locked|busy)|SQLITE_(?:BUSY|LOCKED)/i.test(errorMessage(error));
 }
 
 function runStateWriteError(operation: string, error: unknown): AgentflowRunStateError {

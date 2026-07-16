@@ -6,32 +6,67 @@ interface SchemaDatabase {
   get<T>(sql: string, params?: SqliteValue[]): T | null;
 }
 
+const REQUIRED_SCHEMA_OBJECTS = [
+  "run_state_metadata",
+  "runs",
+  "runs_resume_lookup",
+  "runs_parent_lookup",
+  "runs_recovery_lookup",
+  "run_steps",
+  "run_steps_status_lookup",
+  "artifacts",
+  "events",
+  "sessions",
+  "failures",
+  "approvals",
+  "budgets"
+] as const;
+
 export class AgentflowRunStateSchemaVersionError extends Error {}
 
 export function initializeAgentflowRunStateSchema(database: SchemaDatabase, schemaVersion: number): void {
-  verifyExistingSchema(database, schemaVersion);
-  createSchema(database, schemaVersion);
+  const existingVersion = existingSchemaVersion(database);
+  if (existingVersion === null) {
+    createSchema(database, schemaVersion, true);
+  } else if (existingVersion === "1" && schemaVersion === 2) {
+    migrateVersionOneToTwo(database);
+  }
   verifySchemaVersion(database, schemaVersion);
+  if (existingVersion !== null && schemaNeedsRepair(database)) createSchema(database, schemaVersion);
 }
 
-function verifyExistingSchema(database: SchemaDatabase, schemaVersion: number): void {
+function existingSchemaVersion(database: SchemaDatabase): string | null {
   const metadataTable = database.get<{ name: string }>(
     "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'run_state_metadata'"
   );
-  if (metadataTable !== null) {
-    verifySchemaVersion(database, schemaVersion);
-    return;
-  }
+  if (metadataTable === null) return null;
+  return database.get<{ value: string }>("SELECT value FROM run_state_metadata WHERE key = 'schema_version'")?.value ?? "missing";
+}
 
+function verifyEmptyDatabase(database: SchemaDatabase, schemaVersion: number): void {
   const existingObject = database.get<{ name: string }>(
     "SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name LIMIT 1"
   );
   if (existingObject !== null) throw schemaVersionError("missing", schemaVersion);
 }
 
-function createSchema(database: SchemaDatabase, schemaVersion: number): void {
+function schemaNeedsRepair(database: SchemaDatabase): boolean {
+  const placeholders = REQUIRED_SCHEMA_OBJECTS.map(() => "?").join(", ");
+  const row = database.get<{ count: number }>(
+    `SELECT COUNT(*) AS count FROM sqlite_master WHERE name IN (${placeholders})`,
+    [...REQUIRED_SCHEMA_OBJECTS]
+  );
+  return row?.count !== REQUIRED_SCHEMA_OBJECTS.length;
+}
+
+function createSchema(database: SchemaDatabase, schemaVersion: number, requireEmpty = false): void {
   database.exec("BEGIN IMMEDIATE");
   try {
+    if (requireEmpty) {
+      const lockedVersion = existingSchemaVersion(database);
+      if (lockedVersion === null) verifyEmptyDatabase(database, schemaVersion);
+      else if (lockedVersion !== String(schemaVersion)) throw schemaVersionError(lockedVersion, schemaVersion);
+    }
     database.exec(`
 CREATE TABLE IF NOT EXISTS run_state_metadata (
   key TEXT PRIMARY KEY,
@@ -90,9 +125,13 @@ CREATE TABLE IF NOT EXISTS artifacts (
   content_type TEXT NOT NULL,
   checksum TEXT,
   size_bytes INTEGER CHECK (size_bytes IS NULL OR size_bytes >= 0),
+  status TEXT NOT NULL CHECK (status IN ('available', 'missing', 'stale', 'overwritten')),
+  previous_checksum TEXT,
   metadata_json TEXT NOT NULL CHECK (json_valid(metadata_json)),
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
+  written_at TEXT,
+  checked_at TEXT,
   PRIMARY KEY (run_id, id),
   UNIQUE (run_id, path)
 );
@@ -170,6 +209,30 @@ CREATE TABLE IF NOT EXISTS budgets (
 );
     `);
     database.run("INSERT OR IGNORE INTO run_state_metadata (key, value) VALUES ('schema_version', ?)", [String(schemaVersion)]);
+    database.exec("COMMIT");
+  } catch (error) {
+    rollback(database);
+    throw error;
+  }
+}
+
+function migrateVersionOneToTwo(database: SchemaDatabase): void {
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    const lockedVersion = existingSchemaVersion(database);
+    if (lockedVersion === "2") {
+      database.exec("COMMIT");
+      return;
+    }
+    if (lockedVersion !== "1") throw schemaVersionError(lockedVersion ?? "missing", 2);
+    database.exec(`
+ALTER TABLE artifacts ADD COLUMN status TEXT NOT NULL DEFAULT 'missing'
+  CHECK (status IN ('available', 'missing', 'stale', 'overwritten'));
+ALTER TABLE artifacts ADD COLUMN previous_checksum TEXT;
+ALTER TABLE artifacts ADD COLUMN written_at TEXT;
+ALTER TABLE artifacts ADD COLUMN checked_at TEXT;
+    `);
+    database.run("UPDATE run_state_metadata SET value = '2' WHERE key = 'schema_version'");
     database.exec("COMMIT");
   } catch (error) {
     rollback(database);

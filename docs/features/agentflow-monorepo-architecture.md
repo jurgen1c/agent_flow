@@ -1,7 +1,7 @@
 # Agentflow Monorepo Architecture
 
-Status: implemented workspace shell
-Ticket: AM-6, AM-7, AM-9
+Status: implemented workspace shell and run persistence foundation
+Ticket: AM-6, AM-7, AM-9, AM-18, AM-19
 
 ## Intent
 
@@ -118,9 +118,16 @@ platform orchestration and recovery, while step, session, artifact, approval,
 and budget records model pipeline and collaboration state.
 
 Artifact content and other potentially large generated files live under
-`.agentflow/runs/<run-id>/`; the SQLite artifact rows record their repo-relative
-paths and metadata. Neither the database nor run directories should be
-committed. Run state can record which Agent Memory context was read, but it must
+`.agentflow/runs/r-<sha256(run-id)>/`; the SQLite artifact rows record their repo-relative
+paths and metadata. The artifact registry maps declared paths to fixed-length,
+lowercase hexadecimal digests beneath each run's digested `artifacts/` subtree,
+rejects traversal and symlink escapes, records a
+SHA-256 checksum, producer step, kind, content type, size, status, and
+timestamps, and requires explicit overwrite intent. Registry inspection
+reconciles persisted metadata with the filesystem as `available`, `missing`,
+`stale`, or `overwritten`. Ordered event records and artifact records remain
+queryable after the process that created them exits. Neither the database nor
+run directories should be committed. Run state can record which Agent Memory context was read, but it must
 not become the canonical store for claims, recipes, profile traits, or memory
 waivers. If a workflow discovers durable repository knowledge, the workflow
 should create a reviewable change in `docs/agent-memory`, not mutate generated
@@ -170,7 +177,10 @@ such as `run`, `resume`, and `cleanup` remain reserved placeholders until the
 execution scheduler and command adapters are implemented. The core persistence
 surface now initializes repo-local `.agentflow/agentflow.sqlite` state and
 provides typed create, update, resume-lookup, step, artifact, event, session,
-failure, approval, and budget writes for later runtime phases.
+failure, approval, and budget writes for later runtime phases. Its event log
+provides deterministic sequence-ordered reads, and its artifact registry owns
+safe run-scoped content writes plus restart-safe metadata/status reads. Schema
+version 2 migrates version-1 artifact metadata in place.
 
 The phase-1 authoring boundary exposes parsing, validation, and linting from
 `@jurgen1c/agentflow-core`. Validation returns stable issue codes for structure,

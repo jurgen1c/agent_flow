@@ -67,6 +67,9 @@ export type {
 } from "./simulation";
 export type {
   AgentflowApprovalStatus,
+  AgentflowArtifactRecord,
+  AgentflowArtifactStatus,
+  AgentflowEventRecord,
   AgentflowRunRecord,
   AgentflowRunStateValue,
   AgentflowRunStatus,
@@ -82,7 +85,8 @@ export type {
   UpsertAgentflowArtifactInput,
   UpsertAgentflowBudgetInput,
   UpsertAgentflowSessionInput,
-  UpsertAgentflowStepInput
+  UpsertAgentflowStepInput,
+  WriteAgentflowArtifactInput
 } from "./run_state";
 
 export const plannedAgentflowRuntimeCommands = [
