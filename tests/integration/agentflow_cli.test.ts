@@ -21,7 +21,9 @@ describe("Agentflow CLI", () => {
     expect(result.stdout).toContain("explain <workflow>");
     expect(result.stdout).toContain("graph <workflow>");
     expect(result.stdout).toContain("simulate <workflow> --fixture <file>");
-    expect(result.stdout).toContain("No workflow execution commands are active yet.");
+    expect(result.stdout).toContain("run <workflow> --id <run-id>");
+    expect(result.stdout).toContain("pause <run-id>");
+    expect(result.stdout).toContain("Lifecycle state management is active");
   });
 
   test("renders version from root package metadata", () => {
@@ -31,13 +33,13 @@ describe("Agentflow CLI", () => {
     expect(result.stdout).toBe(`agentflow ${rootPackage.version}`);
   });
 
-  test("keeps execution commands reserved but inactive", () => {
-    for (const command of plannedAgentflowRuntimeCommands.filter((candidate) => !["validate", "lint", "explain", "graph", "simulate"].includes(candidate))) {
+  test("keeps remaining execution commands reserved but inactive", () => {
+    for (const command of plannedAgentflowRuntimeCommands.filter((candidate) => !["validate", "lint", "explain", "graph", "simulate", "run", "resume", "status", "logs", "artifacts", "pause", "cancel"].includes(candidate))) {
       const result = dispatch([command]);
 
       expect(result.exitCode).toBe(7);
       expect(result.stderr).toContain("reserved but not active yet");
-      expect(result.stderr).toContain("Available now: help, version, validate, lint, explain, graph, and simulate.");
+      expect(result.stderr).toContain("run, resume, status, logs, artifacts, pause, and cancel");
     }
   });
 
@@ -56,7 +58,7 @@ describe("Agentflow CLI", () => {
     });
     expect(dispatch(["help", "run"])).toEqual({
       exitCode: 0,
-      stdout: "agentflow run\n\nThis command name is reserved for a future Agentflow runtime surface."
+      stdout: "agentflow run\n\nUsage: agentflow run <workflow> --id <run-id>"
     });
     expect(dispatch(["help", "missing"])).toEqual({
       exitCode: 7,
@@ -141,6 +143,38 @@ describe("Agentflow CLI", () => {
     expect(result.stderr).toContain('Graph node id "terminal:pause" collides');
   });
 
+  test("manages persistent lifecycle state through the asynchronous CLI runner", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agentflow-cli-lifecycle-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const workflowPath = path.join(repo, "workflow.yml");
+    fs.copyFileSync(path.join(repoRoot, "tests/fixtures/agentflow/workflows/simple-ci.yml"), workflowPath);
+
+    const run = await captureCli(["run", path.basename(workflowPath), "--id", "run-cli"], repo);
+    expect(run).toMatchObject({ exitCode: 7 });
+    expect(run.stdout).toContain("Created Agentflow run run-cli");
+    expect(run.stderr).toContain("Workflow step execution is not available yet");
+    expect(await captureCli(["pause", "run-cli"], repo)).toMatchObject({ exitCode: 0 });
+    const resumed = await captureCli(["resume", "run-cli"], repo);
+    expect(resumed.exitCode).toBe(7);
+    expect(resumed.stdout).toContain("Status: running");
+    expect(resumed.stderr).toContain("no workflow steps were executed");
+    const status = await captureCli(["status", "run-cli"], repo);
+    expect(status.stdout).toContain("Workflow: simple-ci (version 1)");
+    expect(status.stdout).toContain("Status: running");
+    const logs = await captureCli(["logs", "run-cli"], repo);
+    expect(logs.stdout).toContain("run.created");
+    expect(logs.stdout).toContain("run.resume");
+    expect(await captureCli(["artifacts", "run-cli"], repo)).toMatchObject({
+      exitCode: 0,
+      stdout: "No artifacts registered for Agentflow run run-cli.\n"
+    });
+    expect((await captureCli(["cancel", "run-cli"], repo)).stdout).toContain("Status: cancelled");
+
+    const restartedStatus = await captureCli(["status", "run-cli"], repo);
+    expect(restartedStatus.stdout).toContain("Status: cancelled");
+    expect(await captureCli(["pause", "missing"], repo)).toMatchObject({ exitCode: 4 });
+  });
+
   test("surfaces validation warnings while preserving a successful exit", () => {
     const fixturePath = path.join(repoRoot, "tests/fixtures/agentflow/invalid/missing-artifact.yml");
     const result = dispatch(["validate", fixturePath]);
@@ -192,3 +226,13 @@ describe("Agentflow CLI", () => {
     expect(agentflowAgentMemoryAdapterPackageBoundary.agentMemoryPackage).toBe("@jurgen1c/agent-memory-core");
   });
 });
+
+async function captureCli(args: string[], cwd: string): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  let stdout = "";
+  let stderr = "";
+  const exitCode = await runCli(args, {
+    stdout: { write: (chunk: string) => { stdout += chunk; return true; } },
+    stderr: { write: (chunk: string) => { stderr += chunk; return true; } }
+  }, { cwd });
+  return { exitCode, stdout, stderr };
+}

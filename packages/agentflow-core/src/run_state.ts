@@ -142,6 +142,17 @@ export interface AgentflowEventRecord {
   createdAt: string;
 }
 
+export interface AgentflowRunEventInput {
+  type: string;
+  payload?: AgentflowRunStateValue;
+}
+
+export interface TransitionAgentflowRunWithEventInput {
+  status: AgentflowRunStatus;
+  allowedFrom: AgentflowRunStatus[];
+  event: AgentflowRunEventInput;
+}
+
 export interface UpsertAgentflowSessionInput {
   id: string;
   runId: string;
@@ -330,6 +341,21 @@ export class AgentflowRunStateStore {
     return this.requireRun(id);
   }
 
+  createRunWithEvent(input: CreateAgentflowRunInput, event: AgentflowRunEventInput): AgentflowRunRecord {
+    this.assertOpen();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const run = this.createRun(input);
+      this.appendNextEvent(run.id, event);
+      this.database.exec("COMMIT");
+      return run;
+    } catch (error) {
+      rollback(this.database);
+      if (error instanceof AgentflowRunStateError) throw error;
+      throw runStateWriteError("create run with event", error);
+    }
+  }
+
   getRun(id: string): AgentflowRunRecord | null {
     this.assertOpen();
     const row = this.database.get<RunRow>("SELECT * FROM runs WHERE id = ?", [requiredString(id, "Run ID")]);
@@ -384,6 +410,50 @@ export class AgentflowRunStateStore {
     }
 
     return this.requireRun(runId);
+  }
+
+  transitionRunWithEvent(id: string, input: TransitionAgentflowRunWithEventInput): AgentflowRunMutationResult {
+    this.assertOpen();
+    const runId = requiredString(id, "Run ID");
+    assertOneOf(input.status, RUN_STATUSES, "run status");
+    for (const status of input.allowedFrom) assertOneOf(status, RUN_STATUSES, "allowed run status");
+    this.database.exec("BEGIN IMMEDIATE");
+
+    try {
+      const current = this.requireRun(runId);
+      if (TERMINAL_RUN_STATUSES.has(current.status) && input.status !== current.status) {
+        throw new AgentflowRunStateError(
+          `Terminal Agentflow run ${runId} cannot transition from ${current.status} to ${input.status}.`,
+          "AGENTFLOW_RUN_TERMINAL"
+        );
+      }
+      if (current.status === input.status) {
+        this.database.exec("COMMIT");
+        return { changed: false, run: current };
+      }
+      if (!input.allowedFrom.includes(current.status)) {
+        throw new AgentflowRunStateError(
+          `Agentflow run ${runId} cannot transition from ${current.status} to ${input.status}.`,
+          "AGENTFLOW_RUN_TRANSITION"
+        );
+      }
+
+      const timestamp = currentTimestamp(this.now);
+      const startedAt = current.startedAt ?? (input.status === "running" ? timestamp : null);
+      const finishedAt = TERMINAL_RUN_STATUSES.has(input.status) ? current.finishedAt ?? timestamp : null;
+      this.database.run(
+        "UPDATE runs SET status = ?, updated_at = ?, started_at = ?, finished_at = ? WHERE id = ?",
+        [input.status, timestamp, startedAt, finishedAt, runId]
+      );
+      this.appendNextEvent(runId, input.event);
+      const run = this.requireRun(runId);
+      this.database.exec("COMMIT");
+      return { changed: true, run };
+    } catch (error) {
+      rollback(this.database);
+      if (error instanceof AgentflowRunStateError) throw error;
+      throw runStateWriteError("transition run", error);
+    }
   }
 
   findResumableRun(input: FindResumableAgentflowRunInput = {}): AgentflowRunRecord | null {
@@ -899,6 +969,26 @@ export class AgentflowRunStateStore {
     return hydrateArtifact(this.repoRoot, row);
   }
 
+  private appendNextEvent(runId: string, event: AgentflowRunEventInput): void {
+    const type = requiredString(event.type, "Event type");
+    const sequence = this.database.get<{ sequence: number }>(
+      "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM events WHERE run_id = ?",
+      [runId]
+    )?.sequence ?? 1;
+    const idPrefix = `lifecycle:${sequence}:${type}`;
+    let id = idPrefix;
+    let collision = 0;
+    while (this.database.get<{ id: string }>("SELECT id FROM events WHERE run_id = ? AND id = ?", [runId, id]) !== null) {
+      collision += 1;
+      id = `${idPrefix}:${collision}`;
+    }
+    this.database.run(
+      `INSERT INTO events (run_id, id, sequence, step_id, session_id, type, payload_json, created_at)
+      VALUES (?, ?, ?, NULL, NULL, ?, ?, ?)`,
+      [runId, id, sequence, type, nullableJson(event.payload), currentTimestamp(this.now)]
+    );
+  }
+
   private write(operation: string, sql: string, params: SqliteValue[]): void {
     try {
       this.database.run(sql, params);
@@ -912,6 +1002,11 @@ export class AgentflowRunStateStore {
       throw new AgentflowRunStateError("Agentflow run-state store is closed.", "AGENTFLOW_RUN_STATE_CLOSED");
     }
   }
+}
+
+export interface AgentflowRunMutationResult {
+  changed: boolean;
+  run: AgentflowRunRecord;
 }
 
 export async function openAgentflowRunState(options: OpenAgentflowRunStateOptions = {}): Promise<AgentflowRunStateStore> {

@@ -30,6 +30,10 @@ export {
   renderAgentflowSimulationSummary,
   simulateAgentflowWorkflow
 } from "./simulation";
+export {
+  createAgentflowLifecycleRun,
+  transitionAgentflowLifecycleRun
+} from "./lifecycle";
 export type {
   AgentflowWorkflow,
   AgentflowWorkflowParseFailure,
@@ -66,10 +70,16 @@ export type {
   AgentflowSimulationVisitedStep
 } from "./simulation";
 export type {
+  AgentflowLifecycleAction,
+  CreateAgentflowLifecycleRunInput
+} from "./lifecycle";
+export type {
   AgentflowApprovalStatus,
   AgentflowArtifactRecord,
   AgentflowArtifactStatus,
   AgentflowEventRecord,
+  AgentflowRunEventInput,
+  AgentflowRunMutationResult,
   AgentflowRunRecord,
   AgentflowRunStateValue,
   AgentflowRunStatus,
@@ -80,6 +90,7 @@ export type {
   FindResumableAgentflowRunInput,
   OpenAgentflowRunStateOptions,
   RecordAgentflowFailureInput,
+  TransitionAgentflowRunWithEventInput,
   UpdateAgentflowRunInput,
   UpsertAgentflowApprovalInput,
   UpsertAgentflowArtifactInput,
@@ -101,6 +112,8 @@ export const plannedAgentflowRuntimeCommands = [
   "status",
   "logs",
   "artifacts",
+  "pause",
+  "cancel",
   "cleanup"
 ] as const;
 

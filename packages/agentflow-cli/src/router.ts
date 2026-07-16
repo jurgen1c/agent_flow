@@ -1,16 +1,21 @@
 import fs from "node:fs";
+import path from "node:path";
 import {
   AgentflowWorkflowGraphError,
+  AgentflowRunStateError,
+  createAgentflowLifecycleRun,
   explainAgentflowWorkflow,
   formatAgentflowWorkflowIssues,
   formatWorkflowParseIssues,
   lintAgentflowWorkflow,
   parseAgentflowWorkflow,
   parseAgentflowSimulationFixture,
+  openAgentflowRunState,
   plannedAgentflowRuntimeCommands,
   renderAgentflowSimulationSummary,
   renderAgentflowWorkflowGraph,
   simulateAgentflowWorkflow,
+  transitionAgentflowLifecycleRun,
   validateAgentflowWorkflow
 } from "@jurgen1c/agentflow-core";
 
@@ -25,8 +30,21 @@ export interface AgentflowCliResult {
   stderr?: string;
 }
 
-export async function runCli(args: string[], streams: AgentflowCliStreams = process): Promise<number> {
-  const result = dispatch(args);
+export interface AgentflowCliOptions {
+  cwd?: string;
+}
+
+const ACTIVE_LIFECYCLE_COMMANDS = ["run", "resume", "status", "logs", "artifacts", "pause", "cancel"] as const;
+type ActiveLifecycleCommand = (typeof ACTIVE_LIFECYCLE_COMMANDS)[number];
+
+export async function runCli(
+  args: string[],
+  streams: AgentflowCliStreams = process,
+  options: AgentflowCliOptions = {}
+): Promise<number> {
+  const result = isActiveLifecycleCommand(args[0])
+    ? await runLifecycleCommand(args[0], args.slice(1), options)
+    : dispatch(args);
 
   if (result.stdout) {
     streams.stdout.write(result.stdout.endsWith("\n") ? result.stdout : `${result.stdout}\n`);
@@ -80,10 +98,17 @@ export function dispatch(args: string[]): AgentflowCliResult {
     return simulateWorkflow(rest);
   }
 
+  if (isActiveLifecycleCommand(command)) {
+    return {
+      exitCode: 1,
+      stderr: `Agentflow ${command} uses persistent run state and must be invoked through the CLI runner.`
+    };
+  }
+
   if (isPlannedRuntimeCommand(command)) {
     return {
       exitCode: 7,
-      stderr: `Agentflow command "${command}" is reserved but not active yet.\nAvailable now: help, version, validate, lint, explain, graph, and simulate.`
+      stderr: `Agentflow command "${command}" is reserved but not active yet.\nAvailable now: help, version, validate, lint, explain, graph, simulate, run, resume, status, logs, artifacts, pause, and cancel.`
     };
   }
 
@@ -98,10 +123,10 @@ function renderHelp(topic?: string): string {
     return [
       `agentflow ${topic}`,
       "",
-      ["validate", "lint", "explain", "graph", "simulate"].includes(topic)
-        ? topic === "simulate"
+      ["validate", "lint", "explain", "graph", "simulate", ...ACTIVE_LIFECYCLE_COMMANDS].includes(topic as ActiveLifecycleCommand)
+        ? lifecycleUsage(topic) ?? (topic === "simulate"
           ? "Usage: agentflow simulate <workflow> --fixture <file>"
-          : `Usage: agentflow ${topic} <workflow>`
+          : `Usage: agentflow ${topic} <workflow>`)
         : "This command name is reserved for a future Agentflow runtime surface."
     ].join("\n");
   }
@@ -117,6 +142,13 @@ function renderHelp(topic?: string): string {
     "  agentflow explain <workflow>",
     "  agentflow graph <workflow>",
     "  agentflow simulate <workflow> --fixture <file>",
+    "  agentflow run <workflow> --id <run-id>",
+    "  agentflow resume <run-id>",
+    "  agentflow status <run-id>",
+    "  agentflow logs <run-id>",
+    "  agentflow artifacts <run-id>",
+    "  agentflow pause <run-id>",
+    "  agentflow cancel <run-id>",
     "",
     "Available now:",
     "  help       Show this help output.",
@@ -126,11 +158,128 @@ function renderHelp(topic?: string): string {
     "  explain <workflow>   Explain steps, artifacts, policies, and warnings.",
     "  graph <workflow>     Print a deterministic workflow graph.",
     "  simulate <workflow> --fixture <file>  Traverse a workflow from fixture data without executing steps.",
+    "  run <workflow> --id <run-id>  Create a persistent run shell.",
+    "  resume <run-id>       Resume a paused, waiting, or pending run.",
+    "  status <run-id>       Inspect persistent run state.",
+    "  logs <run-id>         List ordered lifecycle events.",
+    "  artifacts <run-id>    List registered run artifacts.",
+    "  pause <run-id>        Pause an active run.",
+    "  cancel <run-id>       Cancel a non-terminal run.",
     "",
     "Reserved placeholders:",
-    `  ${plannedAgentflowRuntimeCommands.filter((command) => !["validate", "lint", "explain", "graph", "simulate"].includes(command)).join(", ")}`,
+    `  ${plannedAgentflowRuntimeCommands.filter((command) => !["validate", "lint", "explain", "graph", "simulate", ...ACTIVE_LIFECYCLE_COMMANDS].includes(command as ActiveLifecycleCommand)).join(", ")}`,
     "",
-    "No workflow execution commands are active yet."
+    "Lifecycle state management is active; workflow step execution is not available yet."
+  ].join("\n");
+}
+
+async function runLifecycleCommand(
+  command: ActiveLifecycleCommand,
+  args: string[],
+  options: AgentflowCliOptions
+): Promise<AgentflowCliResult> {
+  const usage = lifecycleUsage(command);
+  if (!validLifecycleArgs(command, args)) return { exitCode: 1, stderr: usage! };
+
+  const workflowPath = command === "run" && options.cwd ? path.resolve(options.cwd, args[0]) : args[0];
+  const workflowResult = command === "run" ? readWorkflow(workflowPath, "run") : null;
+  if (workflowResult && "exitCode" in workflowResult) return workflowResult;
+
+  let store: Awaited<ReturnType<typeof openAgentflowRunState>> | undefined;
+  try {
+    store = await openAgentflowRunState({ cwd: options.cwd });
+
+    if (command === "run") {
+      const result = createAgentflowLifecycleRun(store, { id: args[2], workflow: workflowResult!.workflow });
+      return {
+        exitCode: 7,
+        stdout: [
+          `${result.changed ? "Created" : "Reused"} Agentflow run ${result.run.id} for ${result.run.workflowName} (version ${result.run.workflowVersion}).`,
+          `Status: ${result.run.status}`
+        ].join("\n"),
+        stderr: "Workflow step execution is not available yet; no workflow steps were executed. Inspect the run with `agentflow status <run-id>`."
+      };
+    }
+
+    const runId = args[0];
+    if (command === "status") {
+      const run = requireRun(store, runId);
+      return { exitCode: 0, stdout: renderRunStatus(run) };
+    }
+    if (command === "logs") {
+      requireRun(store, runId);
+      const events = store.listEvents(runId);
+      return {
+        exitCode: 0,
+        stdout: events.length === 0
+          ? `No events recorded for Agentflow run ${runId}.`
+          : events.map((event) => `${event.sequence}\t${event.createdAt}\t${event.type}\t${JSON.stringify(event.payload)}`).join("\n")
+      };
+    }
+    if (command === "artifacts") {
+      requireRun(store, runId);
+      const artifacts = store.listArtifacts(runId);
+      return {
+        exitCode: 0,
+        stdout: artifacts.length === 0
+          ? `No artifacts registered for Agentflow run ${runId}.`
+          : artifacts.map((artifact) => `${artifact.declaredPath}\t${artifact.status}\t${artifact.kind}\t${artifact.contentType}`).join("\n")
+      };
+    }
+
+    const result = transitionAgentflowLifecycleRun(store, runId, command);
+    const verb = command === "pause" ? "Paused" : command === "resume" ? "Resumed" : "Cancelled";
+    const lines = [
+      `${result.changed ? verb : "No change for"} Agentflow run ${runId}.`,
+      `Status: ${result.run.status}`
+    ];
+    if (command === "resume") {
+      return {
+        exitCode: 7,
+        stdout: lines.join("\n"),
+        stderr: "Workflow step execution is not available yet; no workflow steps were executed. Pause or cancel the run explicitly."
+      };
+    }
+    return { exitCode: 0, stdout: lines.join("\n") };
+  } catch (error) {
+    if (error instanceof AgentflowRunStateError) {
+      return { exitCode: error.code === "AGENTFLOW_RUN_NOT_FOUND" ? 4 : 2, stderr: error.message };
+    }
+    return { exitCode: 1, stderr: error instanceof Error ? error.message : String(error) };
+  } finally {
+    store?.close();
+  }
+}
+
+function validLifecycleArgs(command: ActiveLifecycleCommand, args: string[]): boolean {
+  return command === "run"
+    ? args.length === 3 && args[1] === "--id" && args[0].length > 0 && args[2].length > 0
+    : args.length === 1 && args[0].length > 0;
+}
+
+function lifecycleUsage(topic: string): string | null {
+  if (topic === "run") return "Usage: agentflow run <workflow> --id <run-id>";
+  if (isActiveLifecycleCommand(topic)) return `Usage: agentflow ${topic} <run-id>`;
+  return null;
+}
+
+function requireRun(
+  store: Awaited<ReturnType<typeof openAgentflowRunState>>,
+  runId: string
+): NonNullable<ReturnType<typeof store.getRun>> {
+  const run = store.getRun(runId);
+  if (run === null) throw new AgentflowRunStateError(`Agentflow run ${runId} was not found.`, "AGENTFLOW_RUN_NOT_FOUND");
+  return run;
+}
+
+function renderRunStatus(run: NonNullable<ReturnType<Awaited<ReturnType<typeof openAgentflowRunState>>["getRun"]>>): string {
+  return [
+    `Run: ${run.id}`,
+    `Workflow: ${run.workflowName} (version ${run.workflowVersion})`,
+    `Status: ${run.status}`,
+    `Current step: ${run.currentStepId ?? "none"}`,
+    `Created: ${run.createdAt}`,
+    `Updated: ${run.updatedAt}`
   ].join("\n");
 }
 
@@ -225,7 +374,7 @@ function checkWorkflow(command: "validate" | "lint" | "explain" | "graph", args:
 
 function readWorkflow(
   workflowPath: string,
-  command: "validate" | "lint" | "explain" | "graph" | "simulate"
+  command: "validate" | "lint" | "explain" | "graph" | "simulate" | "run"
 ): { workflow: import("@jurgen1c/agentflow-core").AgentflowWorkflow } | AgentflowCliResult {
   let source: string;
 
@@ -259,6 +408,10 @@ function readWorkflow(
 
 function isPlannedRuntimeCommand(command: string): boolean {
   return plannedAgentflowRuntimeCommands.includes(command as (typeof plannedAgentflowRuntimeCommands)[number]);
+}
+
+function isActiveLifecycleCommand(command: string | undefined): command is ActiveLifecycleCommand {
+  return command !== undefined && ACTIVE_LIFECYCLE_COMMANDS.includes(command as ActiveLifecycleCommand);
 }
 
 function readRootPackageVersion(): string {

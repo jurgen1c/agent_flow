@@ -9,6 +9,10 @@ export interface AgentflowCliResult {
   stderr?: string;
 }
 
-export function runCli(args: string[], streams?: AgentflowCliStreams): Promise<number>;
+export interface AgentflowCliOptions {
+  cwd?: string;
+}
+
+export function runCli(args: string[], streams?: AgentflowCliStreams, options?: AgentflowCliOptions): Promise<number>;
 
 export function dispatch(args: string[]): AgentflowCliResult;

@@ -171,10 +171,16 @@ The root `@jurgen1c/agent-memory-cli` package still includes the compatibility
 
 The `agentflow` built executable currently supports help, version, deterministic
 workflow validation, read-only workflow linting, workflow explanation,
-deterministic graph inspection, and fixture-backed workflow simulation.
-Execution command names
-such as `run`, `resume`, and `cleanup` remain reserved placeholders until the
-execution scheduler and command adapters are implemented. The core persistence
+deterministic graph inspection, fixture-backed workflow simulation, and the
+persistent run-lifecycle shell. `run <workflow> --id <run-id>` creates or
+idempotently reopens a pending run, while `status`, `logs`, `artifacts`, `pause`,
+`resume`, and `cancel` inspect or transition that run through the repo-local
+SQLite store. Lifecycle changes append ordered events and survive process
+restart. `run` and `resume` persist the requested lifecycle change, then fail
+with exit code 7 and an actionable message because step runners and the
+execution scheduler are not implemented and no workflow steps were executed.
+Execution commands such as `cleanup` remain reserved placeholders until those
+runtime adapters are implemented. The core persistence
 surface now initializes repo-local `.agentflow/agentflow.sqlite` state and
 provides typed create, update, resume-lookup, step, artifact, event, session,
 failure, approval, and budget writes for later runtime phases. Its event log
@@ -202,7 +208,17 @@ artifact, or run-state files.
 The CLI exposes these APIs through `agentflow validate <workflow>`,
 `agentflow lint <workflow>`, `agentflow explain <workflow>`, and
 `agentflow graph <workflow>`, plus
-`agentflow simulate <workflow> --fixture <file>`.
+`agentflow simulate <workflow> --fixture <file>`. The lifecycle surface is:
+
+```text
+agentflow run <workflow> --id <run-id>
+agentflow resume <run-id>
+agentflow status <run-id>
+agentflow logs <run-id>
+agentflow artifacts <run-id>
+agentflow pause <run-id>
+agentflow cancel <run-id>
+```
 
 Example simulation fixture:
 

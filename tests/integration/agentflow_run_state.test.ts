@@ -865,6 +865,16 @@ describe("Agentflow run-state SQLite store", () => {
       expect(terminal.finishedAt).toBe(FIXED_TIME);
       expect(store.findResumableRun({ workflowName: "terminal" })).toBeNull();
       expect(() => store.updateRun(id, { status: "running" })).toThrow(AgentflowRunStateError);
+      expect(() => store.transitionRunWithEvent(id, {
+        status: "running",
+        allowedFrom: [status],
+        event: { type: "run.resume" }
+      })).toThrow("cannot transition");
+      expect(store.transitionRunWithEvent(id, {
+        status,
+        allowedFrom: [],
+        event: { type: "run.noop" }
+      })).toEqual({ changed: false, run: terminal });
       expect(store.updateRun(id, { status, currentStepId: "later", output: { result: "changed" } })).toEqual(terminal);
     }
 
