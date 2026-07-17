@@ -1,9 +1,11 @@
+import { isDeepStrictEqual } from "node:util";
 import type { AgentflowWorkflow } from "./workflow";
 import { formatAgentflowWorkflowIssues, validateAgentflowWorkflow } from "./validation";
 import {
   AgentflowRunStateError,
   type AgentflowRunMutationResult,
   type AgentflowRunRecord,
+  type AgentflowRunStateValue,
   type AgentflowRunStateStore
 } from "./run_state";
 
@@ -52,7 +54,8 @@ export function createAgentflowLifecycleRun(
         version: input.workflow.version,
         style: input.workflow.style,
         maturity: input.workflow.maturity
-      }
+      },
+      context: { workflow: input.workflow as unknown as AgentflowRunStateValue }
     }, { type: "run.created", payload: { status: "pending" } });
     return { changed: true, run };
   } catch (error) {
@@ -116,5 +119,6 @@ function matchesWorkflow(run: AgentflowRunRecord, workflow: AgentflowWorkflow): 
   return run.workflowName === workflow.name
     && run.workflowVersion === workflow.version
     && run.workflowStyle === workflow.style
-    && run.workflowMaturity === workflow.maturity;
+    && run.workflowMaturity === workflow.maturity
+    && isDeepStrictEqual(run.context.workflow, workflow);
 }

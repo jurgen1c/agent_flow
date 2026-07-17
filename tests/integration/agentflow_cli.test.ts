@@ -23,7 +23,7 @@ describe("Agentflow CLI", () => {
     expect(result.stdout).toContain("simulate <workflow> --fixture <file>");
     expect(result.stdout).toContain("run <workflow> --id <run-id>");
     expect(result.stdout).toContain("pause <run-id>");
-    expect(result.stdout).toContain("Lifecycle state management is active");
+    expect(result.stdout).toContain("Command-only pipeline execution");
   });
 
   test("renders version from root package metadata", () => {
@@ -147,31 +147,32 @@ describe("Agentflow CLI", () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agentflow-cli-lifecycle-"));
     fs.mkdirSync(path.join(repo, ".git"));
     const workflowPath = path.join(repo, "workflow.yml");
-    fs.copyFileSync(path.join(repoRoot, "tests/fixtures/agentflow/workflows/simple-ci.yml"), workflowPath);
+    fs.writeFileSync(workflowPath, `
+name: simple-ci
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: check
+    type: command
+    command: printf 'check passed\\n'
+`);
 
     const run = await captureCli(["run", path.basename(workflowPath), "--id", "run-cli"], repo);
-    expect(run).toMatchObject({ exitCode: 7 });
+    expect(run).toMatchObject({ exitCode: 0 });
     expect(run.stdout).toContain("Created Agentflow run run-cli");
-    expect(run.stderr).toContain("Workflow step execution is not available yet");
-    expect(await captureCli(["pause", "run-cli"], repo)).toMatchObject({ exitCode: 0 });
-    const resumed = await captureCli(["resume", "run-cli"], repo);
-    expect(resumed.exitCode).toBe(7);
-    expect(resumed.stdout).toContain("Status: running");
-    expect(resumed.stderr).toContain("no workflow steps were executed");
+    expect(run.stdout).toContain("Status: completed");
     const status = await captureCli(["status", "run-cli"], repo);
     expect(status.stdout).toContain("Workflow: simple-ci (version 1)");
-    expect(status.stdout).toContain("Status: running");
+    expect(status.stdout).toContain("Status: completed");
     const logs = await captureCli(["logs", "run-cli"], repo);
     expect(logs.stdout).toContain("run.created");
-    expect(logs.stdout).toContain("run.resume");
-    expect(await captureCli(["artifacts", "run-cli"], repo)).toMatchObject({
-      exitCode: 0,
-      stdout: "No artifacts registered for Agentflow run run-cli.\n"
-    });
-    expect((await captureCli(["cancel", "run-cli"], repo)).stdout).toContain("Status: cancelled");
+    expect(logs.stdout).toContain("step.completed");
+    expect((await captureCli(["artifacts", "run-cli"], repo)).stdout).toContain("stdout.log");
 
     const restartedStatus = await captureCli(["status", "run-cli"], repo);
-    expect(restartedStatus.stdout).toContain("Status: cancelled");
+    expect(restartedStatus.stdout).toContain("Status: completed");
+    expect(await captureCli(["pause", "run-cli"], repo)).toMatchObject({ exitCode: 2 });
     expect(await captureCli(["pause", "missing"], repo)).toMatchObject({ exitCode: 4 });
   });
 

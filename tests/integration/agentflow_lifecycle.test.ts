@@ -72,6 +72,13 @@ describe("Agentflow run lifecycle", () => {
       id: "run-shell",
       workflow: { ...workflow, name: "another-workflow" }
     })).toThrow(AgentflowRunStateError);
+    expect(() => createAgentflowLifecycleRun(store, {
+      id: "run-shell",
+      workflow: {
+        ...workflow,
+        steps: workflow.steps.map((step) => ({ ...step, command: "bun test" }))
+      }
+    })).toThrow("already exists");
     expect(() => transitionAgentflowLifecycleRun(store, "missing", "pause")).toThrow("was not found");
     transitionAgentflowLifecycleRun(store, "run-shell", "cancel");
     expect(() => transitionAgentflowLifecycleRun(store, "run-shell", "resume")).toThrow("cannot resume");

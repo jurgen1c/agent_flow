@@ -144,6 +144,7 @@ export interface AgentflowEventRecord {
 
 export interface AgentflowRunEventInput {
   type: string;
+  stepId?: string;
   payload?: AgentflowRunStateValue;
 }
 
@@ -738,6 +739,21 @@ export class AgentflowRunStateStore {
     ]);
   }
 
+  appendRunEvent(runId: string, event: AgentflowRunEventInput): void {
+    this.assertOpen();
+    const normalizedRunId = requiredString(runId, "Run ID");
+    this.requireRun(normalizedRunId);
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.appendNextEvent(normalizedRunId, event);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      rollback(this.database);
+      if (error instanceof AgentflowRunStateError) throw error;
+      throw runStateWriteError("append run event", error);
+    }
+  }
+
   listEvents(runId: string): AgentflowEventRecord[] {
     this.assertOpen();
     const normalizedRunId = requiredString(runId, "Run ID");
@@ -984,8 +1000,8 @@ export class AgentflowRunStateStore {
     }
     this.database.run(
       `INSERT INTO events (run_id, id, sequence, step_id, session_id, type, payload_json, created_at)
-      VALUES (?, ?, ?, NULL, NULL, ?, ?, ?)`,
-      [runId, id, sequence, type, nullableJson(event.payload), currentTimestamp(this.now)]
+      VALUES (?, ?, ?, ?, NULL, ?, ?, ?)`,
+      [runId, id, sequence, optionalString(event.stepId, "Step ID"), type, nullableJson(event.payload), currentTimestamp(this.now)]
     );
   }
 

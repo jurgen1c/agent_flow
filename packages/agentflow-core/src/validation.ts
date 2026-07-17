@@ -7,6 +7,8 @@ import type {
 import { validateAgentflowPolicyPrimitives } from "./policy";
 import { policyGlobLayersHaveWritablePath } from "./policy_utils";
 
+export const MAX_AGENTFLOW_COMMAND_TIMEOUT_SECONDS = 2_147_483.647;
+
 export interface AgentflowWorkflowIssue {
   code: string;
   message: string;
@@ -63,6 +65,7 @@ const TARGET_FIELDS = new Set(["else", "goto", "on_approve", "on_cancel", "on_re
 const SECRET_PATH = /(^|[/._-])(\.env|credentials|id_rsa|id_ed25519|private[_-]?key|secrets?)([/._-]|$)/i;
 const SHELL_EXECUTABLES = new Set(["bash", "dash", "ksh", "sh", "zsh"]);
 const SHELL_ANALYSIS_BUDGET = 65_536;
+export const MAX_AGENTFLOW_COMMAND_RETRIES = 100;
 const STEP_REQUIREMENTS: Readonly<Record<string, ReadonlyArray<readonly [string, "string" | "array"]>>> = {
   approval: [["reviewer", "string"], ["artifacts", "array"]],
   artifact_transform: [["input", "string"], ["output", "string"], ["transform", "string"]],
@@ -289,6 +292,49 @@ function validateRequiredStepFields(context: StepContext, errors: AgentflowWorkf
 
   validateArtifactFieldShapes(context, errors);
 
+  if (context.type === "command" && context.step.timeout_seconds !== undefined &&
+      (typeof context.step.timeout_seconds !== "number" || !Number.isFinite(context.step.timeout_seconds) || context.step.timeout_seconds <= 0)) {
+    addStepIssue(
+      errors,
+      context,
+      "workflow.command.timeout.invalid",
+      "timeout_seconds",
+      "Command timeout_seconds must be a positive finite number."
+    );
+  }
+  if (context.type === "command" && typeof context.step.timeout_seconds === "number" &&
+      Number.isFinite(context.step.timeout_seconds) && context.step.timeout_seconds > MAX_AGENTFLOW_COMMAND_TIMEOUT_SECONDS) {
+    addStepIssue(
+      errors,
+      context,
+      "workflow.command.timeout.invalid",
+      "timeout_seconds",
+      `Command timeout_seconds cannot exceed ${MAX_AGENTFLOW_COMMAND_TIMEOUT_SECONDS}.`
+    );
+  }
+
+  if (context.type === "command" && isRecord(context.step.on_failure)) {
+    const retry = context.step.on_failure.retry;
+    if (retry !== undefined && (!Number.isSafeInteger(retry) || Number(retry) < 0 || Number(retry) > MAX_AGENTFLOW_COMMAND_RETRIES)) {
+      addStepIssue(
+        errors,
+        context,
+        "workflow.command.retry.invalid",
+        "on_failure.retry",
+        `Command on_failure.retry must be an integer from 0 through ${MAX_AGENTFLOW_COMMAND_RETRIES}.`
+      );
+    }
+    if (context.step.on_failure.then === "continue" && context.step.on_failure.allowed !== true) {
+      addStepIssue(
+        errors,
+        context,
+        "workflow.command.continue.not_allowed",
+        "on_failure.allowed",
+        "Command failures may continue only when on_failure.allowed is true."
+      );
+    }
+  }
+
   if (context.type === "condition") {
     const hasBranches = Array.isArray(context.step.branches) && context.step.branches.length > 0;
     const hasInlineCondition = nonEmptyString(context.step.if) !== undefined && nonEmptyString(context.step.then) !== undefined;
@@ -493,7 +539,7 @@ function validateCommands(
       continue;
     }
 
-    const unsafe = destructiveRmReason(context.step.command) ?? unsafeShellReason(context.step.command);
+    const unsafe = agentflowCommandUnsafeReason(context.step.command);
 
     const unsafePolicy = isRecord(workflow.policies) ? workflow.policies.unsafe_operations : undefined;
 
@@ -507,6 +553,10 @@ function validateCommands(
       );
     }
   }
+}
+
+export function agentflowCommandUnsafeReason(command: string): string | undefined {
+  return destructiveRmReason(command) ?? unsafeShellReason(command);
 }
 
 function validateSessionReferences(

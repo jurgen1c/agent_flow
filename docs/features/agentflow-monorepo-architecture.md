@@ -24,7 +24,7 @@ runtime.
 | Agent Memory web UI | `packages/web` | Private workspace shell named `@jurgen1c/agent-memory-web`; bundled inside `@jurgen1c/agent-memory-cli` by default | Local browser UI for inspecting committed memory and generated read models. It should consume core API shapes and static assets, not own repository memory semantics. |
 | Agentflow CLI and runtime | `packages/agentflow` | `@jurgen1c/agentflow` | Workflow definition validation, run creation, resumable execution, step scheduling, event logs, artifact management, policies, approvals, retries, and cleanup. |
 | Agentflow core | `packages/agentflow-core` | Private workspace shell named `@jurgen1c/agentflow-core` until the runtime API is intentionally published | Typed workflow/run primitives, planned command names, and runtime package boundary metadata. |
-| Agentflow CLI | `packages/agentflow-cli` | Public package named `@jurgen1c/agentflow-cli` | `agentflow` executable entrypoint, help and version output, workflow validation and lint adapters, and command gating while runtime behavior is unavailable. |
+| Agentflow CLI | `packages/agentflow-cli` | Public package named `@jurgen1c/agentflow-cli` | `agentflow` executable entrypoint, authoring and inspection commands, command-only pipeline execution, and persistent lifecycle inspection. |
 | Agentflow schemas | `packages/agentflow-schemas` | Private workspace shell named `@jurgen1c/agentflow-schemas` until schemas are intentionally published | JSON schemas for Agentflow project config and workflow definitions. |
 | Agentflow Agent Memory adapter | `packages/agentflow-agent-memory-adapter` | Private workspace shell named `@jurgen1c/agentflow-agent-memory-adapter` until adapter APIs are intentionally published | Typed adapter contract for Agentflow steps that need Agent Memory context. |
 | Agentflow examples | `packages/agentflow-examples` or `examples/agentflow` | `@jurgen1c/agentflow-examples` if published; otherwise examples only | Reviewable workflow, prompt, and template examples for pipeline, recovery, and collaborative workflow styles. Examples must not be required at runtime. |
@@ -187,16 +187,28 @@ The root `@jurgen1c/agent-memory-cli` package still includes the compatibility
 
 The `agentflow` built executable currently supports help, version, deterministic
 workflow validation, read-only workflow linting, workflow explanation,
-deterministic graph inspection, fixture-backed workflow simulation, and the
-persistent run-lifecycle shell. `run <workflow> --id <run-id>` creates or
-idempotently reopens a pending run, while `status`, `logs`, `artifacts`, `pause`,
-`resume`, and `cancel` inspect or transition that run through the repo-local
-SQLite store. Lifecycle changes append ordered events and survive process
-restart. `run` and `resume` persist the requested lifecycle change, then fail
-with exit code 7 and an actionable message because step runners and the
-execution scheduler are not implemented and no workflow steps were executed.
-Execution commands such as `cleanup` remain reserved placeholders until those
-runtime adapters are implemented. The core persistence
+deterministic graph inspection, fixture-backed workflow simulation, command-only
+pipeline execution, and the persistent run lifecycle. `run <workflow> --id
+<run-id>` creates or idempotently reopens a pending run and executes command
+steps in sequence. Each attempt records its status, exit code, timeout result,
+ordered events, captured stdout/stderr log artifacts, and declared output files.
+Combined stdout/stderr capture is capped at 10 MiB per attempt; exceeding the
+limit terminates the child process and fails the step.
+Declared outputs must be repository-relative regular files; the artifact
+registry copies their content into the run's digested storage tree and rejects
+traversal and symlink escapes. Commands support positive `timeout_seconds`,
+up to 100 retries, and `fail`, `pause`, or explicitly allowed `continue` failure
+outcomes. Unexpected failures pause by default.
+Because the direct shell adapter cannot confine arbitrary filesystem writes,
+command execution fails closed when `policies.file_scope` is configured.
+
+`status`, `logs`, `artifacts`, `pause`, `resume`, and `cancel` inspect or
+transition runs through the repo-local SQLite store. Lifecycle changes survive
+process restart. Resuming step execution and non-command step runners remain
+future phases; `resume` currently persists the lifecycle transition and exits
+with an actionable message without executing additional steps. Commands such as
+`cleanup` remain reserved placeholders until their runtime adapters are
+implemented. The core persistence
 surface now initializes repo-local `.agentflow/agentflow.sqlite` state and
 provides typed create, update, resume-lookup, step, artifact, event, session,
 failure, approval, and budget writes for later runtime phases. Its event log

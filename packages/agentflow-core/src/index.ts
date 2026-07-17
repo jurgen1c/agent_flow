@@ -34,6 +34,7 @@ export {
   createAgentflowLifecycleRun,
   transitionAgentflowLifecycleRun
 } from "./lifecycle";
+export { executeAgentflowCommandPipeline } from "./command_execution";
 export {
   evaluateAgentflowPolicy,
   validateAgentflowPolicyPrimitives
@@ -77,6 +78,7 @@ export type {
   AgentflowLifecycleAction,
   CreateAgentflowLifecycleRunInput
 } from "./lifecycle";
+export type { AgentflowCommandPipelineResult } from "./command_execution";
 export type {
   AgentflowPolicyDecision,
   AgentflowPolicyIssue,

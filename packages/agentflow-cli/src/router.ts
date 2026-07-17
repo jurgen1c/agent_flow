@@ -4,6 +4,7 @@ import {
   AgentflowWorkflowGraphError,
   AgentflowRunStateError,
   createAgentflowLifecycleRun,
+  executeAgentflowCommandPipeline,
   explainAgentflowWorkflow,
   formatAgentflowWorkflowIssues,
   formatWorkflowParseIssues,
@@ -158,7 +159,7 @@ function renderHelp(topic?: string): string {
     "  explain <workflow>   Explain steps, artifacts, policies, and warnings.",
     "  graph <workflow>     Print a deterministic workflow graph.",
     "  simulate <workflow> --fixture <file>  Traverse a workflow from fixture data without executing steps.",
-    "  run <workflow> --id <run-id>  Create a persistent run shell.",
+    "  run <workflow> --id <run-id>  Execute a command-only pipeline and persist its run state.",
     "  resume <run-id>       Resume a paused, waiting, or pending run.",
     "  status <run-id>       Inspect persistent run state.",
     "  logs <run-id>         List ordered lifecycle events.",
@@ -169,7 +170,7 @@ function renderHelp(topic?: string): string {
     "Reserved placeholders:",
     `  ${plannedAgentflowRuntimeCommands.filter((command) => !["validate", "lint", "explain", "graph", "simulate", ...ACTIVE_LIFECYCLE_COMMANDS].includes(command as ActiveLifecycleCommand)).join(", ")}`,
     "",
-    "Lifecycle state management is active; workflow step execution is not available yet."
+    "Command-only pipeline execution and persistent lifecycle state are active."
   ].join("\n");
 }
 
@@ -191,13 +192,17 @@ async function runLifecycleCommand(
 
     if (command === "run") {
       const result = createAgentflowLifecycleRun(store, { id: args[2], workflow: workflowResult!.workflow });
+      const execution = await executeAgentflowCommandPipeline(store, result.run.id, workflowResult!.workflow);
+      const lines = [
+        `${result.changed ? "Created" : "Reused"} Agentflow run ${result.run.id} for ${result.run.workflowName} (version ${result.run.workflowVersion}).`,
+        `Status: ${execution.status}`,
+        `Completed steps: ${execution.completedSteps.length === 0 ? "none" : execution.completedSteps.join(", ")}`
+      ];
+      if (execution.failedStep !== undefined) lines.push(`Failed step: ${execution.failedStep}`);
       return {
-        exitCode: 7,
-        stdout: [
-          `${result.changed ? "Created" : "Reused"} Agentflow run ${result.run.id} for ${result.run.workflowName} (version ${result.run.workflowVersion}).`,
-          `Status: ${result.run.status}`
-        ].join("\n"),
-        stderr: "Workflow step execution is not available yet; no workflow steps were executed. Inspect the run with `agentflow status <run-id>`."
+        exitCode: execution.status === "completed" ? 0 : execution.status === "paused" ? 3 : 1,
+        stdout: lines.join("\n"),
+        stderr: execution.message
       };
     }
 
@@ -237,7 +242,7 @@ async function runLifecycleCommand(
       return {
         exitCode: 7,
         stdout: lines.join("\n"),
-        stderr: "Workflow step execution is not available yet; no workflow steps were executed. Pause or cancel the run explicitly."
+        stderr: "Resuming command execution is not available yet; no additional workflow steps were executed. Pause or cancel the run explicitly."
       };
     }
     return { exitCode: 0, stdout: lines.join("\n") };

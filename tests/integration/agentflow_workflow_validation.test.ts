@@ -74,6 +74,66 @@ steps:
     ]);
   });
 
+  test("requires positive finite command timeouts", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: invalid-timeout
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: check
+    type: command
+    command: printf ok
+    timeout_seconds: 0
+`);
+
+    expect(validateAgentflowWorkflow(workflow).errors).toEqual([{
+      code: "workflow.command.timeout.invalid",
+      message: "Command timeout_seconds must be a positive finite number.",
+      path: "steps[0].timeout_seconds",
+      stepId: "check"
+    }]);
+  });
+
+  test("rejects command timeouts outside the Node timer range", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: oversized-timeout
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: check
+    type: command
+    command: printf ok
+    timeout_seconds: 2147483.648
+`);
+
+    expect(validateAgentflowWorkflow(workflow).errors).toEqual([{
+      code: "workflow.command.timeout.invalid",
+      message: "Command timeout_seconds cannot exceed 2147483.647.",
+      path: "steps[0].timeout_seconds",
+      stepId: "check"
+    }]);
+  });
+
+  test("requires bounded retries and explicit permission to continue after command failure", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: invalid-failure-policy
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: check
+    type: command
+    command: printf ok
+    on_failure:
+      retry: -1
+      then: continue
+`);
+
+    expect(validateAgentflowWorkflow(workflow).errors.map((issue) => issue.code)).toEqual([
+      "workflow.command.retry.invalid",
+      "workflow.command.continue.not_allowed"
+    ]);
+  });
+
   test("validates nested targets and loop bounds deterministically", () => {
     const workflow = parseAgentflowWorkflowOrThrow(`name: nested
 version: 1
