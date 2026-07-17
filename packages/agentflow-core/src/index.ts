@@ -34,6 +34,10 @@ export {
   createAgentflowLifecycleRun,
   transitionAgentflowLifecycleRun
 } from "./lifecycle";
+export {
+  evaluateAgentflowPolicy,
+  validateAgentflowPolicyPrimitives
+} from "./policy";
 export type {
   AgentflowWorkflow,
   AgentflowWorkflowParseFailure,
@@ -73,6 +77,12 @@ export type {
   AgentflowLifecycleAction,
   CreateAgentflowLifecycleRunInput
 } from "./lifecycle";
+export type {
+  AgentflowPolicyDecision,
+  AgentflowPolicyIssue,
+  AgentflowPolicyRequest,
+  AgentflowPolicyStatus
+} from "./policy";
 export type {
   AgentflowApprovalStatus,
   AgentflowArtifactRecord,

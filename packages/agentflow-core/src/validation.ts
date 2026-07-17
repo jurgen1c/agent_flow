@@ -4,6 +4,8 @@ import type {
   AgentflowYamlMapping,
   AgentflowYamlValue
 } from "./workflow";
+import { validateAgentflowPolicyPrimitives } from "./policy";
+import { policyGlobLayersHaveWritablePath } from "./policy_utils";
 
 export interface AgentflowWorkflowIssue {
   code: string;
@@ -27,6 +29,13 @@ interface StepContext {
   id?: string;
   type?: string;
   depth: number;
+}
+
+interface WriterScope {
+  session: string;
+  includeLayers: string[][];
+  exclusions: string[];
+  path: string;
 }
 
 const STEP_TYPES = new Set([
@@ -78,12 +87,13 @@ export function validateAgentflowWorkflow(workflow: AgentflowWorkflow): Agentflo
   const ids = new Set(contexts.flatMap((context) => context.id === undefined ? [] : [context.id]));
 
   validateSessionDefinitions(workflow, errors);
+  errors.push(...validateAgentflowPolicyPrimitives(workflow));
   validateStepShapes(contexts, errors);
   validateNestedStepShapes(workflow.steps, errors);
   validateDynamicReferences(workflow, errors);
   validateTargetShapes(contexts, errors);
   validateTargets(contexts, ids, errors);
-  validateCommands(contexts, errors);
+  validateCommands(workflow, contexts, errors);
   validateSessionReferences(workflow, contexts, errors);
   validateControlStepShapes(workflow, contexts, errors);
   validateLoopBounds(contexts, errors);
@@ -473,7 +483,11 @@ function validateDynamicReferences(workflow: AgentflowWorkflow, errors: Agentflo
   });
 }
 
-function validateCommands(contexts: StepContext[], errors: AgentflowWorkflowIssue[]): void {
+function validateCommands(
+  workflow: AgentflowWorkflow,
+  contexts: StepContext[],
+  errors: AgentflowWorkflowIssue[]
+): void {
   for (const context of contexts) {
     if (context.type !== "command" || typeof context.step.command !== "string") {
       continue;
@@ -481,7 +495,9 @@ function validateCommands(contexts: StepContext[], errors: AgentflowWorkflowIssu
 
     const unsafe = destructiveRmReason(context.step.command) ?? unsafeShellReason(context.step.command);
 
-    if (unsafe) {
+    const unsafePolicy = isRecord(workflow.policies) ? workflow.policies.unsafe_operations : undefined;
+
+    if (unsafe && unsafePolicy !== "require_approval" && unsafePolicy !== "allow") {
       addStepIssue(
         errors,
         context,
@@ -790,7 +806,7 @@ function validateParallelWriters(
     }
 
     const outputs = new Set<string>();
-    const scopedBranches: Array<{ id: string; includes: string[]; field: string }> = [];
+    const scopedBranches: Array<{ id: string; writers: WriterScope[]; field: string }> = [];
     const writerFields: string[] = [];
     let writerBranchCount = 0;
 
@@ -820,19 +836,18 @@ function validateParallelWriters(
       }
 
       for (const writer of writerScopes) {
-        if (writer.includes.length === 0) {
+        if (writer.includeLayers.length === 0) {
           errors.push({
             code: "workflow.parallel.file_scope.required",
-            message: `Parallel writer session "${writer.session}" must declare a non-empty file_scope.include list.`,
+            message: `Parallel writer session "${writer.session}" requires a non-empty effective file_scope.include list from policies.file_scope, the session, or the parallel operation.`,
             path: `${writer.path}.file_scope.include`,
             ...(context.id === undefined ? {} : { stepId: context.id })
           });
         }
       }
 
-      const includes = [...new Set(writerScopes.flatMap((writer) => writer.includes))];
-      if (includes.length > 0) {
-        scopedBranches.push({ id: nonEmptyString(child.id) ?? "unnamed", includes, field });
+      if (writerScopes.some((writer) => writer.includeLayers.length > 0)) {
+        scopedBranches.push({ id: nonEmptyString(child.id) ?? "unnamed", writers: writerScopes, field });
       }
     }
 
@@ -850,7 +865,7 @@ function validateParallelWriters(
       for (let rightIndex = leftIndex + 1; rightIndex < scopedBranches.length; rightIndex += 1) {
         const left = scopedBranches[leftIndex];
         const right = scopedBranches[rightIndex];
-        const overlap = firstScopeOverlap(left.includes, right.includes);
+        const overlap = firstWriterScopeOverlap(left.writers, right.writers);
 
         if (overlap && !parallelOverlapAllowed(context.step)) {
           addStepIssue(
@@ -915,27 +930,43 @@ function validateParallelFileScopeEntries(
       });
     }
   }
+
+  const failureRoute = isRecord(step.on_failure) && isRecord(step.on_failure.route_to)
+    ? step.on_failure.route_to
+    : undefined;
+  if (failureRoute !== undefined) {
+    validateParallelFileScopeEntries(
+      failureRoute as AgentflowWorkflowStep,
+      `${path}.on_failure.route_to`,
+      parallel,
+      errors
+    );
+  }
 }
 
 function collectWriterScopes(
   step: AgentflowWorkflowStep,
   workflow: AgentflowWorkflow,
   path: string,
-  inheritedIncludes: string[] = []
-): Array<{ session: string; includes: string[]; path: string }> {
-  const ownScope = isRecord(step.file_scope) ? stringList(step.file_scope.include) : [];
+  inheritedScopes: AgentflowYamlMapping[] = []
+): WriterScope[] {
+  const ownScope = isRecord(step.file_scope) ? step.file_scope : undefined;
+  const operationScopes = ownScope === undefined ? inheritedScopes : [...inheritedScopes, ownScope];
   const session = nonEmptyString(step.session);
   const sessionDefinition = session === undefined ? undefined : workflow.sessions?.[session];
   const sessionScope = isRecord(sessionDefinition) && isRecord(sessionDefinition.file_scope)
-    ? stringList(sessionDefinition.file_scope.include)
-    : [];
-  const includes = ownScope.length > 0
-    ? ownScope
-    : inheritedIncludes.length > 0
-      ? inheritedIncludes
-      : sessionScope;
+    ? sessionDefinition.file_scope
+    : undefined;
+  const globalScope = isRecord(workflow.policies) && isRecord(workflow.policies.file_scope)
+    ? workflow.policies.file_scope
+    : undefined;
+  const scopes = [globalScope, sessionScope, ...operationScopes].filter(
+    (scope): scope is AgentflowYamlMapping => scope !== undefined
+  );
+  const includeLayers = scopes.map((scope) => stringList(scope.include)).filter((layer) => layer.length > 0);
+  const exclusions = scopes.flatMap((scope) => stringList(scope.exclude));
   const writers = session !== undefined && sessionCanModifyFiles(workflow.sessions?.[session])
-    ? [{ session, includes, path }]
+    ? [{ session, includeLayers, exclusions, path }]
     : [];
 
   for (const field of nestedExecutionFields(step)) {
@@ -943,10 +974,27 @@ function collectWriterScopes(
     if (Array.isArray(nested)) {
       nested.forEach((entry, index) => {
         if (isRecord(entry)) {
-          writers.push(...collectWriterScopes(entry as AgentflowWorkflowStep, workflow, `${path}.${field}[${index}]`, includes));
+          writers.push(...collectWriterScopes(
+            entry as AgentflowWorkflowStep,
+            workflow,
+            `${path}.${field}[${index}]`,
+            operationScopes
+          ));
         }
       });
     }
+  }
+
+  const failureRoute = isRecord(step.on_failure) && isRecord(step.on_failure.route_to)
+    ? step.on_failure.route_to
+    : undefined;
+  if (failureRoute !== undefined) {
+    writers.push(...collectWriterScopes(
+      failureRoute as AgentflowWorkflowStep,
+      workflow,
+      `${path}.on_failure.route_to`,
+      operationScopes
+    ));
   }
 
   return writers;
@@ -1527,15 +1575,17 @@ function nodeReachesFromPending(target: string, pending: string[], graph: Map<st
   return false;
 }
 
-function firstScopeOverlap(left: string[], right: string[]): [string, string] | undefined {
-  for (const leftPattern of left) {
-    for (const rightPattern of right) {
-      if (scopePatternsOverlap(leftPattern, rightPattern)) {
-        return [leftPattern, rightPattern];
+function firstWriterScopeOverlap(left: WriterScope[], right: WriterScope[]): [string, string] | undefined {
+  for (const leftWriter of left) {
+    for (const rightWriter of right) {
+      if (policyGlobLayersHaveWritablePath(
+        [...leftWriter.includeLayers, ...rightWriter.includeLayers],
+        [...leftWriter.exclusions, ...rightWriter.exclusions]
+      )) {
+        return [leftWriter.includeLayers.at(-1)?.[0] ?? "**", rightWriter.includeLayers.at(-1)?.[0] ?? "**"];
       }
     }
   }
-
   return undefined;
 }
 
@@ -1588,60 +1638,8 @@ function scopePatternEscapesRepo(pattern: string): boolean {
   return false;
 }
 
-function scopePatternsOverlap(left: string, right: string): boolean {
-  left = normalizeScopePattern(left);
-  right = normalizeScopePattern(right);
-
-  if (left === right) {
-    return true;
-  }
-
-  if (/[{\[]/.test(left) || /[{\[]/.test(right)) {
-    return true;
-  }
-
-  if (!left.includes("**") && !right.includes("**") && pathDepth(left) !== pathDepth(right)) {
-    return false;
-  }
-
-  const leftPrefix = scopePrefix(left);
-  const rightPrefix = scopePrefix(right);
-  const prefixesCanOverlap = leftPrefix.length === 0 || rightPrefix.length === 0 ||
-    scopePrefixCanContain(left, leftPrefix, rightPrefix) ||
-    scopePrefixCanContain(right, rightPrefix, leftPrefix);
-
-  if (!prefixesCanOverlap) {
-    return false;
-  }
-
-  const leftSuffix = scopeSuffix(left);
-  const rightSuffix = scopeSuffix(right);
-
-  if (leftSuffix && rightSuffix && !leftSuffix.endsWith(rightSuffix) && !rightSuffix.endsWith(leftSuffix)) {
-    return false;
-  }
-
-  return hasGlob(left) || hasGlob(right);
-}
-
-function scopePrefixCanContain(pattern: string, prefix: string, candidate: string): boolean {
-  if (!candidate.startsWith(prefix)) {
-    return false;
-  }
-
-  if (candidate.length === prefix.length || hasGlob(pattern)) {
-    return true;
-  }
-
-  return prefix.endsWith("/") || candidate[prefix.length] === "/";
-}
-
 function hasGlob(pattern: string): boolean {
   return /[?*{\[]/.test(pattern);
-}
-
-function pathDepth(pattern: string): number {
-  return pattern.split("/").length;
 }
 
 function normalizeScopePattern(pattern: string): string {
@@ -1662,15 +1660,6 @@ function normalizeScopePattern(pattern: string): string {
   return segments.join("/");
 }
 
-function scopePrefix(pattern: string): string {
-  const wildcardIndex = pattern.search(/[?*{\[]/);
-  return wildcardIndex === -1 ? pattern : pattern.slice(0, wildcardIndex);
-}
-
-function scopeSuffix(pattern: string): string {
-  const wildcardIndex = Math.max(pattern.lastIndexOf("*"), pattern.lastIndexOf("?"), pattern.lastIndexOf("]"));
-  return wildcardIndex === -1 ? pattern : pattern.slice(wildcardIndex + 1);
-}
 
 function parallelOverlapAllowed(step: AgentflowWorkflowStep): boolean {
   const conflictPolicy = step.conflict_policy;

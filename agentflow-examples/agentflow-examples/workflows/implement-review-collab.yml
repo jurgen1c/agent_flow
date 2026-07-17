@@ -18,6 +18,8 @@ sessions:
     role: code_implementer
     authority:
       can_modify_files: true
+    file_scope:
+      include: [app/**, packages/**, tests/**, docs/**]
   reviewer:
     provider: frontier
     resume: true
@@ -86,9 +88,11 @@ approvals:
       - git.diff
       - implementation-summary.md
 
+limits:
+  max_frontier_calls: 6
+
 notify:
   - on: approval.waiting
     channels: [system, terminal]
   - on: workflow.paused
     channels: [email_personal, terminal]
-

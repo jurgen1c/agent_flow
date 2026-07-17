@@ -22,6 +22,8 @@ sessions:
     role: copywriter
     authority:
       can_modify_files: true
+    file_scope:
+      include: [content/**]
   product:
     provider: local
     resume: true
@@ -83,6 +85,9 @@ steps:
     type: input_request
     question: "Product and marketing did not reach agreement. What should the final direction be?"
     save_as: user-input/content-decision.md
+
+limits:
+  max_frontier_calls: 4
 
 notify:
   - on: workflow.completed

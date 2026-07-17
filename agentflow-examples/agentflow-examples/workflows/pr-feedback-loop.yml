@@ -87,9 +87,11 @@ steps:
     type: result
     status: completed
 
+limits:
+  max_frontier_calls: 6
+
 notify:
   - on: loop.timeout
     channels: [email_personal, terminal]
   - on: workflow.paused
     channels: [system, terminal]
-

@@ -261,6 +261,68 @@ steps:
     expect(validateAgentflowWorkflow(disjointScopes)).toEqual({ valid: true, errors: [] });
   });
 
+  test("does not let a shallow non-matching globstar exclusion hide writer overlap", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: shallow-overlap
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: true }
+sessions:
+  left:
+    provider: local
+    authority: { can_modify_files: true }
+    file_scope: { include: [aa, bb], exclude: ["**/a"] }
+  right:
+    provider: local
+    authority: { can_modify_files: true }
+    file_scope: { include: [aa] }
+steps:
+  - id: parallel_work
+    type: parallel
+    branches:
+      - { id: left, session: left }
+      - { id: right, session: right }
+`);
+
+    expect(validateAgentflowWorkflow(workflow).errors.map((issue) => issue.code)).toContain(
+      "workflow.parallel.file_scope.overlap"
+    );
+  });
+
+  test("inherits parallel branch scopes for file-writing recovery routes", () => {
+    const source = `name: parallel-recovery-scope
+version: 1
+style: recovery_pipeline
+maturity: draft
+sessions:
+  worker: { provider: local }
+  fixer: { provider: local, authority: { can_modify_files: true } }
+steps:
+  - id: parallel_work
+    type: parallel
+    branches:
+      - id: left
+        type: command
+        session: worker
+        command: bin/check
+        file_scope: { include: [src/**] }
+        on_failure:
+          route_to: { session: fixer, prompt: Fix the failure }
+      - { id: right, type: command, session: worker, command: echo ok }
+`;
+    const scoped = parseAgentflowWorkflowOrThrow(source);
+    expect(validateAgentflowWorkflow(scoped)).toEqual({ valid: true, errors: [] });
+
+    const unscoped = parseAgentflowWorkflowOrThrow(source.replace(
+      "        file_scope: { include: [src/**] }\n",
+      ""
+    ));
+    expect(validateAgentflowWorkflow(unscoped).errors).toContainEqual(expect.objectContaining({
+      code: "workflow.parallel.file_scope.required",
+      path: "steps[0].branches[0].on_failure.route_to.file_scope.include"
+    }));
+  });
+
   test("inherits parallel writer scopes from session definitions", () => {
     const workflow = parseAgentflowWorkflowOrThrow(`name: session-scopes
 version: 1
@@ -284,6 +346,64 @@ steps:
     branches:
       - { id: ruby, session: ruby }
       - { id: js, session: js }
+`);
+
+    expect(validateAgentflowWorkflow(workflow)).toEqual({ valid: true, errors: [] });
+  });
+
+  test("intersects operation and session scopes for parallel writers", () => {
+    const valid = parseAgentflowWorkflowOrThrow(`name: layered-parallel-scopes
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: true }
+sessions:
+  first: { provider: local, role: first, authority: { can_modify_files: true }, file_scope: { include: [src/a/**] } }
+  second: { provider: local, role: second, authority: { can_modify_files: true }, file_scope: { include: [src/b/**] } }
+steps:
+  - id: parallel_work
+    type: parallel
+    branches:
+      - { id: first, session: first, file_scope: { include: [src/**] } }
+      - { id: second, session: second, file_scope: { include: [src/**] } }
+`);
+    expect(validateAgentflowWorkflow(valid)).toEqual({ valid: true, errors: [] });
+
+    const disjoint = parseAgentflowWorkflowOrThrow(`name: unusable-operation-scope
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: true }
+sessions:
+  writer: { provider: local, role: writer, authority: { can_modify_files: true }, file_scope: { include: [src/**] } }
+steps:
+  - id: parallel_work
+    type: parallel
+    branches:
+      - { id: writer, session: writer, file_scope: { include: [docs/**] } }
+`);
+    expect(validateAgentflowWorkflow(disjoint).errors).toContainEqual({
+      code: "workflow.policy.file_scope.disjoint",
+      message: 'File-writing operation "writer" has no writable path shared by its policy layers.',
+      path: "steps[0].branches[0].file_scope.include"
+    });
+  });
+
+  test("inherits a global policy scope for a parallel writer", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: global-parallel-scope
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: true }
+sessions:
+  writer: { provider: local, role: writer, authority: { can_modify_files: true } }
+policies:
+  file_scope: { include: [src/**] }
+steps:
+  - id: parallel_work
+    type: parallel
+    branches:
+      - { id: writer, session: writer }
 `);
 
     expect(validateAgentflowWorkflow(workflow)).toEqual({ valid: true, errors: [] });
@@ -612,7 +732,7 @@ steps:
 
     expect(validateAgentflowWorkflow(workflow).errors).toContainEqual({
       code: "workflow.parallel.file_scope.required",
-      message: 'Parallel writer session "writer" must declare a non-empty file_scope.include list.',
+      message: 'Parallel writer session "writer" requires a non-empty effective file_scope.include list from policies.file_scope, the session, or the parallel operation.',
       path: "steps[0].body[0].body[0].file_scope.include",
       stepId: "parallel_work"
     });
@@ -659,7 +779,7 @@ steps:
     branches:
       - id: left
         session: first
-        file_scope: { include: [left/**] }
+        file_scope: { include: [shared/**] }
         steps:
           - id: nested
             type: parallel

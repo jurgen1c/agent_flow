@@ -86,7 +86,7 @@ describe("Agentflow CLI", () => {
     const result = dispatch(["lint", fixturePath]);
 
     expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain("workflow.lint.frontier.unbounded");
+    expect(result.stdout).toContain("workflow.lint.artifact.read_before_write");
     expect(fs.readFileSync(fixturePath, "utf8")).toBe(before);
   });
 

@@ -1,7 +1,7 @@
 # Agentflow Monorepo Architecture
 
 Status: implemented workspace shell, run persistence foundation, and Agent Memory context adapter
-Ticket: AM-6, AM-7, AM-9, AM-18, AM-19, AM-21
+Ticket: AM-6, AM-7, AM-9, AM-18, AM-19, AM-21, AM-22
 
 ## Intent
 
@@ -221,6 +221,20 @@ contracts in memory and reports visited steps, available and missing artifacts,
 unresolved branches, and terminal states. It does not run commands, model
 sessions, nested workflows, or MCP calls, and it never writes workflow, fixture,
 artifact, or run-state files.
+
+The policy boundary validates positive workflow budgets, bounded frontier
+model use, model-provider allowlists, approval requirements, file scopes,
+retention rules, cleanup modes, and unsafe-operation modes before lifecycle run
+creation persists state. It also exposes a stateless runtime evaluator that
+returns `allow`, `pause`, or `fail` for budget consumption, model use,
+approval-gated operations, file writes, cleanup requests, and unsafe actions.
+These hooks do not execute steps themselves; command and model runners must call
+them before performing the corresponding operation. Cleanup checks are
+run-status aware, protect retained paths and retention periods, treat a
+non-empty `delete` list as a path allowlist, require explicit recursive intent,
+and never delete files directly. File and cleanup paths are checked from a
+trusted root and reject existing symbolic-link traversal.
+
 The CLI exposes these APIs through `agentflow validate <workflow>`,
 `agentflow lint <workflow>`, `agentflow explain <workflow>`, and
 `agentflow graph <workflow>`, plus

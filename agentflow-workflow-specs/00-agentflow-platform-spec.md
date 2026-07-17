@@ -184,6 +184,54 @@ Validation should catch:
 - Unbounded frontier model usage.
 - Deadlock-prone approvals.
 
+### Policy Contract
+
+Workflow policy is enforced at two boundaries: validation before a run is
+persisted, and a stateless runtime check before an operation consumes budget,
+uses a model, writes a file, performs cleanup, or attempts an unsafe action.
+Runtime checks return `allow`, `pause`, or `fail` with a stable code and an
+actionable message. A caller must not perform the requested operation unless
+the decision is `allow`. File-write and cleanup checks receive a trusted root
+path so existing symlink components can be rejected. Cleanup callers must also
+declare whether deletion is recursive so retained descendants remain protected.
+
+```yaml
+limits:
+  max_frontier_calls: 4
+  max_model_calls: 8
+  max_step_attempts: { implementer: 3 }
+
+policies:
+  model_usage:
+    allowed_providers: [local, frontier]
+  approvals:
+    required_for: [publish]
+  cleanup: require_approval
+  unsafe_operations: deny
+
+sessions:
+  implementer:
+    provider: frontier
+    authority:
+      can_modify_files: true
+    file_scope:
+      include: [app/**, tests/**]
+      exclude: [config/credentials/**]
+```
+
+Frontier sessions require a positive `limits.max_frontier_calls` value.
+Per-step attempt checks pass the step identifier to select its declared
+`limits.max_step_attempts` bound.
+Sessions that can modify files must have an effective file scope unless every
+write is already constrained by a parallel-branch scope. Cleanup follows the
+applicable `retention.on_success`, `retention.on_failure`, or
+`retention.on_cancelled` rule after any retention period and required approval
+have been satisfied. A non-empty `delete` list narrows cleanup to those paths;
+rules such as `keep_all_for_days` or `ask_user` without a `delete` list permit
+the requested paths once their guard expires or is approved. Unsafe operations
+are denied by default; an explicit `require_approval` policy pauses instead of
+executing them until approval is recorded.
+
 ## 9. Authoring Skills
 
 Agentflow should ship with skills that help users create and maintain workflows.
@@ -305,4 +353,3 @@ agentflow cleanup <run-id>
 8. Notifications.
 9. Cleanup and archival.
 10. Authoring skills and graph/simulation tooling.
-

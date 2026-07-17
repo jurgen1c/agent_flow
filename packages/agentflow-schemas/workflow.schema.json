@@ -12,9 +12,102 @@
     "sessions": { "type": "object" },
     "artifacts": { "type": "object" },
     "steps": { "type": "array", "items": { "type": "object" } },
-    "policies": { "type": "object" },
+    "limits": {
+      "type": "object",
+      "properties": {
+        "max_step_attempts": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": { "pattern": "^\\S(?:.*\\S)?$" },
+          "additionalProperties": { "type": "number", "exclusiveMinimum": 0 }
+        }
+      },
+      "patternProperties": {
+        "^max_(?!step_attempts$)": { "type": "number", "exclusiveMinimum": 0 }
+      },
+      "additionalProperties": true
+    },
+    "policies": {
+      "type": "object",
+      "properties": {
+        "approvals": {
+          "type": "object",
+          "properties": {
+            "required_for": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string", "minLength": 1 }
+            }
+          },
+          "additionalProperties": true
+        },
+        "cleanup": { "$ref": "#/$defs/policyMode" },
+        "file_scope": { "$ref": "#/$defs/fileScope" },
+        "model_usage": {
+          "type": "object",
+          "properties": {
+            "allowed_providers": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string", "minLength": 1 }
+            }
+          },
+          "additionalProperties": true
+        },
+        "unsafe_operations": { "$ref": "#/$defs/policyMode" }
+      },
+      "additionalProperties": true
+    },
     "notify": { "type": "array" },
-    "retention": { "type": "object" }
+    "retention": {
+      "type": "object",
+      "properties": {
+        "on_success": { "$ref": "#/$defs/retentionRule" },
+        "on_failure": { "$ref": "#/$defs/retentionRule" },
+        "on_cancelled": { "$ref": "#/$defs/retentionRule" }
+      },
+      "additionalProperties": true
+    }
   },
-  "additionalProperties": true
+  "additionalProperties": true,
+  "$defs": {
+    "policyMode": {
+      "enum": ["allow", "deny", "require_approval"]
+    },
+    "fileScope": {
+      "type": "object",
+      "properties": {
+        "include": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "exclude": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      },
+      "additionalProperties": true
+    },
+    "retentionRule": {
+      "type": "object",
+      "properties": {
+        "keep": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "delete": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "after_days": { "type": "number", "minimum": 0 },
+        "keep_all_for_days": { "type": "number", "minimum": 0 },
+        "ask_user": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    }
+  }
 }

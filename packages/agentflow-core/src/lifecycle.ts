@@ -1,4 +1,5 @@
 import type { AgentflowWorkflow } from "./workflow";
+import { formatAgentflowWorkflowIssues, validateAgentflowWorkflow } from "./validation";
 import {
   AgentflowRunStateError,
   type AgentflowRunMutationResult,
@@ -17,6 +18,14 @@ export function createAgentflowLifecycleRun(
   store: AgentflowRunStateStore,
   input: CreateAgentflowLifecycleRunInput
 ): AgentflowRunMutationResult {
+  const validation = validateAgentflowWorkflow(input.workflow);
+  if (!validation.valid) {
+    throw new AgentflowRunStateError(
+      `Agentflow run ${input.id} cannot start because workflow validation failed:\n${formatAgentflowWorkflowIssues(validation.errors)}`,
+      "AGENTFLOW_WORKFLOW_INVALID"
+    );
+  }
+
   const existing = store.getRun(input.id);
 
   if (existing !== null) {
