@@ -100,6 +100,8 @@ export interface UpsertAgentflowArtifactInput {
 export interface WriteAgentflowArtifactInput extends Omit<UpsertAgentflowArtifactInput, "checksum" | "sizeBytes"> {
   content: string | Uint8Array;
   overwrite?: boolean;
+  requiredRunStatus?: AgentflowRunStatus;
+  requiredArtifacts?: Array<{ path: string; checksum: string }>;
 }
 
 export interface AgentflowArtifactRecord {
@@ -119,6 +121,15 @@ export interface AgentflowArtifactRecord {
   updatedAt: string;
   writtenAt: string | null;
   checkedAt: string | null;
+}
+
+export interface AgentflowArtifactContent {
+  artifact: AgentflowArtifactRecord;
+  content: Buffer;
+}
+
+export interface ReadAgentflowArtifactOptions {
+  maxBytes?: number;
 }
 
 export interface AppendAgentflowEventInput {
@@ -531,7 +542,7 @@ export class AgentflowRunStateStore {
     const runId = requiredString(input.runId, "Run ID");
     this.requireRun(runId);
     const id = requiredString(input.id, "Artifact ID");
-    const artifactPath = repoRelativeArtifactPath(input.path);
+    const artifactPath = normalizeAgentflowArtifactPath(input.path);
     if (input.sizeBytes !== undefined && (!Number.isSafeInteger(input.sizeBytes) || input.sizeBytes < 0)) {
       throw new AgentflowRunStateError("Artifact size must be a non-negative integer.", "AGENTFLOW_ARTIFACT_INVALID");
     }
@@ -594,11 +605,15 @@ export class AgentflowRunStateStore {
     const runId = artifactRunId(input.runId);
     this.requireRun(runId);
     const id = requiredString(input.id, "Artifact ID");
-    const declaredPath = repoRelativeArtifactPath(input.path);
+    const declaredPath = normalizeAgentflowArtifactPath(input.path);
     const kind = requiredString(input.kind, "Artifact kind");
     const contentType = requiredString(input.contentType, "Artifact content type");
     const stepId = optionalString(input.stepId, "Step ID");
     const metadataJson = stableJson(input.metadata ?? {});
+    const requiredArtifacts = (input.requiredArtifacts ?? []).map((artifact) => ({
+      path: normalizeAgentflowArtifactPath(artifact.path),
+      checksum: requiredString(artifact.checksum, "Required artifact checksum")
+    }));
     const content = typeof input.content === "string" ? Buffer.from(input.content, "utf8") : Buffer.from(input.content);
     const checksum = `sha256:${createHash("sha256").update(content).digest("hex")}`;
     const target = artifactStoragePath(this.repoRoot, runId, declaredPath, true);
@@ -610,6 +625,34 @@ export class AgentflowRunStateStore {
 
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      if (input.requiredRunStatus !== undefined) {
+        const status = this.database.get<{ status: AgentflowRunStatus }>("SELECT status FROM runs WHERE id = ?", [runId])?.status;
+        if (status !== input.requiredRunStatus) {
+          throw new AgentflowRunStateError(
+            `Agentflow run ${runId} must be ${input.requiredRunStatus} to publish ${declaredPath}; current status is ${String(status)}.`,
+            "AGENTFLOW_ARTIFACT_RUN_STATUS"
+          );
+        }
+      }
+      for (const requiredArtifact of requiredArtifacts) {
+        const current = this.database.get<Pick<ArtifactRow, "checksum">>(
+          "SELECT checksum FROM artifacts WHERE run_id = ? AND path = ?",
+          [runId, requiredArtifact.path]
+        );
+        let backingChecksum: string | undefined;
+        try {
+          const requiredTarget = artifactStoragePath(this.repoRoot, runId, requiredArtifact.path, false);
+          backingChecksum = artifactChecksum(requiredTarget);
+        } catch {
+          backingChecksum = undefined;
+        }
+        if (current?.checksum !== requiredArtifact.checksum || backingChecksum !== requiredArtifact.checksum) {
+          throw new AgentflowRunStateError(
+            `Required input artifact ${requiredArtifact.path} was overwritten before ${declaredPath} could be published.`,
+            "AGENTFLOW_ARTIFACT_STALE"
+          );
+        }
+      }
       const existing = this.database.get<ArtifactRow>("SELECT * FROM artifacts WHERE run_id = ? AND id = ?", [runId, id]);
       const pathOwner = this.database.get<ArtifactRow>("SELECT * FROM artifacts WHERE run_id = ? AND path = ?", [runId, declaredPath]);
       if (pathOwner !== null && pathOwner.id !== id) {
@@ -717,6 +760,128 @@ export class AgentflowRunStateStore {
       [normalizedRunId]
     );
     return rows.map((row) => this.inspectArtifact(row));
+  }
+
+  getArtifact(runId: string, declaredPath: string): AgentflowArtifactRecord | null {
+    this.assertOpen();
+    const normalizedRunId = artifactRunId(runId);
+    this.requireRun(normalizedRunId);
+    const normalizedPath = normalizeAgentflowArtifactPath(declaredPath);
+    const row = this.database.get<ArtifactRow>(
+      "SELECT * FROM artifacts WHERE run_id = ? AND path = ?",
+      [normalizedRunId, normalizedPath]
+    );
+    return row === null ? null : this.inspectArtifact(row);
+  }
+
+  readArtifact(
+    runId: string,
+    declaredPath: string,
+    options: ReadAgentflowArtifactOptions = {}
+  ): AgentflowArtifactContent {
+    this.assertOpen();
+    const normalizedRunId = artifactRunId(runId);
+    this.requireRun(normalizedRunId);
+    const normalizedPath = normalizeAgentflowArtifactPath(declaredPath);
+    const maxBytes = options.maxBytes;
+    if (maxBytes !== undefined && (!Number.isSafeInteger(maxBytes) || maxBytes < 0)) {
+      throw new AgentflowRunStateError("Artifact read maxBytes must be a non-negative integer.", "AGENTFLOW_ARTIFACT_INVALID");
+    }
+    const row = this.database.get<ArtifactRow>(
+      "SELECT * FROM artifacts WHERE run_id = ? AND path = ?",
+      [normalizedRunId, normalizedPath]
+    );
+    if (row === null) {
+      throw new AgentflowRunStateError(
+        `Declared input artifact ${normalizedPath} was not found for run ${normalizedRunId}.`,
+        "AGENTFLOW_ARTIFACT_NOT_FOUND"
+      );
+    }
+
+    if (maxBytes !== undefined && row.size_bytes !== null && row.size_bytes > maxBytes) {
+      throw new AgentflowRunStateError(
+        `Declared input artifact ${normalizedPath} exceeds the ${maxBytes}-byte read limit.`,
+        "AGENTFLOW_ARTIFACT_TOO_LARGE"
+      );
+    }
+
+    const target = artifactStoragePath(this.repoRoot, normalizedRunId, normalizedPath, false);
+    let descriptor: number;
+    try {
+      descriptor = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (["ENOENT", "ENOTDIR", "ELOOP"].includes(code ?? "")) {
+        throw new AgentflowRunStateError(
+          `Declared input artifact ${normalizedPath} is unavailable for run ${normalizedRunId}; publish it before running the transform.`,
+          "AGENTFLOW_ARTIFACT_UNAVAILABLE",
+          { cause: error }
+        );
+      }
+      throw error;
+    }
+    try {
+      const stat = fs.fstatSync(descriptor);
+      if (!stat.isFile()) {
+        throw new AgentflowRunStateError(`Declared input artifact ${normalizedPath} is not a regular file.`, "AGENTFLOW_ARTIFACT_STALE");
+      }
+      if (maxBytes !== undefined && stat.size > maxBytes) {
+        throw new AgentflowRunStateError(
+          `Declared input artifact ${normalizedPath} exceeds the ${maxBytes}-byte read limit.`,
+          "AGENTFLOW_ARTIFACT_TOO_LARGE"
+        );
+      }
+      if (row.checksum === null || row.size_bytes === null) {
+        throw new AgentflowRunStateError(
+          `Declared input artifact ${normalizedPath} has not been published for run ${normalizedRunId}.`,
+          "AGENTFLOW_ARTIFACT_UNAVAILABLE"
+        );
+      }
+      const buffer = Buffer.allocUnsafe(stat.size);
+      let offset = 0;
+      while (offset < buffer.byteLength) {
+        const bytesRead = fs.readSync(descriptor, buffer, offset, buffer.byteLength - offset, offset);
+        if (bytesRead === 0) break;
+        offset += bytesRead;
+      }
+      const overflow = Buffer.allocUnsafe(1);
+      const overflowBytes = fs.readSync(descriptor, overflow, 0, 1, offset);
+      if (overflowBytes > 0) {
+        throw new AgentflowRunStateError(
+          `Declared input artifact ${normalizedPath} changed while it was being read; retry after republishing it.`,
+          "AGENTFLOW_ARTIFACT_STALE"
+        );
+      }
+      const content = buffer.subarray(0, offset);
+      const checksum = `sha256:${createHash("sha256").update(content).digest("hex")}`;
+      if (row.checksum !== checksum || row.size_bytes !== content.byteLength) {
+        throw new AgentflowRunStateError(
+          `Declared input artifact ${normalizedPath} changed while it was being read; retry after republishing it.`,
+          "AGENTFLOW_ARTIFACT_STALE"
+        );
+      }
+      const timestamp = currentTimestamp(this.now);
+      const status: AgentflowArtifactStatus = row.previous_checksum === null ? "available" : "overwritten";
+      this.database.run(
+        `UPDATE artifacts SET status = ?, checked_at = ?, updated_at = CASE WHEN status = ? THEN updated_at ELSE ? END
+         WHERE run_id = ? AND id = ? AND checksum = ?`,
+        [status, timestamp, status, timestamp, normalizedRunId, row.id, row.checksum]
+      );
+      const current = this.database.get<ArtifactRow>(
+        "SELECT * FROM artifacts WHERE run_id = ? AND id = ?",
+        [normalizedRunId, row.id]
+      );
+      if (current === null || current.checksum !== row.checksum || current.size_bytes !== row.size_bytes || current.written_at !== row.written_at) {
+        throw new AgentflowRunStateError(
+          `Declared input artifact ${normalizedPath} was overwritten while it was being read; retry the transform.`,
+          "AGENTFLOW_ARTIFACT_STALE"
+        );
+      }
+      const artifact = hydrateArtifact(this.repoRoot, current);
+      return { artifact, content };
+    } finally {
+      fs.closeSync(descriptor);
+    }
   }
 
   appendEvent(input: AppendAgentflowEventInput): void {
@@ -1237,7 +1402,7 @@ function sortJsonValue(value: unknown, ancestors: Set<object>): AgentflowRunStat
   return sorted;
 }
 
-function repoRelativeArtifactPath(value: string): string {
+export function normalizeAgentflowArtifactPath(value: string): string {
   const candidate = requiredString(value, "Artifact path").replaceAll("\\", "/");
   if (path.posix.isAbsolute(candidate) || path.win32.isAbsolute(candidate)) {
     throw new AgentflowRunStateError("Artifact path must be repo-relative.", "AGENTFLOW_ARTIFACT_PATH");
@@ -1273,7 +1438,7 @@ function artifactStoragePath(
 
 function artifactStorageLocation(repoRoot: string, runId: string, declaredPath: string): string {
   const normalizedRunId = artifactRunId(runId);
-  const normalizedPath = repoRelativeArtifactPath(declaredPath);
+  const normalizedPath = normalizeAgentflowArtifactPath(declaredPath);
   const artifactRoot = path.join(repoRoot, ".agentflow", "runs", artifactRunDirectory(normalizedRunId), "artifacts");
   const target = path.join(artifactRoot, artifactFileName(normalizedPath));
   assertInsideRepository(

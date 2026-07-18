@@ -23,7 +23,7 @@ describe("Agentflow CLI", () => {
     expect(result.stdout).toContain("simulate <workflow> --fixture <file>");
     expect(result.stdout).toContain("run <workflow> --id <run-id>");
     expect(result.stdout).toContain("pause <run-id>");
-    expect(result.stdout).toContain("Command-only pipeline execution");
+    expect(result.stdout).toContain("Command and artifact-transform pipeline execution");
   });
 
   test("renders version from root package metadata", () => {

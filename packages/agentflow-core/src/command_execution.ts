@@ -12,6 +12,11 @@ import {
 import type { AgentflowWorkflow, AgentflowWorkflowStep, AgentflowYamlMapping } from "./workflow";
 import { evaluateAgentflowPolicy } from "./policy";
 import {
+  AgentflowArtifactTransformRegistry,
+  createAgentflowArtifactTransformRegistry,
+  executeAgentflowArtifactTransform
+} from "./artifact_transform";
+import {
   agentflowCommandUnsafeReason,
   MAX_AGENTFLOW_COMMAND_RETRIES,
   MAX_AGENTFLOW_COMMAND_TIMEOUT_SECONDS
@@ -45,7 +50,8 @@ interface CommandPreflightFailure {
 export async function executeAgentflowCommandPipeline(
   store: AgentflowRunStateStore,
   runId: string,
-  workflow: AgentflowWorkflow
+  workflow: AgentflowWorkflow,
+  transforms: AgentflowArtifactTransformRegistry = createAgentflowArtifactTransformRegistry()
 ): Promise<AgentflowCommandPipelineResult> {
   const existing = store.getRun(runId);
   if (existing === null) throw new Error(`Agentflow run ${runId} was not found.`);
@@ -70,11 +76,42 @@ export async function executeAgentflowCommandPipeline(
     const stoppedBeforeStep = stoppedPipelineResult(store, runId, completedSteps);
     if (stoppedBeforeStep !== undefined) return stoppedBeforeStep;
     const stepId = requiredStepId(step);
+    if (step.type === "artifact_transform") {
+      const preflightError = validateTransformStep(step);
+      if (preflightError !== undefined) {
+        persistTransformPreflightFailure(store, runId, stepId, preflightError);
+        return finishFailure(store, runId, completedSteps, stepId, {
+          exitCode: null,
+          timedOut: false,
+          message: preflightError
+        }, "failed");
+      }
+      const retries = failureRetries(step);
+      let failure: string | undefined;
+      for (let attempt = 1; attempt <= retries + 1; attempt += 1) {
+        const outcome = executeTransformStep(store, runId, stepId, step, transforms, attempt, attempt <= retries);
+        if (outcome.stopped !== undefined) {
+          return stoppedPipelineResult(store, runId, completedSteps)!;
+        }
+        failure = outcome.failure;
+        if (failure === undefined) break;
+      }
+      if (failure === undefined) {
+        completedSteps.push(stepId);
+        continue;
+      }
+      if (failureContinues(step)) continue;
+      return finishFailure(store, runId, completedSteps, stepId, {
+        exitCode: null,
+        timedOut: false,
+        message: failure
+      }, failureStatus(step));
+    }
     if (step.type !== "command") {
       return finishFailure(store, runId, completedSteps, stepId, {
         exitCode: null,
         timedOut: false,
-        message: `Step ${stepId} has unsupported type ${String(step.type)}; only command steps can execute in this runtime phase.`
+        message: `Step ${stepId} has unsupported type ${String(step.type)}; only command and artifact_transform steps can execute in this runtime phase.`
       }, "paused");
     }
 
@@ -163,7 +200,7 @@ export async function executeAgentflowCommandPipeline(
     }
 
     if (lastResult !== undefined) {
-      if (failureThen(step) === "continue") continue;
+      if (failureContinues(step)) continue;
       return finishFailure(store, runId, completedSteps, stepId, {
         exitCode: lastResult.exitCode,
         timedOut: lastResult.timedOut,
@@ -179,6 +216,87 @@ export async function executeAgentflowCommandPipeline(
     event: { type: "run.completed", payload: { completedSteps } }
   });
   return { status: "completed", completedSteps };
+}
+
+function executeTransformStep(
+  store: AgentflowRunStateStore,
+  runId: string,
+  stepId: string,
+  step: AgentflowWorkflowStep,
+  transforms: AgentflowArtifactTransformRegistry,
+  attempt: number,
+  retryable: boolean
+): { failure?: string; stopped?: "paused" | "cancelled" } {
+  const input = {
+    transform: typeof step.transform === "string" ? step.transform : null,
+    input: typeof step.input === "string" ? step.input : null,
+    output: typeof step.output === "string" ? step.output : null
+  };
+  store.updateRun(runId, { currentStepId: stepId, error: null });
+  store.upsertStep({ runId, stepId, attempt, status: "running", input });
+  store.appendRunEvent(runId, { type: "step.started", stepId, payload: { attempt, ...input } });
+
+  try {
+    const result = executeAgentflowArtifactTransform(store, runId, step, transforms, {
+      beforePublish: () => {
+        const stopped = activeStopStatus(store, runId);
+        if (stopped !== undefined) throw new TransformInterruptedError(stopped);
+      }
+    });
+    const stoppedAfterPublish = activeStopStatus(store, runId);
+    if (stoppedAfterPublish !== undefined) {
+      const output = { attempt, status: stoppedAfterPublish, checksum: result.artifact.checksum };
+      store.upsertStep({ runId, stepId, attempt, status: stoppedAfterPublish, output });
+      store.appendRunEvent(runId, { type: "step.interrupted", stepId, payload: output });
+      return { stopped: stoppedAfterPublish };
+    }
+    const output = {
+      attempt,
+      transform: result.transform,
+      input: result.inputPath,
+      output: result.outputPath,
+      checksum: result.artifact.checksum
+    };
+    store.upsertStep({ runId, stepId, attempt, status: "completed", output });
+    store.appendRunEvent(runId, { type: "step.completed", stepId, payload: output });
+    return {};
+  } catch (error) {
+    if (error instanceof TransformInterruptedError) {
+      const output = { attempt, status: error.status };
+      store.upsertStep({ runId, stepId, attempt, status: error.status, output });
+      store.appendRunEvent(runId, { type: "step.interrupted", stepId, payload: output });
+      return { stopped: error.status };
+    }
+    if (error instanceof AgentflowRunStateError && error.code === "AGENTFLOW_ARTIFACT_RUN_STATUS") {
+      const stopped = activeStopStatus(store, runId);
+      if (stopped !== undefined) {
+        const output = { attempt, status: stopped };
+        store.upsertStep({ runId, stepId, attempt, status: stopped, output });
+        store.appendRunEvent(runId, { type: "step.interrupted", stepId, payload: output });
+        return { stopped };
+      }
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    const payload = { attempt, message };
+    store.upsertStep({ runId, stepId, attempt, status: "failed", error: payload });
+    store.recordFailure({
+      id: `artifact-transform:${safeId(stepId)}:attempt-${attempt}`,
+      runId,
+      stepId,
+      classification: "artifact_transform_failure",
+      message,
+      retryable,
+      payload
+    });
+    store.appendRunEvent(runId, { type: "step.failed", stepId, payload });
+    return { failure: message };
+  }
+}
+
+class TransformInterruptedError extends Error {
+  constructor(readonly status: "paused" | "cancelled") {
+    super(`Artifact transform was interrupted because the run was ${status}.`);
+  }
 }
 
 function stoppedPipelineResult(
@@ -386,10 +504,10 @@ function validateCommandStep(
       message: `Command on_failure.retry must be an integer from 0 through ${MAX_AGENTFLOW_COMMAND_RETRIES}.`
     };
   }
-  if (onFailure?.then === "continue" && onFailure.allowed !== true) {
+  if (["continue", "ignore"].includes(normalizedFailureThen(onFailure) ?? "") && onFailure?.allowed !== true) {
     return {
       status: "failed",
-      message: "Command failures may continue only when on_failure.allowed is true."
+      message: "Command failures may continue or be ignored only when on_failure.allowed is true."
     };
   }
 
@@ -418,6 +536,26 @@ function validateCommandStep(
   return undefined;
 }
 
+function validateTransformStep(step: AgentflowWorkflowStep): string | undefined {
+  const onFailure = mapping(step.on_failure);
+  const retry = onFailure?.retry;
+  if (retry !== undefined &&
+      (!Number.isSafeInteger(retry) || Number(retry) < 0 || Number(retry) > MAX_AGENTFLOW_COMMAND_RETRIES)) {
+    return `Artifact transform on_failure.retry must be an integer from 0 through ${MAX_AGENTFLOW_COMMAND_RETRIES}.`;
+  }
+  if (["continue", "ignore"].includes(normalizedFailureThen(onFailure) ?? "") && onFailure?.allowed !== true) {
+    return "Artifact transform failures may continue or be ignored only when on_failure.allowed is true.";
+  }
+  if (onFailure !== undefined) {
+    const then = normalizedFailureThen(onFailure);
+    if ((then !== undefined && !["continue", "ignore", "fail", "pause"].includes(then))
+        || ["goto", "route_to", "on_remediated", "on_unresolved", "return_to"].some((field) => onFailure[field] !== undefined)) {
+      return "Artifact transform runtime supports only retry and then: continue, ignore, fail, or pause.";
+    }
+  }
+  return undefined;
+}
+
 function policyFailure(status: "pause" | "fail", message: string): CommandPreflightFailure {
   return { status: status === "pause" ? "paused" : "failed", message };
 }
@@ -435,6 +573,26 @@ function persistPreflightFailure(
     runId,
     stepId,
     classification: "command_policy",
+    message,
+    retryable: false,
+    payload: error
+  });
+  store.appendRunEvent(runId, { type: "step.rejected", stepId, payload: error });
+}
+
+function persistTransformPreflightFailure(
+  store: AgentflowRunStateStore,
+  runId: string,
+  stepId: string,
+  message: string
+): void {
+  const error = { attempt: 1, message };
+  store.upsertStep({ runId, stepId, attempt: 1, status: "failed", error });
+  store.recordFailure({
+    id: `artifact-transform:${safeId(stepId)}:preflight`,
+    runId,
+    stepId,
+    classification: "artifact_transform_policy",
     message,
     retryable: false,
     payload: error
@@ -476,8 +634,16 @@ function failureRetries(step: AgentflowWorkflowStep): number {
 }
 
 function failureThen(step: AgentflowWorkflowStep): string | undefined {
-  const then = mapping(step.on_failure)?.then;
-  return typeof then === "string" ? then : undefined;
+  return normalizedFailureThen(mapping(step.on_failure));
+}
+
+function normalizedFailureThen(onFailure: AgentflowYamlMapping | undefined): string | undefined {
+  const then = onFailure?.then;
+  return typeof then === "string" && then.trim().length > 0 ? then.trim() : undefined;
+}
+
+function failureContinues(step: AgentflowWorkflowStep): boolean {
+  return ["continue", "ignore"].includes(failureThen(step) ?? "");
 }
 
 function failureStatus(step: AgentflowWorkflowStep): "failed" | "paused" {

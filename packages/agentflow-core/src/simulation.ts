@@ -1,9 +1,17 @@
+import { isDeepStrictEqual } from "node:util";
 import type {
   AgentflowWorkflow,
   AgentflowWorkflowStep,
   AgentflowYamlMapping,
   AgentflowYamlValue
 } from "./workflow";
+import {
+  AgentflowArtifactTransformError,
+  type AgentflowArtifactTransformRegistry,
+  createAgentflowArtifactTransformRegistry,
+  transformAgentflowFixtureArtifact
+} from "./artifact_transform";
+import { normalizeAgentflowArtifactPath } from "./run_state";
 
 export type AgentflowSimulationStatus = "completed" | "failed" | "paused" | "cancelled" | "unresolved";
 export type AgentflowSimulationStepOutcome = "succeeded" | "failed";
@@ -57,6 +65,7 @@ export interface AgentflowSimulationResult {
   visitedSteps: AgentflowSimulationVisitedStep[];
   missingInputs: string[];
   availableArtifacts: string[];
+  artifactValues: Record<string, AgentflowYamlValue>;
   missingArtifacts: AgentflowSimulationMissingArtifact[];
   unresolvedBranches: AgentflowSimulationUnresolvedBranch[];
   terminalStates: AgentflowSimulationTerminalState[];
@@ -69,8 +78,12 @@ export type AgentflowSimulationFixtureParseResult =
 interface SimulationState {
   fixture: AgentflowSimulationFixture;
   artifacts: Set<string>;
+  artifactValues: Map<string, AgentflowYamlValue>;
+  producedArtifacts: Map<string, number>;
+  transforms: AgentflowArtifactTransformRegistry;
   visitedSteps: AgentflowSimulationVisitedStep[];
   missingArtifacts: AgentflowSimulationMissingArtifact[];
+  handledMissingArtifacts: Set<string>;
   unresolvedBranches: AgentflowSimulationUnresolvedBranch[];
   terminalStates: AgentflowSimulationTerminalState[];
   missingInputs: string[];
@@ -164,13 +177,19 @@ export function parseAgentflowSimulationFixture(source: string): AgentflowSimula
 
 export function simulateAgentflowWorkflow(
   workflow: AgentflowWorkflow,
-  fixture: AgentflowSimulationFixture
+  fixture: AgentflowSimulationFixture,
+  transforms: AgentflowArtifactTransformRegistry = createAgentflowArtifactTransformRegistry()
 ): AgentflowSimulationResult {
+  const fixtureArtifacts = canonicalFixtureArtifacts(fixture.artifacts ?? {});
   const state: SimulationState = {
     fixture,
-    artifacts: new Set(Object.keys(fixture.artifacts ?? {})),
+    artifacts: new Set([...fixtureArtifacts.values.keys(), ...fixtureArtifacts.collisions]),
+    artifactValues: fixtureArtifacts.values,
+    producedArtifacts: new Map(),
+    transforms,
     visitedSteps: [],
     missingArtifacts: [],
+    handledMissingArtifacts: new Set(),
     unresolvedBranches: [],
     terminalStates: [],
     missingInputs: requiredWorkflowInputs(workflow).filter((name) => !Object.hasOwn(fixture.inputs ?? {}, name)),
@@ -181,6 +200,9 @@ export function simulateAgentflowWorkflow(
     stepLocations: collectSimulationStepLocations(workflow.steps),
     transitionCount: 0
   };
+  for (const artifact of fixtureArtifacts.collisions) {
+    addUnresolved(state, "(fixture)", `Fixture artifact keys collide at canonical path ${artifact}.`);
+  }
 
   const workflowStepIdCounts = collectSimulationStepIdCounts(workflow.steps);
   const workflowStepIds = new Set(workflowStepIdCounts.keys());
@@ -213,7 +235,10 @@ export function simulateAgentflowWorkflow(
     state.status = control.status;
   }
 
-  const status = state.unresolvedBranches.length > 0 || state.missingArtifacts.length > 0 || state.missingInputs.length > 0
+  const hasUnhandledMissingArtifacts = state.missingArtifacts.some((artifact) =>
+    !state.handledMissingArtifacts.has(missingArtifactKey(artifact))
+  );
+  const status = state.unresolvedBranches.length > 0 || hasUnhandledMissingArtifacts || state.missingInputs.length > 0
     ? "unresolved"
     : state.status ?? "completed";
 
@@ -223,6 +248,7 @@ export function simulateAgentflowWorkflow(
     visitedSteps: state.visitedSteps,
     missingInputs: state.missingInputs,
     availableArtifacts: [...state.artifacts].sort(),
+    artifactValues: Object.fromEntries([...state.artifactValues].sort(([left], [right]) => left.localeCompare(right))),
     missingArtifacts: state.missingArtifacts,
     unresolvedBranches: state.unresolvedBranches,
     terminalStates: state.terminalStates
@@ -323,12 +349,20 @@ function runStep(step: AgentflowWorkflowStep, state: SimulationState, insideLoop
   checkInputs(step, id, state);
 
   if (outcome === "failed") {
+    if (type === "artifact_transform") {
+      return simulatedTransformFailure(step, stepFixture, id, state, "Fixture marks the artifact transform as failed.");
+    }
     return failureControl(step, stepFixture, id, state);
   }
 
-  state.retryAttempts.delete(id);
-
-  recordOutputs(step, stepFixture, id, state);
+  if (type === "artifact_transform") {
+    const transformControl = simulateTransformStep(step, stepFixture, id, state);
+    if (transformControl.kind !== "done") return transformControl;
+    state.retryAttempts.delete(id);
+  } else {
+    state.retryAttempts.delete(id);
+    recordOutputs(step, stepFixture, id, state);
+  }
 
   if (type === "condition") return conditionControl(step, stepFixture, id, visit, state);
   if (type === "manual_gate") return gateControl(step, stepFixture, id, visit, state);
@@ -338,7 +372,12 @@ function runStep(step: AgentflowWorkflowStep, state: SimulationState, insideLoop
       return { kind: "terminal", status: "paused" };
     }
     const saved = nonEmptyString(step.save_as);
-    if (saved !== undefined) state.artifacts.add(saved);
+    if (saved !== undefined) {
+      const artifact = canonicalArtifactName(saved);
+      state.artifacts.add(artifact);
+      state.artifactValues.set(artifact, stepFixture.input);
+      markArtifactProduced(state, artifact);
+    }
   }
   if (type === "loop") return loopControl(step, stepFixture, id, state);
   if (type === "parallel") return parallelControl(step, state, insideLoop);
@@ -441,6 +480,13 @@ function loopControl(
 function parallelControl(step: AgentflowWorkflowStep, state: SimulationState, insideLoop: boolean): SequenceControl {
   const initialArtifacts = new Set(state.artifacts);
   const mergedArtifacts = new Set(initialArtifacts);
+  const initialArtifactValues = new Map(state.artifactValues);
+  const mergedArtifactValues = new Map(initialArtifactValues);
+  const initialProducedArtifacts = new Map(state.producedArtifacts);
+  const mergedProducedArtifacts = new Map(initialProducedArtifacts);
+  const parallelArtifactValues = new Map<string, AgentflowYamlValue | undefined>();
+  const conflictedArtifacts = new Set<string>();
+  const parallelId = nonEmptyString(step.id) ?? "(unnamed)";
   let finalControl: SequenceControl = { kind: "done" };
 
   for (const entries of [step.branches, step.body, step.steps]) {
@@ -448,6 +494,8 @@ function parallelControl(step: AgentflowWorkflowStep, state: SimulationState, in
     for (const entry of entries) {
       if (!isRecord(entry)) continue;
       state.artifacts = new Set(initialArtifacts);
+      state.artifactValues = new Map(initialArtifactValues);
+      state.producedArtifacts = new Map(initialProducedArtifacts);
       const branchId = nonEmptyString(entry.id) ?? "(unnamed)";
       if (!takeTransition(state, branchId)) {
         finalControl = { kind: "terminal", status: "unresolved" };
@@ -479,6 +527,27 @@ function parallelControl(step: AgentflowWorkflowStep, state: SimulationState, in
         if (control.kind !== "done") break;
       }
       for (const artifact of state.artifacts) mergedArtifacts.add(artifact);
+      for (const [artifact, producedCount] of state.producedArtifacts) {
+        const initialCount = initialProducedArtifacts.get(artifact) ?? 0;
+        if (producedCount <= initialCount) continue;
+        mergedProducedArtifacts.set(artifact, Math.max(mergedProducedArtifacts.get(artifact) ?? 0, producedCount));
+        if (conflictedArtifacts.has(artifact)) continue;
+        const hasValue = state.artifactValues.has(artifact);
+        const value = state.artifactValues.get(artifact);
+        const previous = parallelArtifactValues.get(artifact);
+        const valuesConflict = parallelArtifactValues.has(artifact)
+          && (!hasValue || previous === undefined || !isDeepEqualArtifactValue(previous, value!));
+        if (valuesConflict) {
+          addUnresolved(state, parallelId, `Parallel branches produced conflicting values for artifact ${artifact}; fixture simulation cannot apply the declared conflict policy.`);
+          mergedArtifactValues.delete(artifact);
+          conflictedArtifacts.add(artifact);
+          finalControl = { kind: "terminal", status: "unresolved" };
+          continue;
+        }
+        parallelArtifactValues.set(artifact, value);
+        if (hasValue) mergedArtifactValues.set(artifact, value!);
+        else mergedArtifactValues.delete(artifact);
+      }
       if (control.kind !== "done" && finalControl.kind === "done") {
         finalControl = control;
       }
@@ -486,6 +555,8 @@ function parallelControl(step: AgentflowWorkflowStep, state: SimulationState, in
   }
 
   state.artifacts = mergedArtifacts;
+  state.artifactValues = mergedArtifactValues;
+  state.producedArtifacts = mergedProducedArtifacts;
   return finalControl;
 }
 
@@ -542,7 +613,7 @@ function checkInputs(step: AgentflowWorkflowStep, stepId: string, state: Simulat
   if (Array.isArray(step.inputs)) values.push(...step.inputs.flatMap((value) => artifactName(value, state)));
   if (isRecord(step.inputs)) values.push(...nestedArtifactNames(step.inputs, state));
   if (Array.isArray(step.artifacts)) values.push(...step.artifacts.flatMap((value) => artifactName(value, state)));
-  if (step.type === "artifact_transform") values.push(...artifactName(step.input, state));
+  if (step.type === "artifact_transform") values.push(...transformArtifactName(step.input, state));
 
   for (const artifact of values) {
     if (!state.artifacts.has(artifact)) addMissingArtifact(state, { stepId, artifact, kind: "input" });
@@ -559,22 +630,115 @@ function recordOutputs(
   if (Array.isArray(step.outputs)) {
     for (const value of step.outputs) {
       const name = nonEmptyString(value);
-      if (name !== undefined) declared.add(name);
+      if (name !== undefined) declared.add(canonicalArtifactName(name));
     }
   }
   const singleOutput = nonEmptyString(step.output);
-  if (singleOutput !== undefined) declared.add(singleOutput);
+  if (singleOutput !== undefined) declared.add(canonicalArtifactName(singleOutput));
 
-  const provided = new Set(Array.isArray(fixture.outputs) ? fixture.outputs : Object.keys(fixture.outputs ?? {}));
+  let provided: Map<string, AgentflowYamlValue | undefined>;
+  if (Array.isArray(fixture.outputs)) {
+    provided = new Map(fixture.outputs.map((artifact) => [canonicalArtifactName(artifact), undefined]));
+  } else {
+    const canonical = canonicalFixtureArtifacts(fixture.outputs ?? {});
+    provided = new Map(canonical.values);
+    for (const artifact of canonical.collisions) {
+      provided.set(artifact, undefined);
+      addUnresolved(state, stepId, `Fixture output keys collide at canonical path ${artifact}.`);
+    }
+  }
   for (const artifact of declared) {
-    if (provided.has(artifact)) state.artifacts.add(artifact);
+    if (provided.has(artifact)) {
+      state.artifacts.add(artifact);
+      markArtifactProduced(state, artifact);
+      const value = provided.get(artifact);
+      if (value !== undefined) state.artifactValues.set(artifact, value);
+      else state.artifactValues.delete(artifact);
+    }
     else addMissingArtifact(state, { stepId, artifact, kind: "output" });
   }
-  for (const artifact of provided) {
+  for (const artifact of provided.keys()) {
     if (!declared.has(artifact)) {
       addUnresolved(state, stepId, `Fixture provides undeclared output artifact ${artifact}.`);
     }
   }
+}
+
+function simulateTransformStep(
+  step: AgentflowWorkflowStep,
+  stepFixture: AgentflowSimulationStepFixture,
+  stepId: string,
+  state: SimulationState
+): SequenceControl {
+  const inputPath = transformArtifactName(step.input, state)[0];
+  const outputPath = transformArtifactName(step.output, state)[0];
+  const transform = nonEmptyString(step.transform);
+  if (inputPath === undefined || outputPath === undefined || transform === undefined) {
+    return simulatedTransformFailure(step, stepFixture, stepId, state, "Artifact transform paths and transform name must resolve before simulation.");
+  }
+  if (!state.artifacts.has(inputPath)) {
+    const control = simulatedTransformFailure(step, stepFixture, stepId, state, `Fixture does not provide declared transform input ${inputPath}.`);
+    if (!(control.kind === "terminal" && control.status === "unresolved")) {
+      state.handledMissingArtifacts.add(missingArtifactKey({ stepId, artifact: inputPath, kind: "input" }));
+    }
+    return control;
+  }
+
+  const input = state.artifactValues.get(inputPath);
+  if (input === undefined) {
+    return simulatedTransformFailure(step, stepFixture, stepId, state, `Fixture artifact ${inputPath} must include a value to simulate transform ${transform}.`);
+  }
+  try {
+    const output = transformAgentflowFixtureArtifact(
+      transform,
+      input,
+      { inputPath, outputPath },
+      state.transforms
+    );
+    const existing = state.artifactValues.get(outputPath);
+    if (state.artifacts.has(outputPath) && !isDeepEqualArtifactValue(existing, output) && step.overwrite !== true) {
+      return simulatedTransformFailure(step, stepFixture, stepId, state, `Artifact ${outputPath} already exists; declare overwrite: true to replace it during simulation.`);
+    }
+    state.artifacts.add(outputPath);
+    state.artifactValues.set(outputPath, output);
+    markArtifactProduced(state, outputPath);
+    return { kind: "done" };
+  } catch (error) {
+    const message = error instanceof AgentflowArtifactTransformError
+      ? error.message
+      : error instanceof Error ? error.message : String(error);
+    return simulatedTransformFailure(step, stepFixture, stepId, state, message);
+  }
+}
+
+function simulatedTransformFailure(
+  step: AgentflowWorkflowStep,
+  stepFixture: AgentflowSimulationStepFixture,
+  stepId: string,
+  state: SimulationState,
+  message: string
+): SequenceControl {
+  const visit = state.visitedSteps.at(-1);
+  if (visit?.id === stepId && visit.outcome === "succeeded") visit.outcome = "failed";
+  if (isRecord(step.on_failure)) {
+    const control = failureControl(step, stepFixture, stepId, state);
+    const hasExplicitTarget = nonEmptyString(step.on_failure.then) !== undefined
+      || nonEmptyString(step.on_failure.goto) !== undefined
+      || step.on_failure.route_to !== undefined
+      || step.on_failure.on_unresolved !== undefined;
+    if (control.kind === "terminal" && control.status === "failed" && !hasExplicitTarget) {
+      const terminal = state.terminalStates.at(-1);
+      if (terminal?.stepId === stepId && terminal.status === "failed") terminal.status = "paused";
+      return { kind: "terminal", status: "paused" };
+    }
+    return control;
+  }
+  addUnresolved(state, stepId, message);
+  return { kind: "terminal", status: "unresolved" };
+}
+
+function isDeepEqualArtifactValue(left: AgentflowYamlValue | undefined, right: AgentflowYamlValue): boolean {
+  return left !== undefined && isDeepStrictEqual(left, right);
 }
 
 function conditionTargets(step: AgentflowWorkflowStep): Set<string> {
@@ -618,7 +782,41 @@ function artifactName(value: AgentflowYamlValue | undefined, state: SimulationSt
     return typeof resolved === "string" ? artifactName(resolved, state) : [];
   }
   if (name.includes("{{")) return [];
-  return [name];
+  return [canonicalArtifactName(name)];
+}
+
+function transformArtifactName(value: AgentflowYamlValue | undefined, state: SimulationState): string[] {
+  return artifactName(value, state).flatMap((artifact) => tryNormalizeArtifactPath(artifact) ?? []);
+}
+
+function canonicalFixtureArtifacts(artifacts: Record<string, AgentflowYamlValue>): {
+  values: Map<string, AgentflowYamlValue>;
+  collisions: Set<string>;
+} {
+  const values = new Map<string, AgentflowYamlValue>();
+  const collisions = new Set<string>();
+  for (const [artifact, value] of Object.entries(artifacts)) {
+    const canonical = canonicalArtifactName(artifact);
+    if (values.has(canonical) || collisions.has(canonical)) {
+      values.delete(canonical);
+      collisions.add(canonical);
+    } else {
+      values.set(canonical, value);
+    }
+  }
+  return { values, collisions };
+}
+
+function canonicalArtifactName(artifact: string): string {
+  return tryNormalizeArtifactPath(artifact) ?? artifact;
+}
+
+function tryNormalizeArtifactPath(artifact: string): string | undefined {
+  try {
+    return normalizeAgentflowArtifactPath(artifact);
+  } catch {
+    return undefined;
+  }
 }
 
 function nestedArtifactNames(value: AgentflowYamlValue | undefined, state: SimulationState): string[] {
@@ -652,6 +850,14 @@ function addMissingArtifact(state: SimulationState, entry: AgentflowSimulationMi
   if (!state.missingArtifacts.some((candidate) => candidate.stepId === entry.stepId && candidate.artifact === entry.artifact && candidate.kind === entry.kind)) {
     state.missingArtifacts.push(entry);
   }
+}
+
+function markArtifactProduced(state: SimulationState, artifact: string): void {
+  state.producedArtifacts.set(artifact, (state.producedArtifacts.get(artifact) ?? 0) + 1);
+}
+
+function missingArtifactKey(entry: AgentflowSimulationMissingArtifact): string {
+  return `${entry.stepId}\0${entry.kind}\0${entry.artifact}`;
 }
 
 function addUnresolved(state: SimulationState, stepId: string, reason: string): void {

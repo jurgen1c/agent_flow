@@ -39,7 +39,10 @@ steps:
   test("fails closed for invalid failure policies on externally persisted runs", async () => {
     for (const [runId, failurePolicy, expectedMessage] of [
       ["invalid-retry", "retry: 101\n      then: fail", "integer from 0 through 100"],
-      ["unapproved-continue", "then: continue", "on_failure.allowed is true"]
+      ["unapproved-continue", "then: continue", "on_failure.allowed is true"],
+      ["unapproved-ignore", "then: ignore", "on_failure.allowed is true"],
+      ["unapproved-padded-continue", "then: ' continue '", "on_failure.allowed is true"],
+      ["unapproved-padded-ignore", "then: ' ignore '", "on_failure.allowed is true"]
     ] as const) {
       const repoRoot = temporaryRepo();
       const workflow = parseAgentflowWorkflowOrThrow(`

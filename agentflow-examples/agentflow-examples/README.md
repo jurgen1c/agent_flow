@@ -7,7 +7,7 @@ These examples show how Agentflow workflows can start simple and grow into recov
 | File | Style | Shows |
 |---|---|---|
 | `workflows/simple-ci.yml` | Pipeline | Run deterministic local checks |
-| `workflows/jira-ticket-spec.yml` | Pipeline | Fetch Jira ticket via MCP and ask LM to create a concise spec |
+| `workflows/jira-ticket-spec.yml` | Pipeline | Fetch Jira ticket JSON, transform it to Markdown, and ask LM to create a concise spec |
 | `workflows/ticket-lifecycle.yml` | Recovery pipeline | LM/FM ticket implementation lifecycle with CI and PR feedback |
 | `workflows/ci-triage.yml` | Recovery pipeline | Reusable nested workflow for failed CI |
 | `workflows/pr-feedback-loop.yml` | Recovery pipeline | Poll PR comments and route actionable feedback to FM |
@@ -24,6 +24,10 @@ These examples show how Agentflow workflows can start simple and grow into recov
 
 ## Notes
 
+`jira-ticket-spec.yml` uses the built-in `jira_ticket_to_markdown` transform.
+Fixture simulation can provide `ticket.json` and inspect the derived `ticket.md`
+without network access or free-form scripting.
+
 These files are examples, not guaranteed to run unchanged in every repo. Users should adapt:
 
 - CI commands.
@@ -32,4 +36,3 @@ These files are examples, not guaranteed to run unchanged in every repo. Users s
 - Prompt paths.
 - Notification channels.
 - File scopes.
-

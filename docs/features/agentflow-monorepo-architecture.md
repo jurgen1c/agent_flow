@@ -1,7 +1,7 @@
 # Agentflow Monorepo Architecture
 
-Status: implemented workspace shell, run persistence foundation, and Agent Memory context adapter
-Ticket: AM-6, AM-7, AM-9, AM-18, AM-19, AM-21, AM-22
+Status: implemented workspace shell, run persistence foundation, Agent Memory context adapter, and deterministic artifact transforms
+Ticket: AM-6, AM-7, AM-9, AM-18, AM-19, AM-21, AM-22, AM-24
 
 ## Intent
 
@@ -24,7 +24,7 @@ runtime.
 | Agent Memory web UI | `packages/web` | Private workspace shell named `@jurgen1c/agent-memory-web`; bundled inside `@jurgen1c/agent-memory-cli` by default | Local browser UI for inspecting committed memory and generated read models. It should consume core API shapes and static assets, not own repository memory semantics. |
 | Agentflow CLI and runtime | `packages/agentflow` | `@jurgen1c/agentflow` | Workflow definition validation, run creation, resumable execution, step scheduling, event logs, artifact management, policies, approvals, retries, and cleanup. |
 | Agentflow core | `packages/agentflow-core` | Private workspace shell named `@jurgen1c/agentflow-core` until the runtime API is intentionally published | Typed workflow/run primitives, planned command names, and runtime package boundary metadata. |
-| Agentflow CLI | `packages/agentflow-cli` | Public package named `@jurgen1c/agentflow-cli` | `agentflow` executable entrypoint, authoring and inspection commands, command-only pipeline execution, and persistent lifecycle inspection. |
+| Agentflow CLI | `packages/agentflow-cli` | Public package named `@jurgen1c/agentflow-cli` | `agentflow` executable entrypoint, authoring and inspection commands, command and artifact-transform pipeline execution, and persistent lifecycle inspection. |
 | Agentflow schemas | `packages/agentflow-schemas` | Private workspace shell named `@jurgen1c/agentflow-schemas` until schemas are intentionally published | JSON schemas for Agentflow project config and workflow definitions. |
 | Agentflow Agent Memory adapter | `packages/agentflow-agent-memory-adapter` | Private workspace shell named `@jurgen1c/agentflow-agent-memory-adapter` until adapter APIs are intentionally published | Typed adapter contract for Agentflow steps that need Agent Memory context. |
 | Agentflow examples | `packages/agentflow-examples` or `examples/agentflow` | `@jurgen1c/agentflow-examples` if published; otherwise examples only | Reviewable workflow, prompt, and template examples for pipeline, recovery, and collaborative workflow styles. Examples must not be required at runtime. |
@@ -187,11 +187,12 @@ The root `@jurgen1c/agent-memory-cli` package still includes the compatibility
 
 The `agentflow` built executable currently supports help, version, deterministic
 workflow validation, read-only workflow linting, workflow explanation,
-deterministic graph inspection, fixture-backed workflow simulation, command-only
-pipeline execution, and the persistent run lifecycle. `run <workflow> --id
-<run-id>` creates or idempotently reopens a pending run and executes command
-steps in sequence. Each attempt records its status, exit code, timeout result,
-ordered events, captured stdout/stderr log artifacts, and declared output files.
+deterministic graph inspection, fixture-backed workflow simulation, command and
+artifact-transform pipeline execution, and the persistent run lifecycle. `run
+<workflow> --id <run-id>` creates or idempotently reopens a pending run and
+executes supported steps in sequence. Each command attempt records its status,
+exit code, timeout result, ordered events, captured stdout/stderr log artifacts,
+and declared output files.
 Combined stdout/stderr capture is capped at 10 MiB per attempt; exceeding the
 limit terminates the child process and fails the step.
 Declared outputs must be repository-relative regular files; the artifact
@@ -201,6 +202,17 @@ up to 100 retries, and `fail`, `pause`, or explicitly allowed `continue` failure
 outcomes. Unexpected failures pause by default.
 Because the direct shell adapter cannot confine arbitrary filesystem writes,
 command execution fails closed when `policies.file_scope` is configured.
+
+`artifact_transform` steps read one artifact from the run registry by their
+declared `input` path and publish one artifact through the same registry at
+their declared `output` path. They cannot read arbitrary repository files or
+write outside that output boundary. The runtime includes the deterministic
+`jira_ticket_to_markdown` transform; other transform names fail unless callers
+register an implementation explicitly. Missing, stale, oversized, or invalid
+input artifacts fail with an actionable step error. Fixture simulation applies
+the same registry and exposes derived artifact values, so
+`agentflow-examples/workflows/jira-ticket-spec.yml` can produce `ticket.md`
+without calling Jira or executing free-form scripts.
 
 `status`, `logs`, `artifacts`, `pause`, `resume`, and `cancel` inspect or
 transition runs through the repo-local SQLite store. Lifecycle changes survive

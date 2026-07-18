@@ -159,7 +159,7 @@ function renderHelp(topic?: string): string {
     "  explain <workflow>   Explain steps, artifacts, policies, and warnings.",
     "  graph <workflow>     Print a deterministic workflow graph.",
     "  simulate <workflow> --fixture <file>  Traverse a workflow from fixture data without executing steps.",
-    "  run <workflow> --id <run-id>  Execute a command-only pipeline and persist its run state.",
+    "  run <workflow> --id <run-id>  Execute command and artifact-transform steps and persist run state.",
     "  resume <run-id>       Resume a paused, waiting, or pending run.",
     "  status <run-id>       Inspect persistent run state.",
     "  logs <run-id>         List ordered lifecycle events.",
@@ -170,7 +170,7 @@ function renderHelp(topic?: string): string {
     "Reserved placeholders:",
     `  ${plannedAgentflowRuntimeCommands.filter((command) => !["validate", "lint", "explain", "graph", "simulate", ...ACTIVE_LIFECYCLE_COMMANDS].includes(command as ActiveLifecycleCommand)).join(", ")}`,
     "",
-    "Command-only pipeline execution and persistent lifecycle state are active."
+    "Command and artifact-transform pipeline execution plus persistent lifecycle state are active."
   ].join("\n");
 }
 

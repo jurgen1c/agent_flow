@@ -36,6 +36,14 @@ export {
 } from "./lifecycle";
 export { executeAgentflowCommandPipeline } from "./command_execution";
 export {
+  AgentflowArtifactTransformError,
+  AgentflowArtifactTransformRegistry,
+  MAX_AGENTFLOW_TRANSFORM_INPUT_BYTES,
+  createAgentflowArtifactTransformRegistry,
+  executeAgentflowArtifactTransform,
+  transformAgentflowFixtureArtifact
+} from "./artifact_transform";
+export {
   evaluateAgentflowPolicy,
   validateAgentflowPolicyPrimitives
 } from "./policy";
@@ -80,6 +88,13 @@ export type {
 } from "./lifecycle";
 export type { AgentflowCommandPipelineResult } from "./command_execution";
 export type {
+  AgentflowBinaryArtifactValue,
+  AgentflowArtifactTransform,
+  AgentflowArtifactTransformContext,
+  AgentflowArtifactTransformExecutionResult,
+  AgentflowArtifactTransformOutput
+} from "./artifact_transform";
+export type {
   AgentflowPolicyDecision,
   AgentflowPolicyIssue,
   AgentflowPolicyRequest,
@@ -87,6 +102,7 @@ export type {
 } from "./policy";
 export type {
   AgentflowApprovalStatus,
+  AgentflowArtifactContent,
   AgentflowArtifactRecord,
   AgentflowArtifactStatus,
   AgentflowEventRecord,
@@ -101,6 +117,7 @@ export type {
   CreateAgentflowRunInput,
   FindResumableAgentflowRunInput,
   OpenAgentflowRunStateOptions,
+  ReadAgentflowArtifactOptions,
   RecordAgentflowFailureInput,
   TransitionAgentflowRunWithEventInput,
   UpdateAgentflowRunInput,

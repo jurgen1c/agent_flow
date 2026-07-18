@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import path from "node:path";
 import {
+  AgentflowArtifactTransformRegistry,
   parseAgentflowWorkflowOrThrow,
   renderAgentflowSimulationSummary,
   parseAgentflowSimulationFixture,
@@ -434,6 +435,133 @@ steps:
     expect(result.status).toBe("unresolved");
     expect(result.availableArtifacts).toEqual(["shared.json", "used.json"]);
     expect(result.missingArtifacts).toContainEqual({ stepId: "consume", artifact: "shared.json", kind: "input" });
+  });
+
+  test("reports conflicting parallel artifact values instead of choosing a branch", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: conflicting-parallel-artifacts
+version: 1
+style: pipeline
+maturity: draft
+steps:
+  - id: split
+    type: parallel
+    allow_overlap: true
+    conflict_policy: { strategy: manual }
+    branches:
+      - { id: first, type: command, command: echo first, outputs: [shared.json] }
+      - { id: second, type: command, command: echo second, outputs: [shared.json] }
+      - { id: third, type: command, command: echo first-again, outputs: [shared.json] }
+`);
+
+    const result = simulateAgentflowWorkflow(workflow, {
+      steps: {
+        first: { outputs: { "shared.json": "first" } },
+        second: { outputs: { "shared.json": "second" } },
+        third: { outputs: { "shared.json": "first" } }
+      }
+    });
+
+    expect(result.status).toBe("unresolved");
+    expect(result.artifactValues["shared.json"]).toBeUndefined();
+    expect(result.unresolvedBranches).toContainEqual({
+      stepId: "split",
+      reason: "Parallel branches produced conflicting values for artifact shared.json; fixture simulation cannot apply the declared conflict policy."
+    });
+  });
+
+  test("propagates availability-only artifact replacement through parallel merges", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: parallel-availability-replacement
+version: 1
+style: pipeline
+maturity: draft
+steps:
+  - id: split
+    type: parallel
+    branches:
+      - id: replace
+        type: command
+        command: echo replacement
+        outputs: [ticket.json]
+        overwrite: true
+  - id: render
+    type: artifact_transform
+    input: ticket.json
+    output: ticket.md
+    transform: jira_ticket_to_markdown
+`);
+
+    const result = simulateAgentflowWorkflow(workflow, {
+      artifacts: { "ticket.json": { key: "STALE", fields: { summary: "Old" } } },
+      steps: { replace: { outputs: ["ticket.json"] } }
+    });
+
+    expect(result.status).toBe("unresolved");
+    expect(result.artifactValues["ticket.json"]).toBeUndefined();
+    expect(result.artifactValues["ticket.md"]).toBeUndefined();
+  });
+
+  test("merges parallel overwrites of artifacts produced before the parallel step", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: parallel-prior-artifact-overwrite
+version: 1
+style: pipeline
+maturity: draft
+steps:
+  - id: seed
+    type: command
+    command: echo old
+    outputs: [shared.txt]
+  - id: split
+    type: parallel
+    branches:
+      - id: replace
+        type: artifact_transform
+        input: source.txt
+        output: shared.txt
+        transform: uppercase
+        overwrite: true
+`);
+    const registry = new AgentflowArtifactTransformRegistry().register("uppercase", (input) => ({
+      content: Buffer.from(input).toString("utf8").toUpperCase(),
+      contentType: "text/plain"
+    }));
+
+    const result = simulateAgentflowWorkflow(workflow, {
+      artifacts: { "source.txt": "new" },
+      steps: { seed: { outputs: { "shared.txt": "old" } } }
+    }, registry);
+
+    expect(result.status).toBe("completed");
+    expect(result.artifactValues["shared.txt"]).toBe("NEW");
+  });
+
+  test("reports overlapping availability-only parallel outputs as unresolved", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: parallel-availability-conflict
+version: 1
+style: pipeline
+maturity: draft
+steps:
+  - id: split
+    type: parallel
+    allow_overlap: true
+    conflict_policy: { strategy: manual }
+    branches:
+      - { id: first, type: command, command: echo first, outputs: [shared.txt] }
+      - { id: second, type: command, command: echo second, outputs: [shared.txt] }
+`);
+
+    const result = simulateAgentflowWorkflow(workflow, {
+      steps: {
+        first: { outputs: ["shared.txt"] },
+        second: { outputs: ["shared.txt"] }
+      }
+    });
+
+    expect(result.status).toBe("unresolved");
+    expect(result.artifactValues["shared.txt"]).toBeUndefined();
+    expect(result.unresolvedBranches).toContainEqual({
+      stepId: "split",
+      reason: "Parallel branches produced conflicting values for artifact shared.txt; fixture simulation cannot apply the declared conflict policy."
+    });
   });
 
   test("traverses every declared parallel child list", () => {

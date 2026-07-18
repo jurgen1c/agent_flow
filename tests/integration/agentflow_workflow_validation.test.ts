@@ -5,6 +5,7 @@ import {
   formatAgentflowWorkflowIssues,
   lintAgentflowWorkflow,
   parseAgentflowWorkflowOrThrow,
+  simulateAgentflowWorkflow,
   validateAgentflowWorkflow
 } from "../../packages/agentflow-core/src";
 
@@ -125,13 +126,84 @@ steps:
     command: printf ok
     on_failure:
       retry: -1
-      then: continue
+      then: " continue "
 `);
 
     expect(validateAgentflowWorkflow(workflow).errors.map((issue) => issue.code)).toEqual([
       "workflow.command.retry.invalid",
       "workflow.command.continue.not_allowed"
     ]);
+  });
+
+  test("requires bounded retries and explicit permission to continue after transform failure", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: invalid-transform-failure-policy
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: render
+    type: artifact_transform
+    input: ticket.json
+    output: ticket.md
+    transform: jira_ticket_to_markdown
+    on_failure:
+      retry: 101
+      then: " continue "
+`);
+
+    expect(validateAgentflowWorkflow(workflow).errors.map((issue) => issue.code)).toEqual([
+      "workflow.artifact_transform.retry.invalid",
+      "workflow.artifact_transform.continue.not_allowed"
+    ]);
+  });
+
+  test("requires explicit permission to ignore command and transform failures", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: unapproved-ignore
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: command
+    type: command
+    command: exit 1
+    on_failure: { then: " ignore " }
+  - id: transform
+    type: artifact_transform
+    input: ticket.json
+    output: ticket.md
+    transform: jira_ticket_to_markdown
+    on_failure: { then: " ignore " }
+`);
+
+    expect(validateAgentflowWorkflow(workflow).errors.map((issue) => issue.code)).toEqual([
+      "workflow.command.continue.not_allowed",
+      "workflow.artifact_transform.continue.not_allowed"
+    ]);
+  });
+
+  test("rejects transform failure targets unsupported by the runtime", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: unsupported-transform-target
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: render
+    type: artifact_transform
+    input: ticket.json
+    output: ticket.md
+    transform: jira_ticket_to_markdown
+    on_failure: { then: recover }
+  - id: recover
+    type: result
+    status: completed
+`);
+
+    expect(validateAgentflowWorkflow(workflow).errors).toContainEqual({
+      code: "workflow.artifact_transform.target.unsupported",
+      message: "Artifact transform runtime supports only retry and then: continue, ignore, fail, or pause.",
+      path: "steps[0].on_failure.then",
+      stepId: "render"
+    });
   });
 
   test("validates nested targets and loop bounds deterministically", () => {
@@ -2167,6 +2239,68 @@ steps:
     expect(lintAgentflowWorkflow(workflow).warnings.map((issue) => issue.code)).toContain(
       "workflow.lint.artifact.overwrite"
     );
+  });
+
+  test("rejects artifact transform paths that escape the repository", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: unsafe-transform-path
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: render
+    type: artifact_transform
+    input: ../ticket.json
+    output: /tmp/ticket.md
+    transform: jira_ticket_to_markdown
+`);
+
+    expect(validateAgentflowWorkflow(workflow).errors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "workflow.artifact.path.invalid", path: "steps[0].input" }),
+      expect.objectContaining({ code: "workflow.artifact.path.invalid", path: "steps[0].output" })
+    ]));
+    expect(() => simulateAgentflowWorkflow(workflow, { artifacts: { "../ticket.json": {} } })).not.toThrow();
+    expect(simulateAgentflowWorkflow(workflow, { artifacts: { "../ticket.json": {} } }).status).toBe("unresolved");
+  });
+
+  test("rejects artifact transform paths that do not name repository files", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: invalid-transform-files
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: render
+    type: artifact_transform
+    input: .
+    output: ticket/
+    transform: jira_ticket_to_markdown
+`);
+
+    expect(validateAgentflowWorkflow(workflow).errors.map((issue) => [issue.code, issue.path])).toEqual([
+      ["workflow.artifact.path.invalid", "steps[0].input"],
+      ["workflow.artifact.path.invalid", "steps[0].output"]
+    ]);
+  });
+
+  test("rejects dynamic artifact transform paths that the runtime cannot resolve", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: dynamic-transform-paths
+version: 1
+style: pipeline
+maturity: experimental
+inputs:
+  source: { required: true }
+  target: { required: true }
+steps:
+  - id: render
+    type: artifact_transform
+    input: "{{ inputs.source }}"
+    output: "{{ inputs.target }}"
+    transform: jira_ticket_to_markdown
+`);
+
+    expect(validateAgentflowWorkflow(workflow).errors.map((issue) => [issue.code, issue.path])).toEqual([
+      ["workflow.artifact.path.dynamic", "steps[0].input"],
+      ["workflow.artifact.path.dynamic", "steps[0].output"]
+    ]);
   });
 
   test("tracks direct parallel branch outputs in pipeline collisions", () => {

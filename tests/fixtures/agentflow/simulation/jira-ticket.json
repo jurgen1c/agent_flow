@@ -1,0 +1,26 @@
+{
+  "inputs": {
+    "ticket_key": "AM-24"
+  },
+  "steps": {
+    "fetch_ticket": {
+      "outputs": {
+        "ticket.json": {
+          "key": "AM-24",
+          "fields": {
+            "summary": "Implement Agentflow artifact transform steps for pipelines",
+            "status": { "name": "In Progress" },
+            "issuetype": { "name": "Story" },
+            "priority": { "name": "Medium" },
+            "description": "Normalize structured artifacts between pipeline steps."
+          }
+        }
+      }
+    },
+    "create_spec": {
+      "outputs": {
+        "spec.md": "# Implementation spec\n"
+      }
+    }
+  }
+}
