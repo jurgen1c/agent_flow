@@ -191,6 +191,28 @@ describe("Agentflow run-state SQLite store", () => {
     store.close();
   });
 
+  test("validates atomic budget reservations and returns persisted record shapes", async () => {
+    const repoRoot = temporaryRepo();
+    const store = await openAgentflowRunState({ cwd: repoRoot, now: () => FIXED_TIME });
+    store.createRun({ id: "budget-duplicates", workflow: { name: "budget", version: 1, style: "pipeline", maturity: "stable" } });
+    const reservation = { id: "model:model_calls", runId: "budget-duplicates", scope: "workflow", kind: "model_calls", limit: 2, amount: 1, unit: "calls" };
+
+    expect(() => store.reserveBudgets([reservation, reservation])).toThrow(/duplicate IDs/);
+    expect(store.getBudget("budget-duplicates", reservation.id)).toBeNull();
+    expect(() => store.reserveBudgets([{ ...reservation, id: "model:zero", amount: 0 }])).toThrow(/positive finite number/);
+    expect(store.getBudget("budget-duplicates", "model:zero")).toBeNull();
+    expect(store.reserveBudgets([reservation])).toEqual([{
+      id: "model:model_calls",
+      runId: "budget-duplicates",
+      scope: "workflow",
+      kind: "model_calls",
+      limit: 2,
+      used: 1,
+      unit: "calls"
+    }]);
+    store.close();
+  });
+
   test("lists ordered events and run-scoped artifacts after process restart", async () => {
     const repoRoot = temporaryRepo();
     const workflow = { name: "durable", version: 1, style: "pipeline", maturity: "stable" } as const;
@@ -537,6 +559,15 @@ describe("Agentflow run-state SQLite store", () => {
       content: "no"
     })).toThrow(/symbolic link/);
     expect(fs.existsSync(path.join(outside, "escape.txt"))).toBe(false);
+
+    expect(() => store.writeArtifactsAtomically([{
+      id: "linked-batch",
+      runId: "run-safe",
+      path: "linked/escape.txt",
+      kind: "output",
+      contentType: "text/plain",
+      content: "no"
+    }])).toThrow(/symbolic link/);
 
     store.createRun({
       id: "team/run\\safe",

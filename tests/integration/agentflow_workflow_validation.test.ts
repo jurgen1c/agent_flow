@@ -64,6 +64,7 @@ steps:
     type: session_request
     session: lm
     prompt: "Review {{ inputs.missing }}"
+    inputs: [source.md]
     outputs: [result.json]
 `);
 
@@ -71,6 +72,7 @@ steps:
       "workflow.step.id.duplicate",
       "workflow.session.undeclared",
       "workflow.input.undeclared",
+      "workflow.session_request.prompt.invalid",
       "workflow.artifact.output.collision"
     ]);
   });
@@ -313,6 +315,8 @@ steps:
     type: session_request
     session: author
     prompt: prompts/revise.md
+    inputs: [draft.md]
+    outputs: [revision.md]
     then: review
 `);
 
@@ -800,11 +804,11 @@ steps:
   - id: body_work
     type: parallel
     body:
-      - { id: body_writer, type: session_request, session: writer, prompt: Write }
+      - { id: body_writer, type: session_request, session: writer, prompt: Write, inputs: [body-input.md], outputs: [body-output.md] }
   - id: steps_work
     type: parallel
     steps:
-      - { id: steps_writer, type: session_request, session: writer, prompt: Write }
+      - { id: steps_writer, type: session_request, session: writer, prompt: Write, inputs: [steps-input.md], outputs: [steps-output.md] }
 `);
 
     expect(validateAgentflowWorkflow(workflow).errors).toMatchObject([
@@ -1604,7 +1608,7 @@ maturity: draft
 sessions:
   worker: 42
 steps:
-  - { id: ask, type: session_request, session: worker, prompt: Review }
+  - { id: ask, type: session_request, session: worker, prompt: Review, inputs: [request.md], outputs: [response.md] }
 `);
 
     expect(validateAgentflowWorkflow(workflow).errors).toContainEqual({
@@ -1622,7 +1626,7 @@ maturity: draft
 sessions:
   worker: {}
 steps:
-  - { id: ask, type: session_request, session: worker, prompt: Review }
+  - { id: ask, type: session_request, session: worker, prompt: Review, inputs: [request.md], outputs: [response.md] }
 `);
 
     expect(validateAgentflowWorkflow(workflow).errors).toEqual([{
@@ -1701,6 +1705,7 @@ steps:
     session: " worker "
     prompt: " Review result "
     inputs: [" result.md "]
+    outputs: [" reviewed.md "]
     then: " gate "
   - id: " gate "
     type: " manual_gate "

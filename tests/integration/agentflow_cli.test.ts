@@ -58,7 +58,7 @@ describe("Agentflow CLI", () => {
     });
     expect(dispatch(["help", "run"])).toEqual({
       exitCode: 0,
-      stdout: "agentflow run\n\nUsage: agentflow run <workflow> --id <run-id>"
+      stdout: "agentflow run\n\nUsage: agentflow run <workflow> --id <run-id> [--fixture <file>]"
     });
     expect(dispatch(["help", "missing"])).toEqual({
       exitCode: 7,
@@ -174,6 +174,109 @@ steps:
     expect(restartedStatus.stdout).toContain("Status: completed");
     expect(await captureCli(["pause", "run-cli"], repo)).toMatchObject({ exitCode: 2 });
     expect(await captureCli(["pause", "missing"], repo)).toMatchObject({ exitCode: 4 });
+  });
+
+  test("runs session requests through an explicit CLI fixture provider", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agentflow-cli-session-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.mkdirSync(path.join(repo, "prompts"));
+    fs.writeFileSync(path.join(repo, "prompts", "draft.md"), "Draft.\n");
+    fs.writeFileSync(path.join(repo, "workflow.yml"), `name: fixture-session
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  writer: { provider: fixture }
+steps:
+  - { id: draft, type: session_request, session: writer, prompt: prompts/draft.md, inputs: [request.md], outputs: [response.md], on_failure: { retry: 1, then: pause } }
+`);
+    fs.writeFileSync(path.join(repo, "fixture.json"), JSON.stringify({
+      artifacts: { "request.md": "Request" },
+      steps: { draft: { outputs: { "nested/../response.md": "Fixture response" } } }
+    }));
+
+    const withoutFixture = await captureCli(["run", "workflow.yml", "--id", "missing-fixture"], repo);
+    expect(withoutFixture).toMatchObject({ exitCode: 1 });
+    expect(withoutFixture.stderr).toContain("require --fixture");
+    const run = await captureCli(["run", "workflow.yml", "--id", "fixture-run", "--fixture", "fixture.json"], repo);
+
+    expect(run).toMatchObject({ exitCode: 0 });
+    expect(run.stdout).toContain("Status: completed");
+    expect((await captureCli(["artifacts", "fixture-run"], repo)).stdout).toContain("response.md");
+
+    fs.writeFileSync(path.join(repo, "fixture.json"), JSON.stringify({
+      artifacts: { "request.md": "Request" },
+      steps: { draft: { outcome: ["failed", "succeeded"], outputs: { "response.md": "Retried response" } } }
+    }));
+    const retried = await captureCli(["run", "workflow.yml", "--id", "fixture-retry", "--fixture", "fixture.json"], repo);
+    expect(retried).toMatchObject({ exitCode: 0 });
+    expect(retried.stdout).toContain("Status: completed");
+
+    fs.writeFileSync(path.join(repo, "fixture.json"), JSON.stringify({
+      artifacts: { "request.md": "Request" },
+      steps: { draft: { outputs: ["response.md"] } }
+    }));
+    const arrayOutputs = await captureCli(["run", "workflow.yml", "--id", "array-outputs", "--fixture", "fixture.json"], repo);
+    expect(arrayOutputs).toMatchObject({ exitCode: 2 });
+    expect(arrayOutputs.stderr).toContain("array-form outputs are simulation-only");
+    expect(await captureCli(["status", "array-outputs"], repo)).toMatchObject({ exitCode: 4 });
+
+    fs.writeFileSync(path.join(repo, "nested.yml"), `name: nested-fixture-session
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  writer: { provider: fixture }
+steps:
+  - id: bounded
+    type: loop
+    max_iterations: 1
+    body:
+      - { id: " nested-draft ", type: " session_request ", session: writer, prompt: prompts/draft.md, inputs: [request.md], outputs: [response.md] }
+`);
+    const nestedWithoutFixture = await captureCli(["run", "nested.yml", "--id", "nested-missing-fixture"], repo);
+    expect(nestedWithoutFixture).toMatchObject({ exitCode: 1 });
+    expect(nestedWithoutFixture.stderr).toContain("require --fixture");
+
+    fs.writeFileSync(path.join(repo, "fixture.json"), JSON.stringify({
+      artifacts: { "request.md": "Request" },
+      steps: { "nested-draft": { outputs: ["response.md"] } }
+    }));
+    const nestedArrayOutputs = await captureCli(["run", "nested.yml", "--id", "nested-array-outputs", "--fixture", "fixture.json"], repo);
+    expect(nestedArrayOutputs).toMatchObject({ exitCode: 2 });
+    expect(nestedArrayOutputs.stderr).toContain("array-form outputs are simulation-only");
+    expect(await captureCli(["status", "nested-array-outputs"], repo)).toMatchObject({ exitCode: 4 });
+
+    fs.writeFileSync(path.join(repo, "fixture.json"), JSON.stringify({
+      artifacts: { "request.md": "Request" },
+      steps: { "nested-draft": { outputs: { "response.md": "Response" } } }
+    }));
+    fs.writeFileSync(path.join(repo, "nested-unsupported.yml"), fs.readFileSync(path.join(repo, "nested.yml"), "utf8")
+      .replace("provider: fixture", "provider: local"));
+    const nestedUnsupported = await captureCli(["run", "nested-unsupported.yml", "--id", "nested-unsupported", "--fixture", "fixture.json"], repo);
+    expect(nestedUnsupported).toMatchObject({ exitCode: 1 });
+    expect(nestedUnsupported.stderr).toContain('supports only provider "fixture"');
+
+    fs.writeFileSync(path.join(repo, "fixture.json"), JSON.stringify({
+      artifacts: { "request.md": "First", "inputs/../request.md": "Second" },
+      steps: { draft: { outputs: { "response.md": "Response" } } }
+    }));
+    const collidingArtifacts = await captureCli(["run", "workflow.yml", "--id", "colliding-artifacts", "--fixture", "fixture.json"], repo);
+    expect(collidingArtifacts).toMatchObject({ exitCode: 2 });
+    expect(collidingArtifacts.stderr).toContain("collide at canonical path request.md");
+    expect(await captureCli(["status", "colliding-artifacts"], repo)).toMatchObject({ exitCode: 4 });
+
+    fs.writeFileSync(path.join(repo, "fixture.json"), JSON.stringify({
+      artifacts: { "request.md": "Request" },
+      steps: { draft: { outputs: { "response.md": "Response" } } }
+    }));
+    fs.writeFileSync(path.join(repo, "unsupported.yml"), fs.readFileSync(path.join(repo, "workflow.yml"), "utf8")
+      .replace("provider: fixture", "provider: local")
+      .replace("steps:\n", 'steps:\n  - { id: side_effect, type: command, command: "printf side-effect > should-not-exist.txt" }\n'));
+    const unsupported = await captureCli(["run", "unsupported.yml", "--id", "unsupported", "--fixture", "fixture.json"], repo);
+    expect(unsupported).toMatchObject({ exitCode: 1 });
+    expect(unsupported.stderr).toContain('supports only provider "fixture"');
+    expect(fs.existsSync(path.join(repo, "should-not-exist.txt"))).toBe(false);
   });
 
   test("surfaces validation warnings while preserving a successful exit", () => {

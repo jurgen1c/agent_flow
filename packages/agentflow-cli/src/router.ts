@@ -4,11 +4,14 @@ import {
   AgentflowWorkflowGraphError,
   AgentflowRunStateError,
   createAgentflowLifecycleRun,
+  createAgentflowFixtureSessionProvider,
+  createAgentflowSessionProviderRegistry,
   executeAgentflowCommandPipeline,
   explainAgentflowWorkflow,
   formatAgentflowWorkflowIssues,
   formatWorkflowParseIssues,
   lintAgentflowWorkflow,
+  normalizeAgentflowArtifactPath,
   parseAgentflowWorkflow,
   parseAgentflowSimulationFixture,
   openAgentflowRunState,
@@ -144,6 +147,7 @@ function renderHelp(topic?: string): string {
     "  agentflow graph <workflow>",
     "  agentflow simulate <workflow> --fixture <file>",
     "  agentflow run <workflow> --id <run-id>",
+    "  agentflow run <workflow> --id <run-id> --fixture <file>",
     "  agentflow resume <run-id>",
     "  agentflow status <run-id>",
     "  agentflow logs <run-id>",
@@ -159,7 +163,7 @@ function renderHelp(topic?: string): string {
     "  explain <workflow>   Explain steps, artifacts, policies, and warnings.",
     "  graph <workflow>     Print a deterministic workflow graph.",
     "  simulate <workflow> --fixture <file>  Traverse a workflow from fixture data without executing steps.",
-    "  run <workflow> --id <run-id>  Execute command and artifact-transform steps and persist run state.",
+    "  run <workflow> --id <run-id> [--fixture <file>]  Execute command, artifact-transform, and fixture-backed session-request steps.",
     "  resume <run-id>       Resume a paused, waiting, or pending run.",
     "  status <run-id>       Inspect persistent run state.",
     "  logs <run-id>         List ordered lifecycle events.",
@@ -170,7 +174,7 @@ function renderHelp(topic?: string): string {
     "Reserved placeholders:",
     `  ${plannedAgentflowRuntimeCommands.filter((command) => !["validate", "lint", "explain", "graph", "simulate", ...ACTIVE_LIFECYCLE_COMMANDS].includes(command as ActiveLifecycleCommand)).join(", ")}`,
     "",
-    "Command and artifact-transform pipeline execution plus persistent lifecycle state are active."
+    "Command and artifact-transform pipeline execution, including session-request steps, plus persistent lifecycle state are active."
   ].join("\n");
 }
 
@@ -191,8 +195,67 @@ async function runLifecycleCommand(
     store = await openAgentflowRunState({ cwd: options.cwd });
 
     if (command === "run") {
-      const result = createAgentflowLifecycleRun(store, { id: args[2], workflow: workflowResult!.workflow });
-      const execution = await executeAgentflowCommandPipeline(store, result.run.id, workflowResult!.workflow);
+      const fixture = args.length === 5 ? readRunFixture(args[4], options.cwd) : null;
+      if (fixture !== null && "exitCode" in fixture) return fixture;
+      const sessionRequestSteps = collectSessionRequestSteps(workflowResult!.workflow.steps);
+      if (sessionRequestSteps.length > 0 && fixture === null) {
+        return {
+          exitCode: 1,
+          stderr: "Session-request workflows require --fixture <file> until a non-fixture provider adapter is configured."
+        };
+      }
+      const unsupportedProviders = sessionRequestSteps
+        .filter((step) => typeof step.session === "string")
+        .map((step) => workflowResult!.workflow.sessions?.[String(step.session).trim()])
+        .flatMap((session) => session !== null && typeof session === "object" && !Array.isArray(session)
+          ? [String((session as Record<string, unknown>).provider ?? "").trim()]
+          : [])
+        .filter((provider) => provider !== "fixture");
+      if (unsupportedProviders.length > 0) {
+        return {
+          exitCode: 1,
+          stderr: `CLI fixture mode supports only provider "fixture"; unsupported providers: ${[...new Set(unsupportedProviders)].sort().join(", ")}.`
+        };
+      }
+      if (fixture !== null) {
+        const unsupportedOutputStep = sessionRequestSteps.find((step) =>
+          fixture.arrayOutputSteps.has(String(step.id ?? "").trim())
+        );
+        if (unsupportedOutputStep !== undefined) {
+          return {
+            exitCode: 2,
+            stderr: `Run fixture step ${String(unsupportedOutputStep.id).trim()}.outputs must be an object with materializable output values; array-form outputs are simulation-only.`
+          };
+        }
+      }
+      const result = createAgentflowLifecycleRun(store, {
+        id: args[2],
+        workflow: workflowResult!.workflow,
+        ...(fixture === null ? {} : { inputs: fixture.inputs })
+      });
+      if (fixture !== null) {
+        for (const [index, [artifactPath, value]] of Object.entries(fixture.artifacts)
+          .sort(([left], [right]) => left.localeCompare(right)).entries()) {
+          store.writeArtifact({
+            id: `fixture:${index + 1}`,
+            runId: result.run.id,
+            stepId: "fixture",
+            path: artifactPath,
+            kind: "fixture",
+            contentType: artifactPath.endsWith(".json") ? "application/json; charset=utf-8" : "text/plain; charset=utf-8",
+            content: typeof value === "string" ? value : `${JSON.stringify(value)}\n`
+          });
+        }
+      }
+      const providers = createAgentflowSessionProviderRegistry();
+      if (fixture !== null) providers.register("fixture", createAgentflowFixtureSessionProvider(fixture.responses, fixture.outcomes));
+      const execution = await executeAgentflowCommandPipeline(
+        store,
+        result.run.id,
+        workflowResult!.workflow,
+        undefined,
+        providers
+      );
       const lines = [
         `${result.changed ? "Created" : "Reused"} Agentflow run ${result.run.id} for ${result.run.workflowName} (version ${result.run.workflowVersion}).`,
         `Status: ${execution.status}`,
@@ -258,14 +321,83 @@ async function runLifecycleCommand(
 
 function validLifecycleArgs(command: ActiveLifecycleCommand, args: string[]): boolean {
   return command === "run"
-    ? args.length === 3 && args[1] === "--id" && args[0].length > 0 && args[2].length > 0
+    ? (args.length === 3 || (args.length === 5 && args[3] === "--fixture" && args[4].length > 0))
+      && args[1] === "--id" && args[0].length > 0 && args[2].length > 0
     : args.length === 1 && args[0].length > 0;
 }
 
 function lifecycleUsage(topic: string): string | null {
-  if (topic === "run") return "Usage: agentflow run <workflow> --id <run-id>";
+  if (topic === "run") return "Usage: agentflow run <workflow> --id <run-id> [--fixture <file>]";
   if (isActiveLifecycleCommand(topic)) return `Usage: agentflow ${topic} <run-id>`;
   return null;
+}
+
+function readRunFixture(
+  fixturePath: string,
+  cwd?: string
+): {
+  inputs: Record<string, import("@jurgen1c/agentflow-core").AgentflowRunStateValue>;
+  artifacts: Record<string, import("@jurgen1c/agentflow-core").AgentflowRunStateValue>;
+  responses: Record<string, import("@jurgen1c/agentflow-core").AgentflowSessionProviderResponse>;
+  outcomes: Record<string, "succeeded" | "failed" | Array<"succeeded" | "failed">>;
+  arrayOutputSteps: Set<string>;
+} | AgentflowCliResult {
+  const resolvedPath = cwd === undefined ? fixturePath : path.resolve(cwd, fixturePath);
+  let source: string;
+  try {
+    source = fs.readFileSync(resolvedPath, "utf8");
+  } catch (error) {
+    return { exitCode: 1, stderr: `Could not read Agentflow run fixture ${fixturePath}: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  const parsed = parseAgentflowSimulationFixture(source);
+  if (!parsed.ok) return { exitCode: 2, stderr: `Could not parse Agentflow run fixture ${fixturePath}: ${parsed.error}` };
+  const responses: Record<string, import("@jurgen1c/agentflow-core").AgentflowSessionProviderResponse> = {};
+  const outcomes: Record<string, "succeeded" | "failed" | Array<"succeeded" | "failed">> = {};
+  const arrayOutputSteps = new Set<string>();
+  for (const [stepId, fixture] of Object.entries(parsed.fixture.steps ?? {})) {
+    if (fixture.outcome !== undefined) outcomes[stepId] = fixture.outcome;
+    if (Array.isArray(fixture.outputs)) {
+      arrayOutputSteps.add(stepId);
+      continue;
+    }
+    if (fixture.outputs === undefined) continue;
+    const outputs: Record<string, string> = {};
+    for (const [declaredPath, value] of Object.entries(fixture.outputs)) {
+      let canonicalPath: string;
+      try {
+        canonicalPath = normalizeAgentflowArtifactPath(declaredPath);
+      } catch (error) {
+        return { exitCode: 2, stderr: `Run fixture step ${stepId} output ${JSON.stringify(declaredPath)} is invalid: ${error instanceof Error ? error.message : String(error)}` };
+      }
+      if (Object.hasOwn(outputs, canonicalPath)) {
+        return { exitCode: 2, stderr: `Run fixture step ${stepId} output keys collide at canonical path ${canonicalPath}.` };
+      }
+      outputs[canonicalPath] = typeof value === "string" ? value : `${JSON.stringify(value)}\n`;
+    }
+    responses[stepId] = {
+      outputs
+    };
+  }
+  const artifacts: Record<string, import("@jurgen1c/agentflow-core").AgentflowRunStateValue> = {};
+  for (const [declaredPath, value] of Object.entries(parsed.fixture.artifacts ?? {})) {
+    let canonicalPath: string;
+    try {
+      canonicalPath = normalizeAgentflowArtifactPath(declaredPath);
+    } catch (error) {
+      return { exitCode: 2, stderr: `Run fixture artifact ${JSON.stringify(declaredPath)} is invalid: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    if (Object.hasOwn(artifacts, canonicalPath)) {
+      return { exitCode: 2, stderr: `Run fixture artifact keys collide at canonical path ${canonicalPath}.` };
+    }
+    artifacts[canonicalPath] = value as import("@jurgen1c/agentflow-core").AgentflowRunStateValue;
+  }
+  return {
+    inputs: (parsed.fixture.inputs ?? {}) as unknown as Record<string, import("@jurgen1c/agentflow-core").AgentflowRunStateValue>,
+    artifacts,
+    responses,
+    outcomes,
+    arrayOutputSteps
+  };
 }
 
 function requireRun(
@@ -409,6 +541,26 @@ function readWorkflow(
   }
 
   return { workflow: parsed.workflow };
+}
+
+function collectSessionRequestSteps(
+  steps: import("@jurgen1c/agentflow-core").AgentflowWorkflowStep[]
+): import("@jurgen1c/agentflow-core").AgentflowWorkflowStep[] {
+  const requests: import("@jurgen1c/agentflow-core").AgentflowWorkflowStep[] = [];
+  const visit = (step: import("@jurgen1c/agentflow-core").AgentflowWorkflowStep): void => {
+    if (typeof step.type === "string" && step.type.trim() === "session_request") requests.push(step);
+    for (const field of ["body", "steps", "branches"] as const) {
+      const nested = step[field];
+      if (!Array.isArray(nested)) continue;
+      for (const entry of nested) {
+        if (entry !== null && typeof entry === "object" && !Array.isArray(entry)) {
+          visit(entry as import("@jurgen1c/agentflow-core").AgentflowWorkflowStep);
+        }
+      }
+    }
+  };
+  steps.forEach(visit);
+  return requests;
 }
 
 function isPlannedRuntimeCommand(command: string): boolean {

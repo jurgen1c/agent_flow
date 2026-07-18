@@ -143,6 +143,8 @@ steps:
     type: session_request
     session: implementer
     prompt: prompts/implement.md
+    inputs:
+      - spec.md
     outputs:
       - implementation-summary.md
 
@@ -170,6 +172,10 @@ steps:
     prompt: prompts/address-review.md
     inputs:
       - reviews/code-review.json
+      - implementation-summary.md
+    outputs:
+      - implementation-summary.md
+    overwrite: true
     then: review
 ```
 
@@ -377,4 +383,3 @@ For v1:
 - Human escalation on unresolved disagreement.
 - Reviewers cannot modify files by default.
 - Decision records retained permanently unless user cleans them manually.
-

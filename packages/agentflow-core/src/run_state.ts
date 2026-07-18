@@ -171,8 +171,22 @@ export interface UpsertAgentflowSessionInput {
   stepId?: string;
   provider: string;
   status: AgentflowSessionStatus;
-  externalSessionId?: string;
+  externalSessionId?: string | null;
   state?: Record<string, AgentflowRunStateValue>;
+}
+
+export interface AgentflowSessionRecord {
+  id: string;
+  runId: string;
+  stepId: string | null;
+  provider: string;
+  externalSessionId: string | null;
+  status: AgentflowSessionStatus;
+  state: Record<string, AgentflowRunStateValue>;
+  createdAt: string;
+  updatedAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
 }
 
 export interface RecordAgentflowFailureInput {
@@ -210,6 +224,8 @@ export interface UpsertAgentflowBudgetInput {
   used: number;
   unit: string;
 }
+
+export type AgentflowBudgetRecord = UpsertAgentflowBudgetInput;
 
 type SqliteValue = string | number | bigint | null | Uint8Array;
 
@@ -270,6 +286,20 @@ interface RunRow {
   finished_at: string | null;
 }
 
+interface SessionRow {
+  run_id: string;
+  id: string;
+  step_id: string | null;
+  provider: string;
+  external_session_id: string | null;
+  status: AgentflowSessionStatus;
+  state_json: string;
+  created_at: string;
+  updated_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
 const TERMINAL_RUN_STATUSES = new Set<AgentflowRunStatus>(["completed", "failed", "cancelled"]);
 const RUN_STATUSES = ["pending", "running", "waiting", "paused", "completed", "failed", "cancelled"] as const;
 const STEP_STATUSES = [...RUN_STATUSES, "skipped"] as const;
@@ -289,6 +319,7 @@ export class AgentflowRunStateError extends Error {
 }
 
 export class AgentflowRunStateStore {
+  private artifactBatchActive = false;
   readonly repoRoot: string;
   readonly databasePath: string;
   private readonly database: SqliteDatabase;
@@ -601,6 +632,10 @@ export class AgentflowRunStateStore {
   }
 
   writeArtifact(input: WriteAgentflowArtifactInput): AgentflowArtifactRecord {
+    return this.writeArtifactInternal(input, !this.artifactBatchActive);
+  }
+
+  private writeArtifactInternal(input: WriteAgentflowArtifactInput, manageTransaction: boolean): AgentflowArtifactRecord {
     this.assertOpen();
     const runId = artifactRunId(input.runId);
     this.requireRun(runId);
@@ -623,7 +658,7 @@ export class AgentflowRunStateStore {
     let fileMutationStarted = false;
     let committed = false;
 
-    this.database.exec("BEGIN IMMEDIATE");
+    if (manageTransaction) this.database.exec("BEGIN IMMEDIATE");
     try {
       if (input.requiredRunStatus !== undefined) {
         const status = this.database.get<{ status: AgentflowRunStatus }>("SELECT status FROM runs WHERE id = ?", [runId])?.status;
@@ -732,10 +767,10 @@ export class AgentflowRunStateStore {
         retryingPublishedContent ? existing?.written_at ?? timestamp : timestamp,
         timestamp
       ]);
-      this.database.exec("COMMIT");
+      if (manageTransaction) this.database.exec("COMMIT");
       committed = true;
     } catch (error) {
-      rollback(this.database);
+      if (manageTransaction) rollback(this.database);
       if (!committed && fileMutationStarted) restoreArtifactWrite(target, temporaryPath, backupPath, targetExistedBeforeWrite);
       else removeArtifactStagingEntry(temporaryPath);
       if (error instanceof AgentflowRunStateError) throw error;
@@ -746,9 +781,106 @@ export class AgentflowRunStateStore {
       );
     }
 
-    removeArtifactStagingEntry(backupPath);
+    if (!this.artifactBatchActive) removeArtifactStagingEntry(backupPath);
 
     return this.requireArtifact(runId, id);
+  }
+
+  writeArtifactsAtomically(inputs: WriteAgentflowArtifactInput[]): AgentflowArtifactRecord[] {
+    this.assertOpen();
+    if (inputs.length === 0) return [];
+    const runId = artifactRunId(inputs[0]!.runId);
+    if (inputs.some((input) => artifactRunId(input.runId) !== runId)) {
+      throw new AgentflowRunStateError("Atomic artifact batches must belong to one run.", "AGENTFLOW_ARTIFACT_INVALID");
+    }
+    const paths = inputs.map((input) => normalizeAgentflowArtifactPath(input.path));
+    if (new Set(paths).size !== paths.length) {
+      throw new AgentflowRunStateError("Atomic artifact batches must not contain duplicate paths.", "AGENTFLOW_ARTIFACT_INVALID");
+    }
+    let snapshots: Array<{ declaredPath: string; row: ArtifactRow | null; targetExisted: boolean }> = [];
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      snapshots = paths.map((declaredPath) => {
+        const row = this.database.get<ArtifactRow>("SELECT * FROM artifacts WHERE run_id = ? AND path = ?", [runId, declaredPath]);
+        const target = artifactStoragePath(this.repoRoot, runId, declaredPath, false);
+        return { declaredPath, row, targetExisted: artifactTargetExists(target) };
+      });
+      this.artifactBatchActive = true;
+      const artifacts = inputs.map((input) => this.writeArtifact(input));
+      this.database.exec("COMMIT");
+      for (const declaredPath of paths) {
+        const { temporaryPath, backupPath } = artifactStagingPaths(this.repoRoot, runId, declaredPath);
+        removeArtifactStagingEntry(temporaryPath);
+        removeArtifactStagingEntry(backupPath);
+      }
+      return artifacts;
+    } catch (error) {
+      rollback(this.database);
+      try {
+        this.restoreArtifactBatch(runId, snapshots);
+        for (const declaredPath of paths) {
+          const { temporaryPath, backupPath } = artifactStagingPaths(this.repoRoot, runId, declaredPath);
+          removeArtifactStagingEntry(temporaryPath);
+          removeArtifactStagingEntry(backupPath);
+        }
+      } catch (restoreError) {
+        throw new AgentflowRunStateError(
+          `Could not roll back atomic artifact batch for run ${runId}: ${errorMessage(restoreError)}`,
+          "AGENTFLOW_ARTIFACT_ROLLBACK",
+          { cause: error }
+        );
+      }
+      throw error;
+    } finally {
+      this.artifactBatchActive = false;
+    }
+  }
+
+  private restoreArtifactBatch(
+    runId: string,
+    snapshots: Array<{ declaredPath: string; row: ArtifactRow | null; targetExisted: boolean }>
+  ): void {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      for (const snapshot of snapshots) {
+        const target = artifactStoragePath(this.repoRoot, runId, snapshot.declaredPath, true);
+        const { backupPath } = artifactStagingPaths(this.repoRoot, runId, snapshot.declaredPath);
+        if (snapshot.targetExisted) {
+          if (fs.existsSync(backupPath)) {
+            if (isSymbolicLink(backupPath) || !fs.statSync(backupPath).isFile()) {
+              throw new AgentflowRunStateError(
+                `Artifact rollback backup is not a regular file: ${backupPath}`,
+                "AGENTFLOW_ARTIFACT_ROLLBACK"
+              );
+            }
+            fs.rmSync(target, { force: true, recursive: true });
+            fs.renameSync(backupPath, target);
+          } else if (!fs.existsSync(target)) {
+            throw new AgentflowRunStateError(
+              `Artifact rollback backup is missing for ${snapshot.declaredPath}.`,
+              "AGENTFLOW_ARTIFACT_ROLLBACK"
+            );
+          }
+        } else {
+          removeArtifactStagingEntry(target);
+        }
+        this.database.run("DELETE FROM artifacts WHERE run_id = ? AND path = ?", [runId, snapshot.declaredPath]);
+        if (snapshot.row !== null) {
+          const row = snapshot.row;
+          this.database.run(`INSERT INTO artifacts (
+            run_id, id, step_id, path, kind, content_type, checksum, size_bytes, status, previous_checksum,
+            metadata_json, created_at, updated_at, written_at, checked_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+            row.run_id, row.id, row.step_id, row.path, row.kind, row.content_type, row.checksum, row.size_bytes,
+            row.status, row.previous_checksum, row.metadata_json, row.created_at, row.updated_at, row.written_at, row.checked_at
+          ]);
+        }
+      }
+      this.database.exec("COMMIT");
+    } catch (error) {
+      rollback(this.database);
+      throw error;
+    }
   }
 
   listArtifacts(runId: string): AgentflowArtifactRecord[] {
@@ -952,7 +1084,7 @@ export class AgentflowRunStateStore {
       requiredString(input.id, "Session ID"),
       optionalString(input.stepId, "Step ID"),
       requiredString(input.provider, "Session provider"),
-      optionalString(input.externalSessionId, "External session ID"),
+      input.externalSessionId === null ? null : optionalString(input.externalSessionId, "External session ID"),
       input.status,
       stableJson(input.state ?? {}),
       timestamp,
@@ -963,6 +1095,64 @@ export class AgentflowRunStateStore {
       input.externalSessionId === undefined ? 1 : 0,
       input.state === undefined ? 1 : 0
     ]);
+  }
+
+  claimSession(input: UpsertAgentflowSessionInput): void {
+    this.assertOpen();
+    const runId = requiredString(input.runId, "Run ID");
+    const id = requiredString(input.id, "Session ID");
+    const timestamp = currentTimestamp(this.now);
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const existing = this.database.get<Pick<SessionRow, "status" | "finished_at">>(
+        "SELECT status, finished_at FROM sessions WHERE run_id = ? AND id = ?",
+        [runId, id]
+      );
+      if (existing?.status === "running" || existing?.finished_at !== null && existing?.finished_at !== undefined) {
+        throw new AgentflowRunStateError(
+          `Agentflow session ${id} for run ${runId} is already active or terminal.`,
+          "AGENTFLOW_SESSION_ACTIVE"
+        );
+      }
+      this.database.run(`INSERT INTO sessions (
+        run_id, id, step_id, provider, external_session_id, status, state_json,
+        created_at, updated_at, started_at, finished_at
+      ) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, NULL)
+      ON CONFLICT(run_id, id) DO UPDATE SET
+        step_id = excluded.step_id, provider = excluded.provider,
+        external_session_id = excluded.external_session_id, status = 'running',
+        state_json = excluded.state_json, updated_at = excluded.updated_at,
+        started_at = COALESCE(sessions.started_at, excluded.started_at), finished_at = NULL`, [
+        runId, id, optionalString(input.stepId, "Step ID"), requiredString(input.provider, "Session provider"),
+        optionalString(input.externalSessionId ?? undefined, "External session ID"), stableJson(input.state ?? {}),
+        timestamp, timestamp, timestamp
+      ]);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      rollback(this.database);
+      throw error;
+    }
+  }
+
+  getSession(runId: string, id: string): AgentflowSessionRecord | null {
+    this.assertOpen();
+    const normalizedRunId = requiredString(runId, "Run ID");
+    this.requireRun(normalizedRunId);
+    const row = this.database.get<SessionRow>(
+      "SELECT * FROM sessions WHERE run_id = ? AND id = ?",
+      [normalizedRunId, requiredString(id, "Session ID")]
+    );
+    return row === null ? null : hydrateSession(row);
+  }
+
+  listSessions(runId: string): AgentflowSessionRecord[] {
+    this.assertOpen();
+    const normalizedRunId = requiredString(runId, "Run ID");
+    this.requireRun(normalizedRunId);
+    return this.database.all<SessionRow>(
+      "SELECT * FROM sessions WHERE run_id = ? ORDER BY id ASC",
+      [normalizedRunId]
+    ).map(hydrateSession);
   }
 
   recordFailure(input: RecordAgentflowFailureInput): void {
@@ -1081,6 +1271,90 @@ export class AgentflowRunStateStore {
       timestamp,
       timestamp
     ]);
+  }
+
+  reserveBudgets(inputs: Array<Omit<UpsertAgentflowBudgetInput, "used"> & { amount: number }>): AgentflowBudgetRecord[] {
+    this.assertOpen();
+    if (inputs.length === 0) return [];
+    const runId = requiredString(inputs[0]!.runId, "Run ID");
+    if (inputs.some((input) => requiredString(input.runId, "Run ID") !== runId)) {
+      throw new AgentflowRunStateError("Budget reservations must belong to one run.", "AGENTFLOW_BUDGET_INVALID");
+    }
+    const budgetIds = inputs.map((input) => requiredString(input.id, "Budget ID"));
+    if (new Set(budgetIds).size !== budgetIds.length) {
+      throw new AgentflowRunStateError("Atomic budget reservations must not contain duplicate IDs.", "AGENTFLOW_BUDGET_INVALID");
+    }
+    this.requireRun(runId);
+    const timestamp = currentTimestamp(this.now);
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const reservations = inputs.map((input) => {
+        if (!Number.isFinite(input.limit) || input.limit < 0 || !Number.isFinite(input.amount) || input.amount <= 0) {
+          throw new AgentflowRunStateError("Budget limit must be a non-negative finite number and reservation amount must be a positive finite number.", "AGENTFLOW_BUDGET_INVALID");
+        }
+        const id = requiredString(input.id, "Budget ID");
+        const used = this.database.get<{ used: number }>(
+          "SELECT used FROM budgets WHERE run_id = ? AND id = ?",
+          [runId, id]
+        )?.used ?? 0;
+        if (used + input.amount > input.limit) {
+          throw new AgentflowRunStateError(
+            `Budget "${input.kind}" would exceed its limit of ${input.limit} (${used} used, ${input.amount} requested).`,
+            "AGENTFLOW_BUDGET_EXCEEDED"
+          );
+        }
+        return { input, id, used: used + input.amount };
+      });
+      for (const { input, id, used } of reservations) {
+        this.database.run(`INSERT INTO budgets (
+          run_id, id, step_id, session_id, scope, kind, limit_value, used, unit, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(run_id, id) DO UPDATE SET
+          step_id = excluded.step_id, session_id = excluded.session_id, scope = excluded.scope,
+          kind = excluded.kind, limit_value = excluded.limit_value, used = excluded.used,
+          unit = excluded.unit, updated_at = excluded.updated_at`, [
+          runId, id, optionalString(input.stepId, "Step ID"), optionalString(input.sessionId, "Session ID"),
+          requiredString(input.scope, "Budget scope"), requiredString(input.kind, "Budget kind"),
+          input.limit, used, requiredString(input.unit, "Budget unit"), timestamp, timestamp
+        ]);
+      }
+      this.database.exec("COMMIT");
+      return reservations.map(({ id }) => this.getBudget(runId, id)!);
+    } catch (error) {
+      rollback(this.database);
+      throw error;
+    }
+  }
+
+  getBudget(runId: string, id: string): AgentflowBudgetRecord | null {
+    this.assertOpen();
+    const normalizedRunId = requiredString(runId, "Run ID");
+    this.requireRun(normalizedRunId);
+    const row = this.database.get<{
+      id: string;
+      run_id: string;
+      step_id: string | null;
+      session_id: string | null;
+      scope: string;
+      kind: string;
+      limit_value: number;
+      used: number;
+      unit: string;
+    }>("SELECT id, run_id, step_id, session_id, scope, kind, limit_value, used, unit FROM budgets WHERE run_id = ? AND id = ?", [
+      normalizedRunId,
+      requiredString(id, "Budget ID")
+    ]);
+    return row === null ? null : {
+      id: row.id,
+      runId: row.run_id,
+      ...(row.step_id === null ? {} : { stepId: row.step_id }),
+      ...(row.session_id === null ? {} : { sessionId: row.session_id }),
+      scope: row.scope,
+      kind: row.kind,
+      limit: row.limit_value,
+      used: row.used,
+      unit: row.unit
+    };
   }
 
   close(): void {
@@ -1357,6 +1631,22 @@ function hydrateEvent(row: EventRow): AgentflowEventRecord {
   };
 }
 
+function hydrateSession(row: SessionRow): AgentflowSessionRecord {
+  return {
+    id: row.id,
+    runId: row.run_id,
+    stepId: row.step_id,
+    provider: row.provider,
+    externalSessionId: row.external_session_id,
+    status: row.status,
+    state: JSON.parse(row.state_json) as Record<string, AgentflowRunStateValue>,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    startedAt: row.started_at,
+    finishedAt: row.finished_at
+  };
+}
+
 function stableJson(value: unknown): string {
   try {
     return JSON.stringify(sortJsonValue(value, new Set()));
@@ -1564,6 +1854,23 @@ function artifactChecksum(candidate: string): string {
     fs.closeSync(descriptor);
   }
   return `sha256:${hash.digest("hex")}`;
+}
+
+function artifactTargetExists(candidate: string): boolean {
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(candidate);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+  if (stat.isSymbolicLink()) {
+    throw new AgentflowRunStateError(`Artifact target cannot be a symbolic link: ${candidate}`, "AGENTFLOW_ARTIFACT_PATH");
+  }
+  if (!stat.isFile()) {
+    throw new AgentflowRunStateError(`Artifact target is not a regular file: ${candidate}`, "AGENTFLOW_ARTIFACT_PATH");
+  }
+  return true;
 }
 
 function requiredString(value: unknown, label: string): string {

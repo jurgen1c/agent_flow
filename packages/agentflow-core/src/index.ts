@@ -6,6 +6,7 @@ export {
   AgentflowRunStateError,
   AgentflowRunStateStore,
   DEFAULT_AGENTFLOW_DATABASE_PATH,
+  normalizeAgentflowArtifactPath,
   openAgentflowRunState
 } from "./run_state";
 export {
@@ -43,6 +44,20 @@ export {
   executeAgentflowArtifactTransform,
   transformAgentflowFixtureArtifact
 } from "./artifact_transform";
+export {
+  AgentflowSessionProviderRegistry,
+  AgentflowSessionRequestError,
+  AgentflowSessionRequestInterruptedError,
+  MAX_AGENTFLOW_SESSION_INPUT_BYTES,
+  MAX_AGENTFLOW_SESSION_INPUTS,
+  MAX_AGENTFLOW_SESSION_METADATA_BYTES,
+  MAX_AGENTFLOW_SESSION_OUTPUT_BYTES,
+  MAX_AGENTFLOW_SESSION_PROMPT_BYTES,
+  MAX_AGENTFLOW_SESSION_TOTAL_INPUT_BYTES,
+  createAgentflowFixtureSessionProvider,
+  createAgentflowSessionProviderRegistry,
+  executeAgentflowSessionRequest
+} from "./session_request";
 export {
   evaluateAgentflowPolicy,
   validateAgentflowPolicyPrimitives
@@ -95,6 +110,15 @@ export type {
   AgentflowArtifactTransformOutput
 } from "./artifact_transform";
 export type {
+  AgentflowSessionProviderAdapter,
+  AgentflowSessionProviderOutput,
+  AgentflowSessionProviderRequest,
+  AgentflowSessionProviderResponse,
+  AgentflowSessionRequestArtifact,
+  AgentflowSessionRequestExecutionResult,
+  ExecuteAgentflowSessionRequestOptions
+} from "./session_request";
+export type {
   AgentflowPolicyDecision,
   AgentflowPolicyIssue,
   AgentflowPolicyRequest,
@@ -105,10 +129,12 @@ export type {
   AgentflowArtifactContent,
   AgentflowArtifactRecord,
   AgentflowArtifactStatus,
+  AgentflowBudgetRecord,
   AgentflowEventRecord,
   AgentflowRunEventInput,
   AgentflowRunMutationResult,
   AgentflowRunRecord,
+  AgentflowSessionRecord,
   AgentflowRunStateValue,
   AgentflowRunStatus,
   AgentflowSessionStatus,

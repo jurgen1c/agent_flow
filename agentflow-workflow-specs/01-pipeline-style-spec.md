@@ -119,6 +119,34 @@ Validation should warn when:
 - A step writes an artifact also written by another step without `overwrite: true`.
 - A model step lacks bounded inputs.
 
+### 6.1 Session Request Contract
+
+`session_request` is a bounded model operation, not an open-ended chat. Each
+request must declare:
+
+- A static session name that resolves to a session with a static `provider`.
+- A repo-relative prompt file.
+- One or more input artifacts and one or more output artifacts.
+- A boolean session `resume` setting when resumability is enabled.
+
+The runtime selects an explicitly registered provider adapter, reads prompts
+and input artifacts with size limits, and requires the adapter to return every
+declared output and no undeclared outputs. It records a deterministic request
+metadata artifact under `session-requests/<step-id>-<hash>.json`, writes provider
+outputs through the artifact registry, and leaves the session in `waiting`
+state with its external session ID so a later request can resume it.
+Each adapter receives an abort signal, lifecycle cancellation interrupts a
+pending request, and configured model/frontier call budgets are reserved before
+the provider is invoked.
+
+Provider calls are never implicit in simulation. Simulation uses declared JSON
+fixture outputs, and runtime tests can register the fixture provider adapter to
+return deterministic responses without network access.
+The CLI exposes that same deterministic boundary with
+`agentflow run <workflow> --id <run-id> --fixture <file>` for workflows whose
+session provider is `fixture`; non-fixture provider adapters remain an explicit
+embedding concern.
+
 ## 7. Failure Behavior
 
 Pipeline failures should be boring.
@@ -223,4 +251,3 @@ Pipeline workflows should default to:
 - Terminal notifications only.
 - Pause on unexpected failure.
 - Explicit artifact outputs.
-

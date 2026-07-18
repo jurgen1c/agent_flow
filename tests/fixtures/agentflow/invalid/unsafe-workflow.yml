@@ -18,6 +18,8 @@ steps:
     type: session_request
     session: missing_session
     prompt: prompts/review.md
+    inputs: [request.md]
+    outputs: [response.md]
 
   - id: forever
     type: loop

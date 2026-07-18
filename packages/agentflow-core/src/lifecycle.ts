@@ -14,6 +14,7 @@ export type AgentflowLifecycleAction = "pause" | "resume" | "cancel";
 export interface CreateAgentflowLifecycleRunInput {
   id: string;
   workflow: AgentflowWorkflow;
+  inputs?: Record<string, AgentflowRunStateValue>;
 }
 
 export function createAgentflowLifecycleRun(
@@ -31,7 +32,7 @@ export function createAgentflowLifecycleRun(
   const existing = store.getRun(input.id);
 
   if (existing !== null) {
-    if (!matchesWorkflow(existing, input.workflow)) {
+    if (!matchesWorkflow(existing, input.workflow, input.inputs ?? {})) {
       throw new AgentflowRunStateError(
         `Agentflow run ${input.id} already exists for ${existing.workflowName} version ${existing.workflowVersion}. Choose a different run ID.`,
         "AGENTFLOW_RUN_COLLISION"
@@ -55,13 +56,14 @@ export function createAgentflowLifecycleRun(
         style: input.workflow.style,
         maturity: input.workflow.maturity
       },
-      context: { workflow: input.workflow as unknown as AgentflowRunStateValue }
+      context: { workflow: input.workflow as unknown as AgentflowRunStateValue },
+      inputs: input.inputs
     }, { type: "run.created", payload: { status: "pending" } });
     return { changed: true, run };
   } catch (error) {
     if (error instanceof AgentflowRunStateError && error.code === "AGENTFLOW_RUN_COLLISION") {
       const raced = store.getRun(input.id);
-      if (raced !== null && raced.status === "pending" && matchesWorkflow(raced, input.workflow)) {
+      if (raced !== null && raced.status === "pending" && matchesWorkflow(raced, input.workflow, input.inputs ?? {})) {
         return { changed: false, run: raced };
       }
     }
@@ -115,10 +117,15 @@ function transitionRule(
   );
 }
 
-function matchesWorkflow(run: AgentflowRunRecord, workflow: AgentflowWorkflow): boolean {
+function matchesWorkflow(
+  run: AgentflowRunRecord,
+  workflow: AgentflowWorkflow,
+  inputs: Record<string, AgentflowRunStateValue>
+): boolean {
   return run.workflowName === workflow.name
     && run.workflowVersion === workflow.version
     && run.workflowStyle === workflow.style
     && run.workflowMaturity === workflow.maturity
-    && isDeepStrictEqual(run.context.workflow, workflow);
+    && isDeepStrictEqual(run.context.workflow, workflow)
+    && isDeepStrictEqual(run.inputs, inputs);
 }

@@ -61,7 +61,7 @@ steps:
     outputs:
       - implementation-summary.md
     on_failure:
-      then: return_unresolved
+      then: pause
     then: return_remediated
 
   - id: ask_user
@@ -82,4 +82,3 @@ steps:
 limits:
   max_frontier_calls: 2
   max_duration_minutes: 45
-

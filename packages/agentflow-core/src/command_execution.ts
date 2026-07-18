@@ -21,6 +21,13 @@ import {
   MAX_AGENTFLOW_COMMAND_RETRIES,
   MAX_AGENTFLOW_COMMAND_TIMEOUT_SECONDS
 } from "./validation";
+import {
+  AgentflowSessionProviderRegistry,
+  AgentflowSessionPolicyError,
+  AgentflowSessionRequestInterruptedError,
+  createAgentflowSessionProviderRegistry,
+  executeAgentflowSessionRequest
+} from "./session_request";
 
 const MAX_CAPTURE_BYTES = 10 * 1024 * 1024;
 
@@ -51,7 +58,8 @@ export async function executeAgentflowCommandPipeline(
   store: AgentflowRunStateStore,
   runId: string,
   workflow: AgentflowWorkflow,
-  transforms: AgentflowArtifactTransformRegistry = createAgentflowArtifactTransformRegistry()
+  transforms: AgentflowArtifactTransformRegistry = createAgentflowArtifactTransformRegistry(),
+  sessionProviders: AgentflowSessionProviderRegistry = createAgentflowSessionProviderRegistry()
 ): Promise<AgentflowCommandPipelineResult> {
   const existing = store.getRun(runId);
   if (existing === null) throw new Error(`Agentflow run ${runId} was not found.`);
@@ -107,11 +115,125 @@ export async function executeAgentflowCommandPipeline(
         message: failure
       }, failureStatus(step));
     }
+    if (typeof step.type === "string" && step.type.trim() === "session_request") {
+      const preflightError = validateSessionRequestStep(step);
+      if (preflightError !== undefined) {
+        const sessionId = typeof step.session === "string" && step.session.trim().length > 0
+          ? step.session.trim()
+          : undefined;
+        persistSessionRequestFailure(store, runId, stepId, sessionId, preflightError, false, true);
+        return finishFailure(store, runId, completedSteps, stepId, {
+          exitCode: null,
+          timedOut: false,
+          message: preflightError
+        }, "failed");
+      }
+      const retries = failureRetries(step);
+      let failure: string | undefined;
+      for (let attempt = 1; attempt <= retries + 1; attempt += 1) {
+        const stopped = activeStopStatus(store, runId);
+        if (stopped !== undefined) return stoppedPipelineResult(store, runId, completedSteps)!;
+        store.updateRun(runId, { currentStepId: stepId, error: null });
+        const sessionId = (step.session as string).trim();
+        const input = {
+          attempt,
+          session: sessionId,
+          prompt: step.prompt as string,
+          inputs: step.inputs as AgentflowRunStateValue,
+          outputs: step.outputs as AgentflowRunStateValue
+        };
+        store.upsertStep({ runId, stepId, attempt, sessionId, status: "running", input });
+        store.appendRunEvent(runId, { type: "step.started", stepId, payload: input });
+        try {
+          const result = await executeAgentflowSessionRequest(store, runId, workflow, step, sessionProviders, {
+            stopStatus: () => activeStopStatus(store, runId),
+            beforePublish: () => {
+              const status = activeStopStatus(store, runId);
+              if (status !== undefined) throw new AgentflowSessionRequestInterruptedError(status);
+            }
+          });
+          const output = {
+            attempt,
+            session: result.sessionId,
+            provider: result.provider,
+            requestArtifact: result.requestArtifact.declaredPath,
+            outputs: result.outputArtifacts.map((artifact) => artifact.declaredPath),
+            externalSessionId: result.externalSessionId ?? null
+          };
+          store.upsertStep({ runId, stepId, attempt, sessionId, status: "completed", output });
+          store.appendRunEvent(runId, { type: "step.completed", stepId, payload: output });
+          completedSteps.push(stepId);
+          failure = undefined;
+          break;
+        } catch (error) {
+          if (error instanceof AgentflowSessionRequestInterruptedError) {
+            const output = { attempt, status: error.status };
+            persistSessionRequestInterruption(store, runId, workflow, stepId, sessionId, error.status);
+            store.upsertStep({ runId, stepId, attempt, sessionId, status: error.status, output });
+            store.appendRunEvent(runId, { type: "step.interrupted", stepId, payload: output });
+            return stoppedPipelineResult(store, runId, completedSteps)!;
+          }
+          if (error instanceof AgentflowSessionPolicyError) {
+            failure = error.message;
+            persistSessionRequestFailure(store, runId, stepId, sessionId, failure, false, true, attempt);
+            return finishFailure(store, runId, completedSteps, stepId, {
+              exitCode: null,
+              timedOut: false,
+              message: failure
+            }, error.status === "pause" ? "paused" : "failed");
+          }
+          if (error instanceof AgentflowRunStateError && error.code === "AGENTFLOW_ARTIFACT_RUN_STATUS") {
+            const status = activeStopStatus(store, runId);
+            if (status !== undefined) {
+              const output = { attempt, status };
+              persistSessionRequestInterruption(store, runId, workflow, stepId, sessionId, status);
+              store.upsertStep({ runId, stepId, attempt, sessionId, status, output });
+              store.appendRunEvent(runId, { type: "step.interrupted", stepId, payload: output });
+              return stoppedPipelineResult(store, runId, completedSteps)!;
+            }
+          }
+          const stopped = activeStopStatus(store, runId);
+          if (stopped !== undefined) {
+            const output = { attempt, status: stopped };
+            persistSessionRequestInterruption(store, runId, workflow, stepId, sessionId, stopped);
+            store.upsertStep({ runId, stepId, attempt, sessionId, status: stopped, output });
+            store.appendRunEvent(runId, { type: "step.interrupted", stepId, payload: output });
+            return stoppedPipelineResult(store, runId, completedSteps)!;
+          }
+          if (error instanceof AgentflowRunStateError && error.code === "AGENTFLOW_SESSION_ACTIVE") {
+            throw error;
+          }
+          failure = error instanceof Error ? error.message : String(error);
+          const sessionDefinition = mapping(workflow.sessions?.[sessionId]);
+          const provider = typeof sessionDefinition?.provider === "string" ? sessionDefinition.provider.trim() : "unknown";
+          const previousSession = store.getSession(runId, sessionId);
+          store.upsertSession({
+            id: sessionId,
+            runId,
+            stepId,
+            provider,
+            status: "paused",
+            ...(previousSession?.externalSessionId === null || previousSession?.externalSessionId === undefined
+              ? {}
+              : { externalSessionId: previousSession.externalSessionId }),
+            state: { resume: sessionDefinition?.resume === true, lastStepId: stepId, error: failure }
+          });
+          persistSessionRequestFailure(store, runId, stepId, sessionId, failure, attempt <= retries, false, attempt);
+        }
+      }
+      if (failure === undefined) continue;
+      if (failureContinues(step)) continue;
+      return finishFailure(store, runId, completedSteps, stepId, {
+        exitCode: null,
+        timedOut: false,
+        message: failure
+      }, failureStatus(step));
+    }
     if (step.type !== "command") {
       return finishFailure(store, runId, completedSteps, stepId, {
         exitCode: null,
         timedOut: false,
-        message: `Step ${stepId} has unsupported type ${String(step.type)}; only command and artifact_transform steps can execute in this runtime phase.`
+        message: `Step ${stepId} has unsupported type ${String(step.type)}; only command, artifact_transform, and session_request steps can execute in this runtime phase.`
       }, "paused");
     }
 
@@ -216,6 +338,30 @@ export async function executeAgentflowCommandPipeline(
     event: { type: "run.completed", payload: { completedSteps } }
   });
   return { status: "completed", completedSteps };
+}
+
+function persistSessionRequestInterruption(
+  store: AgentflowRunStateStore,
+  runId: string,
+  workflow: AgentflowWorkflow,
+  stepId: string,
+  sessionId: string,
+  status: "paused" | "cancelled"
+): void {
+  const previousSession = store.getSession(runId, sessionId);
+  const sessionDefinition = mapping(workflow.sessions?.[sessionId]);
+  const provider = typeof sessionDefinition?.provider === "string" ? sessionDefinition.provider.trim() : "unknown";
+  store.upsertSession({
+    id: sessionId,
+    runId,
+    stepId,
+    provider,
+    status,
+    ...(previousSession?.externalSessionId === null || previousSession?.externalSessionId === undefined
+      ? {}
+      : { externalSessionId: previousSession.externalSessionId }),
+    state: { resume: sessionDefinition?.resume === true, lastStepId: stepId, interrupted: status }
+  });
 }
 
 function executeTransformStep(
@@ -556,6 +702,36 @@ function validateTransformStep(step: AgentflowWorkflowStep): string | undefined 
   return undefined;
 }
 
+function validateSessionRequestStep(step: AgentflowWorkflowStep): string | undefined {
+  if (typeof step.session !== "string" || step.session.trim().length === 0
+      || typeof step.prompt !== "string" || step.prompt.trim().length === 0
+      || !nonEmptyStringArray(step.inputs) || !nonEmptyStringArray(step.outputs)) {
+    return "Session request requires a non-empty session, prompt, inputs list, and outputs list.";
+  }
+  const onFailure = mapping(step.on_failure);
+  const retry = onFailure?.retry;
+  if (retry !== undefined &&
+      (!Number.isSafeInteger(retry) || Number(retry) < 0 || Number(retry) > MAX_AGENTFLOW_COMMAND_RETRIES)) {
+    return `Session request on_failure.retry must be an integer from 0 through ${MAX_AGENTFLOW_COMMAND_RETRIES}.`;
+  }
+  if (["continue", "ignore"].includes(normalizedFailureThen(onFailure) ?? "") && onFailure?.allowed !== true) {
+    return "Session request failures may continue or be ignored only when on_failure.allowed is true.";
+  }
+  if (onFailure !== undefined) {
+    const then = normalizedFailureThen(onFailure);
+    if ((then !== undefined && !["continue", "ignore", "fail", "pause"].includes(then))
+        || ["goto", "route_to", "on_remediated", "on_unresolved", "return_to"].some((field) => onFailure[field] !== undefined)) {
+      return "Session request runtime supports only retry and then: continue, ignore, fail, or pause.";
+    }
+  }
+  return undefined;
+}
+
+function nonEmptyStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.length > 0
+    && value.every((entry) => typeof entry === "string" && entry.trim().length > 0);
+}
+
 function policyFailure(status: "pause" | "fail", message: string): CommandPreflightFailure {
   return { status: status === "pause" ? "paused" : "failed", message };
 }
@@ -598,6 +774,31 @@ function persistTransformPreflightFailure(
     payload: error
   });
   store.appendRunEvent(runId, { type: "step.rejected", stepId, payload: error });
+}
+
+function persistSessionRequestFailure(
+  store: AgentflowRunStateStore,
+  runId: string,
+  stepId: string,
+  sessionId: string | undefined,
+  message: string,
+  retryable: boolean,
+  rejected: boolean,
+  attempt = 1
+): void {
+  const error = { attempt, message };
+  store.upsertStep({ runId, stepId, attempt, ...(sessionId === undefined ? {} : { sessionId }), status: "failed", error });
+  store.recordFailure({
+    id: `session-request:${safeId(stepId)}:attempt-${attempt}`,
+    runId,
+    stepId,
+    ...(sessionId === undefined ? {} : { sessionId }),
+    classification: rejected ? "session_request_policy" : "session_request_failure",
+    message,
+    retryable,
+    payload: error
+  });
+  store.appendRunEvent(runId, { type: rejected ? "step.rejected" : "step.failed", stepId, payload: error });
 }
 
 function resolveOutputPath(repoRoot: string, declaredPath: string): string | undefined {

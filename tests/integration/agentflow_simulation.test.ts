@@ -114,18 +114,14 @@ sessions:
     const result = simulateAgentflowWorkflow(workflow, { steps: { inspect: {} } });
     const summary = renderAgentflowSimulationSummary(result);
 
-    expect(result.status).toBe("unresolved");
+    expect(result.status).toBe("paused");
     expect(result.missingArtifacts).toEqual([
-      { stepId: "inspect", artifact: "missing.json", kind: "input" },
-      { stepId: "inspect", artifact: "result.json", kind: "output" }
+      { stepId: "inspect", artifact: "missing.json", kind: "input" }
     ]);
-    expect(result.unresolvedBranches).toEqual([
-      { stepId: "route", reason: "Fixture does not select a condition target." }
-    ]);
-    expect(result.visitedSteps.map((step) => step.id)).toEqual(["inspect", "route"]);
-    expect(summary).toContain("Status: unresolved");
+    expect(result.unresolvedBranches).toEqual([]);
+    expect(result.visitedSteps).toEqual([{ id: "inspect", type: "session_request", outcome: "failed" }]);
+    expect(summary).toContain("Status: paused");
     expect(summary).toContain("inspect: missing input artifact missing.json");
-    expect(summary).toContain("route: Fixture does not select a condition target.");
   });
 
   test("requires declared workflow inputs and permits fixture-selected condition fallthrough", () => {

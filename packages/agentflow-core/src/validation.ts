@@ -1,3 +1,4 @@
+import path from "node:path";
 import type {
   AgentflowWorkflow,
   AgentflowWorkflowStep,
@@ -7,6 +8,7 @@ import type {
 import { validateAgentflowPolicyPrimitives } from "./policy";
 import { policyGlobLayersHaveWritablePath } from "./policy_utils";
 import { normalizeAgentflowArtifactPath } from "./run_state";
+import { MAX_AGENTFLOW_SESSION_INPUTS } from "./session_request";
 
 export const MAX_AGENTFLOW_COMMAND_TIMEOUT_SECONDS = 2_147_483.647;
 
@@ -81,7 +83,7 @@ const STEP_REQUIREMENTS: Readonly<Record<string, ReadonlyArray<readonly [string,
   mcp_call: [["server", "string"], ["tool", "string"]],
   result: [["status", "string"]],
   review: [["reviewer", "string"], ["subject", "string"], ["artifacts", "array"]],
-  session_request: [["session", "string"], ["prompt", "string"]],
+  session_request: [["session", "string"], ["prompt", "string"], ["inputs", "array"], ["outputs", "array"]],
   workflow: [["workflow", "string"]]
 };
 
@@ -188,6 +190,22 @@ function validateSessionDefinitions(workflow: AgentflowWorkflow, errors: Agentfl
           code: "workflow.session.provider.required",
           message: `Session "${name}" must declare a non-empty provider.`,
           path: `sessions.${name}.provider`
+        });
+      }
+
+      if (typeof value.provider === "string" && isDynamicReference(value.provider)) {
+        errors.push({
+          code: "workflow.session.provider.dynamic",
+          message: `Session "${name}" must declare a static provider so its adapter can be selected before execution.`,
+          path: `sessions.${name}.provider`
+        });
+      }
+
+      if (value.resume !== undefined && typeof value.resume !== "boolean") {
+        errors.push({
+          code: "workflow.session.resume.invalid",
+          message: `Session "${name}" resume setting must be a boolean.`,
+          path: `sessions.${name}.resume`
         });
       }
 
@@ -315,9 +333,13 @@ function validateRequiredStepFields(context: StepContext, errors: AgentflowWorkf
     );
   }
 
-  if ((context.type === "command" || context.type === "artifact_transform") && isRecord(context.step.on_failure)) {
-    const failureLabel = context.type === "command" ? "Command" : "Artifact transform";
-    const failureCode = context.type === "command" ? "workflow.command" : "workflow.artifact_transform";
+  if ((context.type === "command" || context.type === "artifact_transform" || context.type === "session_request") && isRecord(context.step.on_failure)) {
+    const failureLabel = context.type === "command"
+      ? "Command"
+      : context.type === "artifact_transform" ? "Artifact transform" : "Session request";
+    const failureCode = context.type === "command"
+      ? "workflow.command"
+      : context.type === "artifact_transform" ? "workflow.artifact_transform" : "workflow.session_request";
     const retry = context.step.on_failure.retry;
     const failureThen = typeof context.step.on_failure.then === "string"
       ? context.step.on_failure.then.trim()
@@ -340,15 +362,15 @@ function validateRequiredStepFields(context: StepContext, errors: AgentflowWorkf
         `${failureLabel} failures may continue or be ignored only when on_failure.allowed is true.`
       );
     }
-    if (context.type === "artifact_transform") {
+    if (context.type === "artifact_transform" || context.type === "session_request") {
       const unsupportedTarget = unsupportedTransformFailureTarget(context.step.on_failure);
       if (unsupportedTarget !== undefined) {
         addStepIssue(
           errors,
           context,
-          "workflow.artifact_transform.target.unsupported",
+          `${failureCode}.target.unsupported`,
           `on_failure.${unsupportedTarget}`,
-          "Artifact transform runtime supports only retry and then: continue, ignore, fail, or pause."
+          `${failureLabel} runtime supports only retry and then: continue, ignore, fail, or pause.`
         );
       }
     }
@@ -609,6 +631,19 @@ function validateSessionReferences(
       }
     }
 
+    if (context.type === "session_request") {
+      const session = nonEmptyString(context.step.session);
+      if (session !== undefined && isDynamicReference(session)) {
+        addStepIssue(
+          errors,
+          context,
+          "workflow.session_request.session.dynamic",
+          "session",
+          "Session request steps must use a declared static session so provider and resume settings are inspectable."
+        );
+      }
+    }
+
     visitValue(context.step.on_failure, `${context.path}.on_failure`, (value, path, key) => {
       if (key === "session" && typeof value === "string" && !isDynamicReference(value) && !sessions.has(value)) {
         errors.push({
@@ -846,6 +881,78 @@ function validateArtifactOutputs(
 
 function validateArtifactPaths(contexts: StepContext[], errors: AgentflowWorkflowIssue[]): void {
   for (const context of contexts) {
+    if (context.type === "session_request") {
+      const prompt = nonEmptyString(context.step.prompt);
+      const normalizedPrompt = prompt === undefined ? undefined : path.posix.normalize(prompt);
+      if (prompt !== undefined && (prompt.includes("{{") || prompt.includes("}}") || prompt.includes("\\")
+          || path.posix.isAbsolute(prompt) || path.win32.isAbsolute(prompt)
+          || normalizedPrompt !== prompt || normalizedPrompt === "." || normalizedPrompt === ".."
+          || normalizedPrompt.startsWith("../") || prompt.endsWith("/"))) {
+        addStepIssue(
+          errors,
+          context,
+          "workflow.session_request.prompt.invalid",
+          "prompt",
+          `Session request prompt "${prompt}" must be a normalized repo-relative file path.`
+        );
+      }
+      for (const field of ["inputs", "outputs"] as const) {
+        const seen = new Set<string>();
+        const values = stringList(context.step[field]);
+        if (field === "inputs" && values.length > MAX_AGENTFLOW_SESSION_INPUTS) {
+          addStepIssue(
+            errors,
+            context,
+            "workflow.session_request.inputs.limit",
+            field,
+            `Session requests may declare at most ${MAX_AGENTFLOW_SESSION_INPUTS} input artifacts.`
+          );
+        }
+        for (const [index, value] of values.entries()) {
+          const normalizedReference = value.trim();
+          if (field === "inputs" && isSessionInputReference(normalizedReference)) {
+            if (seen.has(normalizedReference)) {
+              addStepIssue(
+                errors,
+                context,
+                "workflow.session_request.artifact.duplicate",
+                `${field}[${index}]`,
+                `Session request ${field} must not contain duplicate artifact path "${normalizedReference}".`
+              );
+            }
+            seen.add(normalizedReference);
+            continue;
+          }
+          let normalizedValue: string;
+          try {
+            normalizedValue = normalizeAgentflowArtifactPath(value);
+          } catch {
+            normalizedValue = "";
+          }
+          if (value.includes("{{") || value.includes("}}") || normalizedValue.length === 0 || normalizedValue !== value.trim()) {
+            addStepIssue(
+              errors,
+              context,
+              "workflow.session_request.artifact.invalid",
+              `${field}[${index}]`,
+              `Session request ${field.slice(0, -1)} "${value}" must be a normalized repo-relative artifact path.`
+            );
+            continue;
+          }
+          if (seen.has(normalizedValue)) {
+            addStepIssue(
+              errors,
+              context,
+              "workflow.session_request.artifact.duplicate",
+              `${field}[${index}]`,
+              `Session request ${field} must not contain duplicate artifact path "${normalizedValue}".`
+            );
+          }
+          seen.add(normalizedValue);
+        }
+      }
+      continue;
+    }
     if (context.type !== "artifact_transform") continue;
     for (const field of ["input", "output"] as const) {
       const value = nonEmptyString(context.step[field]);
@@ -2705,6 +2812,10 @@ function isDynamicReference(value: string): boolean {
   }
 
   return sawReference && openingEnd === undefined;
+}
+
+function isSessionInputReference(value: string): boolean {
+  return /^\{\{\s*inputs\.[A-Za-z0-9_-]+\s*}}$/.test(value);
 }
 
 function isRecord(value: unknown): value is AgentflowYamlMapping {

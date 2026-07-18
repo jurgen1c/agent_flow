@@ -70,6 +70,10 @@ steps:
     type: session_request
     session: fm
     prompt: prompts/implement.md
+    inputs:
+      - ticket.json
+    outputs:
+      - implementation-summary.md
 
   - id: ci
     type: command
@@ -277,4 +281,3 @@ Recovery validation should enforce:
 - Failure routes do not create unbounded cycles.
 - Model sessions used for remediation are defined.
 - User escalation exists for unresolved failures.
-
