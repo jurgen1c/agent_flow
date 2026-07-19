@@ -59,6 +59,18 @@ export {
   executeAgentflowSessionRequest
 } from "./session_request";
 export {
+  AgentflowMcpCallError,
+  AgentflowMcpCallInterruptedError,
+  AgentflowMcpCallRegistry,
+  MAX_AGENTFLOW_MCP_METADATA_BYTES,
+  MAX_AGENTFLOW_MCP_ARGUMENT_BYTES,
+  MAX_AGENTFLOW_MCP_CONTENT_TYPE_BYTES,
+  MAX_AGENTFLOW_MCP_OUTPUT_BYTES,
+  createAgentflowFixtureMcpAdapter,
+  createAgentflowMcpCallRegistry,
+  executeAgentflowMcpCall
+} from "./mcp_call";
+export {
   evaluateAgentflowPolicy,
   validateAgentflowPolicyPrimitives
 } from "./policy";
@@ -118,6 +130,13 @@ export type {
   AgentflowSessionRequestExecutionResult,
   ExecuteAgentflowSessionRequestOptions
 } from "./session_request";
+export type {
+  AgentflowMcpCallAdapter,
+  AgentflowMcpCallExecutionResult,
+  AgentflowMcpCallRequest,
+  AgentflowMcpCallResponse,
+  ExecuteAgentflowMcpCallOptions
+} from "./mcp_call";
 export type {
   AgentflowPolicyDecision,
   AgentflowPolicyIssue,

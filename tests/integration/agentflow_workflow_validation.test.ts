@@ -1748,8 +1748,10 @@ steps:
     tool: schedule
     arguments:
       then: tomorrow
+    outputs: [event.json]
     on_failure:
       then: ignore
+      allowed: true
 `);
 
     expect(validateAgentflowWorkflow(workflow)).toEqual({ valid: true, errors: [] });

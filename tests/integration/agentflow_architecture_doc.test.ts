@@ -51,7 +51,7 @@ describe("Agentflow monorepo architecture doc", () => {
     for (const status of ["available", "missing", "stale", "overwritten"]) {
       expect(doc).toContain(`\`${status}\``);
     }
-    expect(doc).toContain("version 2 migrates version-1 artifact metadata in place");
+    expect(doc).toContain("version 3 migrates earlier artifact metadata in place");
     expect(doc).toContain("terminal runs are excluded from resume lookup");
     expect(doc).toContain(".agentflow/");
     expect(doc).toContain("The existing CLI remains the compatibility anchor");

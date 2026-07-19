@@ -1,7 +1,7 @@
 # Agentflow Monorepo Architecture
 
-Status: implemented workspace shell, run persistence foundation, Agent Memory context adapter, and deterministic artifact transforms
-Ticket: AM-6, AM-7, AM-9, AM-18, AM-19, AM-21, AM-22, AM-24
+Status: implemented workspace shell, run persistence foundation, Agent Memory context adapter, deterministic artifact transforms, session requests, and MCP call contracts
+Ticket: AM-6, AM-7, AM-9, AM-18, AM-19, AM-21, AM-22, AM-24, AM-25, AM-26
 
 ## Intent
 
@@ -187,8 +187,10 @@ The root `@jurgen1c/agent-memory-cli` package still includes the compatibility
 
 The `agentflow` built executable currently supports help, version, deterministic
 workflow validation, read-only workflow linting, workflow explanation,
-deterministic graph inspection, fixture-backed workflow simulation, command and
-artifact-transform pipeline execution, and the persistent run lifecycle. `run
+deterministic graph inspection, fixture-backed workflow simulation, command,
+artifact-transform, and fixture-backed session-request pipeline execution, and
+the persistent run lifecycle. The core pipeline also executes MCP calls when a
+caller explicitly supplies a server adapter. `run
 <workflow> --id <run-id>` creates or idempotently reopens a pending run and
 executes supported steps in sequence. Each command attempt records its status,
 exit code, timeout result, ordered events, captured stdout/stderr log artifacts,
@@ -214,11 +216,23 @@ the same registry and exposes derived artifact values, so
 `agentflow-examples/workflows/jira-ticket-spec.yml` can produce `ticket.md`
 without calling Jira or executing free-form scripts.
 
+`mcp_call` steps declare a static server and tool, a JSON-compatible arguments
+mapping, and one or more normalized artifact outputs. Runtime integrations are
+registered behind a server adapter boundary; the core package never discovers
+or invokes MCP servers implicitly. Persisted run inputs resolve argument
+references before adapter invocation. Adapter responses must return exactly the
+declared outputs, with a 10 MiB aggregate bound, and optional bounded metadata.
+The request metadata and all returned artifacts publish as one atomic batch, so
+missing outputs, undeclared outputs, collisions, interruption, and invalid
+metadata cannot leave a partial MCP result. Fixture simulation enforces the
+same exact-output and overwrite contract without invoking an adapter, which
+keeps `jira-ticket-spec.yml` deterministic and network-free in tests.
+
 `status`, `logs`, `artifacts`, `pause`, `resume`, and `cancel` inspect or
 transition runs through the repo-local SQLite store. Lifecycle changes survive
-process restart. Resuming step execution and non-command step runners remain
-future phases; `resume` currently persists the lifecycle transition and exits
-with an actionable message without executing additional steps. Commands such as
+process restart. Resuming step execution and other step runners remain future
+phases; `resume` currently persists the lifecycle transition and exits with an
+actionable message without executing additional steps. Commands such as
 `cleanup` remain reserved placeholders until their runtime adapters are
 implemented. The core persistence
 surface now initializes repo-local `.agentflow/agentflow.sqlite` state and
@@ -226,7 +240,7 @@ provides typed create, update, resume-lookup, step, artifact, event, session,
 failure, approval, and budget writes for later runtime phases. Its event log
 provides deterministic sequence-ordered reads, and its artifact registry owns
 safe run-scoped content writes plus restart-safe metadata/status reads. Schema
-version 2 migrates version-1 artifact metadata in place.
+version 3 migrates earlier artifact metadata in place and adds monotonic artifact generations.
 
 The phase-1 authoring boundary exposes parsing, validation, and linting from
 `@jurgen1c/agentflow-core`. Validation returns stable issue codes for structure,
@@ -243,8 +257,8 @@ outcomes, declared outputs, condition targets, manual-gate choices, loop
 iteration counts, and input-request values. The simulator traverses those
 contracts in memory and reports visited steps, available and missing artifacts,
 unresolved branches, and terminal states. It does not run commands, model
-sessions, nested workflows, or MCP calls, and it never writes workflow, fixture,
-artifact, or run-state files.
+sessions, nested workflows, or live MCP adapters, and it never writes workflow,
+fixture, artifact, or run-state files.
 
 The policy boundary validates positive workflow budgets, bounded frontier
 model use, model-provider allowlists, approval requirements, file scopes,

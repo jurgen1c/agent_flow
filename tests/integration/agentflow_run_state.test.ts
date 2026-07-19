@@ -1023,7 +1023,7 @@ describe("Agentflow run-state SQLite store", () => {
     store.close();
 
     const legacy = new Database(path.join(repoRoot, ".agentflow/agentflow.sqlite"));
-    for (const column of ["checked_at", "written_at", "previous_checksum", "status"]) {
+    for (const column of ["generation", "checked_at", "written_at", "previous_checksum", "status"]) {
       legacy.exec(`ALTER TABLE artifacts DROP COLUMN ${column}`);
     }
     legacy.query("UPDATE run_state_metadata SET value = '1' WHERE key = 'schema_version'").run();
@@ -1050,7 +1050,7 @@ describe("Agentflow run-state SQLite store", () => {
       writtenAt: null
     });
     const migrated = new Database(store.databasePath, { readonly: true });
-    expect(migrated.query("SELECT value FROM run_state_metadata WHERE key = 'schema_version'").get()).toEqual({ value: "2" });
+    expect(migrated.query("SELECT value FROM run_state_metadata WHERE key = 'schema_version'").get()).toEqual({ value: "3" });
     migrated.close();
     store.close();
 
@@ -1069,6 +1069,28 @@ describe("Agentflow run-state SQLite store", () => {
     store.close();
     writer.exec("ROLLBACK");
     writer.close();
+  });
+
+  test("repairs a damaged version-two schema before migrating it", async () => {
+    const repoRoot = temporaryRepo();
+    let store = await openAgentflowRunState({ cwd: repoRoot });
+    store.close();
+    const databasePath = path.join(repoRoot, ".agentflow/agentflow.sqlite");
+    const damaged = new Database(databasePath);
+    damaged.exec("DROP TABLE artifacts");
+    damaged.query("UPDATE run_state_metadata SET value = '2' WHERE key = 'schema_version'").run();
+    damaged.close();
+
+    store = await openAgentflowRunState({ cwd: repoRoot });
+
+    expect(store.getRun("missing")).toBeNull();
+    const repaired = new Database(databasePath, { readonly: true });
+    expect(repaired.query("SELECT value FROM run_state_metadata WHERE key = 'schema_version'").get())
+      .toEqual({ value: "3" });
+    expect(repaired.query("SELECT name FROM pragma_table_info('artifacts') WHERE name = 'generation'").get())
+      .toEqual({ name: "generation" });
+    repaired.close();
+    store.close();
   });
 
   test("rejects invalid SQLite options before creating generated state", async () => {

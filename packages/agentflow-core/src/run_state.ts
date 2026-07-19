@@ -7,7 +7,7 @@ import {
   initializeAgentflowRunStateSchema
 } from "./run_state_schema";
 
-export const AGENTFLOW_RUN_STATE_SCHEMA_VERSION = 2;
+export const AGENTFLOW_RUN_STATE_SCHEMA_VERSION = 3;
 export const DEFAULT_AGENTFLOW_DATABASE_PATH = ".agentflow/agentflow.sqlite";
 
 export type AgentflowRunStatus = "pending" | "running" | "waiting" | "paused" | "completed" | "failed" | "cancelled";
@@ -102,6 +102,19 @@ export interface WriteAgentflowArtifactInput extends Omit<UpsertAgentflowArtifac
   overwrite?: boolean;
   requiredRunStatus?: AgentflowRunStatus;
   requiredArtifacts?: Array<{ path: string; checksum: string }>;
+  requiredCurrentArtifact?: {
+    artifact: null | {
+      id: string;
+      producerStepId: string | null;
+      kind: string;
+      contentType: string;
+      checksum: string | null;
+      generation: number;
+      metadata: Record<string, AgentflowRunStateValue>;
+    };
+    backingExists: boolean;
+    backingChecksum: string | null;
+  };
 }
 
 export interface AgentflowArtifactRecord {
@@ -115,6 +128,7 @@ export interface AgentflowArtifactRecord {
   status: AgentflowArtifactStatus;
   checksum: string | null;
   previousChecksum: string | null;
+  generation: number;
   sizeBytes: number | null;
   metadata: Record<string, AgentflowRunStateValue>;
   createdAt: string;
@@ -253,6 +267,7 @@ interface ArtifactRow {
   updated_at: string;
   written_at: string | null;
   checked_at: string | null;
+  generation: number;
 }
 
 interface EventRow {
@@ -610,7 +625,8 @@ export class AgentflowRunStateStore {
           ELSE artifacts.size_bytes
         END,
         metadata_json = excluded.metadata_json,
-        updated_at = excluded.updated_at`, [
+        updated_at = excluded.updated_at,
+        generation = artifacts.generation + 1`, [
         runId,
         id,
         optionalString(input.stepId, "Step ID"),
@@ -690,6 +706,33 @@ export class AgentflowRunStateStore {
       }
       const existing = this.database.get<ArtifactRow>("SELECT * FROM artifacts WHERE run_id = ? AND id = ?", [runId, id]);
       const pathOwner = this.database.get<ArtifactRow>("SELECT * FROM artifacts WHERE run_id = ? AND path = ?", [runId, declaredPath]);
+      if (input.requiredCurrentArtifact !== undefined) {
+        const required = input.requiredCurrentArtifact;
+        const requiredArtifact = required?.artifact;
+        const currentBackingExists = artifactTargetExists(target);
+        const currentBackingChecksum = currentBackingExists ? artifactChecksum(target) : null;
+        const rowMatches = requiredArtifact === null
+          ? pathOwner === null
+          : requiredArtifact !== undefined
+            && pathOwner !== null
+            && pathOwner.id === requiredArtifact.id
+            && pathOwner.step_id === requiredArtifact.producerStepId
+            && pathOwner.kind === requiredArtifact.kind
+            && pathOwner.content_type === requiredArtifact.contentType
+            && pathOwner.checksum === requiredArtifact.checksum
+            && pathOwner.generation === requiredArtifact.generation
+            && stableJson(JSON.parse(pathOwner.metadata_json)) === stableJson(requiredArtifact.metadata);
+        const currentMatches = required !== undefined
+          && rowMatches
+          && currentBackingExists === required.backingExists
+          && currentBackingChecksum === required.backingChecksum;
+        if (!currentMatches) {
+          throw new AgentflowRunStateError(
+            `Artifact ${declaredPath} changed ownership before it could be published.`,
+            "AGENTFLOW_ARTIFACT_STALE"
+          );
+        }
+      }
       if (pathOwner !== null && pathOwner.id !== id) {
         throw new AgentflowRunStateError(
           `Artifact path ${declaredPath} is already registered as ${pathOwner.id} for run ${runId}.`,
@@ -746,7 +789,8 @@ export class AgentflowRunStateStore {
         metadata_json = excluded.metadata_json,
         updated_at = excluded.updated_at,
         written_at = excluded.written_at,
-        checked_at = excluded.checked_at`, [
+        checked_at = excluded.checked_at,
+        generation = artifacts.generation + 1`, [
         runId,
         id,
         stepId,
@@ -869,10 +913,11 @@ export class AgentflowRunStateStore {
           const row = snapshot.row;
           this.database.run(`INSERT INTO artifacts (
             run_id, id, step_id, path, kind, content_type, checksum, size_bytes, status, previous_checksum,
-            metadata_json, created_at, updated_at, written_at, checked_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+            metadata_json, created_at, updated_at, written_at, checked_at, generation
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
             row.run_id, row.id, row.step_id, row.path, row.kind, row.content_type, row.checksum, row.size_bytes,
-            row.status, row.previous_checksum, row.metadata_json, row.created_at, row.updated_at, row.written_at, row.checked_at
+            row.status, row.previous_checksum, row.metadata_json, row.created_at, row.updated_at, row.written_at, row.checked_at,
+            row.generation
           ]);
         }
       }
@@ -904,6 +949,49 @@ export class AgentflowRunStateStore {
       [normalizedRunId, normalizedPath]
     );
     return row === null ? null : this.inspectArtifact(row);
+  }
+
+  getArtifactById(runId: string, artifactId: string): AgentflowArtifactRecord | null {
+    this.assertOpen();
+    const normalizedRunId = artifactRunId(runId);
+    this.requireRun(normalizedRunId);
+    const normalizedId = requiredString(artifactId, "Artifact ID");
+    const row = this.database.get<ArtifactRow>(
+      "SELECT * FROM artifacts WHERE run_id = ? AND id = ?",
+      [normalizedRunId, normalizedId]
+    );
+    return row === null ? null : this.inspectArtifact(row);
+  }
+
+  getArtifactBackingSnapshot(runId: string, declaredPath: string): { exists: boolean; checksum: string | null } {
+    this.assertOpen();
+    const normalizedRunId = artifactRunId(runId);
+    this.requireRun(normalizedRunId);
+    const normalizedPath = normalizeAgentflowArtifactPath(declaredPath);
+    const target = artifactStoragePath(this.repoRoot, normalizedRunId, normalizedPath, false);
+    const exists = artifactTargetExists(target);
+    return { exists, checksum: exists ? artifactChecksum(target) : null };
+  }
+
+  recoverArtifactBacking(runId: string, declaredPath: string): void {
+    this.assertOpen();
+    const normalizedRunId = artifactRunId(runId);
+    this.requireRun(normalizedRunId);
+    const normalizedPath = normalizeAgentflowArtifactPath(declaredPath);
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.database.get<Pick<ArtifactRow, "checksum">>(
+        "SELECT checksum FROM artifacts WHERE run_id = ? AND path = ?",
+        [normalizedRunId, normalizedPath]
+      );
+      const target = artifactStoragePath(this.repoRoot, normalizedRunId, normalizedPath, false);
+      const { temporaryPath, backupPath } = artifactStagingPaths(this.repoRoot, normalizedRunId, normalizedPath);
+      recoverArtifactStaging(target, temporaryPath, backupPath, row?.checksum ?? null);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      rollback(this.database);
+      throw error;
+    }
   }
 
   readArtifact(
@@ -1609,6 +1697,7 @@ function hydrateArtifact(repoRoot: string, row: ArtifactRow): AgentflowArtifactR
     status: row.status,
     checksum: row.checksum,
     previousChecksum: row.previous_checksum,
+    generation: row.generation,
     sizeBytes: row.size_bytes,
     metadata: JSON.parse(row.metadata_json) as Record<string, AgentflowRunStateValue>,
     createdAt: row.created_at,

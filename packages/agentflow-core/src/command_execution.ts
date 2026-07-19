@@ -28,6 +28,15 @@ import {
   createAgentflowSessionProviderRegistry,
   executeAgentflowSessionRequest
 } from "./session_request";
+import {
+  AgentflowMcpCallError,
+  AgentflowMcpCallRegistry,
+  AgentflowMcpCallInterruptedError,
+  createAgentflowMcpCallRegistry,
+  executeAgentflowMcpCall,
+  validateAgentflowMcpArgumentExpressions,
+  validateAgentflowMcpOutputPaths
+} from "./mcp_call";
 
 const MAX_CAPTURE_BYTES = 10 * 1024 * 1024;
 
@@ -59,7 +68,8 @@ export async function executeAgentflowCommandPipeline(
   runId: string,
   workflow: AgentflowWorkflow,
   transforms: AgentflowArtifactTransformRegistry = createAgentflowArtifactTransformRegistry(),
-  sessionProviders: AgentflowSessionProviderRegistry = createAgentflowSessionProviderRegistry()
+  sessionProviders: AgentflowSessionProviderRegistry = createAgentflowSessionProviderRegistry(),
+  mcpCalls: AgentflowMcpCallRegistry = createAgentflowMcpCallRegistry()
 ): Promise<AgentflowCommandPipelineResult> {
   const existing = store.getRun(runId);
   if (existing === null) throw new Error(`Agentflow run ${runId} was not found.`);
@@ -84,6 +94,82 @@ export async function executeAgentflowCommandPipeline(
     const stoppedBeforeStep = stoppedPipelineResult(store, runId, completedSteps);
     if (stoppedBeforeStep !== undefined) return stoppedBeforeStep;
     const stepId = requiredStepId(step);
+    if (typeof step.type === "string" && step.type.trim() === "mcp_call") {
+      const preflightError = validateMcpCallStep(step);
+      if (preflightError !== undefined) {
+        persistMcpCallFailure(store, runId, stepId, preflightError, false, 1, true);
+        return finishFailure(store, runId, completedSteps, stepId, {
+          exitCode: null,
+          timedOut: false,
+          message: preflightError
+        }, "failed");
+      }
+      const retries = failureRetries(step);
+      let failure: string | undefined;
+      for (let attempt = 1; attempt <= retries + 1; attempt += 1) {
+        const stopped = activeStopStatus(store, runId);
+        if (stopped !== undefined) return stoppedPipelineResult(store, runId, completedSteps)!;
+        const server = (step.server as string).trim();
+        const tool = (step.tool as string).trim();
+        const input = {
+          attempt,
+          server,
+          tool,
+          arguments: step.arguments as AgentflowRunStateValue,
+          outputs: step.outputs as AgentflowRunStateValue
+        };
+        store.updateRun(runId, { currentStepId: stepId, error: null });
+        store.upsertStep({ runId, stepId, attempt, status: "running", input });
+        store.appendRunEvent(runId, { type: "step.started", stepId, payload: input });
+        try {
+          const result = await executeAgentflowMcpCall(store, runId, workflow, step, mcpCalls, {
+            stopStatus: () => activeStopStatus(store, runId),
+            beforePublish: () => {
+              const status = activeStopStatus(store, runId);
+              if (status !== undefined) throw new AgentflowMcpCallInterruptedError(status);
+            }
+          });
+          const stoppedAfterPublish = activeStopStatus(store, runId);
+          if (stoppedAfterPublish !== undefined) {
+            persistMcpCallInterruption(store, runId, stepId, attempt, stoppedAfterPublish);
+            return interruptedPipelineResult(store, runId, completedSteps, stoppedAfterPublish);
+          }
+          const output = {
+            attempt,
+            server: result.server,
+            tool: result.tool,
+            requestArtifact: result.requestArtifact.declaredPath,
+            outputs: result.outputArtifacts.map((artifact) => artifact.declaredPath)
+          };
+          store.upsertStep({ runId, stepId, attempt, status: "completed", output });
+          store.appendRunEvent(runId, { type: "step.completed", stepId, payload: output });
+          completedSteps.push(stepId);
+          failure = undefined;
+          break;
+        } catch (error) {
+          if (error instanceof AgentflowMcpCallInterruptedError) {
+            persistMcpCallInterruption(store, runId, stepId, attempt, error.status);
+            return interruptedPipelineResult(store, runId, completedSteps, error.status);
+          }
+          const stopped = activeStopStatus(store, runId);
+          if (stopped !== undefined) {
+            persistMcpCallInterruption(store, runId, stepId, attempt, stopped);
+            return interruptedPipelineResult(store, runId, completedSteps, stopped);
+          }
+          failure = error instanceof Error ? error.message : String(error);
+          const retryable = attempt <= retries && mcpCallFailureIsRetryable(error);
+          persistMcpCallFailure(store, runId, stepId, failure, retryable, attempt);
+          if (!retryable) break;
+        }
+      }
+      if (failure === undefined) continue;
+      if (failureContinues(step)) continue;
+      return finishFailure(store, runId, completedSteps, stepId, {
+        exitCode: null,
+        timedOut: false,
+        message: failure
+      }, failureStatus(step));
+    }
     if (step.type === "artifact_transform") {
       const preflightError = validateTransformStep(step);
       if (preflightError !== undefined) {
@@ -233,7 +319,7 @@ export async function executeAgentflowCommandPipeline(
       return finishFailure(store, runId, completedSteps, stepId, {
         exitCode: null,
         timedOut: false,
-        message: `Step ${stepId} has unsupported type ${String(step.type)}; only command, artifact_transform, and session_request steps can execute in this runtime phase.`
+        message: `Step ${stepId} has unsupported type ${String(step.type)}; only command, artifact_transform, mcp_call, and session_request steps can execute in this runtime phase.`
       }, "paused");
     }
 
@@ -338,6 +424,33 @@ export async function executeAgentflowCommandPipeline(
     event: { type: "run.completed", payload: { completedSteps } }
   });
   return { status: "completed", completedSteps };
+}
+
+function persistMcpCallFailure(
+  store: AgentflowRunStateStore,
+  runId: string,
+  stepId: string,
+  message: string,
+  retryable: boolean,
+  attempt: number,
+  rejected = false
+): void {
+  const payload = { attempt, message };
+  store.upsertStep({ runId, stepId, attempt, status: "failed", error: payload });
+  store.recordFailure({
+    id: rejected ? `mcp-call:${safeId(stepId)}:preflight` : `mcp-call:${safeId(stepId)}:attempt-${attempt}`,
+    runId,
+    stepId,
+    classification: rejected ? "mcp_call_policy" : "mcp_call_failure",
+    message,
+    retryable,
+    payload
+  });
+  store.appendRunEvent(runId, { type: rejected ? "step.rejected" : "step.failed", stepId, payload });
+}
+
+function mcpCallFailureIsRetryable(error: unknown): boolean {
+  return error instanceof AgentflowMcpCallError && error.code === "AGENTFLOW_MCP_ADAPTER_FAILED";
 }
 
 function persistSessionRequestInterruption(
@@ -445,6 +558,18 @@ class TransformInterruptedError extends Error {
   }
 }
 
+function persistMcpCallInterruption(
+  store: AgentflowRunStateStore,
+  runId: string,
+  stepId: string,
+  attempt: number,
+  status: "paused" | "cancelled"
+): void {
+  const output = { attempt, status };
+  store.upsertStep({ runId, stepId, attempt, status, output });
+  store.appendRunEvent(runId, { type: "step.interrupted", stepId, payload: output });
+}
+
 function stoppedPipelineResult(
   store: AgentflowRunStateStore,
   runId: string,
@@ -463,6 +588,19 @@ function stoppedPipelineResult(
     `Agentflow run ${runId} cannot continue while its status is ${String(status)}.`,
     "AGENTFLOW_RUN_TRANSITION"
   );
+}
+
+function interruptedPipelineResult(
+  store: AgentflowRunStateStore,
+  runId: string,
+  completedSteps: string[],
+  interruptedStatus: "paused" | "cancelled"
+): AgentflowCommandPipelineResult {
+  return stoppedPipelineResult(store, runId, completedSteps) ?? {
+    status: interruptedStatus,
+    completedSteps,
+    message: `Agentflow run ${runId} was interrupted as ${interruptedStatus}; no additional commands were started.`
+  };
 }
 
 function activeStopStatus(store: AgentflowRunStateStore, runId: string): "paused" | "cancelled" | undefined {
@@ -727,6 +865,40 @@ function validateSessionRequestStep(step: AgentflowWorkflowStep): string | undef
   return undefined;
 }
 
+function validateMcpCallStep(step: AgentflowWorkflowStep): string | undefined {
+  if (typeof step.server !== "string" || step.server.trim().length === 0
+      || typeof step.tool !== "string" || step.tool.trim().length === 0
+      || mapping(step.arguments) === undefined || !nonEmptyStringArray(step.outputs)) {
+    return "MCP call requires a non-empty server, tool, arguments mapping, and outputs list.";
+  }
+  if ([step.server, step.tool].some((value) => value.includes("{{") || value.includes("}}"))) {
+    return "MCP call server and tool must be static non-empty names.";
+  }
+  try {
+    validateAgentflowMcpArgumentExpressions(step.arguments, typeof step.id === "string" ? step.id.trim() : "(unnamed)");
+    validateAgentflowMcpOutputPaths(step.outputs, typeof step.id === "string" ? step.id.trim() : "(unnamed)");
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+  const onFailure = mapping(step.on_failure);
+  const retry = onFailure?.retry;
+  if (retry !== undefined &&
+      (!Number.isSafeInteger(retry) || Number(retry) < 0 || Number(retry) > MAX_AGENTFLOW_COMMAND_RETRIES)) {
+    return `MCP call on_failure.retry must be an integer from 0 through ${MAX_AGENTFLOW_COMMAND_RETRIES}.`;
+  }
+  if (["continue", "ignore"].includes(normalizedFailureThen(onFailure) ?? "") && onFailure?.allowed !== true) {
+    return "MCP call failures may continue or be ignored only when on_failure.allowed is true.";
+  }
+  if (onFailure !== undefined) {
+    const then = normalizedFailureThen(onFailure);
+    if ((then !== undefined && !["continue", "ignore", "fail", "pause"].includes(then))
+        || ["goto", "route_to", "on_remediated", "on_unresolved", "return_to"].some((field) => onFailure[field] !== undefined)) {
+      return "MCP call runtime supports only retry and then: continue, ignore, fail, or pause.";
+    }
+  }
+  return undefined;
+}
+
 function nonEmptyStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.length > 0
     && value.every((entry) => typeof entry === "string" && entry.trim().length > 0);
@@ -881,5 +1053,7 @@ function stringList(value: unknown): string[] {
 }
 
 function mapping(value: unknown): AgentflowYamlMapping | undefined {
-  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as AgentflowYamlMapping : undefined;
+  return value !== null && typeof value === "object" && !Array.isArray(value) && !(value instanceof Uint8Array)
+    ? value as AgentflowYamlMapping
+    : undefined;
 }

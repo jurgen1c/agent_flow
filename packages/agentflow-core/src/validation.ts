@@ -69,7 +69,7 @@ const SECRET_PATH = /(^|[/._-])(\.env|credentials|id_rsa|id_ed25519|private[_-]?
 const SHELL_EXECUTABLES = new Set(["bash", "dash", "ksh", "sh", "zsh"]);
 const SHELL_ANALYSIS_BUDGET = 65_536;
 export const MAX_AGENTFLOW_COMMAND_RETRIES = 100;
-const STEP_REQUIREMENTS: Readonly<Record<string, ReadonlyArray<readonly [string, "string" | "array"]>>> = {
+const STEP_REQUIREMENTS: Readonly<Record<string, ReadonlyArray<readonly [string, "string" | "array" | "mapping"]>>> = {
   approval: [["reviewer", "string"], ["artifacts", "array"]],
   artifact_transform: [["input", "string"], ["output", "string"], ["transform", "string"]],
   challenge: [["from", "string"], ["to", "string"], ["question", "string"]],
@@ -80,7 +80,7 @@ const STEP_REQUIREMENTS: Readonly<Record<string, ReadonlyArray<readonly [string,
   input_request: [["question", "string"], ["save_as", "string"]],
   loop: [["body", "array"]],
   manual_gate: [["message", "string"], ["options", "array"]],
-  mcp_call: [["server", "string"], ["tool", "string"]],
+  mcp_call: [["server", "string"], ["tool", "string"], ["arguments", "mapping"], ["outputs", "array"]],
   result: [["status", "string"]],
   review: [["reviewer", "string"], ["subject", "string"], ["artifacts", "array"]],
   session_request: [["session", "string"], ["prompt", "string"], ["inputs", "array"], ["outputs", "array"]],
@@ -297,7 +297,9 @@ function validateStepShapes(contexts: StepContext[], errors: AgentflowWorkflowIs
 function validateRequiredStepFields(context: StepContext, errors: AgentflowWorkflowIssue[]): void {
   for (const [field, kind] of STEP_REQUIREMENTS[context.type ?? ""] ?? []) {
     const value = context.step[field];
-    const valid = kind === "string" ? nonEmptyString(value) !== undefined : Array.isArray(value) && value.length > 0;
+    const valid = kind === "string"
+      ? nonEmptyString(value) !== undefined
+      : kind === "array" ? Array.isArray(value) && value.length > 0 : isRecord(value);
 
     if (!valid) {
       addStepIssue(
@@ -305,7 +307,7 @@ function validateRequiredStepFields(context: StepContext, errors: AgentflowWorkf
         context,
         "workflow.step.field.required",
         field,
-        `Step type "${context.type}" requires ${field} to be a non-empty ${kind === "string" ? "string" : "list"}.`
+        `Step type "${context.type}" requires ${field} to be ${kind === "string" ? "a non-empty string" : kind === "array" ? "a non-empty list" : "a mapping"}.`
       );
     }
   }
@@ -333,13 +335,13 @@ function validateRequiredStepFields(context: StepContext, errors: AgentflowWorkf
     );
   }
 
-  if ((context.type === "command" || context.type === "artifact_transform" || context.type === "session_request") && isRecord(context.step.on_failure)) {
+  if ((context.type === "command" || context.type === "artifact_transform" || context.type === "session_request" || context.type === "mcp_call") && isRecord(context.step.on_failure)) {
     const failureLabel = context.type === "command"
       ? "Command"
-      : context.type === "artifact_transform" ? "Artifact transform" : "Session request";
+      : context.type === "artifact_transform" ? "Artifact transform" : context.type === "mcp_call" ? "MCP call" : "Session request";
     const failureCode = context.type === "command"
       ? "workflow.command"
-      : context.type === "artifact_transform" ? "workflow.artifact_transform" : "workflow.session_request";
+      : context.type === "artifact_transform" ? "workflow.artifact_transform" : context.type === "mcp_call" ? "workflow.mcp_call" : "workflow.session_request";
     const retry = context.step.on_failure.retry;
     const failureThen = typeof context.step.on_failure.then === "string"
       ? context.step.on_failure.then.trim()
@@ -362,7 +364,7 @@ function validateRequiredStepFields(context: StepContext, errors: AgentflowWorkf
         `${failureLabel} failures may continue or be ignored only when on_failure.allowed is true.`
       );
     }
-    if (context.type === "artifact_transform" || context.type === "session_request") {
+    if (context.type === "artifact_transform" || context.type === "session_request" || context.type === "mcp_call") {
       const unsupportedTarget = unsupportedTransformFailureTarget(context.step.on_failure);
       if (unsupportedTarget !== undefined) {
         addStepIssue(
@@ -881,6 +883,72 @@ function validateArtifactOutputs(
 
 function validateArtifactPaths(contexts: StepContext[], errors: AgentflowWorkflowIssue[]): void {
   for (const context of contexts) {
+    if (context.type === "mcp_call") {
+      for (const field of ["server", "tool"] as const) {
+        const value = nonEmptyString(context.step[field]);
+        if (value !== undefined && (value.includes("{{") || value.includes("}}"))) {
+          addStepIssue(
+            errors,
+            context,
+            `workflow.mcp_call.${field}.invalid`,
+            field,
+            `MCP call ${field} must be a static non-empty name.`
+          );
+        }
+      }
+      visitValue(context.step.arguments, `${context.path}.arguments`, (value, path) => {
+        if (typeof value !== "string" || (!value.includes("{{") && !value.includes("}}"))) return;
+        const remainder = value.replace(/(?<!\{)\{\{\s*inputs\.([A-Za-z_][A-Za-z0-9_-]*)\s*}}(?!})/g, "");
+        if (!remainder.includes("{{") && !remainder.includes("}}")) return;
+        errors.push({
+          code: "workflow.mcp_call.arguments.expression.unsupported",
+          message: "MCP call argument expressions must use {{ inputs.<name> }} references.",
+          path,
+          ...(context.id === undefined ? {} : { stepId: context.id })
+        });
+      });
+      const seen = new Set<string>();
+      const rawOutputs = Array.isArray(context.step.outputs) ? context.step.outputs : [];
+      for (const [index, value] of rawOutputs.entries()) {
+        if (typeof value !== "string" || value.trim().length === 0) {
+          addStepIssue(
+            errors,
+            context,
+            "workflow.mcp_call.output.invalid",
+            `outputs[${index}]`,
+            "MCP call outputs must contain non-empty normalized static repo-relative artifact paths."
+          );
+          continue;
+        }
+        let normalized = "";
+        try {
+          normalized = normalizeAgentflowArtifactPath(value);
+        } catch {
+          // Report the MCP-specific path contract below.
+        }
+        if (value.includes("{{") || value.includes("}}") || normalized.length === 0 || normalized !== value.trim()) {
+          addStepIssue(
+            errors,
+            context,
+            "workflow.mcp_call.output.invalid",
+            `outputs[${index}]`,
+            `MCP call output "${value}" must be a normalized static repo-relative artifact path.`
+          );
+          continue;
+        }
+        if (seen.has(normalized)) {
+          addStepIssue(
+            errors,
+            context,
+            "workflow.mcp_call.output.duplicate",
+            `outputs[${index}]`,
+            `MCP call outputs must not contain duplicate artifact path "${normalized}".`
+          );
+        }
+        seen.add(normalized);
+      }
+      continue;
+    }
     if (context.type === "session_request") {
       const prompt = nonEmptyString(context.step.prompt);
       const normalizedPrompt = prompt === undefined ? undefined : path.posix.normalize(prompt);
@@ -2819,5 +2887,5 @@ function isSessionInputReference(value: string): boolean {
 }
 
 function isRecord(value: unknown): value is AgentflowYamlMapping {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  return typeof value === "object" && value !== null && !Array.isArray(value) && !(value instanceof Uint8Array);
 }

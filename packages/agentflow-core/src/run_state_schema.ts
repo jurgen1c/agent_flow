@@ -25,11 +25,17 @@ const REQUIRED_SCHEMA_OBJECTS = [
 export class AgentflowRunStateSchemaVersionError extends Error {}
 
 export function initializeAgentflowRunStateSchema(database: SchemaDatabase, schemaVersion: number): void {
-  const existingVersion = existingSchemaVersion(database);
+  let existingVersion = existingSchemaVersion(database);
   if (existingVersion === null) {
     createSchema(database, schemaVersion, true);
-  } else if (existingVersion === "1" && schemaVersion === 2) {
+  } else if (existingVersion === "1" && schemaVersion >= 2) {
     migrateVersionOneToTwo(database);
+    existingVersion = "2";
+  }
+  if (existingVersion === "2" && schemaVersion === 3) {
+    if (schemaNeedsRepair(database)) createSchema(database, 2);
+    migrateVersionTwoToThree(database);
+    existingVersion = "3";
   }
   verifySchemaVersion(database, schemaVersion);
   if (existingVersion !== null && schemaNeedsRepair(database)) createSchema(database, schemaVersion);
@@ -132,6 +138,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
   updated_at TEXT NOT NULL,
   written_at TEXT,
   checked_at TEXT,
+  generation INTEGER NOT NULL DEFAULT 1 CHECK (generation > 0),
   PRIMARY KEY (run_id, id),
   UNIQUE (run_id, path)
 );
@@ -220,7 +227,7 @@ function migrateVersionOneToTwo(database: SchemaDatabase): void {
   database.exec("BEGIN IMMEDIATE");
   try {
     const lockedVersion = existingSchemaVersion(database);
-    if (lockedVersion === "2") {
+    if (lockedVersion === "2" || lockedVersion === "3") {
       database.exec("COMMIT");
       return;
     }
@@ -233,6 +240,29 @@ ALTER TABLE artifacts ADD COLUMN written_at TEXT;
 ALTER TABLE artifacts ADD COLUMN checked_at TEXT;
     `);
     database.run("UPDATE run_state_metadata SET value = '2' WHERE key = 'schema_version'");
+    database.exec("COMMIT");
+  } catch (error) {
+    rollback(database);
+    throw error;
+  }
+}
+
+function migrateVersionTwoToThree(database: SchemaDatabase): void {
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    const lockedVersion = existingSchemaVersion(database);
+    if (lockedVersion === "3") {
+      database.exec("COMMIT");
+      return;
+    }
+    if (lockedVersion !== "2") throw schemaVersionError(lockedVersion ?? "missing", 3);
+    const generation = database.get<{ name: string }>(
+      "SELECT name FROM pragma_table_info('artifacts') WHERE name = 'generation'"
+    );
+    if (generation === null) {
+      database.exec("ALTER TABLE artifacts ADD COLUMN generation INTEGER NOT NULL DEFAULT 1 CHECK (generation > 0)");
+    }
+    database.run("UPDATE run_state_metadata SET value = '3' WHERE key = 'schema_version'");
     database.exec("COMMIT");
   } catch (error) {
     rollback(database);

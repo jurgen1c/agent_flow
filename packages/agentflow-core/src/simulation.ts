@@ -11,7 +11,8 @@ import {
   createAgentflowArtifactTransformRegistry,
   transformAgentflowFixtureArtifact
 } from "./artifact_transform";
-import { normalizeAgentflowArtifactPath } from "./run_state";
+import { normalizeAgentflowArtifactPath, type AgentflowRunStateValue } from "./run_state";
+import { resolveAgentflowMcpArguments } from "./mcp_call";
 
 export type AgentflowSimulationStatus = "completed" | "failed" | "paused" | "cancelled" | "unresolved";
 export type AgentflowSimulationStepOutcome = "succeeded" | "failed";
@@ -357,6 +358,9 @@ function runStep(step: AgentflowWorkflowStep, state: SimulationState, insideLoop
     if (type === "session_request") {
       return simulatedSessionFailure(step, stepFixture, id, state, "Fixture marks the session request as failed.");
     }
+    if (type === "mcp_call") {
+      return simulatedSessionFailure(step, stepFixture, id, state, "Fixture marks the MCP call as failed.");
+    }
     return failureControl(step, stepFixture, id, state);
   }
 
@@ -367,6 +371,10 @@ function runStep(step: AgentflowWorkflowStep, state: SimulationState, insideLoop
   } else if (type === "session_request") {
     const sessionControl = simulateSessionRequestStep(step, stepFixture, id, state);
     if (sessionControl.kind !== "done") return sessionControl;
+    state.retryAttempts.delete(id);
+  } else if (type === "mcp_call") {
+    const mcpControl = simulateMcpCallStep(step, stepFixture, id, state);
+    if (mcpControl.kind !== "done") return mcpControl;
     state.retryAttempts.delete(id);
   } else {
     state.retryAttempts.delete(id);
@@ -399,6 +407,88 @@ function runStep(step: AgentflowWorkflowStep, state: SimulationState, insideLoop
 
   const target = nonEmptyString(step.then) ?? nonEmptyString(step.goto);
   return target === undefined ? { kind: "done" } : controlForTarget(target, id, state);
+}
+
+function simulateMcpCallStep(
+  step: AgentflowWorkflowStep,
+  fixture: AgentflowSimulationStepFixture,
+  stepId: string,
+  state: SimulationState
+): SequenceControl {
+  try {
+    resolveAgentflowMcpArguments(
+      step.arguments,
+      (state.fixture.inputs ?? {}) as Record<string, AgentflowRunStateValue>,
+      stepId
+    );
+  } catch (error) {
+    return simulatedMcpContractFailure(
+      step,
+      fixture,
+      stepId,
+      state,
+      error instanceof Error ? error.message : String(error)
+    );
+  }
+  const declaredOutputs = new Set(
+    (Array.isArray(step.outputs) ? step.outputs : [])
+      .flatMap((output) => nonEmptyString(output) ?? [])
+      .map(canonicalArtifactName)
+  );
+  const providedOutputs = Array.isArray(fixture.outputs)
+    ? exactFixtureArtifactNames(fixture.outputs)
+    : exactFixtureArtifacts(fixture.outputs ?? {});
+  const invalidOutput = providedOutputs.collisions.values().next().value
+    ?? [...declaredOutputs].find((output) => !providedOutputs.values.has(output))
+    ?? [...providedOutputs.values.keys()].find((output) => !declaredOutputs.has(output));
+  if (invalidOutput !== undefined) {
+    return simulatedMcpContractFailure(
+      step,
+      fixture,
+      stepId,
+      state,
+      `MCP fixture outputs must match declared outputs exactly; invalid output ${invalidOutput}.`
+    );
+  }
+  for (const output of declaredOutputs) {
+    if (state.artifacts.has(output) && state.artifactProducers.get(output) !== stepId && step.overwrite !== true) {
+      return simulatedMcpContractFailure(
+        step,
+        fixture,
+        stepId,
+        state,
+        `Artifact ${output} already exists; declare overwrite: true to replace it during simulation.`
+      );
+    }
+  }
+  recordOutputs(step, fixture, stepId, state);
+  return { kind: "done" };
+}
+
+function simulatedMcpContractFailure(
+  step: AgentflowWorkflowStep,
+  fixture: AgentflowSimulationStepFixture,
+  stepId: string,
+  state: SimulationState,
+  _message: string
+): SequenceControl {
+  const visit = state.visitedSteps.at(-1);
+  if (visit?.id === stepId && visit.outcome === "succeeded") visit.outcome = "failed";
+  if (!isRecord(step.on_failure)) {
+    state.terminalStates.push({ stepId, status: "paused" });
+    return { kind: "terminal", status: "paused" };
+  }
+  const control = failureControl(step, fixture, stepId, state, false);
+  const hasExplicitTarget = nonEmptyString(step.on_failure.then) !== undefined
+    || nonEmptyString(step.on_failure.goto) !== undefined
+    || step.on_failure.route_to !== undefined
+    || step.on_failure.on_unresolved !== undefined;
+  if (control.kind === "terminal" && control.status === "failed" && !hasExplicitTarget) {
+    const terminal = state.terminalStates.at(-1);
+    if (terminal?.stepId === stepId && terminal.status === "failed") terminal.status = "paused";
+    return { kind: "terminal", status: "paused" };
+  }
+  return control;
 }
 
 function simulateSessionRequestStep(
@@ -674,10 +764,11 @@ function failureControl(
   step: AgentflowWorkflowStep,
   stepFixture: AgentflowSimulationStepFixture,
   id: string,
-  state: SimulationState
+  state: SimulationState,
+  allowRetry = true
 ): SequenceControl {
   const onFailure = isRecord(step.on_failure) ? step.on_failure : undefined;
-  const retries = typeof onFailure?.retry === "number" && Number.isSafeInteger(onFailure.retry) && onFailure.retry > 0
+  const retries = allowRetry && typeof onFailure?.retry === "number" && Number.isSafeInteger(onFailure.retry) && onFailure.retry > 0
     ? onFailure.retry
     : 0;
   const retryAttempt = state.retryAttempts.get(id) ?? 0;
@@ -913,6 +1004,26 @@ function canonicalFixtureArtifacts(artifacts: Record<string, AgentflowYamlValue>
     } else {
       values.set(canonical, value);
     }
+  }
+  return { values, collisions };
+}
+
+function exactFixtureArtifacts(artifacts: Record<string, AgentflowYamlValue>): {
+  values: Map<string, AgentflowYamlValue>;
+  collisions: Set<string>;
+} {
+  return { values: new Map(Object.entries(artifacts)), collisions: new Set() };
+}
+
+function exactFixtureArtifactNames(artifacts: string[]): {
+  values: Map<string, AgentflowYamlValue>;
+  collisions: Set<string>;
+} {
+  const values = new Map<string, AgentflowYamlValue>();
+  const collisions = new Set<string>();
+  for (const artifact of artifacts) {
+    if (values.has(artifact)) collisions.add(artifact);
+    else values.set(artifact, null);
   }
   return { values, collisions };
 }
