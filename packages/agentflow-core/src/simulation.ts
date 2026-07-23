@@ -13,6 +13,11 @@ import {
 } from "./artifact_transform";
 import { normalizeAgentflowArtifactPath, type AgentflowRunStateValue } from "./run_state";
 import { resolveAgentflowMcpArguments } from "./mcp_call";
+import { selectAgentflowConditionTargetFromValues } from "./condition";
+import {
+  agentflowAmbiguousSuccessTargetMessage,
+  collectAgentflowAmbiguousSuccessTargets
+} from "./success_routing";
 
 export type AgentflowSimulationStatus = "completed" | "failed" | "paused" | "cancelled" | "unresolved";
 export type AgentflowSimulationStepOutcome = "succeeded" | "failed";
@@ -21,7 +26,6 @@ export type AgentflowSimulationVisitedOutcome = AgentflowSimulationStepOutcome |
 export interface AgentflowSimulationStepFixture {
   outcome?: AgentflowSimulationStepOutcome | AgentflowSimulationStepOutcome[];
   outputs?: string[] | Record<string, AgentflowYamlValue>;
-  condition?: string | boolean | Array<string | boolean>;
   choice?: string | string[];
   iterations?: number;
   input?: AgentflowYamlValue;
@@ -93,6 +97,7 @@ interface SimulationState {
   retryAttempts: Map<string, number>;
   recoveryCycles: Map<string, number>;
   maxRecoveryCycles?: number;
+  stepAttemptLimits: Map<string, number>;
   stepLocations: Map<string, SimulationStepLocation>;
   transitionCount: number;
   status?: AgentflowSimulationStatus;
@@ -148,7 +153,7 @@ export function parseAgentflowSimulationFixture(source: string): AgentflowSimula
       if (!isRecord(stepFixture)) {
         return { ok: false, error: `Simulation fixture step ${stepId} must be an object.` };
       }
-      const stepFields = new Set(["outcome", "outputs", "condition", "choice", "iterations", "input", "recovery"]);
+      const stepFields = new Set(["outcome", "outputs", "choice", "iterations", "input", "recovery"]);
       const unknownStepField = Object.keys(stepFixture).find((field) => !stepFields.has(field));
       if (unknownStepField !== undefined) {
         return { ok: false, error: `Unknown simulation fixture field steps.${stepId}.${unknownStepField}.` };
@@ -158,9 +163,6 @@ export function parseAgentflowSimulationFixture(source: string): AgentflowSimula
       }
       if (!validOutputs(stepFixture.outputs)) {
         return { ok: false, error: `Simulation fixture step ${stepId}.outputs must be a list of non-empty artifact names or an object.` };
-      }
-      if (!validCondition(stepFixture.condition)) {
-        return { ok: false, error: `Simulation fixture step ${stepId}.condition must be a target, boolean, or a non-empty list of targets and booleans.` };
       }
       if (!validChoice(stepFixture.choice)) {
         return { ok: false, error: `Simulation fixture step ${stepId}.choice must be a non-empty string or list of non-empty strings.` };
@@ -200,6 +202,7 @@ export function simulateAgentflowWorkflow(
     retryAttempts: new Map(),
     recoveryCycles: new Map(),
     maxRecoveryCycles: workflowRecoveryLimit(workflow),
+    stepAttemptLimits: workflowStepAttemptLimits(workflow),
     stepLocations: collectSimulationStepLocations(workflow.steps),
     transitionCount: 0
   };
@@ -209,6 +212,7 @@ export function simulateAgentflowWorkflow(
 
   const workflowStepIdCounts = collectSimulationStepIdCounts(workflow.steps);
   const workflowStepIds = new Set(workflowStepIdCounts.keys());
+  const ambiguousSuccessTargets = collectAgentflowAmbiguousSuccessTargets(workflow.steps);
   const ambiguousStepIds = [...workflowStepIdCounts]
     .filter(([, count]) => count > 1)
     .map(([id]) => id)
@@ -216,13 +220,20 @@ export function simulateAgentflowWorkflow(
   for (const stepId of ambiguousStepIds) {
     addUnresolved(state, stepId, "Workflow step ID is ambiguous in simulation fixtures and targets.");
   }
+  for (const conflict of ambiguousSuccessTargets) {
+    addUnresolved(
+      state,
+      conflict.stepId ?? "(workflow)",
+      agentflowAmbiguousSuccessTargetMessage(conflict.stepId)
+    );
+  }
   for (const stepId of Object.keys(fixture.steps ?? {}).sort()) {
     if (!workflowStepIds.has(stepId)) {
       addUnresolved(state, stepId, "Fixture references an unknown workflow step ID.");
     }
   }
 
-  let control: SequenceControl = ambiguousStepIds.length > 0
+  let control: SequenceControl = ambiguousStepIds.length > 0 || ambiguousSuccessTargets.length > 0
     ? { kind: "terminal", status: "unresolved" }
     : runSequence(workflow.steps, state, false);
   while (control.kind === "target") {
@@ -323,6 +334,11 @@ function runSequence(
 
     let control = runStep(steps[index], state, insideLoop);
     if (control.kind === "done") {
+      const fallthroughTarget = nonEmptyString(steps[index + 1]?.id);
+      if (fallthroughTarget !== undefined) {
+        control = checkTargetBudget({ kind: "target", target: fallthroughTarget }, state);
+        if (control.kind !== "target") return control;
+      }
       index += 1;
       continue;
     }
@@ -344,6 +360,11 @@ function runStep(step: AgentflowWorkflowStep, state: SimulationState, insideLoop
   const id = nonEmptyString(step.id) ?? "(unnamed)";
   const type = nonEmptyString(step.type) ?? "unknown";
   const visit = state.visits.get(id) ?? 0;
+  const attemptLimit = state.stepAttemptLimits.get(id);
+  if (attemptLimit !== undefined && visit + 1 > attemptLimit) {
+    state.terminalStates.push({ stepId: id, status: "paused" });
+    return { kind: "terminal", status: "paused" };
+  }
   state.visits.set(id, visit + 1);
   const stepFixture = state.fixture.steps?.[id] ?? {};
   const outcome = pickAt(stepFixture.outcome, visit) ?? "succeeded";
@@ -376,12 +397,28 @@ function runStep(step: AgentflowWorkflowStep, state: SimulationState, insideLoop
     const mcpControl = simulateMcpCallStep(step, stepFixture, id, state);
     if (mcpControl.kind !== "done") return mcpControl;
     state.retryAttempts.delete(id);
-  } else {
+  } else if (type === "command") {
+    const fixtureOutputs = canonicalFixtureOutputValues(stepFixture);
+    const collision = declaredOutputArtifacts(step).find((artifact) =>
+      state.artifacts.has(artifact)
+      && state.artifactProducers.get(artifact) !== id
+      && !sameCommandOutputArtifact(state, artifact, fixtureOutputs.get(artifact))
+      && step.overwrite !== true
+    );
+    if (collision !== undefined) {
+      const visitRecord = state.visitedSteps.at(-1);
+      if (visitRecord?.id === id && visitRecord.outcome === "succeeded") visitRecord.outcome = "failed";
+      addUnresolved(state, id, `Artifact ${collision} already exists; declare overwrite: true to replace it during simulation.`);
+      return { kind: "terminal", status: "unresolved" };
+    }
+    state.retryAttempts.delete(id);
+    recordOutputs(step, stepFixture, id, state);
+  } else if (type !== "condition") {
     state.retryAttempts.delete(id);
     recordOutputs(step, stepFixture, id, state);
   }
 
-  if (type === "condition") return conditionControl(step, stepFixture, id, visit, state);
+  if (type === "condition") return conditionControl(step, id, state);
   if (type === "manual_gate") return gateControl(step, stepFixture, id, visit, state);
   if (type === "input_request") {
     if (stepFixture.input === undefined) {
@@ -405,8 +442,45 @@ function runStep(step: AgentflowWorkflowStep, state: SimulationState, insideLoop
     return { kind: "terminal", status: statusFromTerminal(resultStatus) };
   }
 
-  const target = nonEmptyString(step.then) ?? nonEmptyString(step.goto);
+  const target = staticTarget(step.then) ?? staticTarget(step.goto);
   return target === undefined ? { kind: "done" } : controlForTarget(target, id, state);
+}
+
+function canonicalFixtureOutputValues(
+  fixture: AgentflowSimulationStepFixture
+): Map<string, AgentflowYamlValue | undefined> {
+  if (Array.isArray(fixture.outputs)) {
+    return new Map(fixture.outputs.map((artifact) => [canonicalArtifactName(artifact), undefined]));
+  }
+  return new Map(canonicalFixtureArtifacts(fixture.outputs ?? {}).values);
+}
+
+function sameCommandOutputArtifact(
+  state: SimulationState,
+  artifact: string,
+  proposed: AgentflowYamlValue | undefined
+): boolean {
+  const producerId = state.artifactProducers.get(artifact);
+  const location = producerId === undefined ? undefined : state.stepLocations.get(producerId);
+  const producer = location === undefined ? undefined : location.steps[location.index];
+  const existing = state.artifactValues.get(artifact);
+  return nonEmptyString(producer?.type) === "command"
+    && existing !== undefined
+    && proposed !== undefined
+    && isDeepEqualArtifactValue(existing, proposed);
+}
+
+function declaredOutputArtifacts(step: AgentflowWorkflowStep): string[] {
+  const outputs = Array.isArray(step.outputs) ? step.outputs : [];
+  return outputs.flatMap((value) => {
+    const name = nonEmptyString(value);
+    return name === undefined ? [] : [canonicalArtifactName(name)];
+  });
+}
+
+function staticTarget(value: AgentflowYamlValue | undefined): string | undefined {
+  const target = nonEmptyString(value);
+  return target === undefined || target.includes("{{") || target.includes("}}") ? undefined : target;
 }
 
 function simulateMcpCallStep(
@@ -587,33 +661,42 @@ function simulatedSessionFailure(
 
 function conditionControl(
   step: AgentflowWorkflowStep,
-  stepFixture: AgentflowSimulationStepFixture,
   id: string,
-  visit: number,
   state: SimulationState
 ): SequenceControl {
-  const selection = pickAt(stepFixture.condition, visit);
-  let target: string | undefined;
-
-  if (typeof selection === "boolean") {
-    target = nonEmptyString(selection ? step.then : step.else);
-    if (!selection && target === undefined) return { kind: "done" };
-  } else if (typeof selection === "string") {
-    target = selection.trim();
+  const missingRequired = state.missingInputs[0];
+  if (missingRequired !== undefined) {
+    markConditionVisitFailed(state, id);
+    addUnresolved(state, id, `Required condition input ${missingRequired} is missing from the simulation fixture.`);
+    return { kind: "terminal", status: "unresolved" };
   }
-
-  if (target === undefined || target.length === 0) {
-    addUnresolved(state, id, "Fixture does not select a condition target.");
+  let target: string | undefined;
+  try {
+    target = selectAgentflowConditionTargetFromValues(
+      step,
+      state.fixture.inputs ?? {},
+      state.artifactValues
+    ).target;
+  } catch (error) {
+    markConditionVisitFailed(state, id);
+    addUnresolved(state, id, error instanceof Error ? error.message : String(error));
     return { kind: "terminal", status: "unresolved" };
   }
 
+  if (target === undefined) return { kind: "done" };
+
   const allowed = conditionTargets(step);
   if (!allowed.has(target)) {
-    addUnresolved(state, id, `Fixture condition target "${target}" is not declared by this step.`);
+    addUnresolved(state, id, `Condition target "${target}" is not declared by this step.`);
     return { kind: "terminal", status: "unresolved" };
   }
 
   return controlForTarget(target, id, state);
+}
+
+function markConditionVisitFailed(state: SimulationState, stepId: string): void {
+  const visit = state.visitedSteps.at(-1);
+  if (visit?.id === stepId && visit.outcome === "selected") visit.outcome = "failed";
 }
 
 function gateControl(
@@ -774,7 +857,7 @@ function failureControl(
   const retryAttempt = state.retryAttempts.get(id) ?? 0;
   if (retryAttempt < retries) {
     state.retryAttempts.set(id, retryAttempt + 1);
-    return { kind: "target", target: id };
+    return { kind: "target", target: id, budgetChecked: true };
   }
   state.retryAttempts.delete(id);
 
@@ -897,7 +980,10 @@ function simulateTransformStep(
       state.transforms
     );
     const existing = state.artifactValues.get(outputPath);
-    if (state.artifacts.has(outputPath) && !isDeepEqualArtifactValue(existing, output) && step.overwrite !== true) {
+    if (state.artifacts.has(outputPath)
+        && state.artifactProducers.get(outputPath) !== stepId
+        && !isDeepEqualArtifactValue(existing, output)
+        && step.overwrite !== true) {
       return simulatedTransformFailure(step, stepFixture, stepId, state, `Artifact ${outputPath} already exists; declare overwrite: true to replace it during simulation.`);
     }
     state.artifacts.add(outputPath);
@@ -1066,6 +1152,11 @@ function nestedArtifactNames(value: AgentflowYamlValue | undefined, state: Simul
 }
 
 function checkTargetBudget(control: Extract<SequenceControl, { kind: "target" }>, state: SimulationState): SequenceControl {
+  const attemptLimit = state.stepAttemptLimits.get(control.target);
+  if (attemptLimit !== undefined && (state.visits.get(control.target) ?? 0) + 1 > attemptLimit) {
+    state.terminalStates.push({ stepId: control.target, status: "paused" });
+    return { kind: "terminal", status: "paused" };
+  }
   if (control.budgetChecked || state.maxRecoveryCycles === undefined || (state.visits.get(control.target) ?? 0) === 0) {
     return { ...control, budgetChecked: true };
   }
@@ -1078,9 +1169,18 @@ function checkTargetBudget(control: Extract<SequenceControl, { kind: "target" }>
   return { kind: "terminal", status: "unresolved" };
 }
 
+function workflowStepAttemptLimits(workflow: AgentflowWorkflow): Map<string, number> {
+  const limits = isRecord(workflow.limits) ? workflow.limits : undefined;
+  const configured = isRecord(limits?.max_step_attempts) ? limits.max_step_attempts : undefined;
+  return new Map(Object.entries(configured ?? {}).flatMap(([stepId, value]) =>
+    typeof value === "number" && Number.isFinite(value) && value > 0 ? [[stepId, value] as const] : []
+  ));
+}
+
 function workflowRecoveryLimit(workflow: AgentflowWorkflow): number | undefined {
   const limits = isRecord(workflow.limits) ? workflow.limits : undefined;
-  return typeof limits?.max_recovery_cycles === "number" && Number.isSafeInteger(limits.max_recovery_cycles) && limits.max_recovery_cycles > 0
+  return workflow.style !== "pipeline" && typeof limits?.max_recovery_cycles === "number"
+    && Number.isSafeInteger(limits.max_recovery_cycles) && limits.max_recovery_cycles > 0
     ? limits.max_recovery_cycles
     : undefined;
 }
@@ -1143,12 +1243,6 @@ function validOutputs(value: AgentflowYamlValue | undefined): boolean {
     || (Array.isArray(value) && value.every((entry) => nonEmptyString(entry) !== undefined));
 }
 
-function validCondition(value: AgentflowYamlValue | undefined): boolean {
-  if (value === undefined) return true;
-  const valid = (entry: unknown) => typeof entry === "boolean" || (typeof entry === "string" && entry.trim().length > 0);
-  return Array.isArray(value) ? value.length > 0 && value.every(valid) : valid(value);
-}
-
 function validChoice(value: AgentflowYamlValue | undefined): boolean {
   if (value === undefined) return true;
   return Array.isArray(value)
@@ -1185,7 +1279,9 @@ function collectSimulationStepLocations(
 ): Map<string, SimulationStepLocation> {
   steps.forEach((step, index) => {
     const id = nonEmptyString(step.id);
-    if (id !== undefined) locations.set(id, { steps, index, insideLoop });
+    if (id !== undefined && nonEmptyString(step.type) !== undefined) {
+      locations.set(id, { steps, index, insideLoop });
+    }
 
     const nestedInsideLoop = insideLoop || step.type === "loop";
     for (const field of ["body", "steps"] as const) {

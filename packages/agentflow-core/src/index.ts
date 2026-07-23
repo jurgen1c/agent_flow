@@ -27,6 +27,10 @@ export {
   renderAgentflowWorkflowGraph
 } from "./inspection";
 export {
+  AGENTFLOW_AMBIGUOUS_SUCCESS_TARGET_CODE,
+  AgentflowAmbiguousSuccessTargetError
+} from "./success_routing";
+export {
   parseAgentflowSimulationFixture,
   renderAgentflowSimulationSummary,
   simulateAgentflowWorkflow
@@ -36,6 +40,12 @@ export {
   transitionAgentflowLifecycleRun
 } from "./lifecycle";
 export { executeAgentflowCommandPipeline } from "./command_execution";
+export {
+  AgentflowConditionError,
+  agentflowConditionExpressionIsSimple,
+  evaluateAgentflowCondition,
+  selectAgentflowConditionTarget
+} from "./condition";
 export {
   AgentflowArtifactTransformError,
   AgentflowArtifactTransformRegistry,
@@ -114,6 +124,7 @@ export type {
   CreateAgentflowLifecycleRunInput
 } from "./lifecycle";
 export type { AgentflowCommandPipelineResult } from "./command_execution";
+export type { AgentflowConditionSelection } from "./condition";
 export type {
   AgentflowBinaryArtifactValue,
   AgentflowArtifactTransform,

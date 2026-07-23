@@ -43,7 +43,7 @@ describe("Agentflow workflow simulation", () => {
     expect(JSON.stringify(workflow)).toBe(before);
   });
 
-  test("simulates recovery routing from a fixture-selected condition", () => {
+  test("simulates recovery routing from fixture artifact values", () => {
     const result = simulateAgentflowWorkflow(loadExample("ci-triage.yml"), {
       artifacts: {
         "failures/failure.json": { kind: "implementation_error" }
@@ -53,8 +53,7 @@ describe("Agentflow workflow simulation", () => {
         failed_step: "local_ci"
       },
       steps: {
-        classify: { outputs: ["ci/failure-classification.json"] },
-        route: { condition: "return_remediated" }
+        classify: { outputs: { "ci/failure-classification.json": { kind: "flake" } } }
       }
     });
 
@@ -71,8 +70,7 @@ describe("Agentflow workflow simulation", () => {
       },
       steps: {
         implement: { outputs: ["implementation-summary.md"] },
-        review: { outputs: ["reviews/code-review.json"] },
-        route_review: { condition: "record_approval" },
+        review: { outputs: { "reviews/code-review.json": { status: "approved" } } },
         ask_user: { input: "continue" }
       }
     });
@@ -124,7 +122,7 @@ sessions:
     expect(summary).toContain("inspect: missing input artifact missing.json");
   });
 
-  test("requires declared workflow inputs and permits fixture-selected condition fallthrough", () => {
+  test("requires declared workflow inputs and evaluates condition fallthrough from fixture values", () => {
     const workflow = parseAgentflowWorkflowOrThrow(`name: inputs
 version: 1
 style: pipeline
@@ -142,16 +140,66 @@ steps:
     status: completed
 `);
 
-    const missing = simulateAgentflowWorkflow(workflow, { steps: { route: { condition: false } } });
+    const missing = simulateAgentflowWorkflow(workflow, {});
     expect(missing.status).toBe("unresolved");
     expect(missing.missingInputs).toEqual(["required_value"]);
+    expect(missing.visitedSteps.map((step) => step.id)).toEqual(["route"]);
+    expect(missing.terminalStates).toEqual([]);
 
     const present = simulateAgentflowWorkflow(workflow, {
-      inputs: { required_value: false },
-      steps: { route: { condition: false } }
+      inputs: { required_value: false }
     });
     expect(present.status).toBe("completed");
     expect(present.visitedSteps.map((step) => step.id)).toEqual(["route", "finish"]);
+  });
+
+  test("parses fixture artifact strings as the JSON bytes used by runtime conditions", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: condition-json-bytes
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: route, type: condition, if: artifacts.state.ready == true, then: complete, else: fail }
+`);
+
+    const matched = simulateAgentflowWorkflow(workflow, {
+      artifacts: { "state.json": '{"ready":true}' }
+    });
+    expect(matched.status).toBe("completed");
+
+    const invalid = simulateAgentflowWorkflow(workflow, {
+      artifacts: { "state.json": "not-json" }
+    });
+    expect(invalid.status).toBe("unresolved");
+    expect(invalid.unresolvedBranches[0]?.reason).toContain("must contain valid JSON");
+  });
+
+  test("matches runtime fallthrough and output behavior for dynamic routes and conditions", () => {
+    const dynamic = parseAgentflowWorkflowOrThrow(`name: dynamic-success-fallthrough
+version: 1
+style: pipeline
+maturity: experimental
+inputs: { next: {} }
+steps:
+  - { id: first, type: command, command: echo first, then: "target-{{ inputs.next }}" }
+  - { id: second, type: command, command: echo second }
+`);
+    const fallenThrough = simulateAgentflowWorkflow(dynamic, { inputs: { next: "second" } });
+    expect(fallenThrough.status).toBe("completed");
+    expect(fallenThrough.visitedSteps.map((step) => step.id)).toEqual(["first", "second"]);
+
+    const conditionOutput = parseAgentflowWorkflowOrThrow(`name: condition-fixture-output
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: route, type: condition, if: artifacts.state.ready == true, then: complete, else: fail, outputs: [state.json] }
+`);
+    const notFabricated = simulateAgentflowWorkflow(conditionOutput, {
+      steps: { route: { outputs: { "state.json": { ready: true } } } }
+    });
+    expect(notFabricated.status).toBe("unresolved");
+    expect(notFabricated.availableArtifacts).toEqual([]);
   });
 
   test("replays bounded retries from sequential fixture outcomes", () => {
@@ -169,6 +217,28 @@ steps:
       { id: "install", type: "command", outcome: "failed" },
       { id: "install", type: "command", outcome: "succeeded" }
     ]);
+  });
+
+  test("does not charge immediate retries to the recovery-cycle budget", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: immediate-retry-budget
+version: 1
+style: recovery_pipeline
+maturity: experimental
+limits: { max_recovery_cycles: 1 }
+steps:
+  - id: work
+    type: command
+    command: echo work
+    on_failure: { retry: 2 }
+`);
+
+    const result = simulateAgentflowWorkflow(workflow, {
+      steps: { work: { outcome: ["failed", "failed", "succeeded"] } }
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.visitedSteps.map((step) => step.outcome)).toEqual(["failed", "failed", "succeeded"]);
+    expect(result.unresolvedBranches).toEqual([]);
   });
 
   test("simulates standard parallel branch descriptors", () => {
@@ -204,7 +274,7 @@ steps:
     for (const source of [
       { steps: { run: { outcome: "bogus" } } },
       { steps: { run: { outputs: "artifact.txt" } } },
-      { steps: { run: { condition: [] } } },
+      { steps: { run: { condition: false } } },
       { steps: { run: { choice: ["approve", 2] } } },
       { steps: { run: { iterations: -1 } } },
       { steps: { run: { recovery: "unknown" } } },
@@ -273,8 +343,7 @@ steps:
       steps: {
         wait_for_review: { iterations: 1 },
         collect_pr_state: { outputs: ["github/pr-state.json"] },
-        classify_comments: { outputs: ["github/actionable-comments.json"] },
-        route_comments: { condition: "continue_loop" }
+        classify_comments: { outputs: { "github/actionable-comments.json": { count: 0 } } }
       }
     });
 
@@ -333,9 +402,7 @@ steps:
     body:
       - { id: nested_finish, type: result, status: completed }
 `);
-    const result = simulateAgentflowWorkflow(workflow, {
-      steps: { route: { condition: "nested_finish" } }
-    });
+    const result = simulateAgentflowWorkflow(workflow, { artifacts: { "ready.json": true } });
 
     expect(result.status).toBe("completed");
     expect(result.visitedSteps.map((step) => step.id)).toEqual(["route", "nested_finish"]);
@@ -362,6 +429,102 @@ steps:
     expect(result.visitedSteps).toEqual([
       { id: "route", type: "condition", outcome: "failed" }
     ]);
+  });
+
+  test("records condition evaluation errors as failed visits", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: unresolved-condition
+version: 1
+style: pipeline
+maturity: draft
+steps:
+  - { id: route, type: condition, if: artifacts.missing == true, then: complete, else: cancel }
+`);
+
+    const result = simulateAgentflowWorkflow(workflow, {});
+
+    expect(result.status).toBe("unresolved");
+    expect(result.visitedSteps).toEqual([
+      { id: "route", type: "condition", outcome: "failed" }
+    ]);
+  });
+
+  test("fails closed for missing compared values and malformed branch entries", () => {
+    const missingValue = parseAgentflowWorkflowOrThrow(`name: simulated-missing-comparison
+version: 1
+style: pipeline
+maturity: draft
+inputs: { status: {} }
+steps:
+  - { id: route, type: condition, if: status != "changes_requested", then: complete, else: fail }
+`);
+    const missingResult = simulateAgentflowWorkflow(missingValue, {});
+    expect(missingResult.status).toBe("unresolved");
+    expect(missingResult.unresolvedBranches[0]?.reason).toContain("did not resolve to a value");
+
+    const malformedBranches = parseAgentflowWorkflowOrThrow(`name: simulated-malformed-branches
+version: 1
+style: pipeline
+maturity: draft
+inputs: { ready: {} }
+steps:
+  - id: route
+    type: condition
+    branches:
+      - true
+      - { if: ready, then: complete }
+`);
+    const malformedResult = simulateAgentflowWorkflow(malformedBranches, { inputs: { ready: true } });
+    expect(malformedResult.status).toBe("unresolved");
+    expect(malformedResult.unresolvedBranches[0]?.reason).toContain("Condition branches must be a list of mappings");
+
+    const malformedElse = parseAgentflowWorkflowOrThrow(`name: simulated-malformed-else
+version: 1
+style: pipeline
+maturity: draft
+inputs: { ready: {} }
+steps:
+  - { id: route, type: condition, branches: [{ if: ready, then: complete }], else: 42 }
+`);
+    const malformedElseResult = simulateAgentflowWorkflow(malformedElse, { inputs: { ready: false } });
+    expect(malformedElseResult.status).toBe("unresolved");
+    expect(malformedElseResult.unresolvedBranches[0]?.reason).toContain("Condition else must be a non-empty string");
+  });
+
+  test("stops conditions before routing when any required input is absent", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: unrelated-required-input
+version: 1
+style: pipeline
+maturity: draft
+inputs:
+  ready: { required: true }
+  unrelated: { required: true }
+steps:
+  - { id: route, type: condition, if: ready, then: complete, else: cancel }
+`);
+
+    const result = simulateAgentflowWorkflow(workflow, { inputs: { ready: true } });
+
+    expect(result.status).toBe("unresolved");
+    expect(result.visitedSteps).toEqual([{ id: "route", type: "condition", outcome: "failed" }]);
+    expect(result.terminalStates).toEqual([]);
+  });
+
+  test("enforces the runtime artifact read limit during condition simulation", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: oversized-condition-artifact
+version: 1
+style: pipeline
+maturity: draft
+steps:
+  - { id: route, type: condition, if: artifacts.payload.ready, then: complete, else: cancel }
+`);
+
+    const result = simulateAgentflowWorkflow(workflow, {
+      artifacts: { "payload.json": "x".repeat(10 * 1024 * 1024 + 1) }
+    });
+
+    expect(result.status).toBe("unresolved");
+    expect(result.visitedSteps).toEqual([{ id: "route", type: "condition", outcome: "failed" }]);
+    expect(result.unresolvedBranches[0]?.reason).toContain("exceeds the 10485760-byte read limit");
   });
 
   test("requires fixture-selected routed recovery outcomes", () => {
@@ -528,6 +691,101 @@ steps:
 
     expect(result.status).toBe("completed");
     expect(result.artifactValues["shared.txt"]).toBe("NEW");
+  });
+
+  test("allows rerouted transforms to replace outputs they already own", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: simulated-transform-revisit
+version: 1
+style: recovery_pipeline
+maturity: experimental
+limits:
+  max_recovery_cycles: 1
+  max_step_attempts: { update: 1 }
+steps:
+  - { id: seed, type: command, command: echo one, outputs: [source.txt] }
+  - { id: render, type: artifact_transform, input: source.txt, output: rendered.txt, transform: uppercase }
+  - { id: update, type: command, command: echo two, outputs: [source.txt], overwrite: true, then: render }
+`);
+    const registry = new AgentflowArtifactTransformRegistry().register("uppercase", (input) => ({
+      content: Buffer.from(input).toString("utf8").toUpperCase(),
+      contentType: "text/plain"
+    }));
+
+    const result = simulateAgentflowWorkflow(workflow, {
+      steps: {
+        seed: { outputs: { "source.txt": "one" } },
+        update: { outputs: { "source.txt": "two" } }
+      }
+    }, registry);
+
+    expect(result.visitedSteps.map((step) => step.id)).toEqual(["seed", "render", "update", "render"]);
+    expect(result.artifactValues["rendered.txt"]).toBe("TWO");
+  });
+
+  test("stops rerouted commands from replacing foreign-owned outputs", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: simulated-output-owner
+version: 1
+style: recovery_pipeline
+maturity: experimental
+limits: { max_recovery_cycles: 1 }
+steps:
+  - { id: first, type: command, command: echo first, outputs: [shared.txt] }
+  - { id: second, type: command, command: echo second, outputs: [shared.txt], overwrite: true, then: first }
+`);
+
+    const result = simulateAgentflowWorkflow(workflow, {
+      steps: {
+        first: { outputs: { "shared.txt": "first" } },
+        second: { outputs: { "shared.txt": "second" } }
+      }
+    });
+
+    expect(result.status).toBe("unresolved");
+    expect(result.visitedSteps.map((step) => `${step.id}:${step.outcome}`)).toEqual([
+      "first:succeeded", "second:succeeded", "first:failed"
+    ]);
+    expect(result.artifactValues["shared.txt"]).toBe("second");
+  });
+
+  test("allows commands to idempotently publish identical fixture output", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: simulated-idempotent-output
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - { id: first, type: command, command: echo same, outputs: [shared.txt] }
+  - { id: second, type: command, command: echo same, outputs: [shared.txt] }
+`);
+
+    const result = simulateAgentflowWorkflow(workflow, {
+      steps: {
+        first: { outputs: { "shared.txt": "same" } },
+        second: { outputs: { "shared.txt": "same" } }
+      }
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.visitedSteps.map((step) => step.id)).toEqual(["first", "second"]);
+    expect(result.artifactValues["shared.txt"]).toBe("same");
+  });
+
+  test("does not claim identical fixture-owned output as a command artifact", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: simulated-fixture-output-owner
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: write, type: command, command: echo same, outputs: [shared.txt] }
+`);
+
+    const result = simulateAgentflowWorkflow(workflow, {
+      artifacts: { "shared.txt": "same" },
+      steps: { write: { outputs: { "shared.txt": "same" } } }
+    });
+
+    expect(result.status).toBe("unresolved");
+    expect(result.visitedSteps).toEqual([{ id: "write", type: "command", outcome: "failed" }]);
+    expect(result.artifactValues["shared.txt"]).toBe("same");
   });
 
   test("reports overlapping availability-only parallel outputs as unresolved", () => {
@@ -748,15 +1006,73 @@ limits: { max_recovery_cycles: 2 }
 steps:
   - { id: retry, type: condition, if: retry, then: retry, else: complete }
 `);
-    const result = simulateAgentflowWorkflow(workflow, {
-      steps: { retry: { condition: "retry" } }
-    });
+    const result = simulateAgentflowWorkflow(workflow, { inputs: { retry: true } });
 
     expect(result.status).toBe("unresolved");
     expect(result.visitedSteps).toHaveLength(3);
     expect(result.unresolvedBranches).toEqual([
       { stepId: "retry", reason: "Simulation exceeded limits.max_recovery_cycles 2." }
     ]);
+  });
+
+  test("counts implicit fallthrough edges in simulated recovery cycles", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: simulated-fallthrough-cycle
+version: 1
+style: recovery_pipeline
+maturity: draft
+limits: { max_recovery_cycles: 1 }
+steps:
+  - { id: start, type: command, command: echo start, then: third }
+  - { id: second, type: command, command: echo second }
+  - { id: third, type: command, command: echo third, then: second }
+`);
+
+    const result = simulateAgentflowWorkflow(workflow, {});
+
+    expect(result.status).toBe("unresolved");
+    expect(result.visitedSteps.map((step) => step.id)).toEqual(["start", "third", "second", "third", "second"]);
+    expect(result.unresolvedBranches).toEqual([
+      { stepId: "third", reason: "Simulation exceeded limits.max_recovery_cycles 1." }
+    ]);
+  });
+
+  test("applies per-step attempt limits to condition routes", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: simulation-step-attempts
+version: 1
+style: recovery_pipeline
+maturity: experimental
+inputs: { again: {} }
+limits:
+  max_recovery_cycles: 3
+  max_step_attempts: { work: 1 }
+steps:
+  - { id: work, type: command, command: echo work }
+  - { id: route, type: condition, if: again, then: work, else: complete }
+`);
+
+    const result = simulateAgentflowWorkflow(workflow, { inputs: { again: true } });
+
+    expect(result.status).toBe("paused");
+    expect(result.visitedSteps.map((step) => step.id)).toEqual(["work", "route"]);
+    expect(result.terminalStates).toEqual([{ stepId: "work", status: "paused" }]);
+  });
+
+  test("applies fractional step-attempt limits before the first visit", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: simulation-initial-attempt-limit
+version: 1
+style: recovery_pipeline
+maturity: experimental
+limits:
+  max_step_attempts: { work: 0.5 }
+steps:
+  - { id: work, type: command, command: echo work }
+`);
+
+    const result = simulateAgentflowWorkflow(workflow, {});
+
+    expect(result.status).toBe("paused");
+    expect(result.visitedSteps).toEqual([]);
+    expect(result.terminalStates).toEqual([{ stepId: "work", status: "paused" }]);
   });
 
   test("resolves fixture inputs used as artifact references", () => {
@@ -789,8 +1105,8 @@ steps:
   - { id: complete, type: command, command: echo complete, outputs: [done.json] }
 `);
     const result = simulateAgentflowWorkflow(workflow, {
+      inputs: { ready: true },
       steps: {
-        route: { condition: "complete" },
         complete: { outputs: ["done.json"] }
       }
     });
@@ -798,6 +1114,26 @@ steps:
     expect(result.status).toBe("completed");
     expect(result.visitedSteps.map((step) => step.id)).toEqual(["route", "complete"]);
     expect(result.availableArtifacts).toEqual(["done.json"]);
+  });
+
+  test("does not index typeless parallel descriptors as route targets", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: simulated-descriptor-alias
+version: 1
+style: pipeline
+maturity: experimental
+sessions: { worker: { provider: local } }
+steps:
+  - { id: start, type: command, command: echo start, then: complete }
+  - id: parallel_work
+    type: parallel
+    branches:
+      - { id: complete, session: worker }
+`);
+
+    const result = simulateAgentflowWorkflow(workflow, {});
+
+    expect(result.status).toBe("completed");
+    expect(result.visitedSteps.map((step) => step.id)).toEqual(["start"]);
   });
 
   test("counts parallel branch retries against the transition limit", () => {
@@ -908,6 +1244,29 @@ steps:
     expect(result.visitedSteps).toEqual([]);
     expect(result.unresolvedBranches).toEqual([
       { stepId: "shared", reason: "Workflow step ID is ambiguous in simulation fixtures and targets." }
+    ]);
+  });
+
+  test("rejects ambiguous success targets before traversal", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: ambiguous-simulation-success-target
+version: 1
+style: pipeline
+maturity: draft
+steps:
+  - { id: start, type: command, command: echo start, then: second, goto: third }
+  - { id: second, type: command, command: echo second }
+  - { id: third, type: command, command: echo third }
+`);
+
+    const result = simulateAgentflowWorkflow(workflow, {});
+
+    expect(result.status).toBe("unresolved");
+    expect(result.visitedSteps).toEqual([]);
+    expect(result.unresolvedBranches).toEqual([
+      {
+        stepId: "start",
+        reason: 'Step "start" cannot declare both then and goto success targets.'
+      }
     ]);
   });
 

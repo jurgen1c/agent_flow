@@ -37,6 +37,8 @@ import {
   validateAgentflowMcpArgumentExpressions,
   validateAgentflowMcpOutputPaths
 } from "./mcp_call";
+import { selectAgentflowConditionTarget } from "./condition";
+import { assertAgentflowSuccessTargetsAreUnambiguous } from "./success_routing";
 
 const MAX_CAPTURE_BYTES = 10 * 1024 * 1024;
 
@@ -82,6 +84,8 @@ export async function executeAgentflowCommandPipeline(
   if (existing.status !== "pending") {
     throw new Error(`Agentflow run ${runId} cannot execute while its status is ${existing.status}.`);
   }
+  assertAgentflowSuccessTargetsAreUnambiguous(workflow.steps);
+  const stepLocations = collectRuntimeStepLocations(workflow.steps);
 
   store.transitionRunWithEvent(runId, {
     status: "running",
@@ -90,14 +94,22 @@ export async function executeAgentflowCommandPipeline(
   });
 
   const completedSteps: string[] = [];
-  for (const step of workflow.steps) {
+  const routingBudget = createSuccessfulRoutingBudget(workflow);
+  let currentSteps = workflow.steps;
+  let stepIndex = 0;
+  while (stepIndex < currentSteps.length) {
+    const step = currentSteps[stepIndex]!;
     const stoppedBeforeStep = stoppedPipelineResult(store, runId, completedSteps);
     if (stoppedBeforeStep !== undefined) return stoppedBeforeStep;
     const stepId = requiredStepId(step);
-    if (typeof step.type === "string" && step.type.trim() === "mcp_call") {
+    routingBudget.visits.set(stepId, (routingBudget.visits.get(stepId) ?? 0) + 1);
+    const stepType = normalizedTarget(step.type);
+    if (stepType === "mcp_call") {
+      const firstAttempt = allocateStepAttempt(routingBudget, stepId);
+      if (firstAttempt === undefined) return stepAttemptLimitResult(store, runId, completedSteps, stepId, routingBudget);
       const preflightError = validateMcpCallStep(step);
       if (preflightError !== undefined) {
-        persistMcpCallFailure(store, runId, stepId, preflightError, false, 1, true);
+        persistMcpCallFailure(store, runId, stepId, preflightError, false, firstAttempt, true);
         return finishFailure(store, runId, completedSteps, stepId, {
           exitCode: null,
           timedOut: false,
@@ -106,7 +118,9 @@ export async function executeAgentflowCommandPipeline(
       }
       const retries = failureRetries(step);
       let failure: string | undefined;
-      for (let attempt = 1; attempt <= retries + 1; attempt += 1) {
+      for (let attemptIndex = 1; attemptIndex <= retries + 1; attemptIndex += 1) {
+        const attempt = attemptIndex === 1 ? firstAttempt : allocateStepAttempt(routingBudget, stepId);
+        if (attempt === undefined) return stepAttemptLimitResult(store, runId, completedSteps, stepId, routingBudget);
         const stopped = activeStopStatus(store, runId);
         if (stopped !== undefined) return stoppedPipelineResult(store, runId, completedSteps)!;
         const server = (step.server as string).trim();
@@ -157,23 +171,37 @@ export async function executeAgentflowCommandPipeline(
             return interruptedPipelineResult(store, runId, completedSteps, stopped);
           }
           failure = error instanceof Error ? error.message : String(error);
-          const retryable = attempt <= retries && mcpCallFailureIsRetryable(error);
+          const retryable = attemptIndex <= retries && mcpCallFailureIsRetryable(error);
           persistMcpCallFailure(store, runId, stepId, failure, retryable, attempt);
           if (!retryable) break;
         }
       }
-      if (failure === undefined) continue;
-      if (failureContinues(step)) continue;
+      if (failure === undefined) {
+        const routed = routeAfterSuccessfulStep(store, runId, completedSteps, stepId, step, currentSteps, stepIndex, stepLocations, routingBudget);
+        if ("result" in routed) return routed.result;
+        currentSteps = routed.steps;
+        stepIndex = routed.nextIndex;
+        continue;
+      }
+      if (failureContinues(step)) {
+        const routed = fallthroughAfterStep(store, runId, completedSteps, stepId, currentSteps, stepIndex, routingBudget);
+        if ("result" in routed) return routed.result;
+        currentSteps = routed.steps;
+        stepIndex = routed.nextIndex;
+        continue;
+      }
       return finishFailure(store, runId, completedSteps, stepId, {
         exitCode: null,
         timedOut: false,
         message: failure
       }, failureStatus(step));
     }
-    if (step.type === "artifact_transform") {
+    if (stepType === "artifact_transform") {
+      const firstAttempt = allocateStepAttempt(routingBudget, stepId);
+      if (firstAttempt === undefined) return stepAttemptLimitResult(store, runId, completedSteps, stepId, routingBudget);
       const preflightError = validateTransformStep(step);
       if (preflightError !== undefined) {
-        persistTransformPreflightFailure(store, runId, stepId, preflightError);
+        persistTransformPreflightFailure(store, runId, stepId, firstAttempt, preflightError);
         return finishFailure(store, runId, completedSteps, stepId, {
           exitCode: null,
           timedOut: false,
@@ -182,8 +210,10 @@ export async function executeAgentflowCommandPipeline(
       }
       const retries = failureRetries(step);
       let failure: string | undefined;
-      for (let attempt = 1; attempt <= retries + 1; attempt += 1) {
-        const outcome = executeTransformStep(store, runId, stepId, step, transforms, attempt, attempt <= retries);
+      for (let attemptIndex = 1; attemptIndex <= retries + 1; attemptIndex += 1) {
+        const attempt = attemptIndex === 1 ? firstAttempt : allocateStepAttempt(routingBudget, stepId);
+        if (attempt === undefined) return stepAttemptLimitResult(store, runId, completedSteps, stepId, routingBudget);
+        const outcome = executeTransformStep(store, runId, stepId, step, transforms, attempt, attemptIndex <= retries);
         if (outcome.stopped !== undefined) {
           return stoppedPipelineResult(store, runId, completedSteps)!;
         }
@@ -192,22 +222,34 @@ export async function executeAgentflowCommandPipeline(
       }
       if (failure === undefined) {
         completedSteps.push(stepId);
+        const routed = routeAfterSuccessfulStep(store, runId, completedSteps, stepId, step, currentSteps, stepIndex, stepLocations, routingBudget);
+        if ("result" in routed) return routed.result;
+        currentSteps = routed.steps;
+        stepIndex = routed.nextIndex;
         continue;
       }
-      if (failureContinues(step)) continue;
+      if (failureContinues(step)) {
+        const routed = fallthroughAfterStep(store, runId, completedSteps, stepId, currentSteps, stepIndex, routingBudget);
+        if ("result" in routed) return routed.result;
+        currentSteps = routed.steps;
+        stepIndex = routed.nextIndex;
+        continue;
+      }
       return finishFailure(store, runId, completedSteps, stepId, {
         exitCode: null,
         timedOut: false,
         message: failure
       }, failureStatus(step));
     }
-    if (typeof step.type === "string" && step.type.trim() === "session_request") {
+    if (stepType === "session_request") {
+      const firstAttempt = allocateStepAttempt(routingBudget, stepId);
+      if (firstAttempt === undefined) return stepAttemptLimitResult(store, runId, completedSteps, stepId, routingBudget);
       const preflightError = validateSessionRequestStep(step);
       if (preflightError !== undefined) {
         const sessionId = typeof step.session === "string" && step.session.trim().length > 0
           ? step.session.trim()
           : undefined;
-        persistSessionRequestFailure(store, runId, stepId, sessionId, preflightError, false, true);
+        persistSessionRequestFailure(store, runId, stepId, sessionId, preflightError, false, true, firstAttempt);
         return finishFailure(store, runId, completedSteps, stepId, {
           exitCode: null,
           timedOut: false,
@@ -216,7 +258,9 @@ export async function executeAgentflowCommandPipeline(
       }
       const retries = failureRetries(step);
       let failure: string | undefined;
-      for (let attempt = 1; attempt <= retries + 1; attempt += 1) {
+      for (let attemptIndex = 1; attemptIndex <= retries + 1; attemptIndex += 1) {
+        const attempt = attemptIndex === 1 ? firstAttempt : allocateStepAttempt(routingBudget, stepId);
+        if (attempt === undefined) return stepAttemptLimitResult(store, runId, completedSteps, stepId, routingBudget);
         const stopped = activeStopStatus(store, runId);
         if (stopped !== undefined) return stoppedPipelineResult(store, runId, completedSteps)!;
         store.updateRun(runId, { currentStepId: stepId, error: null });
@@ -304,28 +348,110 @@ export async function executeAgentflowCommandPipeline(
               : { externalSessionId: previousSession.externalSessionId }),
             state: { resume: sessionDefinition?.resume === true, lastStepId: stepId, error: failure }
           });
-          persistSessionRequestFailure(store, runId, stepId, sessionId, failure, attempt <= retries, false, attempt);
+          persistSessionRequestFailure(store, runId, stepId, sessionId, failure, attemptIndex <= retries, false, attempt);
         }
       }
-      if (failure === undefined) continue;
-      if (failureContinues(step)) continue;
+      if (failure === undefined) {
+        const routed = routeAfterSuccessfulStep(store, runId, completedSteps, stepId, step, currentSteps, stepIndex, stepLocations, routingBudget);
+        if ("result" in routed) return routed.result;
+        currentSteps = routed.steps;
+        stepIndex = routed.nextIndex;
+        continue;
+      }
+      if (failureContinues(step)) {
+        const routed = fallthroughAfterStep(store, runId, completedSteps, stepId, currentSteps, stepIndex, routingBudget);
+        if ("result" in routed) return routed.result;
+        currentSteps = routed.steps;
+        stepIndex = routed.nextIndex;
+        continue;
+      }
       return finishFailure(store, runId, completedSteps, stepId, {
         exitCode: null,
         timedOut: false,
         message: failure
       }, failureStatus(step));
     }
-    if (step.type !== "command") {
+    if (stepType === "condition") {
+      const attempt = allocateStepAttempt(routingBudget, stepId);
+      if (attempt === undefined) return stepAttemptLimitResult(store, runId, completedSteps, stepId, routingBudget);
+      store.updateRun(runId, { currentStepId: stepId, error: null });
+      store.upsertStep({ runId, stepId, attempt, status: "running", input: { type: "condition" } });
+      store.appendRunEvent(runId, { type: "step.started", stepId, payload: { attempt, type: "condition" } });
+      try {
+        const selection = selectAgentflowConditionTarget(store, runId, step);
+        const stopped = activeStopStatus(store, runId);
+        if (stopped !== undefined) {
+          const output = { attempt, status: stopped, type: "condition" };
+          store.upsertStep({ runId, stepId, attempt, status: stopped, output });
+          store.appendRunEvent(runId, { type: "step.interrupted", stepId, payload: output });
+          return interruptedPipelineResult(store, runId, completedSteps, stopped);
+        }
+        const output = {
+          attempt,
+          matched: selection.matched,
+          expression: selection.expression ?? null,
+          target: selection.target ?? null
+        };
+        store.upsertStep({ runId, stepId, attempt, status: "completed", output });
+        store.appendRunEvent(runId, { type: "step.completed", stepId, payload: output });
+        completedSteps.push(stepId);
+        const routed = routeAfterSuccessfulStep(
+          store,
+          runId,
+          completedSteps,
+          stepId,
+          step,
+          currentSteps,
+          stepIndex,
+          stepLocations,
+          routingBudget,
+          selection.target
+        );
+        if ("result" in routed) return routed.result;
+        currentSteps = routed.steps;
+        stepIndex = routed.nextIndex;
+        continue;
+      } catch (error) {
+        const stopped = activeStopStatus(store, runId);
+        if (stopped !== undefined) {
+          const output = { attempt, status: stopped, type: "condition" };
+          store.upsertStep({ runId, stepId, attempt, status: stopped, output });
+          store.appendRunEvent(runId, { type: "step.interrupted", stepId, payload: output });
+          return interruptedPipelineResult(store, runId, completedSteps, stopped);
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        const failure = { attempt, message };
+        store.upsertStep({ runId, stepId, attempt, status: "failed", error: failure });
+        store.recordFailure({
+          id: `condition:${safeId(stepId)}:evaluation`,
+          runId,
+          stepId,
+          classification: "condition_evaluation",
+          message,
+          retryable: false,
+          payload: failure
+        });
+        store.appendRunEvent(runId, { type: "step.failed", stepId, payload: failure });
+        return finishFailure(store, runId, completedSteps, stepId, {
+          exitCode: null,
+          timedOut: false,
+          message
+        }, "failed");
+      }
+    }
+    if (stepType !== "command") {
       return finishFailure(store, runId, completedSteps, stepId, {
         exitCode: null,
         timedOut: false,
-        message: `Step ${stepId} has unsupported type ${String(step.type)}; only command, artifact_transform, mcp_call, and session_request steps can execute in this runtime phase.`
+        message: `Step ${stepId} has unsupported type ${String(step.type)}; only command, artifact_transform, condition, mcp_call, and session_request steps can execute in this runtime phase.`
       }, "paused");
     }
 
+    const firstAttempt = allocateStepAttempt(routingBudget, stepId);
+    if (firstAttempt === undefined) return stepAttemptLimitResult(store, runId, completedSteps, stepId, routingBudget);
     const preflightError = validateCommandStep(store.repoRoot, workflow, step);
     if (preflightError !== undefined) {
-      persistPreflightFailure(store, runId, stepId, preflightError.message);
+      persistPreflightFailure(store, runId, stepId, firstAttempt, preflightError.message);
       return finishFailure(store, runId, completedSteps, stepId, {
         exitCode: null,
         timedOut: false,
@@ -335,7 +461,9 @@ export async function executeAgentflowCommandPipeline(
 
     const retries = failureRetries(step);
     let lastResult: CommandAttemptResult | undefined;
-    for (let attempt = 1; attempt <= retries + 1; attempt += 1) {
+    for (let attemptIndex = 1; attemptIndex <= retries + 1; attemptIndex += 1) {
+      const attempt = attemptIndex === 1 ? firstAttempt : allocateStepAttempt(routingBudget, stepId);
+      if (attempt === undefined) return stepAttemptLimitResult(store, runId, completedSteps, stepId, routingBudget);
       store.updateRun(runId, { currentStepId: stepId, error: null });
       store.upsertStep({ runId, stepId, attempt, status: "running", input: { command: step.command as string } });
       store.appendRunEvent(runId, { type: "step.started", stepId, payload: { attempt, command: step.command as string } });
@@ -397,7 +525,7 @@ export async function executeAgentflowCommandPipeline(
         stepId,
         classification: lastResult.timedOut ? "command_timeout" : "command_failure",
         message: error.message as string,
-        retryable: attempt <= retries,
+        retryable: attemptIndex <= retries,
         payload: error
       });
       store.appendRunEvent(runId, {
@@ -408,15 +536,236 @@ export async function executeAgentflowCommandPipeline(
     }
 
     if (lastResult !== undefined) {
-      if (failureContinues(step)) continue;
+      if (failureContinues(step)) {
+        const routed = fallthroughAfterStep(store, runId, completedSteps, stepId, currentSteps, stepIndex, routingBudget);
+        if ("result" in routed) return routed.result;
+        currentSteps = routed.steps;
+        stepIndex = routed.nextIndex;
+        continue;
+      }
       return finishFailure(store, runId, completedSteps, stepId, {
         exitCode: lastResult.exitCode,
         timedOut: lastResult.timedOut,
         message: lastResult.message ?? failureMessage(lastResult)
       }, failureStatus(step));
     }
+
+    const routed = routeAfterSuccessfulStep(store, runId, completedSteps, stepId, step, currentSteps, stepIndex, stepLocations, routingBudget);
+    if ("result" in routed) return routed.result;
+    currentSteps = routed.steps;
+    stepIndex = routed.nextIndex;
   }
 
+  return finishCompleted(store, runId, completedSteps);
+}
+
+type SuccessfulRoute =
+  | { steps: AgentflowWorkflowStep[]; nextIndex: number }
+  | { result: AgentflowCommandPipelineResult };
+
+interface RuntimeStepLocation {
+  steps: AgentflowWorkflowStep[];
+  index: number;
+}
+
+interface SuccessfulRoutingBudget {
+  maxRecoveryCycles?: number;
+  stepAttemptLimits: Map<string, number>;
+  visits: Map<string, number>;
+  recoveryCycles: Map<string, number>;
+  attempts: Map<string, number>;
+}
+
+function routeAfterSuccessfulStep(
+  store: AgentflowRunStateStore,
+  runId: string,
+  completedSteps: string[],
+  stepId: string,
+  step: AgentflowWorkflowStep,
+  currentSteps: AgentflowWorkflowStep[],
+  stepIndex: number,
+  stepLocations: Map<string, RuntimeStepLocation>,
+  budget: SuccessfulRoutingBudget,
+  selectedTarget?: string
+): SuccessfulRoute {
+  const stopped = stoppedPipelineResult(store, runId, completedSteps);
+  if (stopped !== undefined) return { result: stopped };
+  const target = selectedTarget ?? (normalizedTarget(step.type) === "condition"
+    ? undefined
+    : normalizedTarget(step.then) ?? normalizedTarget(step.goto));
+  if (target === undefined) {
+    return fallthroughAfterStep(store, runId, completedSteps, stepId, currentSteps, stepIndex, budget);
+  }
+  const nextLocation = stepLocations.get(target);
+  if (nextLocation !== undefined) {
+    const failure = successfulTransitionFailure(store, runId, completedSteps, stepId, target, budget);
+    if (failure !== undefined) return { result: failure };
+    return { steps: nextLocation.steps, nextIndex: nextLocation.index };
+  }
+  if (target === "continue" || target === "ignore") {
+    return fallthroughAfterStep(store, runId, completedSteps, stepId, currentSteps, stepIndex, budget);
+  }
+  if (target === "complete" || target === "completed") return { result: finishCompleted(store, runId, completedSteps) };
+  if (target === "fail") {
+    return { result: finishSuccessfulTerminalRoute(store, runId, completedSteps, stepId, "failed") };
+  }
+  if (target === "pause") {
+    return { result: finishSuccessfulTerminalRoute(store, runId, completedSteps, stepId, "paused") };
+  }
+  if (target === "cancel") {
+    return { result: finishSuccessfulTerminalRoute(store, runId, completedSteps, stepId, "cancelled") };
+  }
+  return { result: finishFailure(store, runId, completedSteps, stepId, {
+    exitCode: null,
+    timedOut: false,
+    message: `Step ${stepId} routed to unresolved target ${target}.`
+  }, "failed") };
+}
+
+function fallthroughAfterStep(
+  store: AgentflowRunStateStore,
+  runId: string,
+  completedSteps: string[],
+  stepId: string,
+  currentSteps: AgentflowWorkflowStep[],
+  stepIndex: number,
+  budget: SuccessfulRoutingBudget
+): SuccessfulRoute {
+  const target = normalizedTarget(currentSteps[stepIndex + 1]?.id);
+  if (target !== undefined) {
+    const failure = successfulTransitionFailure(store, runId, completedSteps, stepId, target, budget);
+    if (failure !== undefined) return { result: failure };
+  }
+  return { steps: currentSteps, nextIndex: stepIndex + 1 };
+}
+
+function successfulTransitionFailure(
+  store: AgentflowRunStateStore,
+  runId: string,
+  completedSteps: string[],
+  stepId: string,
+  target: string,
+  budget: SuccessfulRoutingBudget
+): AgentflowCommandPipelineResult | undefined {
+  const attemptLimit = budget.stepAttemptLimits.get(target);
+  if (attemptLimit !== undefined && (budget.attempts.get(target) ?? 0) + 1 > attemptLimit) {
+    return finishFailure(store, runId, completedSteps, stepId, {
+      exitCode: null,
+      timedOut: false,
+      message: `Step ${stepId} cannot route to ${target} because limits.max_step_attempts allows ${attemptLimit} attempt(s).`
+    }, "paused");
+  }
+  if ((budget.visits.get(target) ?? 0) === 0) return undefined;
+  if (budget.maxRecoveryCycles === undefined) {
+    return finishFailure(store, runId, completedSteps, stepId, {
+      exitCode: null,
+      timedOut: false,
+      message: `Step ${stepId} repeated route target ${target} without a positive executable limits.max_recovery_cycles bound.`
+    }, "paused");
+  }
+  const cycles = (budget.recoveryCycles.get(target) ?? 0) + 1;
+  budget.recoveryCycles.set(target, cycles);
+  if (cycles <= budget.maxRecoveryCycles) return undefined;
+  return finishFailure(store, runId, completedSteps, stepId, {
+    exitCode: null,
+    timedOut: false,
+    message: `Step ${stepId} exceeded limits.max_recovery_cycles ${budget.maxRecoveryCycles} while routing to ${target}.`
+  }, "paused");
+}
+
+function finishSuccessfulTerminalRoute(
+  store: AgentflowRunStateStore,
+  runId: string,
+  completedSteps: string[],
+  stepId: string,
+  status: "failed" | "paused" | "cancelled"
+): AgentflowCommandPipelineResult {
+  const target = status === "failed" ? "fail" : status === "paused" ? "pause" : "cancel";
+  const message = `Step ${stepId} routed the pipeline to ${target}.`;
+  store.updateRun(runId, {
+    currentStepId: null,
+    output: { completedSteps, terminalRoute: { status, stepId } }
+  });
+  store.transitionRunWithEvent(runId, {
+    status,
+    allowedFrom: ["running"],
+    event: { type: `run.${status}`, payload: { routedByStepId: stepId, completedSteps, message } }
+  });
+  return { status, completedSteps, message };
+}
+
+function createSuccessfulRoutingBudget(workflow: AgentflowWorkflow): SuccessfulRoutingBudget {
+  const limits = mapping(workflow.limits);
+  const configuredStepAttempts = mapping(limits?.max_step_attempts);
+  const stepAttemptLimits = new Map(Object.entries(configuredStepAttempts ?? {}).flatMap(([stepId, value]) =>
+    typeof value === "number" && Number.isFinite(value) && value > 0 ? [[stepId, value] as const] : []
+  ));
+  const maxRecoveryCycles = workflow.style !== "pipeline" && typeof limits?.max_recovery_cycles === "number"
+    && Number.isSafeInteger(limits.max_recovery_cycles) && limits.max_recovery_cycles > 0
+    ? limits.max_recovery_cycles
+    : undefined;
+  return { maxRecoveryCycles, stepAttemptLimits, visits: new Map(), recoveryCycles: new Map(), attempts: new Map() };
+}
+
+function collectRuntimeStepLocations(
+  steps: AgentflowWorkflowStep[],
+  locations = new Map<string, RuntimeStepLocation>()
+): Map<string, RuntimeStepLocation> {
+  steps.forEach((step, index) => {
+    if (normalizedTarget(step.type) !== undefined) {
+      const stepId = requiredStepId(step);
+      if (locations.has(stepId)) {
+        throw new AgentflowRunStateError(
+          `Agentflow workflow has multiple steps with ID ${JSON.stringify(stepId)}; runtime routing is ambiguous.`,
+          "AGENTFLOW_STEP_AMBIGUOUS"
+        );
+      }
+      locations.set(stepId, { steps, index });
+    }
+
+    for (const field of ["body", "steps"] as const) {
+      const nested = step[field];
+      if (Array.isArray(nested)) {
+        collectRuntimeStepLocations(nested.filter(isWorkflowStep), locations);
+      }
+    }
+
+    if (normalizedTarget(step.type) === "parallel" && Array.isArray(step.branches)) {
+      collectRuntimeStepLocations(step.branches.filter(isWorkflowStep), locations);
+    }
+  });
+
+  return locations;
+}
+
+function allocateStepAttempt(budget: SuccessfulRoutingBudget, stepId: string): number | undefined {
+  const attempt = (budget.attempts.get(stepId) ?? 0) + 1;
+  const limit = budget.stepAttemptLimits.get(stepId);
+  if (limit !== undefined && attempt > limit) return undefined;
+  budget.attempts.set(stepId, attempt);
+  return attempt;
+}
+
+function stepAttemptLimitResult(
+  store: AgentflowRunStateStore,
+  runId: string,
+  completedSteps: string[],
+  stepId: string,
+  budget: SuccessfulRoutingBudget
+): AgentflowCommandPipelineResult {
+  const limit = budget.stepAttemptLimits.get(stepId)!;
+  return finishFailure(store, runId, completedSteps, stepId, {
+    exitCode: null,
+    timedOut: false,
+    message: `Step ${stepId} cannot start because limits.max_step_attempts allows ${limit} attempt(s).`
+  }, "paused");
+}
+
+function finishCompleted(
+  store: AgentflowRunStateStore,
+  runId: string,
+  completedSteps: string[]
+): AgentflowCommandPipelineResult {
   store.updateRun(runId, { currentStepId: null, output: { completedSteps } });
   store.transitionRunWithEvent(runId, {
     status: "completed",
@@ -424,6 +773,12 @@ export async function executeAgentflowCommandPipeline(
     event: { type: "run.completed", payload: { completedSteps } }
   });
   return { status: "completed", completedSteps };
+}
+
+function normalizedTarget(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.trim().length === 0) return undefined;
+  const target = value.trim();
+  return target.includes("{{") || target.includes("}}") ? undefined : target;
 }
 
 function persistMcpCallFailure(
@@ -496,7 +851,12 @@ function executeTransformStep(
   store.appendRunEvent(runId, { type: "step.started", stepId, payload: { attempt, ...input } });
 
   try {
-    const result = executeAgentflowArtifactTransform(store, runId, step, transforms, {
+    const outputPath = normalizedTarget(step.output);
+    const existingOutput = outputPath === undefined ? null : store.getArtifact(runId, outputPath);
+    const executableStep = attempt > 1 && existingOutput?.producerStepId === stepId
+      ? { ...step, overwrite: true }
+      : step;
+    const result = executeAgentflowArtifactTransform(store, runId, executableStep, transforms, {
       beforePublish: () => {
         const stopped = activeStopStatus(store, runId);
         if (stopped !== undefined) throw new TransformInterruptedError(stopped);
@@ -742,6 +1102,7 @@ function persistDeclaredOutputs(
     const realSource = fs.realpathSync(source);
     if (!inside(store.repoRoot, realSource)) return `Declared output ${declaredPath} resolves outside the repository.`;
     try {
+      const existing = store.getArtifact(runId, declaredPath);
       store.writeArtifact({
         id: `command-output:${createHash("sha256").update(declaredPath).digest("hex")}`,
         runId,
@@ -750,7 +1111,7 @@ function persistDeclaredOutputs(
         kind: "command_output",
         contentType: "application/octet-stream",
         content: fs.readFileSync(realSource),
-        overwrite: attempt > 1 || step.overwrite === true,
+        overwrite: step.overwrite === true || (attempt > 1 && existing?.producerStepId === stepId),
         metadata: { attempt, source: declaredPath }
       });
     } catch (error) {
@@ -912,12 +1273,13 @@ function persistPreflightFailure(
   store: AgentflowRunStateStore,
   runId: string,
   stepId: string,
+  attempt: number,
   message: string
 ): void {
-  const error = { exitCode: null, timedOut: false, message };
-  store.upsertStep({ runId, stepId, attempt: 1, status: "failed", error });
+  const error = { attempt, exitCode: null, timedOut: false, message };
+  store.upsertStep({ runId, stepId, attempt, status: "failed", error });
   store.recordFailure({
-    id: `command:${safeId(stepId)}:preflight`,
+    id: `command:${safeId(stepId)}:attempt-${attempt}:preflight`,
     runId,
     stepId,
     classification: "command_policy",
@@ -932,12 +1294,13 @@ function persistTransformPreflightFailure(
   store: AgentflowRunStateStore,
   runId: string,
   stepId: string,
+  attempt: number,
   message: string
 ): void {
-  const error = { attempt: 1, message };
-  store.upsertStep({ runId, stepId, attempt: 1, status: "failed", error });
+  const error = { attempt, message };
+  store.upsertStep({ runId, stepId, attempt, status: "failed", error });
   store.recordFailure({
-    id: `artifact-transform:${safeId(stepId)}:preflight`,
+    id: `artifact-transform:${safeId(stepId)}:attempt-${attempt}:preflight`,
     runId,
     stepId,
     classification: "artifact_transform_policy",
@@ -1056,4 +1419,8 @@ function mapping(value: unknown): AgentflowYamlMapping | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value) && !(value instanceof Uint8Array)
     ? value as AgentflowYamlMapping
     : undefined;
+}
+
+function isWorkflowStep(value: unknown): value is AgentflowWorkflowStep {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

@@ -687,6 +687,41 @@ steps:
     }
   });
 
+  test("enforces step-attempt limits before MCP preflight rejection", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentflowWorkflowOrThrow(`name: bounded-mcp-preflight
+version: 1
+style: recovery_pipeline
+maturity: experimental
+limits: { max_step_attempts: { fetch: 0.5 } }
+steps:
+  - { id: fetch, type: mcp_call, server: fixture, tool: fetch, arguments: {}, outputs: [ticket.json, ticket.json] }
+`);
+    const store = await openAgentflowRunState({ cwd: root });
+    store.createRunWithEvent({
+      id: "bounded-mcp-preflight",
+      workflow: {
+        name: workflow.name,
+        version: workflow.version,
+        style: workflow.style,
+        maturity: workflow.maturity
+      },
+      context: { workflow: workflow as never }
+    }, { type: "run.created", payload: { status: "pending" } });
+
+    const result = await executeAgentflowCommandPipeline(store, "bounded-mcp-preflight", workflow);
+
+    expect(result).toMatchObject({
+      status: "paused",
+      failedStep: "fetch",
+      message: "Step fetch cannot start because limits.max_step_attempts allows 0.5 attempt(s)."
+    });
+    expect(store.listEvents("bounded-mcp-preflight").map((event) => event.type)).toEqual([
+      "run.created", "run.started", "run.paused"
+    ]);
+    store.close();
+  });
+
   test("checks every output collision before invoking a multi-output adapter", async () => {
     const root = temporaryRepo();
     const workflow = parseAgentflowWorkflowOrThrow(`name: multi-output-collision

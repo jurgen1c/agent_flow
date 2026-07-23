@@ -195,6 +195,12 @@ caller explicitly supplies a server adapter. `run
 executes supported steps in sequence. Each command attempt records its status,
 exit code, timeout result, ordered events, captured stdout/stderr log artifacts,
 and declared output files.
+Successful steps fall through to the next listed step unless they declare a
+static `then` target. Pipeline condition steps evaluate one persisted input or
+published JSON artifact reference, optionally compared with a JSON scalar, and
+select the first matching branch or `else`. Condition text is parsed as data and
+is never executed. Pipeline validation rejects unresolved targets, cycles, and
+condition expressions that require compound or executable logic.
 Combined stdout/stderr capture is capped at 10 MiB per attempt; exceeding the
 limit terminates the child process and fails the step.
 Declared outputs must be repository-relative regular files; the artifact
@@ -295,7 +301,7 @@ Example simulation fixture:
   "artifacts": { "spec.md": "fixture content" },
   "steps": {
     "implement": { "outputs": ["implementation-summary.md"] },
-    "route_review": { "condition": "record_approval" },
+    "review": { "outputs": { "reviews/code-review.json": { "status": "approved" } } },
     "approval_gate": { "choice": "approve" },
     "review_loop": { "iterations": 1 }
   }

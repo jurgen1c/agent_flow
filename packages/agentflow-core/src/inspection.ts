@@ -5,6 +5,7 @@ import type {
   AgentflowYamlMapping,
   AgentflowYamlValue
 } from "./workflow";
+import { assertAgentflowSuccessTargetsAreUnambiguous } from "./success_routing";
 
 export interface AgentflowWorkflowGraphNode {
   id: string;
@@ -47,6 +48,7 @@ export class AgentflowWorkflowGraphError extends Error {
 interface LocatedStep {
   step: AgentflowWorkflowStep;
   path: string;
+  nextId?: string;
 }
 
 export function explainAgentflowWorkflow(workflow: AgentflowWorkflow): string {
@@ -115,6 +117,7 @@ export function explainAgentflowWorkflow(workflow: AgentflowWorkflow): string {
 }
 
 export function buildAgentflowWorkflowGraph(workflow: AgentflowWorkflow): AgentflowWorkflowGraph {
+  assertAgentflowSuccessTargetsAreUnambiguous(workflow.steps);
   const nodes: AgentflowWorkflowGraphNode[] = [];
   const edges: AgentflowWorkflowGraphEdge[] = [];
   const locatedSteps: LocatedStep[] = [];
@@ -122,7 +125,7 @@ export function buildAgentflowWorkflowGraph(workflow: AgentflowWorkflow): Agentf
   collectStepList(workflow.steps, "steps", nodes, edges, locatedSteps);
 
   const stepIds = new Set(locatedSteps.map(({ step }) => nonEmptyString(step.id)).filter(isString));
-  for (const { step } of locatedSteps) {
+  for (const { step, nextId } of locatedSteps) {
     const source = nonEmptyString(step.id);
     if (source === undefined) {
       continue;
@@ -132,6 +135,8 @@ export function buildAgentflowWorkflowGraph(workflow: AgentflowWorkflow): Agentf
     for (const target of targets) {
       if (stepIds.has(target.to)) {
         edges.push({ from: source, to: target.to, kind: target.kind, ...(target.label === undefined ? {} : { label: target.label }) });
+      } else if (["continue", "ignore"].includes(target.to)) {
+        if (nextId !== undefined) edges.push({ from: source, to: nextId, kind: "next" });
       } else if (isTerminalTarget(target.to)) {
         const terminalId = `terminal:${target.to}`;
         nodes.push({ id: terminalId, type: "terminal", path: terminalId, label: target.to });
@@ -218,9 +223,8 @@ function collectStepList(
     }
 
     nodes.push({ id, type, path: stepPath, ...(stepLabel(step) === undefined ? {} : { label: stepLabel(step) }) });
-    locatedSteps.push({ step, path: stepPath });
-
     const nextId = ids.slice(index + 1).find(isString);
+    locatedSteps.push({ step, path: stepPath, ...(nextId === undefined ? {} : { nextId }) });
     if (nextId !== undefined && !hasPrimaryControlTarget(step) && type !== "result") {
       edges.push({ from: id, to: nextId, kind: "next" });
     }

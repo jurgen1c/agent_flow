@@ -213,6 +213,9 @@ steps:
 version: 1
 style: recovery_pipeline
 maturity: draft
+inputs:
+  done:
+    type: boolean
 steps:
   - id: bounded
     type: loop
@@ -1757,6 +1760,25 @@ steps:
     expect(validateAgentflowWorkflow(workflow)).toEqual({ valid: true, errors: [] });
   });
 
+  test("rejects simultaneous then and goto success targets", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: ambiguous-success-target
+version: 1
+style: pipeline
+maturity: draft
+steps:
+  - { id: start, type: command, command: echo start, then: second, goto: third }
+  - { id: second, type: command, command: echo second }
+  - { id: third, type: command, command: echo third }
+`);
+
+    expect(validateAgentflowWorkflow(workflow).errors).toContainEqual({
+      code: "workflow.step.success_target.ambiguous",
+      message: 'Step "start" cannot declare both then and goto success targets.',
+      path: "steps[0].goto",
+      stepId: "start"
+    });
+  });
+
   test("rejects malformed dynamic reference delimiters", () => {
     const workflow = parseAgentflowWorkflowOrThrow(`name: malformed-reference
 version: 1
@@ -1770,6 +1792,23 @@ steps:
       "workflow.reference.dynamic.malformed",
       "workflow.step.target.unresolved"
     ]);
+  });
+
+  test("validates branch targets for normalized condition step types", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: padded-condition
+version: 1
+style: pipeline
+maturity: draft
+steps:
+  - id: route
+    type: " condition "
+    branches:
+      - { if: ready, then: missing }
+`);
+
+    expect(validateAgentflowWorkflow(workflow).errors.map((issue) => issue.code)).toContain(
+      "workflow.step.target.unresolved"
+    );
   });
 
   test("rejects unmatched delimiters even beside a complete reference", () => {
@@ -1892,6 +1931,61 @@ steps:
     expect(validateAgentflowWorkflow(workflow).errors.map((issue) => issue.code)).toContain(
       "workflow.control_flow.cycle.unbounded"
     );
+  });
+
+  test("keeps fallthrough edges for continue and ignore success routes", () => {
+    for (const target of ["continue", "ignore"]) {
+      const workflow = parseAgentflowWorkflowOrThrow(`name: terminal-fallthrough-cycle
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: first, type: command, command: echo first, then: ${target} }
+  - { id: second, type: command, command: echo second, then: first }
+`);
+
+      expect(validateAgentflowWorkflow(workflow).errors.map((issue) => issue.code)).toContain(
+        "workflow.control_flow.cycle.unbounded"
+      );
+    }
+  });
+
+  test("gives declared continue and ignore step IDs precedence over terminal aliases", () => {
+    for (const target of ["continue", "ignore"]) {
+      const workflow = parseAgentflowWorkflowOrThrow(`name: declared-terminal-target
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: start, type: command, command: echo start, then: ${target} }
+  - { id: skipped, type: command, command: echo skipped, then: start }
+  - { id: ${target}, type: command, command: echo done, then: complete }
+`);
+
+      expect(validateAgentflowWorkflow(workflow)).toEqual({ valid: true, errors: [] });
+    }
+  });
+
+  test("does not accept non-executable recovery cycle bounds", () => {
+    for (const bound of [1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      const parsed = parseAgentflowWorkflowOrThrow(`name: invalid-recovery-bound
+version: 1
+style: recovery_pipeline
+maturity: experimental
+limits: { max_recovery_cycles: 1 }
+steps:
+  - { id: first, type: command, command: echo first, then: second }
+  - { id: second, type: command, command: echo second, then: first }
+`);
+      const workflow = {
+        ...parsed,
+        limits: { ...parsed.limits, max_recovery_cycles: bound }
+      };
+
+      expect(validateAgentflowWorkflow(workflow).errors.map((issue) => issue.code)).toContain(
+        "workflow.control_flow.cycle.unbounded"
+      );
+    }
   });
 
   test("does not treat arbitrary command iteration fields as cycle bounds", () => {
@@ -2638,6 +2732,105 @@ steps:
       message: 'Artifact "never-created.txt" is read before any step produces it.',
       path: "steps[0].inputs",
       stepId: "consume"
+    });
+  });
+
+  test("includes condition artifact references in read-before-write linting", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: condition-artifact-order
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: route, type: condition, if: artifacts.result.ready == true, then: complete, else: fail }
+  - { id: produce, type: command, command: echo result, outputs: [result.json] }
+`);
+
+    expect(lintAgentflowWorkflow(workflow).warnings).toContainEqual({
+      code: "workflow.lint.artifact.read_before_write",
+      message: 'Artifact reference "artifacts.result.ready" is read before any step produces it.',
+      path: "steps[0].if",
+      stepId: "route"
+    });
+  });
+
+  test("rejects ambiguous normalized condition artifact aliases", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: ambiguous-condition-artifact
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: hyphen, type: command, command: echo first, outputs: [foo-bar.json] }
+  - { id: underscore, type: command, command: echo second, outputs: [foo_bar.json] }
+  - { id: route, type: condition, if: artifacts.foo_bar.ready, then: complete, else: fail }
+`);
+
+    expect(validateAgentflowWorkflow(workflow).errors).toContainEqual({
+      code: "workflow.condition.artifact.ambiguous",
+      message: 'Condition artifact reference "artifacts.foo_bar.ready" matches multiple declared outputs: foo-bar.json, foo_bar.json.',
+      path: "steps[2].if",
+      stepId: "route"
+    });
+  });
+
+  test("deduplicates canonical-equivalent outputs in condition ambiguity checks", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: canonical-condition-artifact
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: first, type: command, command: echo first, outputs: [./result.json] }
+  - { id: second, type: command, command: echo second, outputs: [result.json], overwrite: true }
+  - { id: route, type: condition, if: artifacts.result.ready, then: complete, else: fail }
+`);
+
+    expect(validateAgentflowWorkflow(workflow)).toEqual({ valid: true, errors: [] });
+  });
+
+  test("rejects mixed inline and branch condition forms", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: mixed-condition
+version: 1
+style: pipeline
+maturity: experimental
+inputs: { ready: {} }
+steps:
+  - id: route
+    type: condition
+    if: inputs.missing
+    then: route
+    branches:
+      - { if: ready, then: complete }
+    else: fail
+`);
+
+    expect(validateAgentflowWorkflow(workflow).errors).toContainEqual({
+      code: "workflow.condition.form.mixed",
+      message: "Condition steps must use either branches with an optional else target or top-level if/then fields, not both.",
+      path: "steps[0].branches",
+      stepId: "route"
+    });
+    expect(validateAgentflowWorkflow(workflow).errors.map((issue) => issue.code)).not.toContain("workflow.input.undeclared");
+    expect(validateAgentflowWorkflow(workflow).errors.map((issue) => issue.code)).not.toContain("workflow.control_flow.cycle.unbounded");
+  });
+
+  test("rejects non-list condition branch definitions", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: malformed-condition-branches
+version: 1
+style: pipeline
+maturity: experimental
+inputs: { ready: {} }
+steps:
+  - id: route
+    type: condition
+    if: ready
+    then: complete
+    branches: { if: ready, then: fail }
+`);
+
+    expect(validateAgentflowWorkflow(workflow).errors).toContainEqual({
+      code: "workflow.step.control.shape",
+      message: "Condition branches must be a list.",
+      path: "steps[0].branches",
+      stepId: "route"
     });
   });
 

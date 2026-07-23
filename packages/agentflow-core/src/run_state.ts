@@ -939,6 +939,17 @@ export class AgentflowRunStateStore {
     return rows.map((row) => this.inspectArtifact(row));
   }
 
+  listArtifactMetadata(runId: string): AgentflowArtifactRecord[] {
+    this.assertOpen();
+    const normalizedRunId = artifactRunId(runId);
+    this.requireRun(normalizedRunId);
+    const rows = this.database.all<ArtifactRow>(
+      "SELECT * FROM artifacts WHERE run_id = ? ORDER BY path ASC, id ASC",
+      [normalizedRunId]
+    );
+    return rows.map((row) => hydrateArtifact(this.repoRoot, row));
+  }
+
   getArtifact(runId: string, declaredPath: string): AgentflowArtifactRecord | null {
     this.assertOpen();
     const normalizedRunId = artifactRunId(runId);

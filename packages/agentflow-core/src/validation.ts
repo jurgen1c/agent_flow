@@ -9,6 +9,16 @@ import { validateAgentflowPolicyPrimitives } from "./policy";
 import { policyGlobLayersHaveWritablePath } from "./policy_utils";
 import { normalizeAgentflowArtifactPath } from "./run_state";
 import { MAX_AGENTFLOW_SESSION_INPUTS } from "./session_request";
+import {
+  agentflowConditionArtifactAlias,
+  agentflowConditionExpressionIsSimple,
+  agentflowConditionReference
+} from "./condition";
+import {
+  AGENTFLOW_AMBIGUOUS_SUCCESS_TARGET_CODE,
+  agentflowAmbiguousSuccessTargetMessage,
+  agentflowStepHasAmbiguousSuccessTarget
+} from "./success_routing";
 
 export const MAX_AGENTFLOW_COMMAND_TIMEOUT_SECONDS = 2_147_483.647;
 
@@ -102,9 +112,10 @@ export function validateAgentflowWorkflow(workflow: AgentflowWorkflow): Agentflo
   validateCommands(workflow, contexts, errors);
   validateSessionReferences(workflow, contexts, errors);
   validateControlStepShapes(workflow, contexts, errors);
+  validateConditionExpressions(workflow, contexts, errors);
   validateLoopBounds(contexts, errors);
   validateControlFlowCycles(workflow, contexts, errors);
-  validateInputReferences(workflow, errors);
+  validateInputReferences(workflow, contexts, errors);
   validateArtifactPaths(contexts, errors);
   validateArtifactOutputs(workflow, contexts, errors);
   validateApprovals(contexts, errors);
@@ -112,6 +123,119 @@ export function validateAgentflowWorkflow(workflow: AgentflowWorkflow): Agentflo
   validateCollaborativeReviewBounds(workflow, contexts, errors);
 
   return { valid: errors.length === 0, errors };
+}
+
+function validateConditionExpressions(
+  workflow: AgentflowWorkflow,
+  contexts: StepContext[],
+  errors: AgentflowWorkflowIssue[]
+): void {
+  for (const context of contexts) {
+    if (context.type !== "condition") continue;
+    const branches = Array.isArray(context.step.branches) ? context.step.branches : [];
+    const usesBranches = branches.length > 0;
+    const expressions: Array<{ value: AgentflowYamlValue | undefined; path: string }> = usesBranches ? [] : [
+      { value: context.step.if, path: `${context.path}.if` }
+    ];
+    if (usesBranches) {
+      branches.forEach((branch, index) => {
+        if (isRecord(branch)) expressions.push({ value: branch.if, path: `${context.path}.branches[${index}].if` });
+      });
+    }
+    for (const expression of expressions) {
+      const value = nonEmptyString(expression.value);
+      if (value !== undefined && !agentflowConditionExpressionIsSimple(value)) {
+        errors.push({
+          code: "workflow.condition.expression.unsupported",
+          message: "Condition expressions support one input or artifact reference with an optional scalar comparison.",
+          path: expression.path,
+          ...(context.id === undefined ? {} : { stepId: context.id })
+        });
+        continue;
+      }
+      const inputName = value === undefined ? undefined : conditionInputName(value);
+      if (inputName !== undefined && !Object.hasOwn(workflow.inputs ?? {}, inputName)) {
+        errors.push({
+          code: "workflow.input.undeclared",
+          message: `Input "${inputName}" is referenced but not declared in workflow inputs.`,
+          path: expression.path,
+          ...(context.id === undefined ? {} : { stepId: context.id })
+        });
+      }
+      const reference = value === undefined ? undefined : agentflowConditionReference(value);
+      if (reference?.scope === "artifacts") {
+        const aliases = contexts.flatMap((candidate) => stepOutputContexts(candidate))
+          .map(({ output }) => ({ output, alias: agentflowConditionArtifactAlias(normalizeArtifactPath(output)) }))
+          .filter(({ alias }) => reference.segments.slice(0, alias.length).join(".") === alias.join("."));
+        const longest = aliases.reduce((length, candidate) => Math.max(length, candidate.alias.length), 0);
+        const matches = [...new Set(aliases
+          .filter((candidate) => candidate.alias.length === longest)
+          .map((candidate) => normalizeArtifactPath(candidate.output)))];
+        if (matches.length > 1) {
+          errors.push({
+            code: "workflow.condition.artifact.ambiguous",
+            message: `Condition artifact reference "artifacts.${reference.segments.join(".")}" matches multiple declared outputs: ${matches.join(", ")}.`,
+            path: expression.path,
+            ...(context.id === undefined ? {} : { stepId: context.id })
+          });
+        }
+      }
+    }
+
+    const targets: Array<{ value: AgentflowYamlValue | undefined; path: string }> = [
+      { value: context.step.then, path: `${context.path}.then` },
+      { value: context.step.else, path: `${context.path}.else` }
+    ];
+    if (Array.isArray(context.step.branches)) {
+      context.step.branches.forEach((branch, index) => {
+        if (isRecord(branch)) targets.push({ value: branch.then, path: `${context.path}.branches[${index}].then` });
+      });
+    }
+    for (const target of targets) {
+      const value = nonEmptyString(target.value);
+      if (value === undefined || !isDynamicReference(value)) continue;
+      errors.push({
+        code: "workflow.condition.target.dynamic",
+        message: "Condition routes must use a static step ID or terminal target.",
+        path: target.path,
+        ...(context.id === undefined ? {} : { stepId: context.id })
+      });
+    }
+
+    if (context.step.on_failure !== undefined) {
+      errors.push({
+        code: "workflow.condition.on_failure.unsupported",
+        message: "Condition steps do not support on_failure policies in this runtime phase.",
+        path: `${context.path}.on_failure`,
+        ...(context.id === undefined ? {} : { stepId: context.id })
+      });
+    }
+
+    if (context.step.goto !== undefined) {
+      errors.push({
+        code: "workflow.condition.goto.unsupported",
+        message: "Condition steps route through branches or if/then/else and do not support goto.",
+        path: `${context.path}.goto`,
+        ...(context.id === undefined ? {} : { stepId: context.id })
+      });
+    }
+
+    if (context.step.outputs !== undefined || context.step.output !== undefined) {
+      errors.push({
+        code: "workflow.condition.outputs.unsupported",
+        message: "Condition steps evaluate existing inputs and artifacts and cannot declare outputs.",
+        path: `${context.path}.${context.step.outputs !== undefined ? "outputs" : "output"}`,
+        ...(context.id === undefined ? {} : { stepId: context.id })
+      });
+    }
+  }
+}
+
+function conditionInputName(expression: string): string | undefined {
+  const match = /^(?:(inputs|artifacts)\.)?([A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)*)\s*(?:(?:==|!=|>=|<=|>|<)|$)/.exec(expression.trim());
+  if (match === null) return undefined;
+  const scope = match[1] ?? (match[2]!.includes(".") ? "artifacts" : "inputs");
+  return scope === "inputs" ? match[2]!.split(".")[0] : undefined;
 }
 
 export function lintAgentflowWorkflow(workflow: AgentflowWorkflow): AgentflowWorkflowLintResult {
@@ -382,6 +506,16 @@ function validateRequiredStepFields(context: StepContext, errors: AgentflowWorkf
     const hasBranches = Array.isArray(context.step.branches) && context.step.branches.length > 0;
     const hasInlineCondition = nonEmptyString(context.step.if) !== undefined && nonEmptyString(context.step.then) !== undefined;
 
+    if (hasBranches && (context.step.if !== undefined || context.step.then !== undefined)) {
+      addStepIssue(
+        errors,
+        context,
+        "workflow.condition.form.mixed",
+        "branches",
+        "Condition steps must use either branches with an optional else target or top-level if/then fields, not both."
+      );
+    }
+
     if (!hasBranches && !hasInlineCondition) {
       addStepIssue(
         errors,
@@ -512,6 +646,16 @@ function validateTargets(contexts: StepContext[], ids: Set<string>, errors: Agen
 function validateTargetShapes(contexts: StepContext[], errors: AgentflowWorkflowIssue[]): void {
   for (const context of contexts) {
     validateTargetMapping(context.step, context.path, context, errors);
+
+    if (context.type !== "condition" && agentflowStepHasAmbiguousSuccessTarget(context.step)) {
+      addStepIssue(
+        errors,
+        context,
+        AGENTFLOW_AMBIGUOUS_SUCCESS_TARGET_CODE,
+        "goto",
+        agentflowAmbiguousSuccessTargetMessage(context.id)
+      );
+    }
 
     if (context.type === "condition" && Array.isArray(context.step.branches)) {
       context.step.branches.forEach((branch, index) => {
@@ -692,10 +836,13 @@ function validateControlFlowCycles(
   );
 
   const limits = isRecord(workflow.limits) ? workflow.limits : undefined;
-  const globallyBounded = typeof limits?.max_recovery_cycles === "number" && limits.max_recovery_cycles > 0;
+  const globallyBounded = workflow.style !== "pipeline"
+    && typeof limits?.max_recovery_cycles === "number"
+    && Number.isSafeInteger(limits.max_recovery_cycles)
+    && limits.max_recovery_cycles > 0;
 
   for (const component of globallyBounded ? [] : components) {
-    const locallyBounded = contexts.some((boundContext) => {
+    const locallyBounded = workflow.style !== "pipeline" && contexts.some((boundContext) => {
       const boundFields = boundContext.type === "loop"
         ? ["max_iterations", "max_duration_seconds", "max_duration_minutes"]
         : boundContext.type === "review"
@@ -718,7 +865,11 @@ function validateControlFlowCycles(
       continue;
     }
 
-    errors.push({
+    errors.push(workflow.style === "pipeline" ? {
+      code: "workflow.control_flow.cycle.unbounded",
+      message: `Pipeline control flow cannot contain a cycle involving ${component.map((context) => `"${context.id}"`).join(", ")}.`,
+      path: "steps"
+    } : {
       code: "workflow.control_flow.cycle.unbounded",
       message: `Control-flow cycle involving ${component.map((context) => `"${context.id}"`).join(", ")} needs a positive limits.max_recovery_cycles or step-level bound.`,
       path: "limits.max_recovery_cycles"
@@ -734,6 +885,10 @@ function validateControlStepShapes(
   const sessions = new Set(Object.keys(workflow.sessions ?? {}));
 
   for (const context of contexts) {
+    if (context.type === "condition" && context.step.branches !== undefined && !Array.isArray(context.step.branches)) {
+      errors.push(controlShapeIssue(context, `${context.path}.branches`, "Condition branches must be a list."));
+    }
+
     if (context.type === "condition" && Array.isArray(context.step.branches)) {
       context.step.branches.forEach((branch, index) => {
         const path = `${context.path}.branches[${index}]`;
@@ -815,12 +970,26 @@ function controlShapeIssue(context: StepContext, path: string, message: string):
   };
 }
 
-function validateInputReferences(workflow: AgentflowWorkflow, errors: AgentflowWorkflowIssue[]): void {
+function validateInputReferences(
+  workflow: AgentflowWorkflow,
+  contexts: StepContext[],
+  errors: AgentflowWorkflowIssue[]
+): void {
   const inputs = new Set(Object.keys(workflow.inputs ?? {}));
   const seen = new Set<string>();
+  const conditionPaths = new Set(contexts.flatMap((context) => {
+    if (context.type !== "condition") return [];
+    const paths = [`${context.path}.if`];
+    if (Array.isArray(context.step.branches)) {
+      context.step.branches.forEach((branch, index) => {
+        if (isRecord(branch)) paths.push(`${context.path}.branches[${index}].if`);
+      });
+    }
+    return paths;
+  }));
 
   visitValue(workflow, "", (value, path) => {
-    if (typeof value !== "string") {
+    if (typeof value !== "string" || conditionPaths.has(path)) {
       return;
     }
 
@@ -1443,6 +1612,7 @@ function lintArtifactOverwrites(contexts: StepContext[], warnings: AgentflowWork
 
   for (const context of contexts) {
     lintDirectParallelBranchInputs(context, contexts, producers, dominators, warnings);
+    lintConditionArtifactInputs(context, contexts, producers, dominators, warnings);
 
     for (const input of stepInputs(context.step)) {
       const inputKey = normalizeArtifactPath(input);
@@ -1476,6 +1646,47 @@ function lintArtifactOverwrites(contexts: StepContext[], warnings: AgentflowWork
       }
 
       seenOutputs.set(outputKey, outputContext);
+    }
+  }
+}
+
+function lintConditionArtifactInputs(
+  context: StepContext,
+  contexts: StepContext[],
+  producers: Map<string, StepContext[]>,
+  dominators: Map<string, Set<string>>,
+  warnings: AgentflowWorkflowIssue[]
+): void {
+  if (context.type !== "condition") return;
+  const expressions: Array<{ value: AgentflowYamlValue | undefined; path: string }> = [
+    { value: context.step.if, path: `${context.path}.if` }
+  ];
+  if (Array.isArray(context.step.branches)) {
+    context.step.branches.forEach((branch, index) => {
+      if (isRecord(branch)) expressions.push({ value: branch.if, path: `${context.path}.branches[${index}].if` });
+    });
+  }
+
+  for (const expression of expressions) {
+    const source = nonEmptyString(expression.value);
+    const reference = source === undefined ? undefined : agentflowConditionReference(source);
+    if (reference?.scope !== "artifacts") continue;
+    const candidates = [...producers.keys()]
+      .map((key) => ({ key, alias: agentflowConditionArtifactAlias(key) }))
+      .filter(({ alias }) => reference.segments.slice(0, alias.length).join(".") === alias.join("."));
+    const longest = candidates.reduce((length, candidate) => Math.max(length, candidate.alias.length), 0);
+    const available = candidates
+      .filter((candidate) => candidate.alias.length === longest)
+      .some((candidate) => (producers.get(candidate.key) ?? []).some((producer) =>
+        producer.path !== context.path && artifactProducerAvailable(producer, context, contexts, dominators)
+      ));
+    if (!available) {
+      warnings.push({
+        code: "workflow.lint.artifact.read_before_write",
+        message: `Artifact reference "artifacts.${reference.segments.join(".")}" is read before any step produces it.`,
+        path: expression.path,
+        ...(context.id === undefined ? {} : { stepId: context.id })
+      });
     }
   }
 }
@@ -1723,7 +1934,7 @@ function buildControlFlowGraph(contexts: StepContext[]): Map<string, string[]> {
       return id !== undefined && ids.has(id) ? [id] : [];
     });
     const explicit = [...directTargets(context.step).filter((target) => ids.has(target)), ...nestedEntries];
-    const next = !hasPrimaryControlTarget(context.step) && context.type !== "result" ? fallthrough.get(context.id) : undefined;
+    const next = !hasPrimaryControlTarget(context.step, ids) && context.type !== "result" ? fallthrough.get(context.id) : undefined;
     return [[context.id, [...new Set(next === undefined ? explicit : [...explicit, next])]] as const];
   }));
 }
@@ -1793,21 +2004,28 @@ function controlFlowDominators(contexts: StepContext[]): Map<string, Set<string>
   return dominators;
 }
 
-function hasPrimaryControlTarget(step: AgentflowWorkflowStep): boolean {
-  if (step.type === "condition") {
-    const hasElse = nonEmptyString(step.else) !== undefined;
-    const hasThen = nonEmptyString(step.then) !== undefined;
+function hasPrimaryControlTarget(step: AgentflowWorkflowStep, ids: ReadonlySet<string>): boolean {
+  if (nonEmptyString(step.type) === "condition") {
+    const hasElse = hasStaticControlTarget(step.else, ids);
+    const hasThen = hasStaticControlTarget(step.then, ids);
     const hasBranches = Array.isArray(step.branches) && step.branches.length > 0 && step.branches.every((branch) =>
-      isRecord(branch) && nonEmptyString(branch.then) !== undefined
+      isRecord(branch) && hasStaticControlTarget(branch.then, ids)
     );
     return hasElse && (hasThen || hasBranches);
   }
 
-  if (["goto", "on_approve", "return_to", "then"].some((field) => nonEmptyString(step[field]) !== undefined)) {
+  if (["goto", "on_approve", "return_to", "then"].some((field) => hasStaticControlTarget(step[field], ids))) {
     return true;
   }
 
   return false;
+}
+
+function hasStaticControlTarget(value: AgentflowYamlValue | undefined, ids: ReadonlySet<string>): boolean {
+  const target = nonEmptyString(value);
+  return target !== undefined
+    && (ids.has(target) || !["continue", "ignore"].includes(target))
+    && !isDynamicReference(target);
 }
 
 function nodeParticipatesInCycle(node: string, graph: Map<string, string[]>): boolean {
@@ -2736,14 +2954,20 @@ interface StepTargetReference {
 function stepTargetReferences(step: AgentflowWorkflowStep, path: string): StepTargetReference[] {
   const targets: StepTargetReference[] = [];
 
-  collectDirectTargets(step, path, targets);
-
-  if (step.type === "condition" && Array.isArray(step.branches)) {
-    step.branches.forEach((branch, index) => {
+  const conditionBranches = Array.isArray(step.branches) ? step.branches : [];
+  const usesConditionBranches = nonEmptyString(step.type) === "condition" && conditionBranches.length > 0;
+  if (usesConditionBranches) {
+    const elseTarget = nonEmptyString(step.else);
+    if (elseTarget !== undefined && !isDynamicReference(elseTarget)) {
+      targets.push({ value: elseTarget, path: `${path}.else` });
+    }
+    conditionBranches.forEach((branch, index) => {
       if (isRecord(branch)) {
         collectDirectTargets(branch, `${path}.branches[${index}]`, targets);
       }
     });
+  } else {
+    collectDirectTargets(step, path, targets);
   }
 
   if (isRecord(step.on_failure)) {
