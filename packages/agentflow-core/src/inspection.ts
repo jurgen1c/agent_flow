@@ -146,6 +146,12 @@ export function buildAgentflowWorkflowGraph(workflow: AgentflowWorkflow): Agentf
 
     if (step.type === "manual_gate") {
       for (const option of stringValues(step.options)) {
+        if (option === "reject" && !targets.some((target) => target.kind === "on_reject")) {
+          const terminalId = "terminal:cancel";
+          nodes.push({ id: terminalId, type: "terminal", path: terminalId, label: "cancel" });
+          edges.push({ from: source, to: terminalId, kind: "option", label: option });
+          continue;
+        }
         if (!isTerminalTarget(option) || targets.some((target) => target.to === option)) {
           continue;
         }
@@ -547,7 +553,18 @@ function uniqueSorted(values: string[]): string[] {
 }
 
 function isTerminalTarget(value: string): boolean {
-  return ["cancel", "complete", "completed", "continue", "fail", "ignore", "pause"].includes(value);
+  return [
+    "cancel",
+    "cancelled",
+    "complete",
+    "completed",
+    "continue",
+    "fail",
+    "failed",
+    "ignore",
+    "pause",
+    "paused"
+  ].includes(value);
 }
 
 function isDynamic(value: string): boolean {

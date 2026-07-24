@@ -187,6 +187,28 @@ steps:
     ]));
   });
 
+  test("renders implicit rejection and terminal completion gate outcomes", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`
+name: implicit-gate-outcomes
+version: 1
+style: pipeline
+maturity: draft
+steps:
+  - id: gate
+    type: manual_gate
+    message: Finish?
+    options: [reject, completed, cancel]
+`);
+
+    const graph = buildAgentflowWorkflowGraph(workflow);
+
+    expect(graph.edges).toEqual(expect.arrayContaining([
+      { from: "gate", to: "terminal:cancel", kind: "option", label: "reject" },
+      { from: "gate", to: "terminal:completed", kind: "option", label: "completed" },
+      { from: "gate", to: "terminal:cancel", kind: "option", label: "cancel" }
+    ]));
+  });
+
   test("does not confuse shell-style target text with Agentflow interpolation", () => {
     const workflow = parseAgentflowWorkflowOrThrow(`
 name: target-syntax

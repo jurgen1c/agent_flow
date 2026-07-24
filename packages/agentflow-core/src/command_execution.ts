@@ -5,6 +5,7 @@ import { spawn } from "node:child_process";
 import { isDeepStrictEqual } from "node:util";
 import {
   AgentflowRunStateError,
+  normalizeAgentflowArtifactPath,
   type AgentflowRunStateValue,
   type AgentflowRunStateStore,
   type AgentflowRunStatus
@@ -51,6 +52,23 @@ export interface AgentflowCommandPipelineResult {
   message?: string;
 }
 
+export type AgentflowPipelineResumeInput =
+  | { outcome: string; decidedBy?: string }
+  | { answer: AgentflowRunStateValue };
+
+interface AgentflowPipelineWaitingState {
+  kind: "manual_gate" | "input_request";
+  stepId: string;
+  attempt: number;
+  reason: "manual_approval" | "missing_input";
+  prompt: string;
+  validOutcomes: string[];
+  saveAs?: string;
+  approvalId?: string;
+  completedSteps: string[];
+  routing: SerializedSuccessfulRoutingBudget;
+}
+
 interface CommandAttemptResult {
   exitCode: number | null;
   signal: NodeJS.Signals | null;
@@ -73,6 +91,30 @@ export async function executeAgentflowCommandPipeline(
   sessionProviders: AgentflowSessionProviderRegistry = createAgentflowSessionProviderRegistry(),
   mcpCalls: AgentflowMcpCallRegistry = createAgentflowMcpCallRegistry()
 ): Promise<AgentflowCommandPipelineResult> {
+  return runAgentflowCommandPipeline(store, runId, workflow, undefined, transforms, sessionProviders, mcpCalls);
+}
+
+export async function resumeAgentflowCommandPipeline(
+  store: AgentflowRunStateStore,
+  runId: string,
+  workflow: AgentflowWorkflow,
+  response: AgentflowPipelineResumeInput,
+  transforms: AgentflowArtifactTransformRegistry = createAgentflowArtifactTransformRegistry(),
+  sessionProviders: AgentflowSessionProviderRegistry = createAgentflowSessionProviderRegistry(),
+  mcpCalls: AgentflowMcpCallRegistry = createAgentflowMcpCallRegistry()
+): Promise<AgentflowCommandPipelineResult> {
+  return runAgentflowCommandPipeline(store, runId, workflow, response, transforms, sessionProviders, mcpCalls);
+}
+
+async function runAgentflowCommandPipeline(
+  store: AgentflowRunStateStore,
+  runId: string,
+  workflow: AgentflowWorkflow,
+  resumeInput: AgentflowPipelineResumeInput | undefined,
+  transforms: AgentflowArtifactTransformRegistry,
+  sessionProviders: AgentflowSessionProviderRegistry,
+  mcpCalls: AgentflowMcpCallRegistry
+): Promise<AgentflowCommandPipelineResult> {
   const existing = store.getRun(runId);
   if (existing === null) throw new Error(`Agentflow run ${runId} was not found.`);
   if (!isDeepStrictEqual(existing.context.workflow, workflow)) {
@@ -81,22 +123,40 @@ export async function executeAgentflowCommandPipeline(
       "AGENTFLOW_RUN_COLLISION"
     );
   }
-  if (existing.status !== "pending") {
+  validateRuntimeInteractionSteps(workflow.steps);
+  if (resumeInput === undefined && existing.status !== "pending") {
     throw new Error(`Agentflow run ${runId} cannot execute while its status is ${existing.status}.`);
+  }
+  if (resumeInput !== undefined && existing.status !== "paused") {
+    throw new AgentflowRunStateError(
+      `Agentflow run ${runId} cannot resume while its status is ${existing.status}.`,
+      "AGENTFLOW_RUN_TRANSITION"
+    );
   }
   assertAgentflowSuccessTargetsAreUnambiguous(workflow.steps);
   const stepLocations = collectRuntimeStepLocations(workflow.steps);
-
-  store.transitionRunWithEvent(runId, {
-    status: "running",
-    allowedFrom: ["pending"],
-    event: { type: "run.started", payload: { status: "running" } }
-  });
-
-  const completedSteps: string[] = [];
-  const routingBudget = createSuccessfulRoutingBudget(workflow);
+  let completedSteps: string[];
+  let routingBudget: SuccessfulRoutingBudget;
   let currentSteps = workflow.steps;
   let stepIndex = 0;
+
+  if (resumeInput === undefined) {
+    store.transitionRunWithEvent(runId, {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    completedSteps = [];
+    routingBudget = createSuccessfulRoutingBudget(workflow);
+  } else {
+    const resumed = resumeWaitingStep(store, runId, workflow, existing.context, resumeInput, stepLocations);
+    if ("result" in resumed) return resumed.result;
+    completedSteps = resumed.completedSteps;
+    routingBudget = resumed.routingBudget;
+    currentSteps = resumed.steps;
+    stepIndex = resumed.nextIndex;
+  }
+
   while (stepIndex < currentSteps.length) {
     const step = currentSteps[stepIndex]!;
     const stoppedBeforeStep = stoppedPipelineResult(store, runId, completedSteps);
@@ -439,11 +499,27 @@ export async function executeAgentflowCommandPipeline(
         }, "failed");
       }
     }
+    if (stepType === "manual_gate" || stepType === "input_request") {
+      const attempt = allocateStepAttempt(routingBudget, stepId);
+      if (attempt === undefined) return stepAttemptLimitResult(store, runId, completedSteps, stepId, routingBudget);
+      try {
+        return pauseForInteraction(store, runId, step, stepType, attempt, completedSteps, routingBudget);
+      } catch (error) {
+        if (!(error instanceof AgentflowRunStateError && error.code === "AGENTFLOW_INTERACTION_INVALID")) {
+          throw error;
+        }
+        return finishFailure(store, runId, completedSteps, stepId, {
+          exitCode: null,
+          timedOut: false,
+          message: error.message
+        }, "failed");
+      }
+    }
     if (stepType !== "command") {
       return finishFailure(store, runId, completedSteps, stepId, {
         exitCode: null,
         timedOut: false,
-        message: `Step ${stepId} has unsupported type ${String(step.type)}; only command, artifact_transform, condition, mcp_call, and session_request steps can execute in this runtime phase.`
+        message: `Step ${stepId} has unsupported type ${String(step.type)}; only command, artifact_transform, condition, input_request, manual_gate, mcp_call, and session_request steps can execute in this runtime phase.`
       }, "paused");
     }
 
@@ -574,6 +650,477 @@ interface SuccessfulRoutingBudget {
   visits: Map<string, number>;
   recoveryCycles: Map<string, number>;
   attempts: Map<string, number>;
+}
+
+interface SerializedSuccessfulRoutingBudget {
+  maxRecoveryCycles?: number;
+  stepAttemptLimits: Record<string, number>;
+  visits: Record<string, number>;
+  recoveryCycles: Record<string, number>;
+  attempts: Record<string, number>;
+}
+
+type ResumedWaitingStep =
+  | { steps: AgentflowWorkflowStep[]; nextIndex: number; completedSteps: string[]; routingBudget: SuccessfulRoutingBudget }
+  | { result: AgentflowCommandPipelineResult };
+
+function pauseForInteraction(
+  store: AgentflowRunStateStore,
+  runId: string,
+  step: AgentflowWorkflowStep,
+  kind: "manual_gate" | "input_request",
+  attempt: number,
+  completedSteps: string[],
+  routingBudget: SuccessfulRoutingBudget
+): AgentflowCommandPipelineResult {
+  const stepId = requiredStepId(step);
+  const run = store.getRun(runId)!;
+  const prompt = resolveInteractionPrompt(
+    kind === "manual_gate" ? step.message : step.question,
+    run.inputs,
+    `${kind === "manual_gate" ? "Manual gate message" : "Input request question"} for step ${stepId}`
+  );
+  const validOutcomes = kind === "manual_gate" ? normalizedStringList(step.options) : [];
+  const saveAs = kind === "input_request"
+    ? requiredStaticString(step.save_as, `Input request artifact for step ${stepId}`)
+    : undefined;
+  const approvalId = kind === "manual_gate" ? `manual-gate:${safeId(stepId)}:attempt-${attempt}` : undefined;
+  const waiting: AgentflowPipelineWaitingState = {
+    kind,
+    stepId,
+    attempt,
+    reason: kind === "manual_gate" ? "manual_approval" : "missing_input",
+    prompt,
+    validOutcomes,
+    ...(saveAs === undefined ? {} : { saveAs }),
+    ...(approvalId === undefined ? {} : { approvalId }),
+    completedSteps: [...completedSteps],
+    routing: serializeRoutingBudget(routingBudget)
+  };
+  const input: Record<string, AgentflowRunStateValue> = kind === "manual_gate"
+    ? { attempt, type: kind, message: prompt, options: validOutcomes }
+    : { attempt, type: kind, question: prompt, saveAs: saveAs! };
+
+  store.updateRun(runId, {
+    currentStepId: stepId,
+    context: { ...run.context, waiting: waiting as unknown as AgentflowRunStateValue },
+    error: null
+  });
+  store.upsertStep({ runId, stepId, attempt, status: "waiting", input });
+  store.appendRunEvent(runId, { type: "step.waiting", stepId, payload: input });
+  if (approvalId !== undefined) {
+    store.upsertApproval({
+      id: approvalId,
+      runId,
+      stepId,
+      status: "requested",
+      context: { message: prompt, options: validOutcomes }
+    });
+  }
+  store.transitionRunWithEvent(runId, {
+    status: "paused",
+    allowedFrom: ["running"],
+    event: {
+      type: "run.paused",
+      stepId,
+      payload: {
+        stepId,
+        reason: waiting.reason,
+        prompt,
+        validOutcomes,
+        ...(saveAs === undefined ? {} : { saveAs })
+      }
+    }
+  });
+  return {
+    status: "paused",
+    completedSteps,
+    message: kind === "manual_gate"
+      ? `Manual gate ${stepId} is waiting for one of: ${validOutcomes.join(", ")}.`
+      : `Input request ${stepId} is waiting for an answer to be saved as ${saveAs}.`
+  };
+}
+
+function resumeWaitingStep(
+  store: AgentflowRunStateStore,
+  runId: string,
+  workflow: AgentflowWorkflow,
+  context: Record<string, AgentflowRunStateValue>,
+  response: AgentflowPipelineResumeInput,
+  stepLocations: Map<string, RuntimeStepLocation>
+): ResumedWaitingStep {
+  const waiting = parseWaitingState(context.waiting);
+  const location = stepLocations.get(waiting.stepId);
+  if (location === undefined) {
+    throw new AgentflowRunStateError(
+      `Agentflow run ${runId} cannot resume because waiting step ${waiting.stepId} is not in its workflow.`,
+      "AGENTFLOW_RESUME_STATE"
+    );
+  }
+  const step = location.steps[location.index]!;
+  if (normalizedTarget(step.type) !== waiting.kind) {
+    throw new AgentflowRunStateError(
+      `Agentflow run ${runId} waiting state does not match workflow step ${waiting.stepId}.`,
+      "AGENTFLOW_RESUME_STATE"
+    );
+  }
+
+  const routingBudget = deserializeRoutingBudget(waiting.routing, workflow);
+  const completedSteps = [...waiting.completedSteps];
+  let selectedTarget: string | undefined;
+  let output: Record<string, AgentflowRunStateValue>;
+
+  if (waiting.kind === "manual_gate") {
+    if (!("outcome" in response)) {
+      throw new AgentflowRunStateError(
+        `Manual gate ${waiting.stepId} requires an explicit --outcome value.`,
+        "AGENTFLOW_GATE_OUTCOME_REQUIRED"
+      );
+    }
+    const outcome = response.outcome.trim();
+    if (!waiting.validOutcomes.includes(outcome)) {
+      throw new AgentflowRunStateError(
+        `Manual gate ${waiting.stepId} rejected outcome ${JSON.stringify(outcome)}; valid outcomes are: ${waiting.validOutcomes.join(", ")}.`,
+        "AGENTFLOW_GATE_OUTCOME_INVALID"
+      );
+    }
+    if (outcome === "pause" || outcome === "paused") {
+      store.updateRun(runId, { context: store.getRun(runId)!.context });
+      store.appendRunEvent(runId, {
+        type: "manual_gate.paused",
+        stepId: waiting.stepId,
+        payload: { outcome }
+      });
+      return {
+        result: {
+          status: "paused",
+          completedSteps,
+          message: `Manual gate ${waiting.stepId} remains paused.`
+        }
+      };
+    }
+    if (response.decidedBy !== undefined && response.decidedBy.trim().length === 0) {
+      throw new AgentflowRunStateError(
+        `Manual gate ${waiting.stepId} decision actor must be non-empty text.`,
+        "AGENTFLOW_INTERACTION_INVALID"
+      );
+    }
+
+    store.transitionRunWithEvent(runId, {
+      status: "running",
+      allowedFrom: ["paused"],
+      event: { type: "run.resume", stepId: waiting.stepId, payload: { outcome } }
+    });
+    const approvalStatus = outcome === "cancel" || outcome === "cancelled"
+      ? "cancelled"
+      : outcome === "reject"
+        ? "rejected"
+        : "approved";
+    store.upsertApproval({
+      id: waiting.approvalId!,
+      runId,
+      stepId: waiting.stepId,
+      status: approvalStatus,
+      ...(response.decidedBy === undefined ? {} : { decidedBy: response.decidedBy }),
+      decision: outcome
+    });
+    output = { attempt: waiting.attempt, outcome };
+    selectedTarget = manualGateOutcomeTarget(step, outcome);
+  } else {
+    if (!("answer" in response)) {
+      throw new AgentflowRunStateError(
+        `Input request ${waiting.stepId} requires an explicit --answer value.`,
+        "AGENTFLOW_INPUT_ANSWER_REQUIRED"
+      );
+    }
+    store.transitionRunWithEvent(runId, {
+      status: "running",
+      allowedFrom: ["paused"],
+      event: { type: "run.resume", stepId: waiting.stepId, payload: { answerProvided: true } }
+    });
+    const answer = response.answer;
+    const textAnswer = typeof answer === "string" ? answer : `${JSON.stringify(answer)}\n`;
+    const contentType = typeof answer === "string"
+      ? "text/plain; charset=utf-8"
+      : "application/json; charset=utf-8";
+    try {
+      const existingArtifact = store.getArtifact(runId, waiting.saveAs!);
+      const mayReplaceExisting = step.overwrite === true
+        || existingArtifact?.producerStepId === waiting.stepId;
+      const artifact = store.writeArtifact({
+        id: mayReplaceExisting && existingArtifact !== null
+          ? existingArtifact.id
+          : `input-request:${safeId(waiting.stepId)}:attempt-${waiting.attempt}`,
+        runId,
+        stepId: waiting.stepId,
+        path: waiting.saveAs!,
+        kind: "input_request",
+        contentType,
+        content: textAnswer,
+        overwrite: mayReplaceExisting,
+        requiredRunStatus: "running",
+        metadata: { question: waiting.prompt }
+      });
+      output = {
+        attempt: waiting.attempt,
+        answerArtifact: artifact.declaredPath,
+        checksum: artifact.checksum
+      };
+    } catch (error) {
+      store.transitionRunWithEvent(runId, {
+        status: "paused",
+        allowedFrom: ["running"],
+        event: {
+          type: "run.paused",
+          stepId: waiting.stepId,
+          payload: { reason: waiting.reason, error: error instanceof Error ? error.message : String(error) }
+        }
+      });
+      throw error;
+    }
+  }
+
+  const { waiting: _waiting, ...resumedContext } = store.getRun(runId)!.context;
+  store.updateRun(runId, { context: resumedContext, error: null });
+  store.upsertStep({
+    runId,
+    stepId: waiting.stepId,
+    attempt: waiting.attempt,
+    status: "completed",
+    output
+  });
+  store.appendRunEvent(runId, {
+    type: "step.completed",
+    stepId: waiting.stepId,
+    payload: output
+  });
+  completedSteps.push(waiting.stepId);
+
+  const routed = routeAfterSuccessfulStep(
+    store,
+    runId,
+    completedSteps,
+    waiting.stepId,
+    step,
+    location.steps,
+    location.index,
+    stepLocations,
+    routingBudget,
+    selectedTarget
+  );
+  if ("result" in routed) return routed;
+  return { ...routed, completedSteps, routingBudget };
+}
+
+function manualGateOutcomeTarget(step: AgentflowWorkflowStep, outcome: string): string | undefined {
+  if (outcome === "approve") return normalizedTarget(step.on_approve);
+  if (outcome === "reject") return normalizedTarget(step.on_reject) ?? "cancel";
+  if (outcome === "cancel" || outcome === "cancelled") return normalizedTarget(step.on_cancel) ?? "cancel";
+  if (outcome === "fail" || outcome === "failed") return "fail";
+  if (outcome === "complete" || outcome === "completed") return "complete";
+  return undefined;
+}
+
+function serializeRoutingBudget(budget: SuccessfulRoutingBudget): SerializedSuccessfulRoutingBudget {
+  return {
+    ...(budget.maxRecoveryCycles === undefined ? {} : { maxRecoveryCycles: budget.maxRecoveryCycles }),
+    stepAttemptLimits: Object.fromEntries([...budget.stepAttemptLimits].sort(([left], [right]) => left.localeCompare(right))),
+    visits: Object.fromEntries([...budget.visits].sort(([left], [right]) => left.localeCompare(right))),
+    recoveryCycles: Object.fromEntries([...budget.recoveryCycles].sort(([left], [right]) => left.localeCompare(right))),
+    attempts: Object.fromEntries([...budget.attempts].sort(([left], [right]) => left.localeCompare(right)))
+  };
+}
+
+function deserializeRoutingBudget(
+  serialized: SerializedSuccessfulRoutingBudget,
+  workflow: AgentflowWorkflow
+): SuccessfulRoutingBudget {
+  const configured = createSuccessfulRoutingBudget(workflow);
+  return {
+    maxRecoveryCycles: configured.maxRecoveryCycles,
+    stepAttemptLimits: configured.stepAttemptLimits,
+    visits: new Map(Object.entries(serialized.visits)),
+    recoveryCycles: new Map(Object.entries(serialized.recoveryCycles)),
+    attempts: new Map(Object.entries(serialized.attempts))
+  };
+}
+
+function parseWaitingState(value: AgentflowRunStateValue | undefined): AgentflowPipelineWaitingState {
+  const record = mapping(value);
+  if (record === undefined) {
+    throw new AgentflowRunStateError(
+      "Paused Agentflow run does not have a persisted manual gate or input request.",
+      "AGENTFLOW_RESUME_STATE"
+    );
+  }
+  const kind = record.kind;
+  const stepId = normalizedTarget(record.stepId);
+  const attempt = record.attempt;
+  const reason = record.reason;
+  const prompt = typeof record.prompt === "string" ? record.prompt : undefined;
+  const validOutcomes = normalizedStringList(record.validOutcomes);
+  const completedSteps = normalizedStringList(record.completedSteps);
+  const routing = mapping(record.routing);
+  if ((kind !== "manual_gate" && kind !== "input_request")
+      || stepId === undefined
+      || !Number.isSafeInteger(attempt)
+      || (attempt as number) < 1
+      || (reason !== "manual_approval" && reason !== "missing_input")
+      || prompt === undefined
+      || routing === undefined) {
+    throw new AgentflowRunStateError(
+      "Paused Agentflow run has invalid persisted interaction state.",
+      "AGENTFLOW_RESUME_STATE"
+    );
+  }
+  const serialized = parseSerializedRoutingBudget(routing);
+  const saveAs = typeof record.saveAs === "string" ? record.saveAs : undefined;
+  const approvalId = typeof record.approvalId === "string" ? record.approvalId : undefined;
+  if ((kind === "manual_gate" && (validOutcomes.length === 0 || approvalId === undefined))
+      || (kind === "input_request" && saveAs === undefined)) {
+    throw new AgentflowRunStateError(
+      "Paused Agentflow run has incomplete persisted interaction state.",
+      "AGENTFLOW_RESUME_STATE"
+    );
+  }
+  return {
+    kind,
+    stepId,
+    attempt: attempt as number,
+    reason,
+    prompt,
+    validOutcomes,
+    ...(saveAs === undefined ? {} : { saveAs }),
+    ...(approvalId === undefined ? {} : { approvalId }),
+    completedSteps,
+    routing: serialized
+  };
+}
+
+function parseSerializedRoutingBudget(value: AgentflowYamlMapping): SerializedSuccessfulRoutingBudget {
+  const parseMap = (
+    field: "stepAttemptLimits" | "visits" | "recoveryCycles" | "attempts",
+    valid: (value: unknown) => boolean
+  ): Record<string, number> => {
+    const candidate = mapping(value[field]);
+    if (candidate === undefined) {
+      throw new AgentflowRunStateError(
+        "Paused Agentflow run has invalid persisted routing state.",
+        "AGENTFLOW_RESUME_STATE"
+      );
+    }
+    const entries = Object.entries(candidate);
+    if (entries.some(([, count]) => !valid(count))) {
+      throw new AgentflowRunStateError(
+        "Paused Agentflow run has invalid persisted routing counters.",
+        "AGENTFLOW_RESUME_STATE"
+      );
+    }
+    return Object.fromEntries(entries) as Record<string, number>;
+  };
+  const parsed: Pick<
+    SerializedSuccessfulRoutingBudget,
+    "stepAttemptLimits" | "visits" | "recoveryCycles" | "attempts"
+  > = {
+    stepAttemptLimits: parseMap(
+      "stepAttemptLimits",
+      (entry) => typeof entry === "number" && Number.isFinite(entry) && entry > 0
+    ),
+    visits: parseMap("visits", (entry) => Number.isSafeInteger(entry) && (entry as number) >= 0),
+    recoveryCycles: parseMap("recoveryCycles", (entry) => Number.isSafeInteger(entry) && (entry as number) >= 0),
+    attempts: parseMap("attempts", (entry) => Number.isSafeInteger(entry) && (entry as number) >= 0)
+  };
+  return {
+    ...parsed,
+    ...(Number.isSafeInteger(value.maxRecoveryCycles) && (value.maxRecoveryCycles as number) > 0
+      ? { maxRecoveryCycles: value.maxRecoveryCycles as number }
+      : {})
+  };
+}
+
+function normalizedStringList(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.flatMap((entry) => typeof entry === "string" && entry.trim().length > 0 ? [entry.trim()] : [])
+    : [];
+}
+
+function requiredStaticString(value: unknown, label: string): string {
+  const normalized = normalizedTarget(value);
+  if (normalized === undefined) {
+    throw new AgentflowRunStateError(`${label} must be a static non-empty string.`, "AGENTFLOW_INTERACTION_INVALID");
+  }
+  return normalized;
+}
+
+function validateRuntimeInteractionSteps(steps: AgentflowWorkflowStep[]): void {
+  for (const step of steps) {
+    const type = normalizedTarget(step.type);
+    const stepId = requiredStepId(step);
+    if (type === "input_request") {
+      const saveAs = requiredStaticString(step.save_as, `Input request artifact for step ${stepId}`);
+      let normalized: string;
+      try {
+        normalized = normalizeAgentflowArtifactPath(saveAs);
+      } catch (error) {
+        throw new AgentflowRunStateError(
+          `Input request artifact for step ${stepId} is invalid: ${error instanceof Error ? error.message : String(error)}`,
+          "AGENTFLOW_INTERACTION_INVALID",
+          { cause: error }
+        );
+      }
+      if (normalized !== saveAs) {
+        throw new AgentflowRunStateError(
+          `Input request artifact for step ${stepId} must be normalized as ${normalized}.`,
+          "AGENTFLOW_INTERACTION_INVALID"
+        );
+      }
+    }
+    for (const field of ["body", "steps", ...(type === "parallel" ? ["branches"] : [])]) {
+      const nested = step[field];
+      if (Array.isArray(nested)) validateRuntimeInteractionSteps(nested.filter(isWorkflowStep));
+    }
+  }
+}
+
+function resolveInteractionPrompt(
+  value: unknown,
+  inputs: Record<string, AgentflowRunStateValue>,
+  label: string
+): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new AgentflowRunStateError(`${label} must be non-empty text.`, "AGENTFLOW_INTERACTION_INVALID");
+  }
+  const template = value.trim();
+  const unsupportedRemainder = template.replace(
+    /(?<!\{)\{\{\s*inputs\.([A-Za-z_][A-Za-z0-9_-]*)\s*}}(?!})/g,
+    ""
+  );
+  if (unsupportedRemainder.includes("{{") || unsupportedRemainder.includes("}}")) {
+    throw new AgentflowRunStateError(
+      `${label} contains an unsupported input expression.`,
+      "AGENTFLOW_INTERACTION_INVALID"
+    );
+  }
+  const resolved = template.replace(
+    /(?<!\{)\{\{\s*inputs\.([A-Za-z_][A-Za-z0-9_-]*)\s*}}(?!})/g,
+    (_match, name: string) => {
+      if (!Object.hasOwn(inputs, name)) {
+        throw new AgentflowRunStateError(
+          `${label} references missing run input ${name}.`,
+          "AGENTFLOW_INTERACTION_INVALID"
+        );
+      }
+      const input = inputs[name]!;
+      return typeof input === "string" ? input : JSON.stringify(input);
+    }
+  ).trim();
+  if (resolved.length === 0) {
+    throw new AgentflowRunStateError(
+      `${label} must resolve to non-empty text.`,
+      "AGENTFLOW_INTERACTION_INVALID"
+    );
+  }
+  return resolved;
 }
 
 function routeAfterSuccessfulStep(

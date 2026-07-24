@@ -2095,6 +2095,16 @@ steps:
     expect(validateAgentflowWorkflow(workflow).errors.map((issue) => issue.code)).toEqual([
       "workflow.approval.deadlock"
     ]);
+    for (const alias of ["paused", "cancelled"]) {
+      const escaped = parseAgentflowWorkflowOrThrow(`name: aliased-gate-${alias}
+version: 1
+style: pipeline
+maturity: draft
+steps:
+  - { id: gate, type: manual_gate, message: Approve?, options: [approve, ${alias}] }
+`);
+      expect(validateAgentflowWorkflow(escaped).errors).toEqual([]);
+    }
   });
 
   test("allows overlapping scopes for explicitly read-only parallel sessions", () => {

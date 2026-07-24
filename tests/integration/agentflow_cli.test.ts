@@ -176,6 +176,175 @@ steps:
     expect(await captureCli(["pause", "missing"], repo)).toMatchObject({ exitCode: 4 });
   });
 
+  test("resumes manual gates and input requests with explicit CLI values", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agentflow-cli-interaction-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.writeFileSync(path.join(repo, "workflow.yml"), `
+name: interactive
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: approve, type: manual_gate, message: Continue?, options: [approve, pause, cancel] }
+  - { id: details, type: input_request, question: Target?, save_as: answers/target.json }
+  - { id: finish, type: command, command: "printf 'done\\n' > finished.txt" }
+`);
+
+    const started = await captureCli(["run", "workflow.yml", "--id", "interactive-run"], repo);
+    expect(started).toMatchObject({ exitCode: 3 });
+    expect(started.stdout).toContain("Status: paused");
+    const status = await captureCli(["status", "interactive-run"], repo);
+    expect(status.stdout).toContain("Waiting reason: manual_approval");
+    expect(status.stdout).toContain("Valid outcomes: approve, pause, cancel");
+
+    const invalid = await captureCli(["resume", "interactive-run", "--outcome", "ship"], repo);
+    expect(invalid).toMatchObject({ exitCode: 2 });
+    expect(invalid.stderr).toContain("valid outcomes are: approve, pause, cancel");
+    const approved = await captureCli(["resume", "interactive-run", "--outcome", "approve"], repo);
+    expect(approved).toMatchObject({ exitCode: 3 });
+    expect(approved.stdout).toContain("Completed steps: approve");
+    const inputStatus = await captureCli(["status", "interactive-run"], repo);
+    expect(inputStatus.stdout).toContain("Waiting reason: missing_input");
+    expect(inputStatus.stdout).toContain("Answer artifact: answers/target.json");
+    expect(inputStatus.stdout).not.toContain("Valid outcomes:");
+
+    const answered = await captureCli([
+      "resume",
+      "interactive-run",
+      "--answer",
+      '{"environment":"staging"}'
+    ], repo);
+    expect(answered).toMatchObject({ exitCode: 0 });
+    expect(answered.stdout).toContain("Status: completed");
+    expect((await captureCli(["artifacts", "interactive-run"], repo)).stdout).toContain("answers/target.json");
+    expect(fs.readFileSync(path.join(repo, "finished.txt"), "utf8")).toBe("done\n");
+  });
+
+  test("restores the CLI fixture provider after a manual gate", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agentflow-cli-fixture-resume-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.mkdirSync(path.join(repo, "prompts"));
+    fs.writeFileSync(path.join(repo, "prompts", "draft.md"), "Draft.\n");
+    fs.writeFileSync(path.join(repo, "workflow.yml"), `
+name: interactive-fixture
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  writer: { provider: fixture }
+steps:
+  - { id: approve, type: manual_gate, message: Continue?, options: [approve, cancel] }
+  - { id: confirm, type: manual_gate, message: Really continue?, options: [approve, cancel] }
+  - { id: draft, type: session_request, session: writer, prompt: prompts/draft.md, inputs: [request.md], outputs: [response.md] }
+`);
+    fs.writeFileSync(path.join(repo, "fixture.json"), JSON.stringify({
+      artifacts: { "request.md": "Request" },
+      steps: { draft: { outputs: { "response.md": "Resumed response" } } }
+    }));
+
+    expect(await captureCli([
+      "run",
+      "workflow.yml",
+      "--id",
+      "fixture-interaction",
+      "--fixture",
+      "fixture.json"
+    ], repo)).toMatchObject({ exitCode: 3 });
+    const resumed = await captureCli([
+      "resume",
+      "fixture-interaction",
+      "--outcome",
+      "approve"
+    ], repo);
+
+    expect(resumed).toMatchObject({ exitCode: 3 });
+    const confirmed = await captureCli([
+      "resume",
+      "fixture-interaction",
+      "--outcome",
+      "approve"
+    ], repo);
+    expect(confirmed).toMatchObject({ exitCode: 0 });
+    expect(confirmed.stdout).toContain("Status: completed");
+    expect((await captureCli(["artifacts", "fixture-interaction"], repo)).stdout).toContain("response.md");
+
+    expect(await captureCli([
+      "run",
+      "workflow.yml",
+      "--id",
+      "fixture-invalid-resume",
+      "--fixture",
+      "fixture.json"
+    ], repo)).toMatchObject({ exitCode: 3 });
+    fs.writeFileSync(path.join(repo, "fixture.json"), JSON.stringify({
+      artifacts: { "request.md": "Request" },
+      steps: { draft: { outputs: ["response.md"] } }
+    }));
+    const invalidResumeFixture = await captureCli([
+      "resume",
+      "fixture-invalid-resume",
+      "--outcome",
+      "approve"
+    ], repo);
+    expect(invalidResumeFixture).toMatchObject({ exitCode: 2 });
+    expect(invalidResumeFixture.stderr).toContain("array-form outputs are simulation-only");
+    expect((await captureCli(["status", "fixture-invalid-resume"], repo)).stdout).toContain("Status: paused");
+
+    fs.writeFileSync(path.join(repo, "fixture.json"), JSON.stringify({
+      artifacts: { "request.md": "Request" },
+      steps: { draft: { outputs: { "response.md": "Resumed response" } } }
+    }));
+    fs.writeFileSync(path.join(repo, "replacement.json"), JSON.stringify({
+      artifacts: { "request.md": "Request" },
+      steps: { draft: { outcome: "failed", outputs: { "response.md": "Replacement response" } } }
+    }));
+    const pausedWithReplacement = await captureCli([
+      "resume",
+      "fixture-invalid-resume",
+      "--outcome",
+      "approve",
+      "--fixture",
+      "replacement.json"
+    ], repo);
+    expect(pausedWithReplacement).toMatchObject({ exitCode: 3 });
+    fs.writeFileSync(path.join(repo, "replacement.json"), JSON.stringify({
+      artifacts: { "request.md": "Request" },
+      steps: { draft: { outputs: { "response.md": "Replacement response" } } }
+    }));
+    const resumedWithPersistedReplacement = await captureCli([
+      "resume",
+      "fixture-invalid-resume",
+      "--outcome",
+      "approve"
+    ], repo);
+    expect(resumedWithPersistedReplacement).toMatchObject({ exitCode: 0 });
+
+    expect(await captureCli([
+      "run",
+      "workflow.yml",
+      "--id",
+      "fixture-subdirectory-resume",
+      "--fixture",
+      "fixture.json"
+    ], repo)).toMatchObject({ exitCode: 3 });
+    fs.mkdirSync(path.join(repo, "nested"));
+    const resumedFromSubdirectory = await captureCli([
+      "resume",
+      "fixture-subdirectory-resume",
+      "--outcome",
+      "approve"
+    ], path.join(repo, "nested"));
+    expect(resumedFromSubdirectory).toMatchObject({ exitCode: 3 });
+    const confirmedFromSubdirectory = await captureCli([
+      "resume",
+      "fixture-subdirectory-resume",
+      "--outcome",
+      "approve"
+    ], path.join(repo, "nested"));
+    expect(confirmedFromSubdirectory).toMatchObject({ exitCode: 0 });
+    expect(confirmedFromSubdirectory.stdout).toContain("Status: completed");
+  });
+
   test("runs session requests through an explicit CLI fixture provider", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agentflow-cli-session-"));
     fs.mkdirSync(path.join(repo, ".git"));

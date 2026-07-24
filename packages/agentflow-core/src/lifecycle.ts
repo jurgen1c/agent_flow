@@ -82,11 +82,56 @@ export function transitionAgentflowLifecycleRun(
   }
 
   const { targetStatus, allowedFrom } = transitionRule(current, action);
+  if (action === "cancel" && current.context.waiting !== undefined) {
+    closeCancelledInteraction(store, runId, current.context.waiting);
+  }
   return store.transitionRunWithEvent(runId, {
     status: targetStatus,
     allowedFrom,
     event: { type: `run.${action}`, payload: { status: targetStatus } }
   });
+}
+
+function closeCancelledInteraction(
+  store: AgentflowRunStateStore,
+  runId: string,
+  value: AgentflowRunStateValue
+): void {
+  const waiting = value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value
+    : undefined;
+  const run = store.getRun(runId)!;
+  const { waiting: _waiting, ...context } = run.context;
+  store.updateRun(runId, { currentStepId: null, context });
+
+  const stepId = typeof waiting?.stepId === "string" && waiting.stepId.trim().length > 0
+    ? waiting.stepId.trim()
+    : undefined;
+  const attempt = waiting?.attempt;
+  if (stepId === undefined || !Number.isSafeInteger(attempt) || (attempt as number) < 1) return;
+
+  const output = { attempt: attempt as number, reason: "run_cancelled" };
+  store.upsertStep({
+    runId,
+    stepId,
+    attempt: attempt as number,
+    status: "cancelled",
+    output
+  });
+  store.appendRunEvent(runId, { type: "step.interrupted", stepId, payload: output });
+
+  const approvalId = typeof waiting?.approvalId === "string" && waiting.approvalId.trim().length > 0
+    ? waiting.approvalId.trim()
+    : undefined;
+  if (waiting?.kind === "manual_gate" && approvalId !== undefined) {
+    store.upsertApproval({
+      id: approvalId,
+      runId,
+      stepId,
+      status: "cancelled",
+      decision: "cancel"
+    });
+  }
 }
 
 function transitionRule(
@@ -101,6 +146,12 @@ function transitionRule(
 
   if (action === "resume") {
     if (["pending", "running", "waiting", "paused"].includes(run.status)) {
+      if (run.context.waiting !== undefined) {
+        throw new AgentflowRunStateError(
+          `Agentflow run ${run.id} is waiting for an explicit manual-gate outcome or input-request answer.`,
+          "AGENTFLOW_INTERACTION_REQUIRED"
+        );
+      }
       return { targetStatus: "running", allowedFrom: ["pending", "waiting", "paused"] };
     }
   }

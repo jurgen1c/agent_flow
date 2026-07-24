@@ -1187,6 +1187,41 @@ steps:
     expect(result.terminalStates).toEqual([{ stepId: "gate", status: "cancelled" }]);
   });
 
+  test("treats declared completion gate outcomes as terminal", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: completed-gate
+version: 1
+style: pipeline
+maturity: draft
+steps:
+  - { id: gate, type: manual_gate, message: Finish?, options: [complete, cancel] }
+  - { id: never, type: command, command: echo never }
+`);
+    const result = simulateAgentflowWorkflow(workflow, {
+      steps: { gate: { choice: "complete" } }
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.visitedSteps.map((step) => step.id)).toEqual(["gate"]);
+    expect(result.terminalStates).toEqual([{ stepId: "gate", status: "completed" }]);
+  });
+
+  test("routes the cancelled gate alias through on_cancel", () => {
+    const workflow = parseAgentflowWorkflowOrThrow(`name: cancelled-gate-handler
+version: 1
+style: pipeline
+maturity: draft
+steps:
+  - { id: gate, type: manual_gate, message: Continue?, options: [approve, cancelled], on_cancel: cleanup }
+  - { id: cleanup, type: command, command: echo cleanup }
+`);
+    const result = simulateAgentflowWorkflow(workflow, {
+      steps: { gate: { choice: "cancelled" } }
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.visitedSteps.map((step) => step.id)).toEqual(["gate", "cleanup"]);
+  });
+
   test("traverses both nested lists in parallel branch descriptors", () => {
     const workflow = parseAgentflowWorkflowOrThrow(`name: both-branch-lists
 version: 1

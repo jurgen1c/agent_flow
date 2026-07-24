@@ -1052,6 +1052,45 @@ function validateArtifactOutputs(
 
 function validateArtifactPaths(contexts: StepContext[], errors: AgentflowWorkflowIssue[]): void {
   for (const context of contexts) {
+    if (context.type === "manual_gate" || context.type === "input_request") {
+      const promptField = context.type === "manual_gate" ? "message" : "question";
+      const prompt = nonEmptyString(context.step[promptField]);
+      if (prompt !== undefined) {
+        const remainder = prompt.replace(
+          /(?<!\{)\{\{\s*inputs\.([A-Za-z_][A-Za-z0-9_-]*)\s*}}(?!})/g,
+          ""
+        );
+        if (remainder.includes("{{") || remainder.includes("}}")) {
+          addStepIssue(
+            errors,
+            context,
+            `workflow.${context.type}.${promptField}.expression.unsupported`,
+            promptField,
+            `${context.type === "manual_gate" ? "Manual gate message" : "Input request question"} supports only inputs.<name> expressions.`
+          );
+        }
+      }
+      if (context.type === "input_request") {
+        const saveAs = nonEmptyString(context.step.save_as);
+        let normalized = "";
+        try {
+          normalized = saveAs === undefined ? "" : normalizeAgentflowArtifactPath(saveAs);
+        } catch {
+          // Report the input-request-specific path contract below.
+        }
+        if (saveAs !== undefined
+            && (isDynamicReference(saveAs) || normalized.length === 0 || normalized !== saveAs.trim())) {
+          addStepIssue(
+            errors,
+            context,
+            "workflow.input_request.save_as.invalid",
+            "save_as",
+            `Input request artifact "${saveAs}" must be a normalized static repo-relative path.`
+          );
+        }
+      }
+      continue;
+    }
     if (context.type === "mcp_call") {
       for (const field of ["server", "tool"] as const) {
         const value = nonEmptyString(context.step[field]);
@@ -1228,7 +1267,7 @@ function validateApprovals(contexts: StepContext[], errors: AgentflowWorkflowIss
     }
 
     const options = stringList(context.step.options);
-    const hasEscape = options.some((option) => ["cancel", "pause", "reject"].includes(option));
+    const hasEscape = options.some((option) => ["cancel", "cancelled", "pause", "paused", "reject"].includes(option));
 
     if (!hasEscape) {
       addStepIssue(
@@ -1236,7 +1275,7 @@ function validateApprovals(contexts: StepContext[], errors: AgentflowWorkflowIss
         context,
         "workflow.approval.deadlock",
         "options",
-        "Manual gate needs a pause, cancel, or reject outcome so the workflow cannot wait forever."
+        "Manual gate needs a pause, paused, cancel, cancelled, or reject outcome so the workflow cannot wait forever."
       );
     }
   }

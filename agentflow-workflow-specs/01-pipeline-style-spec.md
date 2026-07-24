@@ -200,7 +200,48 @@ Pipeline workflows can pause for approval.
 
 Manual gates must define all possible outcomes.
 
-## 10. Notifications
+At runtime, a manual gate persists its message and valid outcomes in the run's
+waiting state, records a requested approval, and pauses before starting any
+later step. Resuming requires one declared outcome:
+
+```bash
+agentflow resume <run-id> --outcome approve
+```
+
+An invalid outcome must leave the run paused and must not mutate the approval or
+start later steps. `approve` continues through `on_approve` when declared,
+`reject` continues through `on_reject` or cancels by default, `cancel` continues
+through `on_cancel` or cancels by default, and `pause` leaves the gate waiting.
+The resume path completes the waiting step exactly once and continues from its
+success route without replaying earlier steps.
+
+## 10. Input Requests
+
+Pipeline workflows can pause for missing information and declare where the
+answer is saved:
+
+```yaml
+- id: deployment_target
+  type: input_request
+  question: "Which environment should receive this release?"
+  save_as: answers/deployment-target.json
+```
+
+The run persists the question, waiting reason, current step, and declared answer
+artifact before pausing. Resuming requires an explicit answer:
+
+```bash
+agentflow resume <run-id> --answer '{"environment":"staging"}'
+```
+
+String answers are stored as UTF-8 text. Other JSON values are stored as
+UTF-8 JSON. The artifact is attributed to the input-request step and must obey
+the same normalized, repo-relative, collision-safe artifact contract as other
+declared outputs. CLI fixture-backed providers are restored from the fixture
+path persisted by `agentflow run`; `--fixture <file>` may be supplied again to
+use an updated deterministic response set.
+
+## 11. Notifications
 
 Recommended defaults:
 
@@ -214,7 +255,7 @@ notify:
     channels: [terminal, system]
 ```
 
-## 11. Cleanup
+## 12. Cleanup
 
 Pipeline runs often generate temporary logs. They should define retention.
 
@@ -230,7 +271,7 @@ retention:
       - raw/**
 ```
 
-## 12. Validation Rules
+## 13. Validation Rules
 
 Pipeline validation should enforce:
 
@@ -241,7 +282,7 @@ Pipeline validation should enforce:
 - No missing manual gate outcomes.
 - No secret files passed into model prompts.
 
-## 13. Good Defaults
+## 14. Good Defaults
 
 Pipeline workflows should default to:
 

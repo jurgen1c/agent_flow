@@ -39,7 +39,10 @@ export {
   createAgentflowLifecycleRun,
   transitionAgentflowLifecycleRun
 } from "./lifecycle";
-export { executeAgentflowCommandPipeline } from "./command_execution";
+export {
+  executeAgentflowCommandPipeline,
+  resumeAgentflowCommandPipeline
+} from "./command_execution";
 export {
   AgentflowConditionError,
   agentflowConditionExpressionIsSimple,
@@ -123,7 +126,10 @@ export type {
   AgentflowLifecycleAction,
   CreateAgentflowLifecycleRunInput
 } from "./lifecycle";
-export type { AgentflowCommandPipelineResult } from "./command_execution";
+export type {
+  AgentflowCommandPipelineResult,
+  AgentflowPipelineResumeInput
+} from "./command_execution";
 export type { AgentflowConditionSelection } from "./condition";
 export type {
   AgentflowBinaryArtifactValue,

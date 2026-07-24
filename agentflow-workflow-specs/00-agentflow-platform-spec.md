@@ -328,7 +328,8 @@ agentflow lint <workflow>
 agentflow graph <workflow>
 agentflow simulate <workflow>
 agentflow run <workflow> --input key=value
-agentflow resume <run-id>
+agentflow resume <run-id> --outcome <choice> [--fixture <file>]
+agentflow resume <run-id> --answer <value> [--fixture <file>]
 agentflow status <run-id>
 agentflow logs <run-id>
 agentflow artifacts <run-id>
@@ -345,7 +346,7 @@ agentflow cleanup <run-id>
 
 1. Workflow schema parser and validator.
 2. Run state, artifact registry, and event log.
-3. Command, session, condition, and manual gate runners.
+3. Command, session, condition, manual gate, and input request runners.
 4. Pipeline workflow support.
 5. Failure payloads and recovery workflows.
 6. Nested workflows and loops.

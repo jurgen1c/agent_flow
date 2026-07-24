@@ -718,11 +718,19 @@ function gateControl(
     return { kind: "terminal", status: "unresolved" };
   }
 
-  const field = choice === "approve" ? "on_approve" : choice === "cancel" ? "on_cancel" : choice === "reject" ? "on_reject" : undefined;
+  const field = choice === "approve"
+    ? "on_approve"
+    : choice === "cancel" || choice === "cancelled"
+      ? "on_cancel"
+      : choice === "reject"
+        ? "on_reject"
+        : undefined;
   const target = field === undefined ? undefined : nonEmptyString(step[field]);
   if (target !== undefined) return controlForTarget(target, id, state);
   if (choice === "reject") return controlForTarget("cancel", id, state);
-  if (["pause", "cancel", "cancelled", "fail", "failed"].includes(choice)) return controlForTarget(choice, id, state);
+  if (["pause", "cancel", "cancelled", "fail", "failed", "complete", "completed"].includes(choice)) {
+    return controlForTarget(choice, id, state);
+  }
   return { kind: "done" };
 }
 

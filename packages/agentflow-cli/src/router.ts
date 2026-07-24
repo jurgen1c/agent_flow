@@ -18,6 +18,7 @@ import {
   plannedAgentflowRuntimeCommands,
   renderAgentflowSimulationSummary,
   renderAgentflowWorkflowGraph,
+  resumeAgentflowCommandPipeline,
   simulateAgentflowWorkflow,
   transitionAgentflowLifecycleRun,
   validateAgentflowWorkflow
@@ -148,7 +149,8 @@ function renderHelp(topic?: string): string {
     "  agentflow simulate <workflow> --fixture <file>",
     "  agentflow run <workflow> --id <run-id>",
     "  agentflow run <workflow> --id <run-id> --fixture <file>",
-    "  agentflow resume <run-id>",
+    "  agentflow resume <run-id> --outcome <choice> [--fixture <file>]",
+    "  agentflow resume <run-id> --answer <value> [--fixture <file>]",
     "  agentflow status <run-id>",
     "  agentflow logs <run-id>",
     "  agentflow artifacts <run-id>",
@@ -164,7 +166,7 @@ function renderHelp(topic?: string): string {
     "  graph <workflow>     Print a deterministic workflow graph.",
     "  simulate <workflow> --fixture <file>  Traverse a workflow from fixture data without executing steps.",
     "  run <workflow> --id <run-id> [--fixture <file>]  Execute command, artifact-transform, and fixture-backed session-request steps.",
-    "  resume <run-id>       Resume a paused, waiting, or pending run.",
+    "  resume <run-id> (--outcome <choice> | --answer <value>) [--fixture <file>]  Resume a paused interaction.",
     "  status <run-id>       Inspect persistent run state.",
     "  logs <run-id>         List ordered lifecycle events.",
     "  artifacts <run-id>    List registered run artifacts.",
@@ -234,6 +236,14 @@ async function runLifecycleCommand(
         ...(fixture === null ? {} : { inputs: fixture.inputs })
       });
       if (fixture !== null) {
+        store.updateRun(result.run.id, {
+          context: {
+            ...result.run.context,
+            cliFixturePath: path.resolve(options.cwd ?? process.cwd(), args[4])
+          }
+        });
+      }
+      if (fixture !== null) {
         for (const [index, [artifactPath, value]] of Object.entries(fixture.artifacts)
           .sort(([left], [right]) => left.localeCompare(right)).entries()) {
           store.writeArtifact({
@@ -295,19 +305,74 @@ async function runLifecycleCommand(
       };
     }
 
+    if (command === "resume") {
+      const run = requireRun(store, runId);
+      const workflow = run.context.workflow;
+      if (workflow === null || typeof workflow !== "object" || Array.isArray(workflow)) {
+        throw new AgentflowRunStateError(
+          `Agentflow run ${runId} does not contain its persisted workflow definition.`,
+          "AGENTFLOW_RESUME_STATE"
+        );
+      }
+      const response = args[1] === "--outcome"
+        ? { outcome: args[2] }
+        : { answer: parseCliAnswer(args[2]) };
+      const persistedFixturePath = typeof run.context.cliFixturePath === "string"
+        ? run.context.cliFixturePath
+        : undefined;
+      const fixturePath = args.length === 5 ? args[4] : persistedFixturePath;
+      const fixture = fixturePath === undefined ? null : readRunFixture(fixturePath, options.cwd);
+      if (fixture !== null && "exitCode" in fixture) return fixture;
+      if (fixture !== null) {
+        const unsupportedOutputStep = collectSessionRequestSteps(
+          (workflow as unknown as import("@jurgen1c/agentflow-core").AgentflowWorkflow).steps
+        ).find((step) => fixture.arrayOutputSteps.has(String(step.id ?? "").trim()));
+        if (unsupportedOutputStep !== undefined) {
+          return {
+            exitCode: 2,
+            stderr: `Run fixture step ${String(unsupportedOutputStep.id).trim()}.outputs must be an object with materializable output values; array-form outputs are simulation-only.`
+          };
+        }
+      }
+      const providers = createAgentflowSessionProviderRegistry();
+      if (fixture !== null) {
+        providers.register("fixture", createAgentflowFixtureSessionProvider(fixture.responses, fixture.outcomes));
+      }
+      const execution = await resumeAgentflowCommandPipeline(
+        store,
+        runId,
+        workflow as unknown as import("@jurgen1c/agentflow-core").AgentflowWorkflow,
+        response,
+        undefined,
+        providers
+      );
+      if (args.length === 5 && execution.status === "paused") {
+        const resumedRun = requireRun(store, runId);
+        store.updateRun(runId, {
+          context: {
+            ...resumedRun.context,
+            cliFixturePath: path.resolve(options.cwd ?? process.cwd(), args[4])
+          }
+        });
+      }
+      const lines = [
+        `Resumed Agentflow run ${runId}.`,
+        `Status: ${execution.status}`,
+        `Completed steps: ${execution.completedSteps.length === 0 ? "none" : execution.completedSteps.join(", ")}`
+      ];
+      return {
+        exitCode: execution.status === "completed" ? 0 : execution.status === "paused" ? 3 : 1,
+        stdout: lines.join("\n"),
+        stderr: execution.message
+      };
+    }
+
     const result = transitionAgentflowLifecycleRun(store, runId, command);
-    const verb = command === "pause" ? "Paused" : command === "resume" ? "Resumed" : "Cancelled";
+    const verb = command === "pause" ? "Paused" : "Cancelled";
     const lines = [
       `${result.changed ? verb : "No change for"} Agentflow run ${runId}.`,
       `Status: ${result.run.status}`
     ];
-    if (command === "resume") {
-      return {
-        exitCode: 7,
-        stdout: lines.join("\n"),
-        stderr: "Resuming command execution is not available yet; no additional workflow steps were executed. Pause or cancel the run explicitly."
-      };
-    }
     return { exitCode: 0, stdout: lines.join("\n") };
   } catch (error) {
     if (error instanceof AgentflowRunStateError) {
@@ -320,16 +385,42 @@ async function runLifecycleCommand(
 }
 
 function validLifecycleArgs(command: ActiveLifecycleCommand, args: string[]): boolean {
-  return command === "run"
-    ? (args.length === 3 || (args.length === 5 && args[3] === "--fixture" && args[4].length > 0))
+  if (command === "run") {
+    return (args.length === 3 || (args.length === 5 && args[3] === "--fixture" && args[4].length > 0))
       && args[1] === "--id" && args[0].length > 0 && args[2].length > 0
-    : args.length === 1 && args[0].length > 0;
+  }
+  if (command === "resume") {
+    return (args.length === 3 || (args.length === 5 && args[3] === "--fixture" && args[4].length > 0))
+      && args[0].length > 0
+      && ["--outcome", "--answer"].includes(args[1])
+      && (args[1] === "--answer" || args[2].length > 0);
+  }
+  return args.length === 1 && args[0].length > 0;
 }
 
 function lifecycleUsage(topic: string): string | null {
   if (topic === "run") return "Usage: agentflow run <workflow> --id <run-id> [--fixture <file>]";
+  if (topic === "resume") return "Usage: agentflow resume <run-id> (--outcome <choice> | --answer <value>) [--fixture <file>]";
   if (isActiveLifecycleCommand(topic)) return `Usage: agentflow ${topic} <run-id>`;
   return null;
+}
+
+function parseCliAnswer(value: string): import("@jurgen1c/agentflow-core").AgentflowRunStateValue {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (isRunStateValue(parsed)) return parsed;
+  } catch {
+    // Plain text answers are valid input-request values.
+  }
+  return value;
+}
+
+function isRunStateValue(value: unknown): value is import("@jurgen1c/agentflow-core").AgentflowRunStateValue {
+  if (value === null || typeof value === "boolean" || typeof value === "string") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (Array.isArray(value)) return value.every(isRunStateValue);
+  return typeof value === "object"
+    && Object.values(value as Record<string, unknown>).every(isRunStateValue);
 }
 
 function readRunFixture(
@@ -410,14 +501,30 @@ function requireRun(
 }
 
 function renderRunStatus(run: NonNullable<ReturnType<Awaited<ReturnType<typeof openAgentflowRunState>>["getRun"]>>): string {
-  return [
+  const lines = [
     `Run: ${run.id}`,
     `Workflow: ${run.workflowName} (version ${run.workflowVersion})`,
     `Status: ${run.status}`,
-    `Current step: ${run.currentStepId ?? "none"}`,
+    `Current step: ${run.currentStepId ?? "none"}`
+  ];
+  const waiting = run.context.waiting;
+  if (waiting !== null && typeof waiting === "object" && !Array.isArray(waiting)) {
+    const reason = waiting.reason;
+    const prompt = waiting.prompt;
+    if (typeof reason === "string") lines.push(`Waiting reason: ${reason}`);
+    if (typeof prompt === "string") lines.push(`Prompt: ${prompt}`);
+    if (waiting.kind === "manual_gate" && Array.isArray(waiting.validOutcomes)) {
+      lines.push(`Valid outcomes: ${waiting.validOutcomes.join(", ") || "none"}`);
+    }
+    if (waiting.kind === "input_request" && typeof waiting.saveAs === "string") {
+      lines.push(`Answer artifact: ${waiting.saveAs}`);
+    }
+  }
+  lines.push(
     `Created: ${run.createdAt}`,
     `Updated: ${run.updatedAt}`
-  ].join("\n");
+  );
+  return lines.join("\n");
 }
 
 function simulateWorkflow(args: string[]): AgentflowCliResult {
