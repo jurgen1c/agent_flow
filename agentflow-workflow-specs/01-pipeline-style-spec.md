@@ -250,7 +250,15 @@ use an updated deterministic response set.
 
 ## 11. Notifications
 
-Recommended defaults:
+Pipeline notifications are emitted for configured completion, failure, and
+paused outcomes. The built-in runtime channels are `terminal` and `system`;
+embedders can register additional named channel adapters. Delivery attempts are
+currently synchronous; a promise-returning adapter is rejected as a delivery
+failure so a required channel cannot be recorded as delivered before it settles.
+Each attempt is recorded in the ordered run event log. A failed delivery is
+diagnostic by default and does not change the pipeline outcome. Set
+`required: true` on a notification rule when failure to deliver any channel
+must fail a completed or paused pipeline.
 
 ```yaml
 notify:
@@ -260,11 +268,16 @@ notify:
     channels: [terminal]
   - on: workflow.paused
     channels: [terminal, system]
+    required: true
 ```
 
 ## 12. Cleanup
 
-Pipeline runs often generate temporary logs. They should define retention.
+Every completed, failed, or cancelled pipeline writes a deterministic
+runtime-owned `final-summary.md` artifact. Paused runs remain resumable and do
+not write a final summary until they reach a terminal outcome. Workflow steps
+cannot publish that reserved path. Pipeline runs often generate temporary logs,
+so terminal runs can define retention rules for registered artifact paths.
 
 ```yaml
 retention:
@@ -277,6 +290,15 @@ retention:
       - temp/**
       - raw/**
 ```
+
+Retention removes only the backing content for matched registered artifacts;
+the artifact metadata remains queryable with `missing` status. Run state and
+ordered events live in SQLite and are never cleanup candidates, while
+`final-summary.md` is always retained. `keep` overrides `delete`. Rules with a
+positive `after_days` or `keep_all_for_days`, or with `ask_user: true`, are
+recorded as deferred for a later cleanup command instead of running early.
+Cleanup policy decisions and deletion failures are recorded without rewriting
+the already-determined pipeline outcome.
 
 ## 13. Validation Rules
 

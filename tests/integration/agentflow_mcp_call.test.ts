@@ -640,7 +640,8 @@ steps:
       expect(result).toMatchObject({ status: "failed", failedStep: "fetch" });
       expect(result.message).toContain("normalized static repo-relative artifact path");
       expect(invoked).toBe(false);
-      expect(store.listArtifacts("invalid-runtime-output")).toEqual([]);
+      expect(store.listArtifacts("invalid-runtime-output").map((artifact) => artifact.declaredPath))
+        .toEqual(["final-summary.md"]);
       store.close();
     }
   });

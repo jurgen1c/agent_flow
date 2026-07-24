@@ -8,11 +8,13 @@ import {
   normalizeAgentflowArtifactPath,
   type AgentflowRunStateValue,
   type AgentflowRunStateStore,
+  type AgentflowRunStopStatus,
   type AgentflowRunStatus,
   type AgentflowFailureOutcome
 } from "./run_state";
 import type { AgentflowWorkflow, AgentflowWorkflowStep, AgentflowYamlMapping } from "./workflow";
 import { evaluateAgentflowPolicy } from "./policy";
+import { validateAgentflowRetentionPolicy } from "./policy_validation";
 import {
   AgentflowArtifactTransformRegistry,
   createAgentflowArtifactTransformRegistry,
@@ -41,6 +43,20 @@ import {
 } from "./mcp_call";
 import { selectAgentflowConditionTarget } from "./condition";
 import { assertAgentflowSuccessTargetsAreUnambiguous } from "./success_routing";
+import {
+  createAgentflowNotificationRegistry,
+  deliverAgentflowNotifications,
+  validateAgentflowNotifications,
+  type AgentflowNotificationRegistry
+} from "./notifications";
+import {
+  AGENTFLOW_FINAL_SUMMARY_PATH,
+  agentflowPipelineEffectsFinalized,
+  applyAgentflowRetention,
+  markAgentflowPipelineEffectsFinalized,
+  writeAgentflowFinalSummary
+} from "./retention";
+import { withAgentflowPipelineFinalization } from "./finalization";
 
 const MAX_CAPTURE_BYTES = 10 * 1024 * 1024;
 
@@ -91,9 +107,19 @@ export async function executeAgentflowCommandPipeline(
   workflow: AgentflowWorkflow,
   transforms: AgentflowArtifactTransformRegistry = createAgentflowArtifactTransformRegistry(),
   sessionProviders: AgentflowSessionProviderRegistry = createAgentflowSessionProviderRegistry(),
-  mcpCalls: AgentflowMcpCallRegistry = createAgentflowMcpCallRegistry()
+  mcpCalls: AgentflowMcpCallRegistry = createAgentflowMcpCallRegistry(),
+  notifications: AgentflowNotificationRegistry = createAgentflowNotificationRegistry()
 ): Promise<AgentflowCommandPipelineResult> {
-  return runAgentflowCommandPipeline(store, runId, workflow, undefined, transforms, sessionProviders, mcpCalls);
+  return runAgentflowCommandPipeline(
+    store,
+    runId,
+    workflow,
+    undefined,
+    transforms,
+    sessionProviders,
+    mcpCalls,
+    notifications
+  );
 }
 
 export async function resumeAgentflowCommandPipeline(
@@ -103,9 +129,19 @@ export async function resumeAgentflowCommandPipeline(
   response: AgentflowPipelineResumeInput,
   transforms: AgentflowArtifactTransformRegistry = createAgentflowArtifactTransformRegistry(),
   sessionProviders: AgentflowSessionProviderRegistry = createAgentflowSessionProviderRegistry(),
-  mcpCalls: AgentflowMcpCallRegistry = createAgentflowMcpCallRegistry()
+  mcpCalls: AgentflowMcpCallRegistry = createAgentflowMcpCallRegistry(),
+  notifications: AgentflowNotificationRegistry = createAgentflowNotificationRegistry()
 ): Promise<AgentflowCommandPipelineResult> {
-  return runAgentflowCommandPipeline(store, runId, workflow, response, transforms, sessionProviders, mcpCalls);
+  return runAgentflowCommandPipeline(
+    store,
+    runId,
+    workflow,
+    response,
+    transforms,
+    sessionProviders,
+    mcpCalls,
+    notifications
+  );
 }
 
 async function runAgentflowCommandPipeline(
@@ -115,7 +151,8 @@ async function runAgentflowCommandPipeline(
   resumeInput: AgentflowPipelineResumeInput | undefined,
   transforms: AgentflowArtifactTransformRegistry,
   sessionProviders: AgentflowSessionProviderRegistry,
-  mcpCalls: AgentflowMcpCallRegistry
+  mcpCalls: AgentflowMcpCallRegistry,
+  notifications: AgentflowNotificationRegistry
 ): Promise<AgentflowCommandPipelineResult> {
   const existing = store.getRun(runId);
   if (existing === null) throw new Error(`Agentflow run ${runId} was not found.`);
@@ -125,7 +162,21 @@ async function runAgentflowCommandPipeline(
       "AGENTFLOW_RUN_COLLISION"
     );
   }
-  validateRuntimeInteractionSteps(workflow.steps);
+  const notificationIssue = validateAgentflowNotifications(workflow)[0];
+  if (notificationIssue !== undefined) {
+    throw new AgentflowRunStateError(
+      `Agentflow run ${runId} cannot execute invalid notifications: ${notificationIssue.code} (${notificationIssue.path}): ${notificationIssue.message}`,
+      "AGENTFLOW_WORKFLOW_INVALID"
+    );
+  }
+  const retentionIssue = validateAgentflowRetentionPolicy(workflow.retention)[0];
+  if (retentionIssue !== undefined) {
+    throw new AgentflowRunStateError(
+      `Agentflow run ${runId} cannot execute invalid retention: ${retentionIssue.code} (${retentionIssue.path}): ${retentionIssue.message}`,
+      "AGENTFLOW_WORKFLOW_INVALID"
+    );
+  }
+  validateRuntimeInteractionSteps(workflow.steps, workflow.style === "pipeline");
   if (resumeInput === undefined && existing.status !== "pending") {
     throw new Error(`Agentflow run ${runId} cannot execute while its status is ${existing.status}.`);
   }
@@ -149,9 +200,17 @@ async function runAgentflowCommandPipeline(
       event: { type: "run.started", payload: { status: "running" } }
     });
     completedSteps = [];
-    routingBudget = createSuccessfulRoutingBudget(workflow);
+    routingBudget = createSuccessfulRoutingBudget(workflow, notifications);
   } else {
-    const resumed = resumeWaitingStep(store, runId, workflow, existing.context, resumeInput, stepLocations);
+    const resumed = resumeWaitingStep(
+      store,
+      runId,
+      workflow,
+      existing.context,
+      resumeInput,
+      stepLocations,
+      notifications
+    );
     if ("result" in resumed) return resumed.result;
     completedSteps = resumed.completedSteps;
     routingBudget = resumed.routingBudget;
@@ -176,7 +235,7 @@ async function runAgentflowCommandPipeline(
           exitCode: null,
           timedOut: false,
           message: preflightError
-        }, "failed");
+        }, "failed", routingBudget.terminalEffects);
       }
       const retries = failureRetries(step);
       let failure: string | undefined;
@@ -256,7 +315,7 @@ async function runAgentflowCommandPipeline(
         exitCode: null,
         timedOut: false,
         message: failure
-      }, failureStatus(step));
+      }, failureStatus(step), routingBudget.terminalEffects);
     }
     if (stepType === "artifact_transform") {
       const firstAttempt = allocateStepAttempt(routingBudget, stepId);
@@ -268,7 +327,7 @@ async function runAgentflowCommandPipeline(
           exitCode: null,
           timedOut: false,
           message: preflightError
-        }, "failed");
+        }, "failed", routingBudget.terminalEffects);
       }
       const retries = failureRetries(step);
       let failure: string | undefined;
@@ -301,7 +360,7 @@ async function runAgentflowCommandPipeline(
         exitCode: null,
         timedOut: false,
         message: failure
-      }, failureStatus(step));
+      }, failureStatus(step), routingBudget.terminalEffects);
     }
     if (stepType === "session_request") {
       const firstAttempt = allocateStepAttempt(routingBudget, stepId);
@@ -316,7 +375,7 @@ async function runAgentflowCommandPipeline(
           exitCode: null,
           timedOut: false,
           message: preflightError
-        }, "failed");
+        }, "failed", routingBudget.terminalEffects);
       }
       const retries = failureRetries(step);
       let failure: string | undefined;
@@ -373,7 +432,7 @@ async function runAgentflowCommandPipeline(
               exitCode: null,
               timedOut: false,
               message: failure
-            }, error.status === "pause" ? "paused" : "failed");
+            }, error.status === "pause" ? "paused" : "failed", routingBudget.terminalEffects);
           }
           if (error instanceof AgentflowRunStateError && error.code === "AGENTFLOW_ARTIFACT_RUN_STATUS") {
             const status = activeStopStatus(store, runId);
@@ -443,7 +502,7 @@ async function runAgentflowCommandPipeline(
         exitCode: null,
         timedOut: false,
         message: failure
-      }, failureStatus(step));
+      }, failureStatus(step), routingBudget.terminalEffects);
     }
     if (stepType === "condition") {
       const attempt = allocateStepAttempt(routingBudget, stepId);
@@ -510,7 +569,7 @@ async function runAgentflowCommandPipeline(
           exitCode: null,
           timedOut: false,
           message
-        }, "failed");
+        }, "failed", routingBudget.terminalEffects);
       }
     }
     if (stepType === "manual_gate" || stepType === "input_request") {
@@ -526,7 +585,7 @@ async function runAgentflowCommandPipeline(
           exitCode: null,
           timedOut: false,
           message: error.message
-        }, "failed");
+        }, "failed", routingBudget.terminalEffects);
       }
     }
     if (stepType !== "command") {
@@ -534,7 +593,7 @@ async function runAgentflowCommandPipeline(
         exitCode: null,
         timedOut: false,
         message: `Step ${stepId} has unsupported type ${String(step.type)}; only command, artifact_transform, condition, input_request, manual_gate, mcp_call, and session_request steps can execute in this runtime phase.`
-      }, "paused");
+      }, "paused", routingBudget.terminalEffects);
     }
 
     const firstAttempt = allocateStepAttempt(routingBudget, stepId);
@@ -553,7 +612,7 @@ async function runAgentflowCommandPipeline(
         exitCode: null,
         timedOut: false,
         message: preflightError.message
-      }, preflightError.status);
+      }, preflightError.status, routingBudget.terminalEffects);
     }
 
     const retries = failureRetries(step);
@@ -571,7 +630,7 @@ async function runAgentflowCommandPipeline(
         timeoutMilliseconds(step),
         () => activeStopStatus(store, runId)
       );
-      const stoppedAfterCommand = stoppedPipelineResult(store, runId, completedSteps);
+      const stoppedAfterCommand = activeStopStatus(store, runId);
       if (stoppedAfterCommand !== undefined) {
         let logPersistenceError: string | undefined;
         try {
@@ -584,15 +643,15 @@ async function runAgentflowCommandPipeline(
           runId,
           stepId,
           attempt,
-          status: stoppedAfterCommand.status,
+          status: stoppedAfterCommand,
           output: { ...commandOutput(lastResult, attempt), logPersistenceError: logPersistenceError ?? null }
         });
         store.appendRunEvent(runId, {
           type: "step.interrupted",
           stepId,
-          payload: { attempt, status: stoppedAfterCommand.status, logPersistenceError: logPersistenceError ?? null }
+          payload: { attempt, status: stoppedAfterCommand, logPersistenceError: logPersistenceError ?? null }
         });
-        return stoppedAfterCommand;
+        return stoppedPipelineResult(store, runId, completedSteps)!;
       }
       try {
         persistCommandLog(store, runId, stepId, attempt, "stdout", lastResult.stdout);
@@ -645,7 +704,7 @@ async function runAgentflowCommandPipeline(
         exitCode: lastResult.exitCode,
         timedOut: lastResult.timedOut,
         message: lastResult.message ?? failureMessage(lastResult)
-      }, failureStatus(step));
+      }, failureStatus(step), routingBudget.terminalEffects);
     }
 
     const routed = routeAfterSuccessfulStep(store, runId, completedSteps, stepId, step, currentSteps, stepIndex, stepLocations, routingBudget);
@@ -654,7 +713,7 @@ async function runAgentflowCommandPipeline(
     stepIndex = routed.nextIndex;
   }
 
-  return finishCompleted(store, runId, completedSteps);
+  return finishCompleted(store, runId, completedSteps, routingBudget.terminalEffects);
 }
 
 type SuccessfulRoute =
@@ -667,11 +726,17 @@ interface RuntimeStepLocation {
 }
 
 interface SuccessfulRoutingBudget {
+  terminalEffects: AgentflowPipelineTerminalEffects;
   maxRecoveryCycles?: number;
   stepAttemptLimits: Map<string, number>;
   visits: Map<string, number>;
   recoveryCycles: Map<string, number>;
   attempts: Map<string, number>;
+}
+
+interface AgentflowPipelineTerminalEffects {
+  workflow: AgentflowWorkflow;
+  notifications: AgentflowNotificationRegistry;
 }
 
 interface SerializedSuccessfulRoutingBudget {
@@ -739,27 +804,46 @@ function pauseForInteraction(
       context: { message: prompt, options: validOutcomes }
     });
   }
-  store.transitionRunWithEvent(runId, {
-    status: "paused",
-    allowedFrom: ["running"],
-    event: {
-      type: "run.paused",
+  const resultMessage = kind === "manual_gate"
+    ? `Manual gate ${stepId} is waiting for one of: ${validOutcomes.join(", ")}.`
+    : `Input request ${stepId} is waiting for an answer to be saved as ${saveAs}.`;
+  const finalized = finalizePipelineRun(store, runId, routingBudget.terminalEffects, {
+    intendedStatus: "paused",
+    completedSteps,
+    currentStepId: stepId,
+    message: resultMessage,
+    eventPayload: {
       stepId,
-      payload: {
-        stepId,
-        reason: waiting.reason,
-        prompt,
-        validOutcomes,
-        ...(saveAs === undefined ? {} : { saveAs })
+      reason: waiting.reason,
+      prompt,
+      validOutcomes,
+      ...(saveAs === undefined ? {} : { saveAs })
+    },
+    eventStepId: stepId,
+    failureContext: run.context,
+    onFinalStatus: (status, message) => {
+      if (status !== "failed") return;
+      const error = {
+        attempt,
+        message: message ?? "Required paused notification failed.",
+        outcome: "fail"
+      };
+      store.upsertStep({ runId, stepId, attempt, status: "failed", error });
+      if (approvalId !== undefined) {
+        store.upsertApproval({
+          id: approvalId,
+          runId,
+          stepId,
+          status: "cancelled",
+          decision: "notification_failure"
+        });
       }
     }
   });
   return {
-    status: "paused",
+    status: finalized.status,
     completedSteps,
-    message: kind === "manual_gate"
-      ? `Manual gate ${stepId} is waiting for one of: ${validOutcomes.join(", ")}.`
-      : `Input request ${stepId} is waiting for an answer to be saved as ${saveAs}.`
+    message: finalized.message ?? resultMessage
   };
 }
 
@@ -769,7 +853,8 @@ function resumeWaitingStep(
   workflow: AgentflowWorkflow,
   context: Record<string, AgentflowRunStateValue>,
   response: AgentflowPipelineResumeInput,
-  stepLocations: Map<string, RuntimeStepLocation>
+  stepLocations: Map<string, RuntimeStepLocation>,
+  notifications: AgentflowNotificationRegistry
 ): ResumedWaitingStep {
   const waiting = parseWaitingState(context.waiting);
   const location = stepLocations.get(waiting.stepId);
@@ -787,7 +872,7 @@ function resumeWaitingStep(
     );
   }
 
-  const routingBudget = deserializeRoutingBudget(waiting.routing, workflow);
+  const routingBudget = deserializeRoutingBudget(waiting.routing, workflow, notifications);
   const completedSteps = [...waiting.completedSteps];
   let selectedTarget: string | undefined;
   let output: Record<string, AgentflowRunStateValue>;
@@ -889,14 +974,17 @@ function resumeWaitingStep(
         checksum: artifact.checksum
       };
     } catch (error) {
-      store.transitionRunWithEvent(runId, {
-        status: "paused",
-        allowedFrom: ["running"],
-        event: {
-          type: "run.paused",
-          stepId: waiting.stepId,
-          payload: { reason: waiting.reason, error: error instanceof Error ? error.message : String(error) }
-        }
+      const message = error instanceof Error ? error.message : String(error);
+      const { waiting: _waiting, ...failureContext } = store.getRun(runId)!.context;
+      finalizePipelineRun(store, runId, routingBudget.terminalEffects, {
+        intendedStatus: "paused",
+        completedSteps,
+        currentStepId: waiting.stepId,
+        output: { completedSteps },
+        message,
+        eventPayload: { reason: waiting.reason, error: message },
+        eventStepId: waiting.stepId,
+        failureContext
       });
       throw error;
     }
@@ -955,10 +1043,12 @@ function serializeRoutingBudget(budget: SuccessfulRoutingBudget): SerializedSucc
 
 function deserializeRoutingBudget(
   serialized: SerializedSuccessfulRoutingBudget,
-  workflow: AgentflowWorkflow
+  workflow: AgentflowWorkflow,
+  notifications: AgentflowNotificationRegistry
 ): SuccessfulRoutingBudget {
-  const configured = createSuccessfulRoutingBudget(workflow);
+  const configured = createSuccessfulRoutingBudget(workflow, notifications);
   return {
+    terminalEffects: configured.terminalEffects,
     maxRecoveryCycles: configured.maxRecoveryCycles,
     stepAttemptLimits: configured.stepAttemptLimits,
     visits: new Map(Object.entries(serialized.visits)),
@@ -1074,10 +1164,32 @@ function requiredStaticString(value: unknown, label: string): string {
   return normalized;
 }
 
-function validateRuntimeInteractionSteps(steps: AgentflowWorkflowStep[]): void {
+function validateRuntimeInteractionSteps(
+  steps: AgentflowWorkflowStep[],
+  reserveFinalSummary: boolean
+): void {
   for (const step of steps) {
     const type = normalizedTarget(step.type);
     const stepId = requiredStepId(step);
+    const outputPaths = [
+      ...(typeof step.output === "string" ? [step.output] : []),
+      ...(typeof step.save_as === "string" ? [step.save_as] : []),
+      ...(Array.isArray(step.outputs) ? step.outputs.filter((value): value is string => typeof value === "string") : [])
+    ];
+    for (const outputPath of outputPaths) {
+      let normalized: string | undefined;
+      try {
+        normalized = normalizeAgentflowArtifactPath(outputPath);
+      } catch {
+        normalized = undefined;
+      }
+      if (reserveFinalSummary && normalized === AGENTFLOW_FINAL_SUMMARY_PATH) {
+        throw new AgentflowRunStateError(
+          `Agentflow workflow step ${stepId} cannot publish reserved runtime summary ${AGENTFLOW_FINAL_SUMMARY_PATH}.`,
+          "AGENTFLOW_WORKFLOW_INVALID"
+        );
+      }
+    }
     if (type === "input_request") {
       const saveAs = requiredStaticString(step.save_as, `Input request artifact for step ${stepId}`);
       let normalized: string;
@@ -1099,7 +1211,9 @@ function validateRuntimeInteractionSteps(steps: AgentflowWorkflowStep[]): void {
     }
     for (const field of ["body", "steps", ...(type === "parallel" ? ["branches"] : [])]) {
       const nested = step[field];
-      if (Array.isArray(nested)) validateRuntimeInteractionSteps(nested.filter(isWorkflowStep));
+      if (Array.isArray(nested)) {
+        validateRuntimeInteractionSteps(nested.filter(isWorkflowStep), reserveFinalSummary);
+      }
     }
   }
 }
@@ -1174,21 +1288,50 @@ function routeAfterSuccessfulStep(
   if (target === "continue" || target === "ignore") {
     return fallthroughAfterStep(store, runId, completedSteps, stepId, currentSteps, stepIndex, budget);
   }
-  if (target === "complete" || target === "completed") return { result: finishCompleted(store, runId, completedSteps) };
+  if (target === "complete" || target === "completed") {
+    return { result: finishCompleted(store, runId, completedSteps, budget.terminalEffects) };
+  }
   if (target === "fail") {
-    return { result: finishSuccessfulTerminalRoute(store, runId, completedSteps, stepId, "failed") };
+    return {
+      result: finishSuccessfulTerminalRoute(
+        store,
+        runId,
+        completedSteps,
+        stepId,
+        "failed",
+        budget.terminalEffects
+      )
+    };
   }
   if (target === "pause") {
-    return { result: finishSuccessfulTerminalRoute(store, runId, completedSteps, stepId, "paused") };
+    return {
+      result: finishSuccessfulTerminalRoute(
+        store,
+        runId,
+        completedSteps,
+        stepId,
+        "paused",
+        budget.terminalEffects
+      )
+    };
   }
   if (target === "cancel") {
-    return { result: finishSuccessfulTerminalRoute(store, runId, completedSteps, stepId, "cancelled") };
+    return {
+      result: finishSuccessfulTerminalRoute(
+        store,
+        runId,
+        completedSteps,
+        stepId,
+        "cancelled",
+        budget.terminalEffects
+      )
+    };
   }
   return { result: finishFailure(store, runId, completedSteps, stepId, {
     exitCode: null,
     timedOut: false,
     message: `Step ${stepId} routed to unresolved target ${target}.`
-  }, "failed") };
+  }, "failed", budget.terminalEffects) };
 }
 
 function fallthroughAfterStep(
@@ -1222,7 +1365,7 @@ function successfulTransitionFailure(
       exitCode: null,
       timedOut: false,
       message: `Step ${stepId} cannot route to ${target} because limits.max_step_attempts allows ${attemptLimit} attempt(s).`
-    }, "paused");
+    }, "paused", budget.terminalEffects);
   }
   if ((budget.visits.get(target) ?? 0) === 0) return undefined;
   if (budget.maxRecoveryCycles === undefined) {
@@ -1230,7 +1373,7 @@ function successfulTransitionFailure(
       exitCode: null,
       timedOut: false,
       message: `Step ${stepId} repeated route target ${target} without a positive executable limits.max_recovery_cycles bound.`
-    }, "paused");
+    }, "paused", budget.terminalEffects);
   }
   const cycles = (budget.recoveryCycles.get(target) ?? 0) + 1;
   budget.recoveryCycles.set(target, cycles);
@@ -1239,7 +1382,7 @@ function successfulTransitionFailure(
     exitCode: null,
     timedOut: false,
     message: `Step ${stepId} exceeded limits.max_recovery_cycles ${budget.maxRecoveryCycles} while routing to ${target}.`
-  }, "paused");
+  }, "paused", budget.terminalEffects);
 }
 
 function finishSuccessfulTerminalRoute(
@@ -1247,23 +1390,26 @@ function finishSuccessfulTerminalRoute(
   runId: string,
   completedSteps: string[],
   stepId: string,
-  status: "failed" | "paused" | "cancelled"
+  status: "failed" | "paused" | "cancelled",
+  terminalEffects: AgentflowPipelineTerminalEffects
 ): AgentflowCommandPipelineResult {
   const target = status === "failed" ? "fail" : status === "paused" ? "pause" : "cancel";
   const message = `Step ${stepId} routed the pipeline to ${target}.`;
-  store.updateRun(runId, {
+  const finalized = finalizePipelineRun(store, runId, terminalEffects, {
+    intendedStatus: status,
+    completedSteps,
     currentStepId: null,
-    output: { completedSteps, terminalRoute: { status, stepId } }
+    output: { completedSteps, terminalRoute: { status, stepId } },
+    message,
+    eventPayload: { routedByStepId: stepId, completedSteps, message }
   });
-  store.transitionRunWithEvent(runId, {
-    status,
-    allowedFrom: ["running"],
-    event: { type: `run.${status}`, payload: { routedByStepId: stepId, completedSteps, message } }
-  });
-  return { status, completedSteps, message };
+  return { status: finalized.status, completedSteps, message: finalized.message ?? message };
 }
 
-function createSuccessfulRoutingBudget(workflow: AgentflowWorkflow): SuccessfulRoutingBudget {
+function createSuccessfulRoutingBudget(
+  workflow: AgentflowWorkflow,
+  notifications: AgentflowNotificationRegistry
+): SuccessfulRoutingBudget {
   const limits = mapping(workflow.limits);
   const configuredStepAttempts = mapping(limits?.max_step_attempts);
   const stepAttemptLimits = new Map(Object.entries(configuredStepAttempts ?? {}).flatMap(([stepId, value]) =>
@@ -1273,7 +1419,14 @@ function createSuccessfulRoutingBudget(workflow: AgentflowWorkflow): SuccessfulR
     && Number.isSafeInteger(limits.max_recovery_cycles) && limits.max_recovery_cycles > 0
     ? limits.max_recovery_cycles
     : undefined;
-  return { maxRecoveryCycles, stepAttemptLimits, visits: new Map(), recoveryCycles: new Map(), attempts: new Map() };
+  return {
+    terminalEffects: { workflow, notifications },
+    maxRecoveryCycles,
+    stepAttemptLimits,
+    visits: new Map(),
+    recoveryCycles: new Map(),
+    attempts: new Map()
+  };
 }
 
 function collectRuntimeStepLocations(
@@ -1327,21 +1480,232 @@ function stepAttemptLimitResult(
     exitCode: null,
     timedOut: false,
     message: `Step ${stepId} cannot start because limits.max_step_attempts allows ${limit} attempt(s).`
-  }, "paused");
+  }, "paused", budget.terminalEffects);
 }
 
 function finishCompleted(
   store: AgentflowRunStateStore,
   runId: string,
-  completedSteps: string[]
+  completedSteps: string[],
+  terminalEffects: AgentflowPipelineTerminalEffects
 ): AgentflowCommandPipelineResult {
-  store.updateRun(runId, { currentStepId: null, output: { completedSteps } });
-  store.transitionRunWithEvent(runId, {
-    status: "completed",
-    allowedFrom: ["running"],
-    event: { type: "run.completed", payload: { completedSteps } }
+  const finalized = finalizePipelineRun(store, runId, terminalEffects, {
+    intendedStatus: "completed",
+    completedSteps,
+    currentStepId: null,
+    output: { completedSteps },
+    eventPayload: { completedSteps }
   });
-  return { status: "completed", completedSteps };
+  return { status: finalized.status, completedSteps, ...(finalized.message === undefined ? {} : { message: finalized.message }) };
+}
+
+interface FinalizePipelineRunInput {
+  intendedStatus: Extract<AgentflowRunStatus, "completed" | "failed" | "paused" | "cancelled">;
+  completedSteps: string[];
+  currentStepId: string | null;
+  output?: AgentflowRunStateValue;
+  error?: AgentflowRunStateValue;
+  message?: string;
+  eventPayload: AgentflowRunStateValue;
+  eventStepId?: string;
+  failureContext?: Record<string, AgentflowRunStateValue>;
+  onFinalStatus?: (
+    status: Extract<AgentflowRunStatus, "completed" | "failed" | "paused" | "cancelled">,
+    message: string | undefined
+  ) => void;
+}
+
+function finalizePipelineRun(
+  store: AgentflowRunStateStore,
+  runId: string,
+  terminalEffects: AgentflowPipelineTerminalEffects,
+  input: FinalizePipelineRunInput
+): {
+  status: Extract<AgentflowRunStatus, "completed" | "failed" | "paused" | "cancelled">;
+  message?: string;
+} {
+  if (terminalEffects.workflow.style !== "pipeline") {
+    store.updateRun(runId, {
+      currentStepId: input.currentStepId,
+      ...(input.output === undefined ? {} : { output: input.output }),
+      ...(input.error === undefined ? {} : { error: input.error })
+    });
+    store.transitionRunWithEvent(runId, {
+      status: input.intendedStatus,
+      allowedFrom: ["running"],
+      event: {
+        type: `run.${input.intendedStatus}`,
+        ...(input.eventStepId === undefined ? {} : { stepId: input.eventStepId }),
+        payload: input.eventPayload
+      }
+    });
+    return {
+      status: input.intendedStatus,
+      ...(input.message === undefined ? {} : { message: input.message })
+    };
+  }
+
+  return withAgentflowPipelineFinalization(
+    store,
+    runId,
+    () => finalizationResultForCurrentRun(store, runId, input),
+    () => finalizePipelineRunLocked(store, runId, terminalEffects, input)
+  );
+}
+
+function finalizePipelineRunLocked(
+  store: AgentflowRunStateStore,
+  runId: string,
+  terminalEffects: AgentflowPipelineTerminalEffects,
+  input: FinalizePipelineRunInput
+): {
+  status: Extract<AgentflowRunStatus, "completed" | "failed" | "paused" | "cancelled">;
+  message?: string;
+} {
+  const current = store.getRun(runId);
+  if (current?.status !== "running") {
+    return finalizationResultForCurrentRun(store, runId, input);
+  }
+
+  let status = input.intendedStatus;
+  let message = input.message;
+  let error = input.error;
+  let summaryReady = status === "paused";
+
+  if (!summaryReady) {
+    try {
+      writeAgentflowFinalSummary(store, runId, terminalEffects.workflow, {
+        status,
+        completedSteps: input.completedSteps,
+        ...(message === undefined ? {} : { message })
+      });
+      summaryReady = true;
+    } catch (summaryError) {
+      ({ status, message, error } = recordSummaryFailure(store, runId, summaryError));
+    }
+  }
+
+  if (summaryReady || input.intendedStatus === "failed") {
+    const delivery = deliverAgentflowNotifications(
+      store,
+      runId,
+      terminalEffects.workflow,
+      input.intendedStatus,
+      terminalEffects.notifications
+    );
+    if (delivery.requiredFailure !== undefined && input.intendedStatus !== "failed") {
+      status = "failed";
+      message = `Required ${delivery.requiredFailure.channel} notification for ${delivery.requiredFailure.event} failed: ${delivery.requiredFailure.message}`;
+      error = {
+        code: "notification.required.failed",
+        channel: delivery.requiredFailure.channel,
+        event: delivery.requiredFailure.event,
+        message
+      };
+      try {
+        writeAgentflowFinalSummary(store, runId, terminalEffects.workflow, {
+          status,
+          completedSteps: input.completedSteps,
+          message
+        });
+      } catch (summaryError) {
+        ({ status, message, error } = recordSummaryFailure(store, runId, summaryError));
+      }
+    }
+  }
+
+  if (input.intendedStatus !== "failed" && status === "failed") {
+    deliverAgentflowNotifications(
+      store,
+      runId,
+      terminalEffects.workflow,
+      "failed",
+      terminalEffects.notifications
+    );
+  }
+
+  input.onFinalStatus?.(status, message);
+  store.updateRun(runId, {
+    currentStepId: input.currentStepId,
+    ...(status === "failed" && input.failureContext !== undefined ? { context: input.failureContext } : {}),
+    ...(input.output === undefined ? {} : { output: input.output }),
+    ...(error === undefined ? {} : { error })
+  });
+  const eventPayload = status === input.intendedStatus
+    ? input.eventPayload
+    : {
+        code: finalizationErrorCode(error),
+        completedSteps: input.completedSteps,
+        message: message ?? "Pipeline finalization failed."
+      };
+  store.transitionRunWithEvent(runId, {
+    status,
+    allowedFrom: ["running"],
+    event: {
+      type: `run.${status}`,
+      ...(input.eventStepId === undefined ? {} : { stepId: input.eventStepId }),
+      payload: eventPayload
+    }
+  });
+  applyAgentflowRetention(store, runId, terminalEffects.workflow, status);
+  if (status === "paused" || status === "cancelled" || notificationFinalizationFailed(error)) {
+    markAgentflowPipelineEffectsFinalized(store, runId, status);
+  }
+  return { status, ...(message === undefined ? {} : { message }) };
+}
+
+function finalizationResultForCurrentRun(
+  store: AgentflowRunStateStore,
+  runId: string,
+  input: FinalizePipelineRunInput
+): {
+  status: Extract<AgentflowRunStatus, "completed" | "failed" | "paused" | "cancelled">;
+  message?: string;
+} {
+  const run = store.getRun(runId);
+  if (run?.status === "completed") return { status: "completed" };
+  const stopped = stoppedPipelineResult(store, runId, input.completedSteps);
+  if (stopped !== undefined) {
+    return {
+      status: stopped.status,
+      ...(stopped.message === undefined ? {} : { message: stopped.message })
+    };
+  }
+  return {
+    status: input.intendedStatus,
+    ...(input.message === undefined ? {} : { message: input.message })
+  };
+}
+
+function recordSummaryFailure(
+  store: AgentflowRunStateStore,
+  runId: string,
+  summaryError: unknown
+): {
+  status: "failed";
+  message: string;
+  error: AgentflowRunStateValue;
+} {
+  const message = `Could not persist final pipeline summary: ${summaryError instanceof Error ? summaryError.message : String(summaryError)}`;
+  store.appendRunEvent(runId, {
+    type: "summary.failed",
+    payload: { message }
+  });
+  return {
+    status: "failed",
+    message,
+    error: {
+      code: "summary.persist.failed",
+      message
+    }
+  };
+}
+
+function finalizationErrorCode(error: AgentflowRunStateValue | undefined): string {
+  if (error === null || typeof error !== "object" || Array.isArray(error)) {
+    return "pipeline.finalization.failed";
+  }
+  return typeof error.code === "string" ? error.code : "pipeline.finalization.failed";
 }
 
 function normalizedTarget(value: unknown): string | undefined {
@@ -1384,7 +1748,7 @@ function persistSessionRequestInterruption(
   workflow: AgentflowWorkflow,
   stepId: string,
   sessionId: string,
-  status: "paused" | "cancelled"
+  status: AgentflowRunStopStatus
 ): void {
   const previousSession = store.getSession(runId, sessionId);
   const sessionDefinition = mapping(workflow.sessions?.[sessionId]);
@@ -1410,7 +1774,7 @@ function executeTransformStep(
   transforms: AgentflowArtifactTransformRegistry,
   attempt: number,
   retryable: boolean
-): { failure?: string; stopped?: "paused" | "cancelled" } {
+): { failure?: string; stopped?: AgentflowRunStopStatus } {
   const input = {
     transform: typeof step.transform === "string" ? step.transform : null,
     input: typeof step.input === "string" ? step.input : null,
@@ -1483,7 +1847,7 @@ function executeTransformStep(
 }
 
 class TransformInterruptedError extends Error {
-  constructor(readonly status: "paused" | "cancelled") {
+  constructor(readonly status: AgentflowRunStopStatus) {
     super(`Artifact transform was interrupted because the run was ${status}.`);
   }
 }
@@ -1493,7 +1857,7 @@ function persistMcpCallInterruption(
   runId: string,
   stepId: string,
   attempt: number,
-  status: "paused" | "cancelled"
+  status: AgentflowRunStopStatus
 ): void {
   const output = { attempt, status };
   store.upsertStep({ runId, stepId, attempt, status, output });
@@ -1505,9 +1869,36 @@ function stoppedPipelineResult(
   runId: string,
   completedSteps: string[]
 ): AgentflowCommandPipelineResult | undefined {
-  const status = store.getRun(runId)?.status;
+  const run = store.getRun(runId);
+  const status = run?.status;
   if (status === "running") return undefined;
+  if (status === "failed") {
+    const workflow = run!.context.workflow as unknown as AgentflowWorkflow;
+    if (workflow.style === "pipeline") {
+      applyAgentflowRetention(store, runId, workflow, status);
+      markAgentflowPipelineEffectsFinalized(store, runId, status);
+    }
+    return {
+      status,
+      completedSteps,
+      message: terminalFailureMessage(run?.error)
+    };
+  }
   if (status === "paused" || status === "cancelled") {
+    if (status === "cancelled") {
+      const workflow = run!.context.workflow as unknown as AgentflowWorkflow;
+      if (workflow.style === "pipeline") {
+        if (!agentflowPipelineEffectsFinalized(store, runId, status)) {
+          writeAgentflowFinalSummary(store, runId, workflow, {
+            status,
+            completedSteps,
+            message: `Agentflow run ${runId} was cancelled.`
+          });
+        }
+        applyAgentflowRetention(store, runId, workflow, status);
+        markAgentflowPipelineEffectsFinalized(store, runId, status);
+      }
+    }
     return {
       status,
       completedSteps,
@@ -1524,7 +1915,7 @@ function interruptedPipelineResult(
   store: AgentflowRunStateStore,
   runId: string,
   completedSteps: string[],
-  interruptedStatus: "paused" | "cancelled"
+  interruptedStatus: AgentflowRunStopStatus
 ): AgentflowCommandPipelineResult {
   return stoppedPipelineResult(store, runId, completedSteps) ?? {
     status: interruptedStatus,
@@ -1533,9 +1924,22 @@ function interruptedPipelineResult(
   };
 }
 
-function activeStopStatus(store: AgentflowRunStateStore, runId: string): "paused" | "cancelled" | undefined {
-  const status = store.getRun(runId)?.status;
-  return status === "paused" || status === "cancelled" ? status : undefined;
+function activeStopStatus(store: AgentflowRunStateStore, runId: string): AgentflowRunStopStatus | undefined {
+  const run = store.getRun(runId);
+  const status = run?.status;
+  return status === "paused" || status === "failed" || status === "cancelled" ? status : undefined;
+}
+
+function notificationFinalizationFailed(error: AgentflowRunStateValue | null | undefined): boolean {
+  return error !== null && typeof error === "object" && !Array.isArray(error)
+    && error.code === "notification.required.failed";
+}
+
+function terminalFailureMessage(error: AgentflowRunStateValue | null | undefined): string {
+  return error !== null && typeof error === "object" && !Array.isArray(error)
+    && typeof error.message === "string"
+    ? error.message
+    : "The pipeline failed while it was being finalized.";
 }
 
 function finishFailure(
@@ -1544,24 +1948,37 @@ function finishFailure(
   completedSteps: string[],
   stepId: string,
   failure: { exitCode: number | null; timedOut: boolean; message: string },
-  status: "failed" | "paused"
+  status: "failed" | "paused",
+  terminalEffects: AgentflowPipelineTerminalEffects
 ): AgentflowCommandPipelineResult {
   const failureOutcome = status === "failed" ? "fail" : "pause";
   const persistedFailure = { ...failure, outcome: failureOutcome };
-  store.updateRun(runId, { currentStepId: stepId, error: persistedFailure });
-  store.transitionRunWithEvent(runId, {
-    status,
-    allowedFrom: ["running"],
-    event: { type: `run.${status}`, payload: { stepId, ...persistedFailure } }
+  const finalized = finalizePipelineRun(store, runId, terminalEffects, {
+    intendedStatus: status,
+    completedSteps,
+    currentStepId: stepId,
+    output: { completedSteps },
+    error: persistedFailure,
+    message: failure.message,
+    eventPayload: { stepId, ...persistedFailure },
+    eventStepId: stepId
   });
-  return { status, completedSteps, failedStep: stepId, failureOutcome, ...failure };
+  const finalFailureOutcome = finalized.status === "failed" ? "fail" : "pause";
+  return {
+    status: finalized.status,
+    completedSteps,
+    failedStep: stepId,
+    failureOutcome: finalFailureOutcome,
+    ...failure,
+    ...(finalized.message === undefined ? {} : { message: finalized.message })
+  };
 }
 
 function runCommand(
   repoRoot: string,
   command: string,
   timeoutMs: number | undefined,
-  stopStatus: () => "paused" | "cancelled" | undefined
+  stopStatus: () => AgentflowRunStopStatus | undefined
 ): Promise<CommandAttemptResult> {
   return new Promise((resolve) => {
     const stdout: Buffer[] = [];

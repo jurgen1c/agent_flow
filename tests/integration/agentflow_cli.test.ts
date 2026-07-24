@@ -3,7 +3,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { agentflowAgentMemoryAdapterPackageBoundary } from "../../packages/agentflow-agent-memory-adapter/src";
 import { dispatch, runCli } from "../../packages/agentflow-cli/src/router";
-import { agentflowCorePackageBoundary, plannedAgentflowRuntimeCommands } from "../../packages/agentflow-core/src";
+import {
+  agentflowCorePackageBoundary,
+  createAgentflowLifecycleRun,
+  openAgentflowRunState,
+  parseAgentflowWorkflowOrThrow,
+  plannedAgentflowRuntimeCommands
+} from "../../packages/agentflow-core/src";
 import { agentflowSchemaPackageBoundary } from "../../packages/agentflow-schemas/src";
 
 const repoRoot = path.resolve(".");
@@ -174,6 +180,62 @@ steps:
     expect(restartedStatus.stdout).toContain("Status: completed");
     expect(await captureCli(["pause", "run-cli"], repo)).toMatchObject({ exitCode: 2 });
     expect(await captureCli(["pause", "missing"], repo)).toMatchObject({ exitCode: 4 });
+  });
+
+  test("renders terminal notifications and retained artifact status through the CLI", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agentflow-cli-notification-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.writeFileSync(path.join(repo, "workflow.yml"), `
+name: cli-notification
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: check, type: command, command: "printf 'passed\\n'" }
+notify:
+  - { on: workflow.completed, channels: [terminal] }
+retention:
+  on_success:
+    delete: [logs/**]
+`);
+
+    const run = await captureCli(["run", "workflow.yml", "--id", "cli-notification"], repo);
+
+    expect(run).toMatchObject({ exitCode: 0, stderr: "" });
+    expect(run.stdout).toContain("Notification: Agentflow workflow cli-notification run cli-notification completed.");
+    const artifacts = await captureCli(["artifacts", "cli-notification"], repo);
+    expect(artifacts.stdout).toContain("final-summary.md\tavailable\trun_summary");
+    expect(artifacts.stdout).toMatch(/logs\/check-[a-f0-9]{8}\/attempt-1\/stdout\.log\tmissing\tcommand_log/);
+  });
+
+  test("returns failure when a required lifecycle notification cannot be delivered", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agentflow-cli-pause-notification-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const workflow = parseAgentflowWorkflowOrThrow(`
+name: cli-pause-notification
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: check, type: command, command: "printf ok" }
+notify:
+  - { on: workflow.paused, channels: [unregistered], required: true }
+`);
+    const store = await openAgentflowRunState({ cwd: repo });
+    createAgentflowLifecycleRun(store, { id: "cli-pause-notification", workflow });
+    store.close();
+
+    const paused = await captureCli(["pause", "cli-pause-notification"], repo);
+
+    expect(paused).toMatchObject({
+      exitCode: 1,
+      stderr: expect.stringContaining(
+        "Required unregistered notification for workflow.paused failed"
+      )
+    });
+    expect(paused.stdout).toContain("Failed to pause Agentflow run cli-pause-notification.");
+    expect(paused.stdout).toContain("Status: failed");
+    expect(paused.stdout).not.toContain("Paused Agentflow run");
   });
 
   test("resumes manual gates and input requests with explicit CLI values", async () => {

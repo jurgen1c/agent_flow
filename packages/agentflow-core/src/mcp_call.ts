@@ -4,6 +4,7 @@ import {
   normalizeAgentflowArtifactPath,
   type AgentflowArtifactRecord,
   type AgentflowRunStateStore,
+  type AgentflowRunStopStatus,
   type AgentflowRunStateValue,
   type WriteAgentflowArtifactInput
 } from "./run_state";
@@ -43,7 +44,7 @@ export interface AgentflowMcpCallExecutionResult {
 
 export interface ExecuteAgentflowMcpCallOptions {
   beforePublish?: () => void;
-  stopStatus?: () => "paused" | "cancelled" | undefined;
+  stopStatus?: () => AgentflowRunStopStatus | undefined;
 }
 
 export class AgentflowMcpCallError extends Error {
@@ -57,7 +58,7 @@ export class AgentflowMcpCallError extends Error {
 }
 
 export class AgentflowMcpCallInterruptedError extends AgentflowMcpCallError {
-  constructor(readonly status: "paused" | "cancelled") {
+  constructor(readonly status: AgentflowRunStopStatus) {
     super(`MCP call was interrupted because the run was ${status}.`, "AGENTFLOW_MCP_INTERRUPTED");
   }
 }

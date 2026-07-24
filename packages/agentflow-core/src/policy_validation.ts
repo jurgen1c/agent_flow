@@ -137,7 +137,7 @@ export function validateAgentflowPolicyPrimitives(workflow: AgentflowWorkflow): 
   }
 
   validateStepFileScopes(workflow, workflow.steps, "steps", errors);
-  validateRetentionPolicy(workflow.retention, errors);
+  errors.push(...validateAgentflowRetentionPolicy(workflow.retention));
   return errors;
 }
 
@@ -308,12 +308,13 @@ function validateFileScope(
   }
 }
 
-function validateRetentionPolicy(value: AgentflowYamlValue | undefined, errors: AgentflowPolicyIssue[]): void {
-  if (value === undefined) return;
+export function validateAgentflowRetentionPolicy(value: AgentflowYamlValue | undefined): AgentflowPolicyIssue[] {
+  const errors: AgentflowPolicyIssue[] = [];
+  if (value === undefined) return errors;
   const retention = mapping(value);
   if (retention === undefined) {
     errors.push(issue("workflow.policy.retention.invalid", "retention", "Retention policy must be a mapping."));
-    return;
+    return errors;
   }
   for (const name of ["on_success", "on_failure", "on_cancelled"]) {
     const ruleValue = retention[name];
@@ -359,6 +360,7 @@ function validateRetentionPolicy(value: AgentflowYamlValue | undefined, errors: 
       ));
     }
   }
+  return errors;
 }
 
 function sessionUsedOutsideParallel(value: AgentflowYamlValue, sessionName: string, insideParallel = false): boolean {

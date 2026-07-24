@@ -4,6 +4,7 @@ import {
   AgentflowWorkflowGraphError,
   AgentflowRunStateError,
   createAgentflowLifecycleRun,
+  createAgentflowNotificationRegistry,
   createAgentflowFixtureSessionProvider,
   createAgentflowSessionProviderRegistry,
   executeAgentflowCommandPipeline,
@@ -259,17 +260,26 @@ async function runLifecycleCommand(
       }
       const providers = createAgentflowSessionProviderRegistry();
       if (fixture !== null) providers.register("fixture", createAgentflowFixtureSessionProvider(fixture.responses, fixture.outcomes));
+      const terminalNotifications: string[] = [];
+      const notifications = createAgentflowNotificationRegistry({
+        terminal: (notification) => {
+          terminalNotifications.push(notification.message);
+        }
+      });
       const execution = await executeAgentflowCommandPipeline(
         store,
         result.run.id,
         workflowResult!.workflow,
         undefined,
-        providers
+        providers,
+        undefined,
+        notifications
       );
       const lines = [
         `${result.changed ? "Created" : "Reused"} Agentflow run ${result.run.id} for ${result.run.workflowName} (version ${result.run.workflowVersion}).`,
         `Status: ${execution.status}`,
-        `Completed steps: ${execution.completedSteps.length === 0 ? "none" : execution.completedSteps.join(", ")}`
+        `Completed steps: ${execution.completedSteps.length === 0 ? "none" : execution.completedSteps.join(", ")}`,
+        ...terminalNotifications.map((message) => `Notification: ${message}`)
       ];
       if (execution.failedStep !== undefined) lines.push(`Failed step: ${execution.failedStep}`);
       return {
@@ -338,13 +348,21 @@ async function runLifecycleCommand(
       if (fixture !== null) {
         providers.register("fixture", createAgentflowFixtureSessionProvider(fixture.responses, fixture.outcomes));
       }
+      const terminalNotifications: string[] = [];
+      const notifications = createAgentflowNotificationRegistry({
+        terminal: (notification) => {
+          terminalNotifications.push(notification.message);
+        }
+      });
       const execution = await resumeAgentflowCommandPipeline(
         store,
         runId,
         workflow as unknown as import("@jurgen1c/agentflow-core").AgentflowWorkflow,
         response,
         undefined,
-        providers
+        providers,
+        undefined,
+        notifications
       );
       if (args.length === 5 && execution.status === "paused") {
         const resumedRun = requireRun(store, runId);
@@ -358,7 +376,8 @@ async function runLifecycleCommand(
       const lines = [
         `Resumed Agentflow run ${runId}.`,
         `Status: ${execution.status}`,
-        `Completed steps: ${execution.completedSteps.length === 0 ? "none" : execution.completedSteps.join(", ")}`
+        `Completed steps: ${execution.completedSteps.length === 0 ? "none" : execution.completedSteps.join(", ")}`,
+        ...terminalNotifications.map((message) => `Notification: ${message}`)
       ];
       return {
         exitCode: execution.status === "completed" ? 0 : execution.status === "paused" ? 3 : 1,
@@ -367,13 +386,34 @@ async function runLifecycleCommand(
       };
     }
 
-    const result = transitionAgentflowLifecycleRun(store, runId, command);
+    const terminalNotifications: string[] = [];
+    const result = transitionAgentflowLifecycleRun(
+      store,
+      runId,
+      command,
+      createAgentflowNotificationRegistry({
+        terminal: (notification) => {
+          terminalNotifications.push(notification.message);
+        }
+      })
+    );
     const verb = command === "pause" ? "Paused" : "Cancelled";
     const lines = [
-      `${result.changed ? verb : "No change for"} Agentflow run ${runId}.`,
-      `Status: ${result.run.status}`
+      result.run.status === "failed"
+        ? `Failed to ${command} Agentflow run ${runId}.`
+        : `${result.changed ? verb : "No change for"} Agentflow run ${runId}.`,
+      `Status: ${result.run.status}`,
+      ...terminalNotifications.map((message) => `Notification: ${message}`)
     ];
-    return { exitCode: 0, stdout: lines.join("\n") };
+    return {
+      exitCode: result.run.status === "failed" ? 1 : 0,
+      stdout: lines.join("\n"),
+      ...(result.run.status === "failed" && result.run.error !== null
+        && typeof result.run.error === "object" && !Array.isArray(result.run.error)
+        && typeof result.run.error.message === "string"
+        ? { stderr: result.run.error.message }
+        : {})
+    };
   } catch (error) {
     if (error instanceof AgentflowRunStateError) {
       return { exitCode: error.code === "AGENTFLOW_RUN_NOT_FOUND" ? 4 : 2, stderr: error.message };

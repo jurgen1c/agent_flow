@@ -130,7 +130,12 @@ steps:
       "run.completed"
     ]);
     const artifacts = store.listArtifacts("run-safe");
-    expect(artifacts.map((artifact) => artifact.declaredPath)).toHaveLength(3);
+    expect(artifacts.map((artifact) => artifact.declaredPath)).toHaveLength(4);
+    expect(artifacts).toContainEqual(expect.objectContaining({
+      declaredPath: "final-summary.md",
+      kind: "run_summary",
+      status: "available"
+    }));
     expect(artifacts.map((artifact) => artifact.declaredPath)).toContain("ci/result.txt");
     expect(readArtifact(repoRoot, artifacts.find((artifact) => artifact.declaredPath === "ci/result.txt")!.storagePath))
       .toBe("artifact output\n");
@@ -332,6 +337,10 @@ steps:
   - id: mutate
     type: command
     command: touch second-step-started
+retention:
+  on_cancelled:
+    delete: [logs/**]
+    after_days: 7
 `);
     const store = await openAgentflowRunState({ cwd: repoRoot });
     createAgentflowLifecycleRun(store, { id: "run-cancelled", workflow });
@@ -345,6 +354,9 @@ steps:
     expect(Date.now() - startedAt).toBeLessThan(1_000);
     expect(fs.existsSync(marker)).toBe(false);
     expect(store.listEvents("run-cancelled").map((event) => event.type)).toContain("step.interrupted");
+    expect(store.listEvents("run-cancelled").filter((event) => event.type === "retention.deferred"))
+      .toHaveLength(1);
+    expect(store.getArtifact("run-cancelled", "final-summary.md")?.generation).toBe(1);
     const stdout = store.listArtifacts("run-cancelled").find((artifact) => artifact.declaredPath.endsWith("stdout.log"))!;
     expect(readArtifact(repoRoot, stdout.storagePath)).toBe("before cancellation\n");
     store.close();
@@ -377,6 +389,58 @@ steps:
     expect(fs.existsSync(marker)).toBe(false);
     const stdout = store.listArtifacts("run-paused").find((artifact) => artifact.declaredPath.endsWith("stdout.log"))!;
     expect(readArtifact(repoRoot, stdout.storagePath)).toBe("before pause\n");
+    store.close();
+  });
+
+  test("preserves failed status when a running command is interrupted by terminal finalization", async () => {
+    const repoRoot = temporaryRepo();
+    const marker = path.join(repoRoot, "second-step-started");
+    const workflow = parseAgentflowWorkflowOrThrow(`
+name: failed-run
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: wait
+    type: command
+    command: sleep 2
+  - id: mutate
+    type: command
+    command: touch second-step-started
+`);
+    const store = await openAgentflowRunState({ cwd: repoRoot });
+    createAgentflowLifecycleRun(store, { id: "run-failed", workflow });
+
+    const startedAt = Date.now();
+    const execution = executeAgentflowCommandPipeline(store, "run-failed", workflow);
+    setTimeout(() => {
+      store.updateRun("run-failed", {
+        error: {
+          code: "notification.required.failed",
+          message: "Required lifecycle notification failed."
+        }
+      });
+      store.transitionRunWithEvent("run-failed", {
+        status: "failed",
+        allowedFrom: ["running"],
+        event: {
+          type: "run.failed",
+          payload: { code: "notification.required.failed" }
+        }
+      });
+    }, 25);
+    const result = await execution;
+
+    expect(result).toMatchObject({
+      status: "failed",
+      message: "Required lifecycle notification failed."
+    });
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    expect(fs.existsSync(marker)).toBe(false);
+    expect(store.listEvents("run-failed")).toContainEqual(expect.objectContaining({
+      type: "step.interrupted",
+      payload: expect.objectContaining({ status: "failed" })
+    }));
     store.close();
   });
 

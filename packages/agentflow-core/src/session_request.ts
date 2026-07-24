@@ -7,6 +7,7 @@ import {
   normalizeAgentflowArtifactPath,
   type AgentflowArtifactRecord,
   type AgentflowRunStateStore,
+  type AgentflowRunStopStatus,
   type AgentflowRunStateValue
 } from "./run_state";
 import { evaluateAgentflowPolicy } from "./policy";
@@ -64,7 +65,7 @@ export interface AgentflowSessionRequestExecutionResult {
 
 export interface ExecuteAgentflowSessionRequestOptions {
   beforePublish?: () => void;
-  stopStatus?: () => "paused" | "cancelled" | undefined;
+  stopStatus?: () => AgentflowRunStopStatus | undefined;
 }
 
 export class AgentflowSessionRequestError extends Error {
@@ -78,7 +79,7 @@ export class AgentflowSessionRequestError extends Error {
 }
 
 export class AgentflowSessionRequestInterruptedError extends AgentflowSessionRequestError {
-  constructor(readonly status: "paused" | "cancelled") {
+  constructor(readonly status: AgentflowRunStopStatus) {
     super(`Session request was interrupted because the run was ${status}.`, "AGENTFLOW_SESSION_INTERRUPTED");
   }
 }

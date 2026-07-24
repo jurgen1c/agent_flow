@@ -1,7 +1,7 @@
 # Agentflow Monorepo Architecture
 
-Status: implemented workspace shell, run persistence foundation, Agent Memory context adapter, deterministic artifact transforms, session requests, and MCP call contracts
-Ticket: AM-6, AM-7, AM-9, AM-18, AM-19, AM-21, AM-22, AM-24, AM-25, AM-26
+Status: implemented workspace shell, run persistence foundation, Agent Memory context adapter, deterministic artifact transforms, session requests, MCP call contracts, pipeline notifications, and terminal retention defaults
+Ticket: AM-6, AM-7, AM-9, AM-18, AM-19, AM-21, AM-22, AM-24, AM-25, AM-26, AM-30
 
 ## Intent
 
@@ -216,6 +216,19 @@ the `recovery_pipeline` style rather than a simple pipeline policy.
 Because the direct shell adapter cannot confine arbitrary filesystem writes,
 command execution fails closed when `policies.file_scope` is configured.
 
+Pipeline finalization delivers configured `workflow.completed`,
+`workflow.failed`, and `workflow.paused` notifications through registered
+channel adapters. The built-in registry provides terminal output and
+argument-safe operating-system notification commands. Every attempt is recorded
+as an ordered `notification.delivered` or `notification.failed` event; optional delivery failures remain
+diagnostic, while required delivery failures turn completed or paused outcomes
+into failed runs. Terminal completion, failure, and cancellation also write a
+deterministic, runtime-owned `final-summary.md` artifact. Immediate retention
+rules remove only matched
+artifact backings after policy evaluation, preserve SQLite state/events and the
+summary, and retain artifact metadata as `missing`. Positive time guards and
+approval-gated rules are recorded as deferred.
+
 `artifact_transform` steps read one artifact from the run registry by their
 declared `input` path and publish one artifact through the same registry at
 their declared `output` path. They cannot read arbitrary repository files or
@@ -243,9 +256,10 @@ keeps `jira-ticket-spec.yml` deterministic and network-free in tests.
 transition runs through the repo-local SQLite store. Lifecycle changes survive
 process restart. Resuming step execution and other step runners remain future
 phases; `resume` currently persists the lifecycle transition and exits with an
-actionable message without executing additional steps. Commands such as
-`cleanup` remain reserved placeholders until their runtime adapters are
-implemented. The core persistence
+actionable message without executing additional steps. The standalone
+`cleanup` command remains reserved for selecting older runs and satisfying
+deferred time or approval guards; immediate terminal retention is active. The
+core persistence
 surface now initializes repo-local `.agentflow/agentflow.sqlite` state and
 provides typed create, update, resume-lookup, step, artifact, event, session,
 failure, approval, and budget writes for later runtime phases. Its event log

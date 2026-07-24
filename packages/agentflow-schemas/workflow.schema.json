@@ -70,7 +70,41 @@
     }
   },
   "additionalProperties": true,
+  "allOf": [
+    {
+      "if": {
+        "properties": { "style": { "const": "pipeline" } },
+        "required": ["style"]
+      },
+      "then": {
+        "properties": {
+          "notify": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/notificationRule" }
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
+    "notificationRule": {
+      "type": "object",
+      "required": ["on", "channels"],
+      "properties": {
+        "on": {
+          "type": "string",
+          "minLength": 1
+        },
+        "channels": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "required": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
     "policyMode": {
       "enum": ["allow", "deny", "require_approval"]
     },

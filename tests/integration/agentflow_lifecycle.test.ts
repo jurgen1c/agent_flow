@@ -56,8 +56,12 @@ describe("Agentflow run lifecycle", () => {
     expect(store.listEvents("run-shell").map((event) => [event.sequence, event.type, event.payload])).toEqual([
       [1, "run.created", { status: "pending" }],
       [2, "run.pause", { status: "paused" }],
-      [3, "run.resume", { status: "running" }],
-      [4, "run.cancel", { status: "cancelled" }]
+      [3, "pipeline.effects.finalized", { status: "paused", transitionSequence: 2 }],
+      [4, "lifecycle.pause.finalized", { status: "paused" }],
+      [5, "run.resume", { status: "running" }],
+      [6, "run.cancel", { status: "cancelled" }],
+      [7, "pipeline.effects.finalized", { status: "cancelled", transitionSequence: 6 }],
+      [8, "lifecycle.cancel.finalized", { status: "cancelled" }]
     ]);
     store.close();
   });
@@ -142,7 +146,9 @@ describe("Agentflow run lifecycle", () => {
     expect(store.listEvents("run-event-id").map((event) => [event.sequence, event.id])).toEqual([
       [1, "lifecycle:1:run.created"],
       [2, "lifecycle:3:run.pause"],
-      [3, "lifecycle:3:run.pause:1"]
+      [3, "lifecycle:3:run.pause:1"],
+      [4, "lifecycle:4:pipeline.effects.finalized"],
+      [5, "lifecycle:5:lifecycle.pause.finalized"]
     ]);
     store.close();
   });

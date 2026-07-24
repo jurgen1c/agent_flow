@@ -60,7 +60,11 @@ describe("Agentflow artifact transform steps", () => {
     const result = await executeAgentflowCommandPipeline(store, "jira-transform", workflow);
 
     expect(result).toMatchObject({ status: "completed", completedSteps: ["render_ticket"] });
-    expect(store.listArtifacts("jira-transform").map((artifact) => artifact.declaredPath)).toEqual(["ticket.json", "ticket.md"]);
+    expect(store.listArtifacts("jira-transform").map((artifact) => artifact.declaredPath)).toEqual([
+      "final-summary.md",
+      "ticket.json",
+      "ticket.md"
+    ]);
     expect(store.readArtifact("jira-transform", "ticket.md").content.toString("utf8"))
       .toContain("## Description\n\nNormalize structured artifacts between pipeline steps.");
     expect(store.listEvents("jira-transform").map((event) => event.type)).toEqual([
@@ -68,6 +72,7 @@ describe("Agentflow artifact transform steps", () => {
       "run.started",
       "step.started",
       "step.completed",
+      "notification.delivered",
       "run.completed"
     ]);
     store.close();
@@ -353,6 +358,8 @@ steps:
       "run.started",
       "step.started",
       "run.cancel",
+      "pipeline.effects.finalized",
+      "lifecycle.cancel.finalized",
       "step.interrupted"
     ]);
     store.close();
@@ -408,6 +415,8 @@ steps:
       "run.started",
       "step.started",
       "run.cancel",
+      "pipeline.effects.finalized",
+      "lifecycle.cancel.finalized",
       "step.interrupted"
     ]);
     store.close();

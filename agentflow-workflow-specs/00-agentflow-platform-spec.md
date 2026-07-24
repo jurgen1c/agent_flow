@@ -286,6 +286,9 @@ notify:
 ```
 
 Notification delivery failure must not fail the workflow unless `required: true`.
+The initial runtime adapters are `terminal` and `system`. Each channel attempt
+is persisted as `notification.delivered` or `notification.failed`; registered
+custom adapters may implement additional channel names.
 
 ## 12. Retention and Cleanup
 
@@ -318,6 +321,12 @@ agentflow cleanup --older-than 30d --status completed
 agentflow archive run_123
 agentflow export run_123 --format zip
 ```
+
+Terminal pipeline finalization writes `final-summary.md` through the artifact registry.
+Automatic terminal cleanup acts only on registered artifact backings, retains
+the final summary and authoritative SQLite state/events, and leaves deleted
+artifact metadata inspectable as `missing`. Delayed and approval-gated rules
+remain deferred until an explicit cleanup command can satisfy their guard.
 
 ## 13. CLI
 

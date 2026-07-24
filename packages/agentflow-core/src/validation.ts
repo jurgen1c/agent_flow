@@ -19,6 +19,8 @@ import {
   agentflowAmbiguousSuccessTargetMessage,
   agentflowStepHasAmbiguousSuccessTarget
 } from "./success_routing";
+import { validateAgentflowNotifications } from "./notifications";
+import { AGENTFLOW_FINAL_SUMMARY_PATH } from "./retention";
 
 export const MAX_AGENTFLOW_COMMAND_TIMEOUT_SECONDS = 2_147_483.647;
 
@@ -104,6 +106,7 @@ export function validateAgentflowWorkflow(workflow: AgentflowWorkflow): Agentflo
 
   validateSessionDefinitions(workflow, errors);
   errors.push(...validateAgentflowPolicyPrimitives(workflow));
+  errors.push(...validateAgentflowNotifications(workflow));
   validateStepShapes(contexts, errors);
   validateNestedStepShapes(workflow.steps, errors);
   validateDynamicReferences(workflow, errors);
@@ -1033,6 +1036,16 @@ function validateArtifactOutputs(
   for (const context of contexts) {
     for (const { output, outputContext } of stepOutputContexts(context)) {
       const outputKey = normalizeArtifactPath(output);
+      if (outputKey === AGENTFLOW_FINAL_SUMMARY_PATH) {
+        addStepIssue(
+          errors,
+          outputContext,
+          "workflow.artifact.output.reserved",
+          outputField(outputContext.step),
+          `Artifact "${AGENTFLOW_FINAL_SUMMARY_PATH}" is reserved for the runtime's final pipeline summary.`
+        );
+        continue;
+      }
       const previous = outputs.get(outputKey);
 
       if (previous && outputContext.step.overwrite !== true) {

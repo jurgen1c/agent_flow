@@ -87,6 +87,17 @@ export {
   evaluateAgentflowPolicy,
   validateAgentflowPolicyPrimitives
 } from "./policy";
+export {
+  AgentflowNotificationRegistry,
+  createAgentflowNotificationRegistry,
+  deliverAgentflowNotifications,
+  validateAgentflowNotifications
+} from "./notifications";
+export {
+  AGENTFLOW_FINAL_SUMMARY_PATH,
+  applyAgentflowRetention,
+  writeAgentflowFinalSummary
+} from "./retention";
 export type {
   AgentflowWorkflow,
   AgentflowWorkflowParseFailure,
@@ -174,6 +185,7 @@ export type {
   AgentflowRunRecord,
   AgentflowSessionRecord,
   AgentflowRunStateValue,
+  AgentflowRunStopStatus,
   AgentflowRunStatus,
   AgentflowSessionStatus,
   AgentflowStepStatus,
@@ -192,6 +204,16 @@ export type {
   UpsertAgentflowStepInput,
   WriteAgentflowArtifactInput
 } from "./run_state";
+export type {
+  AgentflowNotification,
+  AgentflowNotificationAdapter,
+  AgentflowNotificationDeliveryResult,
+  AgentflowNotificationEvent,
+  AgentflowNotificationIssue
+} from "./notifications";
+export type {
+  AgentflowFinalSummaryInput
+} from "./retention";
 
 export const plannedAgentflowRuntimeCommands = [
   "init",

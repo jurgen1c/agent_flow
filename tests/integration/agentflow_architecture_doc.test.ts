@@ -53,6 +53,10 @@ describe("Agentflow monorepo architecture doc", () => {
     }
     expect(doc).toContain("version 3 migrates earlier artifact metadata in place");
     expect(doc).toContain("terminal runs are excluded from resume lookup");
+    expect(doc).toContain("`workflow.completed`");
+    expect(doc).toContain("`notification.delivered`");
+    expect(doc).toContain("`final-summary.md`");
+    expect(doc).toContain("retain artifact metadata as `missing`");
     expect(doc).toContain(".agentflow/");
     expect(doc).toContain("The existing CLI remains the compatibility anchor");
     expect(doc).toContain("Implementation Order");
