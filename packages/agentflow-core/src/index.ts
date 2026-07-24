@@ -167,6 +167,8 @@ export type {
   AgentflowArtifactStatus,
   AgentflowBudgetRecord,
   AgentflowEventRecord,
+  AgentflowFailureOutcome,
+  AgentflowFailureRecord,
   AgentflowRunEventInput,
   AgentflowRunMutationResult,
   AgentflowRunRecord,

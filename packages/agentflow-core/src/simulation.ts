@@ -81,6 +81,7 @@ export type AgentflowSimulationFixtureParseResult =
   | { ok: false; error: string };
 
 interface SimulationState {
+  workflowStyle: AgentflowWorkflow["style"];
   fixture: AgentflowSimulationFixture;
   artifacts: Set<string>;
   artifactValues: Map<string, AgentflowYamlValue>;
@@ -186,6 +187,7 @@ export function simulateAgentflowWorkflow(
 ): AgentflowSimulationResult {
   const fixtureArtifacts = canonicalFixtureArtifacts(fixture.artifacts ?? {});
   const state: SimulationState = {
+    workflowStyle: workflow.style,
     fixture,
     artifacts: new Set([...fixtureArtifacts.values.keys(), ...fixtureArtifacts.collisions]),
     artifactValues: fixtureArtifacts.values,
@@ -374,7 +376,7 @@ function runStep(step: AgentflowWorkflowStep, state: SimulationState, insideLoop
 
   if (outcome === "failed") {
     if (type === "artifact_transform") {
-      return simulatedTransformFailure(step, stepFixture, id, state, "Fixture marks the artifact transform as failed.");
+      return failureControl(step, stepFixture, id, state);
     }
     if (type === "session_request") {
       return simulatedSessionFailure(step, stepFixture, id, state, "Fixture marks the session request as failed.");
@@ -891,13 +893,11 @@ function failureControl(
   const unresolvedTarget = nonEmptyString(unresolved?.then);
   if (unresolvedTarget !== undefined) return controlForTarget(unresolvedTarget, id, state);
 
-  if (onFailure?.retry !== undefined) {
-    state.terminalStates.push({ stepId: id, status: "failed" });
-    return { kind: "terminal", status: "failed" };
-  }
-
-  state.terminalStates.push({ stepId: id, status: "failed" });
-  return { kind: "terminal", status: "failed" };
+  const defaultStatus = state.workflowStyle === "pipeline" && nonEmptyString(step.type) !== "condition"
+    ? "paused"
+    : "failed";
+  state.terminalStates.push({ stepId: id, status: defaultStatus });
+  return { kind: "terminal", status: defaultStatus };
 }
 
 function checkInputs(step: AgentflowWorkflowStep, stepId: string, state: SimulationState): void {

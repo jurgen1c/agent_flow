@@ -160,12 +160,24 @@ steps:
 
     const result = await executeAgentflowCommandPipeline(store, "run-failed", workflow);
 
-    expect(result).toMatchObject({ status: "failed", failedStep: "test", exitCode: 23, timedOut: false });
+    expect(result).toMatchObject({
+      status: "failed",
+      failedStep: "test",
+      failureOutcome: "fail",
+      exitCode: 23,
+      timedOut: false
+    });
     expect(store.getRun("run-failed")).toMatchObject({
       status: "failed",
       currentStepId: "test",
-      error: { exitCode: 23, timedOut: false }
+      error: { exitCode: 23, timedOut: false, outcome: "fail" }
     });
+    expect(store.listFailures("run-failed")).toMatchObject([{
+      stepId: "test",
+      classification: "command_failure",
+      retryable: false,
+      payload: { attempt: 1, exitCode: 23, timedOut: false, outcome: "fail" }
+    }]);
     expect(store.listEvents("run-failed").map((event) => event.type)).toContain("step.failed");
     const stderr = store.listArtifacts("run-failed").find((artifact) => artifact.declaredPath.endsWith("stderr.log"))!;
     expect(readArtifact(repoRoot, stderr.storagePath)).toBe("failure details\n");
@@ -203,7 +215,74 @@ steps:
       "run.completed"
     ]);
     expect(store.listArtifacts("run-retry").filter((artifact) => artifact.kind === "command_log")).toHaveLength(4);
+    expect(store.listFailures("run-retry")).toMatchObject([{
+      stepId: "flaky",
+      retryable: true,
+      payload: { attempt: 1, outcome: "retry" }
+    }]);
     store.close();
+  });
+
+  test("persists retry exhaustion and allowed continuation as explicit outcomes", async () => {
+    const repoRoot = temporaryRepo();
+    const pausedWorkflow = parseAgentflowWorkflowOrThrow(`
+name: exhausted-retry
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: required
+    type: command
+    command: exit 17
+    on_failure: { retry: 1 }
+`);
+    const pausedStore = await openAgentflowRunState({ cwd: repoRoot });
+    createAgentflowLifecycleRun(pausedStore, { id: "exhausted-retry", workflow: pausedWorkflow });
+
+    const paused = await executeAgentflowCommandPipeline(pausedStore, "exhausted-retry", pausedWorkflow);
+
+    expect(paused).toMatchObject({ status: "paused", failedStep: "required", failureOutcome: "pause" });
+    expect(pausedStore.listFailures("exhausted-retry").map((failure) => ({
+      retryable: failure.retryable,
+      attempt: failure.attempt,
+      outcome: failure.outcome
+    }))).toEqual([
+      { retryable: true, attempt: 1, outcome: "retry" },
+      { retryable: false, attempt: 2, outcome: "pause" }
+    ]);
+    pausedStore.close();
+
+    const continuedWorkflow = parseAgentflowWorkflowOrThrow(`
+name: optional-step
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: optional
+    type: command
+    command: exit 5
+    on_failure: { then: continue, allowed: true, reason: Optional check }
+  - id: after
+    type: command
+    command: printf done > done.txt
+    outputs: [done.txt]
+`);
+    const continuedStore = await openAgentflowRunState({ cwd: repoRoot });
+    createAgentflowLifecycleRun(continuedStore, { id: "continued-failure", workflow: continuedWorkflow });
+
+    const continued = await executeAgentflowCommandPipeline(
+      continuedStore,
+      "continued-failure",
+      continuedWorkflow
+    );
+
+    expect(continued).toMatchObject({ status: "completed", completedSteps: ["after"] });
+    expect(continuedStore.listFailures("continued-failure")).toMatchObject([{
+      stepId: "optional",
+      retryable: false,
+      payload: { attempt: 1, outcome: "continue" }
+    }]);
+    continuedStore.close();
   });
 
   test("terminates commands after timeout_seconds and pauses by default", async () => {
@@ -224,8 +303,16 @@ steps:
 
     const result = await executeAgentflowCommandPipeline(store, "run-timeout", workflow);
 
-    expect(result).toMatchObject({ status: "paused", failedStep: "wait", timedOut: true });
-    expect(store.getRun("run-timeout")?.status).toBe("paused");
+    expect(result).toMatchObject({
+      status: "paused",
+      failedStep: "wait",
+      failureOutcome: "pause",
+      timedOut: true
+    });
+    expect(store.getRun("run-timeout")).toMatchObject({
+      status: "paused",
+      error: { outcome: "pause" }
+    });
     expect(store.listEvents("run-timeout").map((event) => event.type)).toContain("step.timed_out");
     store.close();
   });

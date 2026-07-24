@@ -15,6 +15,7 @@ export type AgentflowStepStatus = AgentflowRunStatus | "skipped";
 export type AgentflowSessionStatus = AgentflowRunStatus;
 export type AgentflowApprovalStatus = "requested" | "approved" | "rejected" | "cancelled";
 export type AgentflowArtifactStatus = "available" | "missing" | "stale" | "overwritten";
+export type AgentflowFailureOutcome = "retry" | "pause" | "fail" | "continue";
 export type AgentflowRunStateValue = null | boolean | number | string | AgentflowRunStateValue[] | { [key: string]: AgentflowRunStateValue };
 
 export interface OpenAgentflowRunStateOptions {
@@ -215,6 +216,21 @@ export interface RecordAgentflowFailureInput {
   resolvedAt?: string;
 }
 
+export interface AgentflowFailureRecord {
+  id: string;
+  runId: string;
+  stepId: string | null;
+  sessionId: string | null;
+  classification: string;
+  message: string;
+  retryable: boolean;
+  attempt: number | null;
+  outcome: AgentflowFailureOutcome | null;
+  payload: AgentflowRunStateValue | null;
+  createdAt: string;
+  resolvedAt: string | null;
+}
+
 export interface UpsertAgentflowApprovalInput {
   id: string;
   runId: string;
@@ -315,6 +331,19 @@ interface SessionRow {
   finished_at: string | null;
 }
 
+interface FailureRow {
+  run_id: string;
+  id: string;
+  step_id: string | null;
+  session_id: string | null;
+  classification: string;
+  message: string;
+  retryable: number;
+  payload_json: string | null;
+  created_at: string;
+  resolved_at: string | null;
+}
+
 const TERMINAL_RUN_STATUSES = new Set<AgentflowRunStatus>(["completed", "failed", "cancelled"]);
 const RUN_STATUSES = ["pending", "running", "waiting", "paused", "completed", "failed", "cancelled"] as const;
 const STEP_STATUSES = [...RUN_STATUSES, "skipped"] as const;
@@ -322,6 +351,7 @@ const APPROVAL_STATUSES = ["requested", "approved", "rejected", "cancelled"] as 
 const TERMINAL_APPROVAL_STATUSES = new Set<AgentflowApprovalStatus>(["approved", "rejected", "cancelled"]);
 const WORKFLOW_STYLES = ["pipeline", "recovery_pipeline", "collaborative"] as const;
 const WORKFLOW_MATURITIES = ["draft", "experimental", "stable", "trusted"] as const;
+const FAILURE_OUTCOMES = new Set<AgentflowFailureOutcome>(["retry", "pause", "fail", "continue"]);
 
 export class AgentflowRunStateError extends Error {
   readonly code: string;
@@ -1273,6 +1303,16 @@ export class AgentflowRunStateStore {
     ]);
   }
 
+  listFailures(runId: string): AgentflowFailureRecord[] {
+    this.assertOpen();
+    const normalizedRunId = requiredString(runId, "Run ID");
+    this.requireRun(normalizedRunId);
+    return this.database.all<FailureRow>(
+      "SELECT * FROM failures WHERE run_id = ? ORDER BY created_at ASC, rowid ASC",
+      [normalizedRunId]
+    ).map(hydrateFailure);
+  }
+
   resolveFailure(runId: string, failureId: string, resolvedAt?: string): void {
     this.assertOpen();
     const normalizedRunId = requiredString(runId, "Run ID");
@@ -1744,6 +1784,33 @@ function hydrateSession(row: SessionRow): AgentflowSessionRecord {
     updatedAt: row.updated_at,
     startedAt: row.started_at,
     finishedAt: row.finished_at
+  };
+}
+
+function hydrateFailure(row: FailureRow): AgentflowFailureRecord {
+  const payload = row.payload_json === null
+    ? null
+    : JSON.parse(row.payload_json) as AgentflowRunStateValue;
+  const payloadRecord = payload !== null && typeof payload === "object" && !Array.isArray(payload)
+    ? payload
+    : undefined;
+  const attempt = payloadRecord?.attempt;
+  const outcome = payloadRecord?.outcome;
+  return {
+    id: row.id,
+    runId: row.run_id,
+    stepId: row.step_id,
+    sessionId: row.session_id,
+    classification: row.classification,
+    message: row.message,
+    retryable: row.retryable === 1,
+    attempt: typeof attempt === "number" && Number.isSafeInteger(attempt) && attempt > 0 ? attempt : null,
+    outcome: typeof outcome === "string" && FAILURE_OUTCOMES.has(outcome as AgentflowFailureOutcome)
+      ? outcome as AgentflowFailureOutcome
+      : null,
+    payload,
+    createdAt: row.created_at,
+    resolvedAt: row.resolved_at
   };
 }
 

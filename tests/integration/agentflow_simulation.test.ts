@@ -881,6 +881,31 @@ steps:
     expect(result.terminalStates).toEqual([{ stepId: "run", status: "failed" }]);
   });
 
+  test("pauses pipeline failures by default unless the policy explicitly fails", () => {
+    for (const [name, onFailure, expected] of [
+      ["unexpected", "", "paused"],
+      ["retry-exhausted", "on_failure: { retry: 1 }", "paused"],
+      ["explicit-fail", "on_failure: { then: fail }", "failed"]
+    ] as const) {
+      const workflow = parseAgentflowWorkflowOrThrow(`name: ${name}
+version: 1
+style: pipeline
+maturity: draft
+steps:
+  - id: run
+    type: command
+    command: echo run
+    ${onFailure}
+`);
+      const result = simulateAgentflowWorkflow(workflow, {
+        steps: { run: { outcome: ["failed", "failed"] } }
+      });
+
+      expect(result.status).toBe(expected);
+      expect(result.terminalStates).toEqual([{ stepId: "run", status: expected }]);
+    }
+  });
+
   test("preserves enclosing loop context through parallel branches", () => {
     const workflow = parseAgentflowWorkflowOrThrow(`name: looped-parallel
 version: 1

@@ -173,6 +173,13 @@ on_failure:
 
 If failure handling needs diagnosis, remediation, or return-to-step behavior, use the recovery pipeline style.
 
+Each failed executable attempt persists a failure summary with the attempt
+number and normalized outcome: `retry`, `pause`, `fail`, or `continue`.
+Exhausting retries without an explicit terminal target pauses a pipeline.
+`continue` is never implicit: it requires `allowed: true`, leaves the failed
+step out of the completed-step list, and records the continuation decision
+before the next listed step starts.
+
 ## 8. Conditions
 
 Conditions are allowed but should remain simple.

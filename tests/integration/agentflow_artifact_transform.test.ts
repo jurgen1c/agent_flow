@@ -593,6 +593,17 @@ steps:
     expect(unknown.visitedSteps.map((step) => step.id)).toEqual(["render"]);
   });
 
+  test("pauses fixture-declared transform failures without an explicit policy", () => {
+    const result = simulateAgentflowWorkflow(transformWorkflow("jira_ticket_to_markdown"), {
+      artifacts: { "ticket.json": { key: "AM-29", fields: { summary: "Failure behavior" } } },
+      steps: { render: { outcome: "failed" } }
+    });
+
+    expect(result.status).toBe("paused");
+    expect(result.visitedSteps).toEqual([{ id: "render", type: "artifact_transform", outcome: "failed" }]);
+    expect(result.terminalStates).toEqual([{ stepId: "render", status: "paused" }]);
+  });
+
   test("normalizes transform paths during simulation like runtime artifact storage", () => {
     const workflow = parseAgentflowWorkflowOrThrow(`name: normalized-transform-paths
 version: 1
@@ -902,6 +913,11 @@ steps:
     const result = await executeAgentflowCommandPipeline(store, "ignored-transform", workflow);
 
     expect(result).toMatchObject({ status: "completed", completedSteps: ["after"] });
+    expect(store.listFailures("ignored-transform")).toMatchObject([{
+      stepId: "render",
+      retryable: false,
+      payload: { attempt: 1, outcome: "continue" }
+    }]);
     expect(store.readArtifact("ignored-transform", "done.txt").content.toString()).toBe("done");
     store.close();
   });

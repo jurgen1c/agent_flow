@@ -1222,6 +1222,11 @@ steps:
     expect(result).toMatchObject({ status: "completed", completedSteps: ["fetch"] });
     expect(attempts).toBe(2);
     expect(store.listEvents("retry").filter((event) => event.type === "step.failed")).toHaveLength(1);
+    expect(store.listFailures("retry")).toMatchObject([{
+      stepId: "fetch",
+      retryable: true,
+      payload: { attempt: 1, outcome: "retry" }
+    }]);
     store.close();
   });
 
@@ -1251,11 +1256,16 @@ steps:
 
     const result = await executeAgentflowCommandPipeline(store, "deterministic-failure", workflow);
 
-    expect(result).toMatchObject({ status: "paused", failedStep: "fetch" });
+    expect(result).toMatchObject({ status: "paused", failedStep: "fetch", failureOutcome: "pause" });
     expect(result.message).toContain("No adapter is registered for MCP server missing");
     expect(store.listEvents("deterministic-failure").filter((event) => event.type === "step.failed"))
       .toHaveLength(1);
     expect(retryableValues).toEqual([false]);
+    expect(store.listFailures("deterministic-failure")).toMatchObject([{
+      stepId: "fetch",
+      retryable: false,
+      payload: { attempt: 1, outcome: "pause" }
+    }]);
     store.close();
   });
 

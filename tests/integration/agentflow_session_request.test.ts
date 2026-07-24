@@ -840,6 +840,11 @@ steps:
     const result = await executeAgentflowCommandPipeline(store, "atomic-session", workflow, undefined, providers);
 
     expect(result).toMatchObject({ status: "completed", completedSteps: [] });
+    expect(store.listFailures("atomic-session")).toMatchObject([{
+      stepId: "draft",
+      retryable: false,
+      payload: { attempt: 1, outcome: "continue" }
+    }]);
     expect(store.listArtifacts("atomic-session").map((artifact) => artifact.declaredPath)).not.toContain("first.md");
     expect(store.listArtifacts("atomic-session").map((artifact) => artifact.declaredPath)).not.toContain("second.md");
     store.close();

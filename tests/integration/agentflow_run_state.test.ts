@@ -157,6 +157,21 @@ describe("Agentflow run-state SQLite store", () => {
       unit: "tokens"
     });
 
+    expect(store.listFailures("run-recovery")).toEqual([{
+      id: "failure-1",
+      runId: "run-recovery",
+      stepId: "diagnose",
+      sessionId: null,
+      classification: "test_failure",
+      message: "Focused test failed",
+      retryable: true,
+      attempt: null,
+      outcome: null,
+      payload: { exitCode: 1 },
+      createdAt: FIXED_TIME,
+      resolvedAt: now
+    }]);
+
     const database = new Database(store.databasePath, { readonly: true });
     for (const table of ["runs", "run_steps", "artifacts", "events", "sessions", "failures", "approvals", "budgets"]) {
       expect(database.query(`SELECT COUNT(*) AS count FROM ${table}`).get()).toEqual({ count: table === "runs" ? 2 : 1 });

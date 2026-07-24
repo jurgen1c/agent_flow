@@ -207,7 +207,12 @@ Declared outputs must be repository-relative regular files; the artifact
 registry copies their content into the run's digested storage tree and rejects
 traversal and symlink escapes. Commands support positive `timeout_seconds`,
 up to 100 retries, and `fail`, `pause`, or explicitly allowed `continue` failure
-outcomes. Unexpected failures pause by default.
+outcomes. Every failed executable attempt records its attempt number, summary,
+retryability, and normalized `retry`, `pause`, `fail`, or `continue` outcome in
+run state; callers can inspect those summaries with `listFailures(runId)`.
+Unexpected pipeline failures and exhausted retry-only policies pause by default.
+Failures that need diagnosis, remediation, or return-to-step routing belong in
+the `recovery_pipeline` style rather than a simple pipeline policy.
 Because the direct shell adapter cannot confine arbitrary filesystem writes,
 command execution fails closed when `policies.file_scope` is configured.
 
