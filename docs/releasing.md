@@ -32,6 +32,9 @@ Agentic Development.
    npm view @jurgen1c/agent-flow version
    ```
 
-Trusted Publishing must authorize repository `jurgen1c/agent_flow`, workflow
-`.github/workflows/publish.yml`, with no environment unless the workflow is
-updated to use one.
+For the first publication of this new scoped package, add a repository Actions
+secret named `NPM_TOKEN` containing a granular npm token with permission to
+publish new `@jurgen1c` packages and bypass 2FA. After the bootstrap release,
+remove the secret and configure npm Trusted Publishing for GitHub user
+`jurgen1c`, repository `agent_flow`, workflow `publish.yml`, allowed action
+`npm publish`, and no environment.
