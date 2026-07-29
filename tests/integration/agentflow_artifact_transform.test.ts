@@ -125,7 +125,7 @@ steps:
     expect(result).toMatchObject({ status: "paused", failedStep: "render" });
     expect(result.message).toContain("Could not read declared input ticket.json");
     expect(result.message).toContain("publish it before running the transform");
-    expect(store.listArtifacts("missing-input")).toEqual([]);
+    expect(store.listArtifacts("missing-input").filter((artifact) => artifact.kind !== "failure_payload")).toEqual([]);
     store.close();
   });
 

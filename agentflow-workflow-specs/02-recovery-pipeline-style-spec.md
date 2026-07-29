@@ -28,7 +28,7 @@ Every failed step writes a failure payload.
 
 ```json
 {
-  "id": "failure_001",
+  "id": "command:ci:attempt-1",
   "step_id": "ci",
   "step_type": "command",
   "status": "failed",
@@ -37,18 +37,53 @@ Every failed step writes a failure payload.
   "command": "bin/ci",
   "summary": "RSpec failure in ExporterSpec",
   "artifacts": {
-    "combined_log": "ci/latest.log"
+    "available": [
+      "logs/ci/attempt-1/stdout.log",
+      "logs/ci/attempt-1/stderr.log"
+    ],
+    "withheld": []
   },
-  "classification": null,
-  "remediation_status": null
+  "logs": {
+    "stdout": "logs/ci/attempt-1/stdout.log",
+    "stderr": "logs/ci/attempt-1/stderr.log"
+  },
+  "classification": "command_failure",
+  "remediation_status": null,
+  "path": "failures/command-ci-attempt-1-<sha256-12>.json",
+  "redactions": {
+    "applied": false,
+    "marker": "[REDACTED]",
+    "fields": [],
+    "unscanned_artifacts": []
+  }
 }
 ```
 
-The payload is saved under:
+The payload is registered as a run artifact at:
 
 ```text
-.agentflow/runs/<run-id>/failures/failure_001.json
+failures/<failure-id-slug>-<sha256-12>.json
 ```
+
+The artifact registry stores its backing bytes under the run's generated
+`.agentflow/runs/` tree and indexes the declared path in both artifact metadata
+and `listFailures(runId)`. Recovery routes use the declared path, never the
+opaque backing filename.
+
+Before a failure payload can become session input, Agentflow scans textual
+attachments within per-file, aggregate-byte, and attachment-count limits and
+snapshots every available attachment explicitly tagged with the failed attempt
+under the failure path. The immutable, attempt-scoped snapshots prevent a later
+retry from changing the bytes exposed by an earlier failure or stale output
+from being attributed to a later attempt. Secret-like command, summary, and
+attachment content is replaced with `[REDACTED]`.
+Binary, oversized, missing, or otherwise unscannable attachments are withheld
+from the available list and reported in redaction metadata. A failure in the
+artifact store itself remains indexed with a payload-persistence diagnostic so
+the original runtime failure is not hidden. Retention always preserves
+artifacts whose kinds are `failure_payload` or `failure_attachment`, even when a
+workflow declares a broader deletion pattern, so an indexed recovery route
+never points to a payload or attachment deleted during terminal finalization.
 
 ## 4. Example: CI Recovery
 

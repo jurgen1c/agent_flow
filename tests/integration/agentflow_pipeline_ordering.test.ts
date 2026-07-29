@@ -922,6 +922,22 @@ steps:
       failedStep: "route",
       message: "Step route cannot route to work because limits.max_step_attempts allows 1 attempt(s)."
     });
+    const failure = store.listFailures("step-attempt-limit")[0]!;
+    const failurePath = failure.payloadPath!;
+    expect(failure).toMatchObject({
+      stepId: "route",
+      classification: "routing_limit",
+      attempt: 1,
+      outcome: "pause",
+      payloadPath: expect.stringMatching(/^failures\/.+\.json$/)
+    });
+    expect(JSON.parse(store.readArtifact("step-attempt-limit", failurePath).content.toString("utf8")))
+      .toMatchObject({
+        step_id: "route",
+        step_type: "routing",
+        attempt: 1,
+        classification: "routing_limit"
+      });
     store.close();
   });
 
@@ -951,6 +967,10 @@ steps:
       message: "Step work cannot start because limits.max_step_attempts allows 1 attempt(s)."
     });
     expect(store.listEvents("retry-attempt-limit").filter((event) => event.type === "step.started").length).toBe(1);
+    expect(store.listFailures("retry-attempt-limit")).toMatchObject([
+      { classification: "command_failure", attempt: 1 },
+      { classification: "step_attempt_limit", attempt: 2, payloadPath: expect.any(String) }
+    ]);
     store.close();
   });
 
@@ -990,6 +1010,11 @@ steps:
       expect(store.listEvents(`bounded-${kind}-preflight`).map((event) => event.type)).toEqual([
         "run.created", "run.started", "run.paused"
       ]);
+      expect(store.listFailures(`bounded-${kind}-preflight`)).toMatchObject([{
+        classification: "step_attempt_limit",
+        attempt: 1,
+        payloadPath: expect.any(String)
+      }]);
       store.close();
     }
   });

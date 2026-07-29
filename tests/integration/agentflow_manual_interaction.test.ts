@@ -14,6 +14,55 @@ import {
 } from "../../packages/agentflow-core/src";
 
 describe("Agentflow manual gates and input requests", () => {
+  test("captures malformed persisted interaction attempts as failure payloads", async () => {
+    const repoRoot = temporaryRepo();
+    const parsed = parseAgentflowWorkflowOrThrow(`
+name: malformed-interaction
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: gate, type: manual_gate, message: Review?, options: [approve] }
+`);
+    const workflow = {
+      ...parsed,
+      steps: [{ ...parsed.steps[0]!, message: 123 }]
+    } as unknown as typeof parsed;
+    const store = await openAgentflowRunState({ cwd: repoRoot });
+    store.createRunWithEvent({
+      id: "malformed-interaction",
+      workflow: {
+        name: workflow.name,
+        version: workflow.version,
+        style: workflow.style,
+        maturity: workflow.maturity
+      },
+      context: { workflow: workflow as never }
+    }, { type: "run.created", payload: { status: "pending" } });
+
+    const result = await executeAgentflowCommandPipeline(store, "malformed-interaction", workflow);
+
+    expect(result).toMatchObject({ status: "failed", failedStep: "gate" });
+    const failure = store.listFailures("malformed-interaction")[0]!;
+    const failurePath = failure.payloadPath;
+    expect(failure).toMatchObject({
+      stepId: "gate",
+      classification: "interaction_failure",
+      attempt: 1,
+      outcome: "fail",
+      payloadPath: expect.any(String)
+    });
+    expect(JSON.parse(store.readArtifact(
+      "malformed-interaction",
+      failurePath!
+    ).content.toString("utf8"))).toMatchObject({
+      step_id: "gate",
+      step_type: "manual_gate",
+      classification: "interaction_failure"
+    });
+    store.close();
+  });
+
   test("pauses at a manual gate, rejects invalid outcomes, and resumes from that step", async () => {
     const repoRoot = temporaryRepo();
     let now = "2026-07-23T12:00:00.000Z";

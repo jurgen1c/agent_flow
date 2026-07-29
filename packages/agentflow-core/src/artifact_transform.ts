@@ -31,6 +31,7 @@ export interface AgentflowArtifactTransformExecutionResult {
 }
 
 export interface ExecuteAgentflowArtifactTransformOptions {
+  attempt?: number;
   beforePublish?: () => void;
 }
 
@@ -141,7 +142,12 @@ export function executeAgentflowArtifactTransform(
     overwrite: step.overwrite === true,
     requiredRunStatus: "running",
     requiredArtifacts: [{ path: inputPath, checksum: input.artifact.checksum! }],
-    metadata: { transform: transformName, input: inputPath, inputChecksum: input.artifact.checksum }
+    metadata: {
+      transform: transformName,
+      input: inputPath,
+      inputChecksum: input.artifact.checksum,
+      ...(options.attempt === undefined ? {} : { attempt: options.attempt })
+    }
   });
   return { transform: transformName, inputPath, outputPath, artifact };
 }

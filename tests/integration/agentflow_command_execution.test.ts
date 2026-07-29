@@ -3,11 +3,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  MAX_AGENTFLOW_FAILURE_ATTACHMENT_COUNT,
+  MAX_AGENTFLOW_FAILURE_ATTACHMENT_SCAN_BYTES,
+  MAX_AGENTFLOW_FAILURE_TOTAL_ATTACHMENT_BYTES,
   type AgentflowRunStateValue,
   createAgentflowLifecycleRun,
   executeAgentflowCommandPipeline,
   openAgentflowRunState,
   parseAgentflowWorkflowOrThrow,
+  persistAgentflowFailurePayload,
   transitionAgentflowLifecycleRun
 } from "../../packages/agentflow-core/src";
 
@@ -76,6 +80,42 @@ steps:
       expect(fs.existsSync(path.join(repoRoot, "command-started"))).toBe(false);
       store.close();
     }
+  });
+
+  test("records a preflight failure for a malformed persisted command", async () => {
+    const repoRoot = temporaryRepo();
+    const parsed = parseAgentflowWorkflowOrThrow(`
+name: malformed-command
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: malformed, type: command, command: printf valid }
+`);
+    const workflow = {
+      ...parsed,
+      steps: [{ ...parsed.steps[0]!, command: 123 }]
+    } as unknown as typeof parsed;
+    const store = await openAgentflowRunState({ cwd: repoRoot });
+    store.createRunWithEvent({
+      id: "malformed-command",
+      workflow: {
+        name: workflow.name,
+        version: workflow.version,
+        style: workflow.style,
+        maturity: workflow.maturity
+      },
+      context: { workflow: workflow as unknown as AgentflowRunStateValue }
+    }, { type: "run.created", payload: { status: "pending" } });
+
+    const result = await executeAgentflowCommandPipeline(store, "malformed-command", workflow);
+
+    expect(result).toMatchObject({ status: "failed", failedStep: "malformed" });
+    expect(store.getRun("malformed-command")?.status).toBe("failed");
+    const failure = store.listFailures("malformed-command")[0]!;
+    expect(JSON.parse(store.readArtifact("malformed-command", failure.payloadPath!).content.toString("utf8")))
+      .toMatchObject({ command: null, summary: "Command steps require a non-empty command." });
+    store.close();
   });
 
   test("does not allow a second executor to share a running run", async () => {
@@ -177,12 +217,35 @@ steps:
       currentStepId: "test",
       error: { exitCode: 23, timedOut: false, outcome: "fail" }
     });
-    expect(store.listFailures("run-failed")).toMatchObject([{
+    const failure = store.listFailures("run-failed")[0]!;
+    const failurePath = failure.payloadPath;
+    expect(failure).toMatchObject({
       stepId: "test",
       classification: "command_failure",
       retryable: false,
+      payloadPath: expect.stringMatching(/^failures\/.+\.json$/),
       payload: { attempt: 1, exitCode: 23, timedOut: false, outcome: "fail" }
-    }]);
+    });
+    expect(failurePath).toMatch(/^failures\/.+\.json$/);
+    const failurePayload = JSON.parse(store.readArtifact("run-failed", failurePath!).content.toString("utf8"));
+    expect(failurePayload).toMatchObject({
+      id: failure.id,
+      step_id: "test",
+      step_type: "command",
+      status: "failed",
+      attempt: 1,
+      exit_code: 23,
+      command: "printf 'failure details\\n' >&2; exit 23",
+      summary: "Command exited with status 23.",
+      logs: {
+        stdout: expect.stringMatching(/stdout\.log$/),
+        stderr: expect.stringMatching(/stderr\.log$/)
+      },
+      classification: "command_failure",
+      remediation_status: null,
+      path: failurePath,
+      redactions: { applied: false, marker: "[REDACTED]" }
+    });
     expect(store.listEvents("run-failed").map((event) => event.type)).toContain("step.failed");
     const stderr = store.listArtifacts("run-failed").find((artifact) => artifact.declaredPath.endsWith("stderr.log"))!;
     expect(readArtifact(repoRoot, stderr.storagePath)).toBe("failure details\n");
@@ -544,8 +607,10 @@ steps:
 `);
     const store = await openAgentflowRunState({ cwd: repoRoot });
     createAgentflowLifecycleRun(store, { id: "run-log-failure", workflow });
-    store.writeArtifact = () => {
-      throw new Error("simulated log registry failure");
+    const writeArtifact = store.writeArtifact.bind(store);
+    store.writeArtifact = (input) => {
+      if (input.kind === "command_log") throw new Error("simulated log registry failure");
+      return writeArtifact(input);
     };
 
     const result = await executeAgentflowCommandPipeline(store, "run-log-failure", workflow);
@@ -553,6 +618,699 @@ steps:
     expect(result).toMatchObject({ status: "paused", failedStep: "check" });
     expect(result.message).toContain("Could not persist command logs");
     expect(store.getRun("run-log-failure")?.status).toBe("paused");
+    const failure = store.listFailures("run-log-failure")[0]!;
+    expect(failure.payloadPath).toMatch(/^failures\/.+\.json$/);
+    expect(JSON.parse(store.readArtifact("run-log-failure", failure.payloadPath!).content.toString("utf8")))
+      .toMatchObject({
+        logs: { stdout: null, stderr: null },
+        artifacts: { available: [], withheld: [] }
+      });
+    store.close();
+  });
+
+  test("keeps the original step failure when attachment metadata cannot be scanned", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentflowWorkflowOrThrow(`
+name: metadata-scan-failure
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - { id: check, type: command, command: "exit 9", on_failure: { then: pause } }
+`);
+    const store = await openAgentflowRunState({ cwd: repoRoot });
+    createAgentflowLifecycleRun(store, { id: "metadata-scan-failure", workflow });
+    store.listArtifactMetadata = () => {
+      throw new Error("simulated damaged artifact metadata");
+    };
+
+    const result = await executeAgentflowCommandPipeline(store, "metadata-scan-failure", workflow);
+
+    expect(result).toMatchObject({ status: "paused", failedStep: "check", exitCode: 9 });
+    const failure = store.listFailures("metadata-scan-failure")[0]!;
+    expect(failure.payloadPath).toMatch(/^failures\/.+\.json$/);
+    expect(failure.payload).toMatchObject({
+      failurePayloadPath: failure.payloadPath,
+      payloadPersistenceError: "simulated damaged artifact metadata"
+    });
+    store.close();
+  });
+
+  test("withholds an attachment overwritten after attempt selection", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentflowWorkflowOrThrow(`
+name: raced-failure-attachment
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - { id: check, type: command, command: exit 1 }
+`);
+    const store = await openAgentflowRunState({ cwd: repoRoot });
+    createAgentflowLifecycleRun(store, { id: "raced-failure-attachment", workflow });
+    store.writeArtifact({
+      id: "attempt-output",
+      runId: "raced-failure-attachment",
+      stepId: "check",
+      path: "attempt.log",
+      kind: "command_log",
+      contentType: "text/plain",
+      content: "first attempt",
+      metadata: { attempt: 1 }
+    });
+    const readArtifact = store.readArtifact.bind(store);
+    let raced = false;
+    store.readArtifact = ((runId, artifactPath, options) => {
+      if (!raced && artifactPath === "attempt.log") {
+        raced = true;
+        store.writeArtifact({
+          id: "attempt-output",
+          runId,
+          stepId: "check",
+          path: artifactPath,
+          kind: "command_log",
+          contentType: "text/plain",
+          content: "second attempt",
+          metadata: { attempt: 2 },
+          overwrite: true
+        });
+      }
+      return readArtifact(runId, artifactPath, options);
+    }) as typeof store.readArtifact;
+
+    const persisted = persistAgentflowFailurePayload(store, {
+      id: "command:check:attempt-1",
+      runId: "raced-failure-attachment",
+      stepId: "check",
+      stepType: "command",
+      attempt: 1,
+      summary: "failed",
+      classification: "command_failure",
+      retryable: false,
+      outcome: "pause"
+    });
+    const payload = JSON.parse(
+      readArtifact("raced-failure-attachment", persisted.path!).content.toString("utf8")
+    );
+
+    expect(payload.artifacts).toEqual({ available: [], withheld: ["attempt.log"] });
+    expect(payload.redactions.unscanned_artifacts).toEqual(["attempt.log"]);
+    store.close();
+  });
+
+  test("indexes failure-attachment write errors as persistence diagnostics", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentflowWorkflowOrThrow(`
+name: failed-failure-attachment
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - { id: check, type: command, command: exit 1 }
+`);
+    const store = await openAgentflowRunState({ cwd: repoRoot });
+    createAgentflowLifecycleRun(store, { id: "failed-failure-attachment", workflow });
+    store.writeArtifact({
+      id: "attempt-output",
+      runId: "failed-failure-attachment",
+      stepId: "check",
+      path: "attempt.log",
+      kind: "command_log",
+      contentType: "text/plain",
+      content: "safe evidence",
+      metadata: { attempt: 1 }
+    });
+    const writeArtifact = store.writeArtifact.bind(store);
+    store.writeArtifact = ((input) => {
+      if (input.kind === "failure_attachment") throw new Error("simulated attachment write failure");
+      return writeArtifact(input);
+    }) as typeof store.writeArtifact;
+
+    const persisted = persistAgentflowFailurePayload(store, {
+      id: "command:check:attempt-1",
+      runId: "failed-failure-attachment",
+      stepId: "check",
+      stepType: "command",
+      attempt: 1,
+      summary: "failed",
+      classification: "command_failure",
+      retryable: false,
+      outcome: "pause"
+    });
+    const failure = store.listFailures("failed-failure-attachment")[0]!;
+    const payload = JSON.parse(
+      store.readArtifact("failed-failure-attachment", persisted.path!).content.toString("utf8")
+    );
+
+    expect(persisted.persistenceError).toBe("simulated attachment write failure");
+    expect(failure.payload).toMatchObject({
+      payloadPersistenceError: "simulated attachment write failure"
+    });
+    expect(payload.artifacts).toEqual({ available: [], withheld: ["attempt.log"] });
+    store.close();
+  });
+
+  test("rolls back failure attachments when payload persistence fails", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentflowWorkflowOrThrow(`
+name: failed-failure-payload
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - { id: check, type: command, command: exit 1 }
+`);
+    const store = await openAgentflowRunState({ cwd: repoRoot });
+    createAgentflowLifecycleRun(store, { id: "failed-failure-payload", workflow });
+    store.writeArtifact({
+      id: "attempt-output",
+      runId: "failed-failure-payload",
+      stepId: "check",
+      path: "attempt.log",
+      kind: "command_log",
+      contentType: "text/plain",
+      content: "safe evidence",
+      metadata: { attempt: 1 }
+    });
+    const writeArtifact = store.writeArtifact.bind(store);
+    store.writeArtifact = ((input) => {
+      if (input.kind === "failure_payload") throw new Error("simulated payload write failure");
+      return writeArtifact(input);
+    }) as typeof store.writeArtifact;
+
+    const persisted = persistAgentflowFailurePayload(store, {
+      id: "command:check:attempt-1",
+      runId: "failed-failure-payload",
+      stepId: "check",
+      stepType: "command",
+      attempt: 1,
+      summary: "failed",
+      classification: "command_failure",
+      retryable: false,
+      outcome: "pause"
+    });
+
+    expect(persisted).toMatchObject({
+      path: null,
+      persistenceError: "simulated payload write failure"
+    });
+    expect(store.listArtifactMetadata("failed-failure-payload").map((artifact) => artifact.kind))
+      .toEqual(["command_log"]);
+    expect(store.listFailures("failed-failure-payload")[0]?.payloadPath).toBeNull();
+    store.close();
+  });
+
+  test("persists repeated deterministic failures idempotently", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentflowWorkflowOrThrow(`
+name: idempotent-failure-payload
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - { id: check, type: command, command: exit 1 }
+`);
+    const store = await openAgentflowRunState({ cwd: repoRoot });
+    createAgentflowLifecycleRun(store, { id: "idempotent-failure-payload", workflow });
+    const input = {
+      id: "routing:check:attempt-2:limit",
+      runId: "idempotent-failure-payload",
+      stepId: "check",
+      stepType: "routing",
+      attempt: 2,
+      summary: "Step check cannot start because limits.max_step_attempts allows 1 attempt(s).",
+      classification: "step_attempt_limit",
+      retryable: false,
+      outcome: "pause" as const,
+      indexPayload: { attempt: 2, limit: 1, token: "replayed-secret" }
+    };
+
+    const first = persistAgentflowFailurePayload(store, input);
+    const replay = persistAgentflowFailurePayload(store, input);
+
+    expect(replay).toEqual(first);
+    expect(store.listFailures(input.runId)).toHaveLength(1);
+    expect(store.listArtifactMetadata(input.runId).filter((artifact) => artifact.kind === "failure_payload"))
+      .toHaveLength(1);
+    for (const changed of [
+      { stepType: "command" },
+      { exitCode: 1 },
+      { command: "exit 9" },
+      { logs: { stderr: "different.log" } },
+      { indexPayload: { attempt: 2, limit: 2, token: "replayed-secret" } },
+      { classification: "different_failure" }
+    ]) {
+      expect(() => persistAgentflowFailurePayload(store, {
+        ...input,
+        ...changed
+      })).toThrow("already exists with different failure data");
+    }
+    expect(store.listFailures(input.runId)).toHaveLength(1);
+    store.close();
+  });
+
+  test("redacts secret-like command and log content in recovery-facing failure artifacts", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentflowWorkflowOrThrow(`
+name: redacted-failure
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - id: secret-check
+    type: command
+    command: |
+      AWS_SECRET_ACCESS_KEY=aws-secret-value MY_API_TOKEN=super-secret-value sh -c "printf 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz\\nProxy-Authorization: Basic dXNlcjpwYXNzd29yZA==\\nAuthorization: ApiKey opaque-api-key-value\\nMY_API_TOKEN=log-secret-value\\n-----BEGIN PGP PRIVATE KEY BLOCK-----\\ncHJpdmF0ZS1rZXk=\\n-----END PGP PRIVATE KEY BLOCK-----\\n' >&2; exit 12" --password cli-password-value --api-token "quoted-cli-token" --verbose
+    on_failure: { then: pause }
+`);
+    const store = await openAgentflowRunState({ cwd: repoRoot });
+    createAgentflowLifecycleRun(store, { id: "redacted-failure", workflow });
+
+    const result = await executeAgentflowCommandPipeline(store, "redacted-failure", workflow);
+
+    expect(result).toMatchObject({ status: "paused", failedStep: "secret-check" });
+    const failure = store.listFailures("redacted-failure")[0]!;
+    const serialized = store.readArtifact("redacted-failure", failure.payloadPath!).content.toString("utf8");
+    expect(serialized).not.toContain("super-secret-value");
+    expect(serialized).not.toContain("aws-secret-value");
+    expect(serialized).not.toContain("log-secret-value");
+    expect(serialized).not.toContain("abcdefghijklmnopqrstuvwxyz");
+    expect(serialized).not.toContain("dXNlcjpwYXNzd29yZA");
+    expect(serialized).not.toContain("opaque-api-key-value");
+    expect(serialized).not.toContain("cHJpdmF0ZS1rZXk");
+    expect(serialized).not.toContain("cli-password-value");
+    expect(serialized).not.toContain("quoted-cli-token");
+    const payload = JSON.parse(serialized);
+    const stderrPath = payload.logs.stderr as string;
+    const redactedFields = payload.redactions.fields as string[];
+    expect(payload.command).toContain("AWS_SECRET_ACCESS_KEY=[REDACTED]");
+    expect(payload.command).toContain("MY_API_TOKEN=[REDACTED]");
+    expect(payload.command).toContain("--password [REDACTED]");
+    expect(payload.command).toContain("--api-token [REDACTED]");
+    expect(payload.command).toContain("--verbose");
+    expect(stderrPath).toMatch(/^failures\/.+\/attachments\/.+\/stderr\.log$/);
+    expect(payload.redactions).toMatchObject({ applied: true, marker: "[REDACTED]" });
+    expect(redactedFields).toContain("command");
+    expect(redactedFields.some((field) => /^artifacts\..+stderr\.log$/.test(field))).toBe(true);
+    expect(store.readArtifact("redacted-failure", stderrPath).content.toString("utf8"))
+      .toBe([
+        "Authorization: Bearer [REDACTED]",
+        "Proxy-Authorization: Basic [REDACTED]",
+        "Authorization: ApiKey [REDACTED]",
+        "MY_API_TOKEN=[REDACTED]",
+        "[REDACTED]",
+        ""
+      ].join("\n"));
+    store.close();
+  });
+
+  test("snapshots only artifacts explicitly associated with the failed attempt", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentflowWorkflowOrThrow(`
+name: attempt-scoped-failure
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: check, type: command, command: exit 1 }
+`);
+    const store = await openAgentflowRunState({ cwd: repoRoot });
+    createAgentflowLifecycleRun(store, { id: "attempt-scoped-failure", workflow });
+    transitionAgentflowLifecycleRun(store, "attempt-scoped-failure", "resume");
+    const stripeLikeToken = ["sk", "_live_", "123456789012345678901234"].join("");
+    const slackLikeToken = ["xox", "b-", "1234567890-1234567890-abcdefghijklmnop"].join("");
+    for (const [artifactPath, metadata] of [
+      ["stale-unversioned.log", {}],
+      ["stale-prior-attempt.log", { attempt: 1 }],
+      ["current-attempt.log", { attempt: 2 }]
+    ] as const) {
+      store.writeArtifact({
+        id: artifactPath,
+        runId: "attempt-scoped-failure",
+        stepId: "check",
+        path: artifactPath,
+        kind: "command_log",
+        contentType: "text/plain",
+        content: artifactPath === "current-attempt.log"
+          ? [
+              'Authorization: "Token quoted-authorization-secret"',
+              "Cookie: session=cookie-secret",
+              "password is phrase-secret",
+              `Stripe ${stripeLikeToken}`,
+              "GitLab glpat-12345678901234567890",
+              `Slack ${slackLikeToken}`,
+              "JWT eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature123456789",
+              "aws configure set aws_secret_access_key attachment-aws-secret",
+              "npm config set //registry.npmjs.org/:_authToken attachment-npm-secret",
+              ""
+            ].join("\n")
+          : artifactPath,
+        metadata
+      });
+    }
+    store.writeArtifact({
+      id: "structured-secret",
+      runId: "attempt-scoped-failure",
+      stepId: "check",
+      path: "structured-secret.yaml",
+      kind: "command_log",
+      contentType: "application/yaml",
+      content: "api_token: |\n  yaml-block-secret\n",
+      metadata: { attempt: 2 }
+    });
+    store.writeArtifact({
+      id: "private-key-secret",
+      runId: "attempt-scoped-failure",
+      stepId: "check",
+      path: "private-key-secret.json",
+      kind: "command_log",
+      contentType: "application/json",
+      content: "{\"private_key\":\"opaque-private-key-secret\"}\n",
+      metadata: { attempt: 2 }
+    });
+    store.writeArtifact({
+      id: "authorization-secret",
+      runId: "attempt-scoped-failure",
+      stepId: "check",
+      path: "authorization-secret.json",
+      kind: "command_log",
+      contentType: "application/json",
+      content: "{\"Authorization\":\"ApiKey structured-authorization-secret\"}\n",
+      metadata: { attempt: 2 }
+    });
+    store.writeArtifact({
+      id: "dotted-secret",
+      runId: "attempt-scoped-failure",
+      stepId: "check",
+      path: "dotted-secret.json",
+      kind: "command_log",
+      contentType: "application/json",
+      content: "{\"database.password\":\"dotted-structured-secret\"}\n",
+      metadata: { attempt: 2 }
+    });
+    store.writeArtifact({
+      id: "camel-secret",
+      runId: "attempt-scoped-failure",
+      stepId: "check",
+      path: "camel-secret.json",
+      kind: "command_log",
+      contentType: "application/json",
+      content: "{\"awsSecretAccessKey\":\"camel-structured-secret\"}\n",
+      metadata: { attempt: 2 }
+    });
+    store.writeArtifact({
+      id: "credentials-secret",
+      runId: "attempt-scoped-failure",
+      stepId: "check",
+      path: "credentials-secret.json",
+      kind: "command_log",
+      contentType: "application/json",
+      content: "{\"credentials\":\"structured-credentials-secret\",\"passphrase\":\"structured-passphrase-secret\"}\n",
+      metadata: { attempt: 2 }
+    });
+    store.writeArtifact({
+      id: "auth-secret",
+      runId: "attempt-scoped-failure",
+      stepId: "check",
+      path: "auth-secret.json",
+      kind: "command_log",
+      contentType: "application/json",
+      content: "{\"auth\":\"dXNlcjphdXRoLXNlY3JldA==\"}\n",
+      metadata: { attempt: 2 }
+    });
+    store.writeArtifact({
+      id: "plain-html-secret",
+      runId: "attempt-scoped-failure",
+      stepId: "check",
+      path: "plain-html-secret.log",
+      kind: "command_log",
+      contentType: "text/plain",
+      content: '<input type="password" value="plain-html-secret-value">',
+      metadata: { attempt: 2 }
+    });
+    store.writeArtifact({
+      id: "plain-block-secret",
+      runId: "attempt-scoped-failure",
+      stepId: "check",
+      path: "plain-block-secret.log",
+      kind: "command_log",
+      contentType: "text/plain",
+      content: "api_token: |\n  plain-block-secret-value\n",
+      metadata: { attempt: 2 }
+    });
+    store.writeArtifact({
+      id: "invalid-utf8",
+      runId: "attempt-scoped-failure",
+      stepId: "check",
+      path: "invalid-utf8.log",
+      kind: "command_log",
+      contentType: "text/plain; charset=utf-8",
+      content: Buffer.from([0xc3, 0x28]),
+      metadata: { attempt: 2 }
+    });
+    store.writeArtifact({
+      id: "unsupported-html-secret",
+      runId: "attempt-scoped-failure",
+      stepId: "check",
+      path: "unsupported-secret.html",
+      kind: "command_log",
+      contentType: "text/html",
+      content: '<input name="password" value="html-secret-value">',
+      metadata: { attempt: 2 }
+    });
+    store.writeArtifact({
+      id: "safe-markdown",
+      runId: "attempt-scoped-failure",
+      stepId: "check",
+      path: "safe-evidence.md",
+      kind: "session_output",
+      contentType: "text/markdown; charset=utf-8",
+      content: "# Safe evidence\n\nNo credentials here.\n",
+      metadata: { attempt: 2 }
+    });
+    store.writeArtifact({
+      id: "unsafe-markdown",
+      runId: "attempt-scoped-failure",
+      stepId: "check",
+      path: "unsafe-evidence.md",
+      kind: "session_output",
+      contentType: "text/markdown",
+      content: '<input name="password" value="markdown-html-secret">',
+      metadata: { attempt: 2 }
+    });
+
+    const persisted = persistAgentflowFailurePayload(store, {
+      id: "command:check:attempt-2",
+      runId: "attempt-scoped-failure",
+      stepId: "check",
+      stepType: "command",
+      attempt: 2,
+      command: "AUTHORIZATION=authorization-assignment-secret COOKIE=cookie-assignment-secret PASSPHRASE=passphrase-assignment-secret CREDENTIALS=credentials-assignment-secret PGPASSWORD=database-secret MYSQL_PWD=mysql-secret aws configure set aws_secret_access_key positional-secret && npm config set //registry.npmjs.org/:_authToken=npm_abcdefghijklmnopqrstuvwxyz1234567890 && tool --password \"abc\\\"def\" --api-token $'ansi-token-secret' --user alice:curl-secret --proxy-user \"bob:proxy-secret\" -ucarol:short-secret --password flag-prefix\\ flag-suffix-leak --mode safe && curl -u user:'mixed-secret-suffix' -H 'X-Api-Key: header-secret-suffix' && PASSWORD=plain'assignment-secret-suffix' tool",
+      summary: "password: correct horse battery staple\nAPI key is spaced-api-secret\nBasic dTpw\nGitHub token github_pat_11ABCDEFGHijklmnopqrstuv1234567890\nnpm token npm_zyxwvutsrqponmlkjihgfedcba0987654321\nnext diagnostic line",
+      classification: "command_failure",
+      retryable: false,
+      outcome: "pause",
+      indexPayload: {
+        api_token: "plain-index-secret",
+        nested: { AWS_SECRET_ACCESS_KEY: "nested-index-secret" }
+      }
+    });
+
+    const serialized = store.readArtifact("attempt-scoped-failure", persisted.path!).content.toString("utf8");
+    expect(serialized).not.toContain("plain-index-secret");
+    expect(serialized).not.toContain("nested-index-secret");
+    expect(serialized).not.toContain("yaml-block-secret");
+    expect(serialized).not.toContain("opaque-private-key-secret");
+    expect(serialized).not.toContain("plain-block-secret-value");
+    expect(serialized).not.toContain("structured-authorization-secret");
+    expect(serialized).not.toContain("dotted-structured-secret");
+    expect(serialized).not.toContain("camel-structured-secret");
+    expect(serialized).not.toContain("structured-credentials-secret");
+    expect(serialized).not.toContain("structured-passphrase-secret");
+    expect(serialized).not.toContain("dXNlcjphdXRoLXNlY3JldA==");
+    expect(serialized).not.toContain("plain-html-secret-value");
+    expect(serialized).not.toContain("quoted-authorization-secret");
+    expect(serialized).not.toContain("cookie-secret");
+    expect(serialized).not.toContain("phrase-secret");
+    expect(serialized).not.toContain(stripeLikeToken);
+    expect(serialized).not.toContain("glpat-12345678901234567890");
+    expect(serialized).not.toContain(slackLikeToken);
+    expect(serialized).not.toContain("eyJhbGciOiJIUzI1NiJ9");
+    expect(serialized).not.toContain('abc\\"def');
+    expect(serialized).not.toContain("database-secret");
+    expect(serialized).not.toContain("mysql-secret");
+    expect(serialized).not.toContain("ansi-token-secret");
+    expect(serialized).not.toContain("curl-secret");
+    expect(serialized).not.toContain("proxy-secret");
+    expect(serialized).not.toContain("short-secret");
+    expect(serialized).not.toContain("positional-secret");
+    expect(serialized).not.toContain("html-secret-value");
+    expect(serialized).not.toContain("markdown-html-secret");
+    expect(serialized).not.toContain("authorization-assignment-secret");
+    expect(serialized).not.toContain("cookie-assignment-secret");
+    expect(serialized).not.toContain("passphrase-assignment-secret");
+    expect(serialized).not.toContain("credentials-assignment-secret");
+    expect(serialized).not.toContain("flag-suffix-leak");
+    expect(serialized).not.toContain("mixed-secret-suffix");
+    expect(serialized).not.toContain("header-secret-suffix");
+    expect(serialized).not.toContain("assignment-secret-suffix");
+    expect(serialized).not.toContain("github_pat_11ABCDEFGHijklmnopqrstuv1234567890");
+    expect(serialized).not.toContain("npm_abcdefghijklmnopqrstuvwxyz1234567890");
+    expect(serialized).not.toContain("npm_zyxwvutsrqponmlkjihgfedcba0987654321");
+    expect(serialized).not.toContain("horse battery staple");
+    expect(serialized).not.toContain("spaced-api-secret");
+    expect(serialized).not.toContain("attachment-aws-secret");
+    expect(serialized).not.toContain("attachment-npm-secret");
+    expect(persisted.indexPayload).toEqual({
+      api_token: "[REDACTED]",
+      nested: { AWS_SECRET_ACCESS_KEY: "[REDACTED]" }
+    });
+    const payload = JSON.parse(serialized);
+    expect(payload.command).toBe(
+      "AUTHORIZATION=[REDACTED] COOKIE=[REDACTED] PASSPHRASE=[REDACTED] CREDENTIALS=[REDACTED] PGPASSWORD=[REDACTED] MYSQL_PWD=[REDACTED] aws configure set aws_secret_access_key [REDACTED] && npm config set //registry.npmjs.org/:_authToken=[REDACTED] && tool --password [REDACTED] --api-token [REDACTED] --user [REDACTED] --proxy-user [REDACTED] -u[REDACTED] --password [REDACTED] --mode safe && curl -u [REDACTED] -H [REDACTED] && PASSWORD=[REDACTED] tool"
+    );
+    expect(payload.summary).toBe("password: [REDACTED]\nAPI key is [REDACTED]\nBasic [REDACTED]\nGitHub token [REDACTED]\nnpm token [REDACTED]\nnext diagnostic line");
+    expect(payload.artifacts.available).toHaveLength(2);
+    expect(payload.artifacts.withheld).toEqual([
+      "auth-secret.json",
+      "authorization-secret.json",
+      "camel-secret.json",
+      "credentials-secret.json",
+      "dotted-secret.json",
+      "invalid-utf8.log",
+      "plain-block-secret.log",
+      "plain-html-secret.log",
+      "private-key-secret.json",
+      "structured-secret.yaml",
+      "unsafe-evidence.md",
+      "unsupported-secret.html"
+    ]);
+    expect(payload.redactions.unscanned_artifacts).toEqual([
+      "auth-secret.json",
+      "authorization-secret.json",
+      "camel-secret.json",
+      "credentials-secret.json",
+      "dotted-secret.json",
+      "invalid-utf8.log",
+      "plain-block-secret.log",
+      "plain-html-secret.log",
+      "private-key-secret.json",
+      "structured-secret.yaml",
+      "unsafe-evidence.md",
+      "unsupported-secret.html"
+    ]);
+    const currentAttemptSnapshot = (payload.artifacts.available as string[])
+      .find((artifactPath) => artifactPath.endsWith("/current-attempt.log"))!;
+    const markdownSnapshot = (payload.artifacts.available as string[])
+      .find((artifactPath) => artifactPath.endsWith("/safe-evidence.md"))!;
+    expect(store.readArtifact("attempt-scoped-failure", currentAttemptSnapshot).content.toString())
+      .toBe([
+        'Authorization: "[REDACTED]"',
+        "Cookie: [REDACTED]",
+        "password is [REDACTED]",
+        "Stripe [REDACTED]",
+        "GitLab [REDACTED]",
+        "Slack [REDACTED]",
+        "JWT [REDACTED]",
+        "aws configure set aws_secret_access_key [REDACTED]",
+        "npm config set //registry.npmjs.org/:_authToken [REDACTED]",
+        ""
+      ].join("\n"));
+    expect(store.readArtifact("attempt-scoped-failure", markdownSnapshot).content.toString())
+      .toBe("# Safe evidence\n\nNo credentials here.\n");
+
+    const malformed = persistAgentflowFailurePayload(store, {
+      id: "command:check:attempt-3",
+      runId: "attempt-scoped-failure",
+      stepId: "check",
+      stepType: "command",
+      attempt: 3,
+      command: 'API_TOKEN="unterminated-secret',
+      summary: "shell syntax failure",
+      classification: "command_failure",
+      retryable: false,
+      outcome: "pause"
+    });
+    const malformedPayload = JSON.parse(
+      store.readArtifact("attempt-scoped-failure", malformed.path!).content.toString("utf8")
+    );
+    expect(malformedPayload.command).toBe('API_TOKEN="[REDACTED]');
+    expect(JSON.stringify(malformedPayload)).not.toContain("unterminated-secret");
+    store.close();
+  });
+
+  test("bounds aggregate failure attachment scans by count and bytes", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentflowWorkflowOrThrow(`
+name: bounded-failure-attachments
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - { id: check, type: command, command: exit 1 }
+`);
+    const store = await openAgentflowRunState({ cwd: repoRoot });
+    createAgentflowLifecycleRun(store, { id: "bounded-failure-attachments", workflow });
+    for (let index = 0; index <= MAX_AGENTFLOW_FAILURE_ATTACHMENT_COUNT; index += 1) {
+      store.writeArtifact({
+        id: `count-${index}`,
+        runId: "bounded-failure-attachments",
+        stepId: "check",
+        path: `count/${String(index).padStart(3, "0")}.log`,
+        kind: "command_log",
+        contentType: "text/plain",
+        content: "safe",
+        metadata: { attempt: 1 }
+      });
+    }
+    const countFailure = persistAgentflowFailurePayload(store, {
+      id: "count-bound",
+      runId: "bounded-failure-attachments",
+      stepId: "check",
+      stepType: "command",
+      attempt: 1,
+      summary: "failed",
+      classification: "command_failure",
+      retryable: false,
+      outcome: "pause"
+    });
+    const countPayload = JSON.parse(
+      store.readArtifact("bounded-failure-attachments", countFailure.path!).content.toString("utf8")
+    );
+    expect(countPayload.artifacts.available).toHaveLength(MAX_AGENTFLOW_FAILURE_ATTACHMENT_COUNT);
+    expect(countPayload.artifacts.withheld).toEqual(["count/064.log"]);
+
+    const aggregateArtifactCount = Math.floor(
+      MAX_AGENTFLOW_FAILURE_TOTAL_ATTACHMENT_BYTES / MAX_AGENTFLOW_FAILURE_ATTACHMENT_SCAN_BYTES
+    ) + 1;
+    for (let index = 0; index < aggregateArtifactCount; index += 1) {
+      store.writeArtifact({
+        id: `bytes-${index}`,
+        runId: "bounded-failure-attachments",
+        stepId: "byte-check",
+        path: `bytes/${index}.log`,
+        kind: "command_log",
+        contentType: "text/plain",
+        content: Buffer.alloc(MAX_AGENTFLOW_FAILURE_ATTACHMENT_SCAN_BYTES, 0x61),
+        metadata: { attempt: 1 }
+      });
+    }
+    const byteFailure = persistAgentflowFailurePayload(store, {
+      id: "byte-bound",
+      runId: "bounded-failure-attachments",
+      stepId: "byte-check",
+      stepType: "command",
+      attempt: 1,
+      summary: "failed",
+      classification: "command_failure",
+      retryable: false,
+      outcome: "pause"
+    });
+    const bytePayload = JSON.parse(
+      store.readArtifact("bounded-failure-attachments", byteFailure.path!).content.toString("utf8")
+    );
+    expect(bytePayload.artifacts.available).toHaveLength(aggregateArtifactCount - 1);
+    expect(bytePayload.artifacts.withheld).toEqual([`bytes/${aggregateArtifactCount - 1}.log`]);
     store.close();
   });
 

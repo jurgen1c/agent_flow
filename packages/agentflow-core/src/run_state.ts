@@ -228,6 +228,7 @@ export interface AgentflowFailureRecord {
   retryable: boolean;
   attempt: number | null;
   outcome: AgentflowFailureOutcome | null;
+  payloadPath: string | null;
   payload: AgentflowRunStateValue | null;
   createdAt: string;
   resolvedAt: string | null;
@@ -1490,7 +1491,25 @@ export class AgentflowRunStateStore {
     return this.database.all<FailureRow>(
       "SELECT * FROM failures WHERE run_id = ? ORDER BY created_at ASC, rowid ASC",
       [normalizedRunId]
-    ).map(hydrateFailure);
+    ).map((row) => {
+      const failure = hydrateFailure(row);
+      if (failure.payloadPath === null) return failure;
+      let artifact: AgentflowArtifactRecord | null;
+      try {
+        artifact = this.getArtifact(normalizedRunId, failure.payloadPath);
+      } catch {
+        artifact = null;
+      }
+      const metadata = artifact?.metadata;
+      return artifact?.kind === "failure_payload"
+          && ["available", "overwritten"].includes(artifact.status)
+          && metadata !== null
+          && typeof metadata === "object"
+          && !Array.isArray(metadata)
+          && metadata.failureId === failure.id
+        ? failure
+        : { ...failure, payloadPath: null };
+    });
   }
 
   resolveFailure(runId: string, failureId: string, resolvedAt?: string): void {
@@ -1981,6 +2000,7 @@ function hydrateFailure(row: FailureRow): AgentflowFailureRecord {
     : undefined;
   const attempt = payloadRecord?.attempt;
   const outcome = payloadRecord?.outcome;
+  const payloadPath = payloadRecord?.failurePayloadPath;
   return {
     id: row.id,
     runId: row.run_id,
@@ -1993,6 +2013,7 @@ function hydrateFailure(row: FailureRow): AgentflowFailureRecord {
     outcome: typeof outcome === "string" && FAILURE_OUTCOMES.has(outcome as AgentflowFailureOutcome)
       ? outcome as AgentflowFailureOutcome
       : null,
+    payloadPath: typeof payloadPath === "string" && payloadPath.length > 0 ? payloadPath : null,
     payload,
     createdAt: row.created_at,
     resolvedAt: row.resolved_at

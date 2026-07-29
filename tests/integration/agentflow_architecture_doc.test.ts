@@ -56,6 +56,9 @@ describe("Agentflow monorepo architecture doc", () => {
     expect(doc).toContain("`workflow.completed`");
     expect(doc).toContain("`notification.delivered`");
     expect(doc).toContain("`final-summary.md`");
+    expect(doc).toContain("`failures/*.json`");
+    expect(doc).toContain("`[REDACTED]`");
+    expect(doc).toContain("payload path for recovery routing");
     expect(doc).toContain("retain artifact metadata as `missing`");
     expect(doc).toContain(".agentflow/");
     expect(doc).toContain("The existing CLI remains the compatibility anchor");

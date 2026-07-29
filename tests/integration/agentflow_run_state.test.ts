@@ -12,6 +12,54 @@ import {
 const FIXED_TIME = "2026-07-15T12:00:00.000Z";
 
 describe("Agentflow run-state SQLite store", () => {
+  test("exposes only failure payload paths with a currently readable backing", async () => {
+    const repoRoot = temporaryRepo();
+    const store = await openAgentflowRunState({ cwd: repoRoot, now: () => FIXED_TIME });
+    store.createRun({
+      id: "failure-backing",
+      workflow: { name: "failure-backing", version: 1, style: "recovery_pipeline", maturity: "experimental" }
+    });
+    const artifact = store.writeArtifact({
+      id: "failure-payload",
+      runId: "failure-backing",
+      stepId: "check",
+      path: "failures/check.json",
+      kind: "failure_payload",
+      contentType: "application/json",
+      content: "{}\n",
+      metadata: { failureId: "failure-1" }
+    });
+    store.recordFailure({
+      id: "failure-1",
+      runId: "failure-backing",
+      stepId: "check",
+      classification: "command_failure",
+      message: "failed",
+      retryable: false,
+      payload: { attempt: 1, outcome: "fail", failurePayloadPath: artifact.declaredPath }
+    });
+
+    expect(store.listFailures("failure-backing")[0]?.payloadPath).toBe("failures/check.json");
+    const database = new Database(path.join(repoRoot, ".agentflow/agentflow.sqlite"));
+    const updateMetadata = database.query(
+      "UPDATE artifacts SET metadata_json = ? WHERE run_id = ? AND path = ?"
+    );
+    for (const invalidMetadata of ["null", "[]", "\"failure-1\""]) {
+      updateMetadata.run(invalidMetadata, "failure-backing", "failures/check.json");
+      expect(store.listFailures("failure-backing")[0]?.payloadPath).toBeNull();
+    }
+    updateMetadata.run(
+      JSON.stringify({ failureId: "failure-1" }),
+      "failure-backing",
+      "failures/check.json"
+    );
+    database.close();
+    expect(store.listFailures("failure-backing")[0]?.payloadPath).toBe("failures/check.json");
+    fs.unlinkSync(path.join(repoRoot, artifact.storagePath));
+    expect(store.listFailures("failure-backing")[0]?.payloadPath).toBeNull();
+    store.close();
+  });
+
   test("creates and updates resumable runs in a repository-local database", async () => {
     const repoRoot = temporaryRepo();
     const store = await openAgentflowRunState({ cwd: path.join(repoRoot, "nested"), now: () => FIXED_TIME });
@@ -112,7 +160,11 @@ describe("Agentflow run-state SQLite store", () => {
       classification: "test_failure",
       message: "Focused test failed",
       retryable: true,
-      payload: { exitCode: 1 }
+      payload: {
+        exitCode: 1,
+        path: "domain/value",
+        failurePayloadPath: "failures/report.json"
+      }
     });
     store.upsertApproval({
       id: "approval-1",
@@ -167,7 +219,12 @@ describe("Agentflow run-state SQLite store", () => {
       retryable: true,
       attempt: null,
       outcome: null,
-      payload: { exitCode: 1 },
+      payloadPath: null,
+      payload: {
+        exitCode: 1,
+        path: "domain/value",
+        failurePayloadPath: "failures/report.json"
+      },
       createdAt: FIXED_TIME,
       resolvedAt: now
     }]);

@@ -1,7 +1,7 @@
 # Agentflow Monorepo Architecture
 
-Status: implemented workspace shell, run persistence foundation, Agent Memory context adapter, deterministic artifact transforms, session requests, MCP call contracts, pipeline notifications, and terminal retention defaults
-Ticket: AM-6, AM-7, AM-9, AM-18, AM-19, AM-21, AM-22, AM-24, AM-25, AM-26, AM-30
+Status: implemented workspace shell, run persistence foundation, Agent Memory context adapter, deterministic artifact transforms, session requests, MCP call contracts, structured failure payloads, pipeline notifications, and terminal retention defaults
+Ticket: AM-6, AM-7, AM-9, AM-18, AM-19, AM-21, AM-22, AM-24, AM-25, AM-26, AM-30, AM-31
 
 ## Intent
 
@@ -209,7 +209,18 @@ traversal and symlink escapes. Commands support positive `timeout_seconds`,
 up to 100 retries, and `fail`, `pause`, or explicitly allowed `continue` failure
 outcomes. Every failed executable attempt records its attempt number, summary,
 retryability, and normalized `retry`, `pause`, `fail`, or `continue` outcome in
-run state; callers can inspect those summaries with `listFailures(runId)`.
+run state. It also publishes a typed JSON artifact at a deterministic
+`failures/*.json` declared path with the step type, exit code and command when
+applicable, safe log/artifact references, classification, and remediation
+status. `listFailures(runId)` exposes that payload path for recovery routing.
+Secret-like command, summary, and textual attachment content is replaced with
+`[REDACTED]` before the payload is available as session input; unscannable
+attachments are withheld and flagged in the payload's redaction metadata.
+Available attachments are immutable snapshots explicitly scoped to the failed
+attempt, so retries cannot change earlier recovery evidence or attach stale
+outputs. Structured attachments with sensitive keys are withheld, and terminal
+retention implicitly preserves failure payload and attachment artifacts by kind so indexed payload paths remain
+readable.
 Unexpected pipeline failures and exhausted retry-only policies pause by default.
 Failures that need diagnosis, remediation, or return-to-step routing belong in
 the `recovery_pipeline` style rather than a simple pipeline policy.

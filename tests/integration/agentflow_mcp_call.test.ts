@@ -527,7 +527,23 @@ steps:
 
     expect(result).toMatchObject({ status: "paused", failedStep: "fetch" });
     expect(result.message).toContain("no response for step fetch");
-    expect(store.listArtifacts("missing-fixture")).toEqual([]);
+    expect(store.listArtifacts("missing-fixture").filter((artifact) => artifact.kind !== "failure_payload")).toEqual([]);
+    const failure = store.listFailures("missing-fixture")[0]!;
+    expect(failure.payloadPath).toMatch(/^failures\/.+\.json$/);
+    expect(JSON.parse(store.readArtifact("missing-fixture", failure.payloadPath!).content.toString("utf8")))
+      .toMatchObject({
+        id: failure.id,
+        step_id: "fetch",
+        step_type: "mcp_call",
+        status: "failed",
+        attempt: 1,
+        exit_code: null,
+        command: null,
+        logs: { stdout: null, stderr: null },
+        classification: "mcp_call_failure",
+        remediation_status: null,
+        path: failure.payloadPath
+      });
     store.close();
   });
 
@@ -542,7 +558,7 @@ steps:
       const result = await executeAgentflowCommandPipeline(store, "invalid-output", workflow, undefined, undefined, calls);
 
       expect(result).toMatchObject({ status: "paused", failedStep: "fetch" });
-      expect(store.listArtifacts("invalid-output")).toEqual([]);
+      expect(store.listArtifacts("invalid-output").filter((artifact) => artifact.kind !== "failure_payload")).toEqual([]);
       store.close();
     }
   });
@@ -640,7 +656,9 @@ steps:
       expect(result).toMatchObject({ status: "failed", failedStep: "fetch" });
       expect(result.message).toContain("normalized static repo-relative artifact path");
       expect(invoked).toBe(false);
-      expect(store.listArtifacts("invalid-runtime-output").map((artifact) => artifact.declaredPath))
+      expect(store.listArtifacts("invalid-runtime-output")
+        .filter((artifact) => artifact.kind !== "failure_payload")
+        .map((artifact) => artifact.declaredPath))
         .toEqual(["final-summary.md"]);
       store.close();
     }
@@ -1377,7 +1395,7 @@ steps:
 
     expect(result).toMatchObject({ status: "paused", failedStep: "fetch" });
     expect(result.message).toContain("metadata");
-    expect(store.listArtifacts("oversized-metadata")).toEqual([]);
+    expect(store.listArtifacts("oversized-metadata").filter((artifact) => artifact.kind !== "failure_payload")).toEqual([]);
     store.close();
   });
 
@@ -1398,7 +1416,7 @@ steps:
 
       expect(result).toMatchObject({ status: "paused", failedStep: "fetch" });
       expect(result.message).toContain("outputs for step fetch exceed");
-      expect(store.listArtifacts("oversized-output")).toEqual([]);
+      expect(store.listArtifacts("oversized-output").filter((artifact) => artifact.kind !== "failure_payload")).toEqual([]);
       store.close();
     }
   });
@@ -1424,7 +1442,7 @@ steps:
 
     expect(result).toMatchObject({ status: "paused", failedStep: "fetch" });
     expect(result.message).toContain("content types");
-    expect(store.listArtifacts("oversized-content-type")).toEqual([]);
+    expect(store.listArtifacts("oversized-content-type").filter((artifact) => artifact.kind !== "failure_payload")).toEqual([]);
     store.close();
   });
 
@@ -1464,7 +1482,7 @@ steps:
       const result = await executeAgentflowCommandPipeline(store, "non-plain-response", workflow, undefined, undefined, calls);
 
       expect(result).toMatchObject({ status: "paused", failedStep: "fetch" });
-      expect(store.listArtifacts("non-plain-response")).toEqual([]);
+      expect(store.listArtifacts("non-plain-response").filter((artifact) => artifact.kind !== "failure_payload")).toEqual([]);
       store.close();
     }
   });
@@ -1483,7 +1501,7 @@ steps:
       const result = await executeAgentflowCommandPipeline(store, "invalid-json", workflow, undefined, undefined, calls);
 
       expect(result).toMatchObject({ status: "paused", failedStep: "fetch" });
-      expect(store.listArtifacts("invalid-json")).toEqual([]);
+      expect(store.listArtifacts("invalid-json").filter((artifact) => artifact.kind !== "failure_payload")).toEqual([]);
       store.close();
     }
   });

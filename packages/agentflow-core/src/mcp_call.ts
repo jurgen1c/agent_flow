@@ -43,6 +43,7 @@ export interface AgentflowMcpCallExecutionResult {
 }
 
 export interface ExecuteAgentflowMcpCallOptions {
+  attempt?: number;
   beforePublish?: () => void;
   stopStatus?: () => AgentflowRunStopStatus | undefined;
 }
@@ -225,7 +226,11 @@ export async function executeAgentflowMcpCall(
       overwrite: existingRequestArtifact !== null,
       requiredRunStatus: "running" as const,
       requiredCurrentArtifact: artifactSnapshots.request.required,
-      metadata: { server, tool }
+      metadata: {
+        server,
+        tool,
+        ...(options.attempt === undefined ? {} : { attempt: options.attempt })
+      }
     },
     ...outputs.map((outputPath) => {
       const output = returned.get(outputPath)!;
@@ -242,7 +247,12 @@ export async function executeAgentflowMcpCall(
         overwrite: step.overwrite === true || ownedMcpOutput(existing, stepId, server, tool),
         requiredRunStatus: "running" as const,
         requiredCurrentArtifact: snapshot.required,
-        metadata: { server, tool, requestArtifact: requestPath }
+        metadata: {
+          server,
+          tool,
+          requestArtifact: requestPath,
+          ...(options.attempt === undefined ? {} : { attempt: options.attempt })
+        }
       };
     })
   ];

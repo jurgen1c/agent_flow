@@ -100,6 +100,8 @@ export function applyAgentflowRetention(
   const candidates = store.listArtifactMetadata(runId)
     .filter((artifact) =>
       artifact.status !== "missing"
+      && artifact.kind !== "failure_payload"
+      && artifact.kind !== "failure_attachment"
       && deletions.some((pattern) => matchesPolicyGlob(artifact.declaredPath, pattern))
       && !keep.some((pattern) => matchesPolicyGlob(artifact.declaredPath, pattern))
     )

@@ -57,6 +57,10 @@ import {
   writeAgentflowFinalSummary
 } from "./retention";
 import { withAgentflowPipelineFinalization } from "./finalization";
+import {
+  persistAgentflowFailurePayload,
+  type PersistAgentflowFailurePayloadResult
+} from "./failure_payload";
 
 const MAX_CAPTURE_BYTES = 10 * 1024 * 1024;
 
@@ -258,6 +262,7 @@ async function runAgentflowCommandPipeline(
         store.appendRunEvent(runId, { type: "step.started", stepId, payload: input });
         try {
           const result = await executeAgentflowMcpCall(store, runId, workflow, step, mcpCalls, {
+            attempt,
             stopStatus: () => activeStopStatus(store, runId),
             beforePublish: () => {
               const status = activeStopStatus(store, runId);
@@ -397,6 +402,7 @@ async function runAgentflowCommandPipeline(
         store.appendRunEvent(runId, { type: "step.started", stepId, payload: input });
         try {
           const result = await executeAgentflowSessionRequest(store, runId, workflow, step, sessionProviders, {
+            attempt,
             stopStatus: () => activeStopStatus(store, runId),
             beforePublish: () => {
               const status = activeStopStatus(store, runId);
@@ -553,18 +559,23 @@ async function runAgentflowCommandPipeline(
           return interruptedPipelineResult(store, runId, completedSteps, stopped);
         }
         const message = error instanceof Error ? error.message : String(error);
-        const failure = { attempt, message, outcome: "fail" };
-        store.upsertStep({ runId, stepId, attempt, status: "failed", error: failure });
-        store.recordFailure({
-          id: `condition:${safeId(stepId)}:evaluation`,
+        const failureId = `condition:${safeId(stepId)}:evaluation`;
+        const failure = { attempt, message, outcome: "fail" as const };
+        const persisted = persistAgentflowFailurePayload(store, {
+          id: failureId,
           runId,
           stepId,
+          stepType: "condition",
+          attempt,
+          summary: message,
           classification: "condition_evaluation",
-          message,
           retryable: false,
-          payload: failure
+          outcome: "fail",
+          indexPayload: failure
         });
-        store.appendRunEvent(runId, { type: "step.failed", stepId, payload: failure });
+        const indexedFailure = { ...persisted.indexPayload, ...failureReference(persisted) };
+        store.upsertStep({ runId, stepId, attempt, status: "failed", error: indexedFailure });
+        store.appendRunEvent(runId, { type: "step.failed", stepId, payload: indexedFailure });
         return finishFailure(store, runId, completedSteps, stepId, {
           exitCode: null,
           timedOut: false,
@@ -581,6 +592,19 @@ async function runAgentflowCommandPipeline(
         if (!(error instanceof AgentflowRunStateError && error.code === "AGENTFLOW_INTERACTION_INVALID")) {
           throw error;
         }
+        persistAgentflowFailurePayload(store, {
+          id: `interaction:${safeId(stepId)}:attempt-${attempt}`,
+          runId,
+          stepId,
+          stepType,
+          attempt,
+          exitCode: null,
+          summary: error.message,
+          classification: "interaction_failure",
+          retryable: false,
+          outcome: "fail",
+          indexPayload: { attempt, message: error.message, outcome: "fail" }
+        });
         return finishFailure(store, runId, completedSteps, stepId, {
           exitCode: null,
           timedOut: false,
@@ -589,10 +613,25 @@ async function runAgentflowCommandPipeline(
       }
     }
     if (stepType !== "command") {
+      const attempt = (routingBudget.attempts.get(stepId) ?? 0) + 1;
+      const message = `Step ${stepId} has unsupported type ${String(step.type)}; only command, artifact_transform, condition, input_request, manual_gate, mcp_call, and session_request steps can execute in this runtime phase.`;
+      persistAgentflowFailurePayload(store, {
+        id: `runtime:${safeId(stepId)}:attempt-${attempt}`,
+        runId,
+        stepId,
+        stepType: stepType ?? "unknown",
+        attempt,
+        exitCode: null,
+        summary: message,
+        classification: "unsupported_step",
+        retryable: false,
+        outcome: "pause",
+        indexPayload: { attempt, message, outcome: "pause" }
+      });
       return finishFailure(store, runId, completedSteps, stepId, {
         exitCode: null,
         timedOut: false,
-        message: `Step ${stepId} has unsupported type ${String(step.type)}; only command, artifact_transform, condition, input_request, manual_gate, mcp_call, and session_request steps can execute in this runtime phase.`
+        message
       }, "paused", routingBudget.terminalEffects);
     }
 
@@ -604,6 +643,7 @@ async function runAgentflowCommandPipeline(
         store,
         runId,
         stepId,
+        typeof step.command === "string" ? step.command : null,
         firstAttempt,
         preflightError.message,
         preflightError.status === "paused" ? "pause" : "fail"
@@ -674,21 +714,33 @@ async function runAgentflowCommandPipeline(
       }
 
       const retryable = attemptIndex <= retries;
-      const error = { ...commandError(lastResult, attempt), outcome: failureOutcome(step, retryable) };
-      store.upsertStep({ runId, stepId, attempt, status: "failed", error });
-      store.recordFailure({
-        id: `command:${safeId(stepId)}:attempt-${attempt}`,
+      const outcome = failureOutcome(step, retryable);
+      const failureId = `command:${safeId(stepId)}:attempt-${attempt}`;
+      const error = { ...commandError(lastResult, attempt), outcome };
+      const persisted = persistAgentflowFailurePayload(store, {
+        id: failureId,
         runId,
         stepId,
+        stepType: "command",
+        attempt,
+        exitCode: lastResult.exitCode,
+        command: step.command as string,
+        summary: error.message as string,
         classification: lastResult.timedOut ? "command_timeout" : "command_failure",
-        message: error.message as string,
         retryable,
-        payload: error
+        outcome,
+        logs: {
+          stdout: commandLogPath(stepId, attempt, "stdout"),
+          stderr: commandLogPath(stepId, attempt, "stderr")
+        },
+        indexPayload: error
       });
+      const indexedError = { ...persisted.indexPayload, ...failureReference(persisted) };
+      store.upsertStep({ runId, stepId, attempt, status: "failed", error: indexedError });
       store.appendRunEvent(runId, {
         type: lastResult.timedOut ? "step.timed_out" : "step.failed",
         stepId,
-        payload: error
+        payload: indexedError
       });
     }
 
@@ -823,12 +875,28 @@ function pauseForInteraction(
     failureContext: run.context,
     onFinalStatus: (status, message) => {
       if (status !== "failed") return;
+      const failureMessage = message ?? "Required paused notification failed.";
       const error = {
         attempt,
-        message: message ?? "Required paused notification failed.",
+        message: failureMessage,
         outcome: "fail"
       };
-      store.upsertStep({ runId, stepId, attempt, status: "failed", error });
+      const persisted = persistAgentflowFailurePayload(store, {
+        id: `interaction:${safeId(stepId)}:attempt-${attempt}:notification`,
+        runId,
+        stepId,
+        stepType: kind,
+        attempt,
+        exitCode: null,
+        summary: failureMessage,
+        classification: "notification_failure",
+        retryable: false,
+        outcome: "fail",
+        indexPayload: error
+      });
+      const indexedError = { ...persisted.indexPayload, ...failureReference(persisted) };
+      store.upsertStep({ runId, stepId, attempt, status: "failed", error: indexedError });
+      store.appendRunEvent(runId, { type: "step.failed", stepId, payload: indexedError });
       if (approvalId !== undefined) {
         store.upsertApproval({
           id: approvalId,
@@ -1327,10 +1395,25 @@ function routeAfterSuccessfulStep(
       )
     };
   }
+  const attempt = Math.max(1, budget.attempts.get(stepId) ?? 0);
+  const message = `Step ${stepId} routed to unresolved target ${target}.`;
+  persistAgentflowFailurePayload(store, {
+    id: `routing:${safeId(stepId)}:to-${safeId(target)}:attempt-${attempt}`,
+    runId,
+    stepId,
+    stepType: "routing",
+    attempt,
+    exitCode: null,
+    summary: message,
+    classification: "routing_target",
+    retryable: false,
+    outcome: "fail",
+    indexPayload: { attempt, target, message, outcome: "fail" }
+  });
   return { result: finishFailure(store, runId, completedSteps, stepId, {
     exitCode: null,
     timedOut: false,
-    message: `Step ${stepId} routed to unresolved target ${target}.`
+    message
   }, "failed", budget.terminalEffects) };
 }
 
@@ -1361,28 +1444,62 @@ function successfulTransitionFailure(
 ): AgentflowCommandPipelineResult | undefined {
   const attemptLimit = budget.stepAttemptLimits.get(target);
   if (attemptLimit !== undefined && (budget.attempts.get(target) ?? 0) + 1 > attemptLimit) {
-    return finishFailure(store, runId, completedSteps, stepId, {
+    return finishRoutingFailure(store, runId, completedSteps, stepId, target, {
       exitCode: null,
       timedOut: false,
       message: `Step ${stepId} cannot route to ${target} because limits.max_step_attempts allows ${attemptLimit} attempt(s).`
-    }, "paused", budget.terminalEffects);
+    }, budget);
   }
   if ((budget.visits.get(target) ?? 0) === 0) return undefined;
   if (budget.maxRecoveryCycles === undefined) {
-    return finishFailure(store, runId, completedSteps, stepId, {
+    return finishRoutingFailure(store, runId, completedSteps, stepId, target, {
       exitCode: null,
       timedOut: false,
       message: `Step ${stepId} repeated route target ${target} without a positive executable limits.max_recovery_cycles bound.`
-    }, "paused", budget.terminalEffects);
+    }, budget);
   }
   const cycles = (budget.recoveryCycles.get(target) ?? 0) + 1;
   budget.recoveryCycles.set(target, cycles);
   if (cycles <= budget.maxRecoveryCycles) return undefined;
-  return finishFailure(store, runId, completedSteps, stepId, {
+  return finishRoutingFailure(store, runId, completedSteps, stepId, target, {
     exitCode: null,
     timedOut: false,
     message: `Step ${stepId} exceeded limits.max_recovery_cycles ${budget.maxRecoveryCycles} while routing to ${target}.`
-  }, "paused", budget.terminalEffects);
+  }, budget);
+}
+
+function finishRoutingFailure(
+  store: AgentflowRunStateStore,
+  runId: string,
+  completedSteps: string[],
+  stepId: string,
+  target: string,
+  failure: { exitCode: null; timedOut: false; message: string },
+  budget: SuccessfulRoutingBudget
+): AgentflowCommandPipelineResult {
+  const attempt = Math.max(1, budget.attempts.get(stepId) ?? 0);
+  persistAgentflowFailurePayload(store, {
+    id: `routing:${safeId(stepId)}:to-${safeId(target)}:attempt-${attempt}`,
+    runId,
+    stepId,
+    stepType: "routing",
+    attempt,
+    exitCode: null,
+    summary: failure.message,
+    classification: "routing_limit",
+    retryable: false,
+    outcome: "pause",
+    indexPayload: { attempt, target, message: failure.message, outcome: "pause" }
+  });
+  return finishFailure(
+    store,
+    runId,
+    completedSteps,
+    stepId,
+    failure,
+    "paused",
+    budget.terminalEffects
+  );
 }
 
 function finishSuccessfulTerminalRoute(
@@ -1476,11 +1593,26 @@ function stepAttemptLimitResult(
   budget: SuccessfulRoutingBudget
 ): AgentflowCommandPipelineResult {
   const limit = budget.stepAttemptLimits.get(stepId)!;
-  return finishFailure(store, runId, completedSteps, stepId, {
+  const attempt = (budget.attempts.get(stepId) ?? 0) + 1;
+  const failure = {
     exitCode: null,
     timedOut: false,
     message: `Step ${stepId} cannot start because limits.max_step_attempts allows ${limit} attempt(s).`
-  }, "paused", budget.terminalEffects);
+  };
+  persistAgentflowFailurePayload(store, {
+    id: `routing:${safeId(stepId)}:attempt-${attempt}:limit`,
+    runId,
+    stepId,
+    stepType: "routing",
+    attempt,
+    exitCode: null,
+    summary: failure.message,
+    classification: "step_attempt_limit",
+    retryable: false,
+    outcome: "pause",
+    indexPayload: { attempt, limit, message: failure.message, outcome: "pause" }
+  });
+  return finishFailure(store, runId, completedSteps, stepId, failure, "paused", budget.terminalEffects);
 }
 
 function finishCompleted(
@@ -1725,17 +1857,26 @@ function persistMcpCallFailure(
   rejected = false
 ): void {
   const payload = { attempt, message, outcome };
-  store.upsertStep({ runId, stepId, attempt, status: "failed", error: payload });
-  store.recordFailure({
-    id: rejected ? `mcp-call:${safeId(stepId)}:preflight` : `mcp-call:${safeId(stepId)}:attempt-${attempt}`,
+  const failureId = rejected ? `mcp-call:${safeId(stepId)}:preflight` : `mcp-call:${safeId(stepId)}:attempt-${attempt}`;
+  const persisted = persistAgentflowFailurePayload(store, {
+    id: failureId,
     runId,
     stepId,
+    stepType: "mcp_call",
+    attempt,
+    summary: message,
     classification: rejected ? "mcp_call_policy" : "mcp_call_failure",
-    message,
     retryable,
-    payload
+    outcome,
+    indexPayload: payload
   });
-  store.appendRunEvent(runId, { type: rejected ? "step.rejected" : "step.failed", stepId, payload });
+  const indexedPayload = { ...persisted.indexPayload, ...failureReference(persisted) };
+  store.upsertStep({ runId, stepId, attempt, status: "failed", error: indexedPayload });
+  store.appendRunEvent(runId, {
+    type: rejected ? "step.rejected" : "step.failed",
+    stepId,
+    payload: indexedPayload
+  });
 }
 
 function mcpCallFailureIsRetryable(error: unknown): boolean {
@@ -1791,6 +1932,7 @@ function executeTransformStep(
       ? { ...step, overwrite: true }
       : step;
     const result = executeAgentflowArtifactTransform(store, runId, executableStep, transforms, {
+      attempt,
       beforePublish: () => {
         const stopped = activeStopStatus(store, runId);
         if (stopped !== undefined) throw new TransformInterruptedError(stopped);
@@ -1830,18 +1972,24 @@ function executeTransformStep(
       }
     }
     const message = error instanceof Error ? error.message : String(error);
-    const payload = { attempt, message, outcome: failureOutcome(step, retryable) };
-    store.upsertStep({ runId, stepId, attempt, status: "failed", error: payload });
-    store.recordFailure({
-      id: `artifact-transform:${safeId(stepId)}:attempt-${attempt}`,
+    const outcome = failureOutcome(step, retryable);
+    const payload = { attempt, message, outcome };
+    const failureId = `artifact-transform:${safeId(stepId)}:attempt-${attempt}`;
+    const persisted = persistAgentflowFailurePayload(store, {
+      id: failureId,
       runId,
       stepId,
+      stepType: "artifact_transform",
+      attempt,
+      summary: message,
       classification: "artifact_transform_failure",
-      message,
       retryable,
-      payload
+      outcome,
+      indexPayload: payload
     });
-    store.appendRunEvent(runId, { type: "step.failed", stepId, payload });
+    const indexedPayload = { ...persisted.indexPayload, ...failureReference(persisted) };
+    store.upsertStep({ runId, stepId, attempt, status: "failed", error: indexedPayload });
+    store.appendRunEvent(runId, { type: "step.failed", stepId, payload: indexedPayload });
     return { failure: message };
   }
 }
@@ -2062,12 +2210,20 @@ function persistCommandLog(
     id: `command:${safeId(stepId)}:attempt-${attempt}:${stream}`,
     runId,
     stepId,
-    path: `logs/${safeId(stepId)}/attempt-${attempt}/${stream}.log`,
+    path: commandLogPath(stepId, attempt, stream),
     kind: "command_log",
     contentType: "text/plain; charset=utf-8",
     content,
     metadata: { attempt, stream }
   });
+}
+
+function commandLogPath(
+  stepId: string,
+  attempt: number,
+  stream: "stdout" | "stderr"
+): string {
+  return `logs/${safeId(stepId)}/attempt-${attempt}/${stream}.log`;
 }
 
 function persistDeclaredOutputs(
@@ -2262,22 +2418,30 @@ function persistPreflightFailure(
   store: AgentflowRunStateStore,
   runId: string,
   stepId: string,
+  command: string | null,
   attempt: number,
   message: string,
   outcome: Exclude<AgentflowFailureOutcome, "retry" | "continue">
 ): void {
   const error = { attempt, exitCode: null, timedOut: false, message, outcome };
-  store.upsertStep({ runId, stepId, attempt, status: "failed", error });
-  store.recordFailure({
-    id: `command:${safeId(stepId)}:attempt-${attempt}:preflight`,
+  const failureId = `command:${safeId(stepId)}:attempt-${attempt}:preflight`;
+  const persisted = persistAgentflowFailurePayload(store, {
+    id: failureId,
     runId,
     stepId,
+    stepType: "command",
+    attempt,
+    exitCode: null,
+    command,
+    summary: message,
     classification: "command_policy",
-    message,
     retryable: false,
-    payload: error
+    outcome,
+    indexPayload: error
   });
-  store.appendRunEvent(runId, { type: "step.rejected", stepId, payload: error });
+  const indexedError = { ...persisted.indexPayload, ...failureReference(persisted) };
+  store.upsertStep({ runId, stepId, attempt, status: "failed", error: indexedError });
+  store.appendRunEvent(runId, { type: "step.rejected", stepId, payload: indexedError });
 }
 
 function persistTransformPreflightFailure(
@@ -2289,17 +2453,22 @@ function persistTransformPreflightFailure(
   outcome: Exclude<AgentflowFailureOutcome, "retry" | "continue">
 ): void {
   const error = { attempt, message, outcome };
-  store.upsertStep({ runId, stepId, attempt, status: "failed", error });
-  store.recordFailure({
-    id: `artifact-transform:${safeId(stepId)}:attempt-${attempt}:preflight`,
+  const failureId = `artifact-transform:${safeId(stepId)}:attempt-${attempt}:preflight`;
+  const persisted = persistAgentflowFailurePayload(store, {
+    id: failureId,
     runId,
     stepId,
+    stepType: "artifact_transform",
+    attempt,
+    summary: message,
     classification: "artifact_transform_policy",
-    message,
     retryable: false,
-    payload: error
+    outcome,
+    indexPayload: error
   });
-  store.appendRunEvent(runId, { type: "step.rejected", stepId, payload: error });
+  const indexedError = { ...persisted.indexPayload, ...failureReference(persisted) };
+  store.upsertStep({ runId, stepId, attempt, status: "failed", error: indexedError });
+  store.appendRunEvent(runId, { type: "step.rejected", stepId, payload: indexedError });
 }
 
 function persistSessionRequestFailure(
@@ -2314,18 +2483,34 @@ function persistSessionRequestFailure(
   attempt = 1
 ): void {
   const error = { attempt, message, outcome };
-  store.upsertStep({ runId, stepId, attempt, ...(sessionId === undefined ? {} : { sessionId }), status: "failed", error });
-  store.recordFailure({
-    id: `session-request:${safeId(stepId)}:attempt-${attempt}`,
+  const failureId = `session-request:${safeId(stepId)}:attempt-${attempt}`;
+  const persisted = persistAgentflowFailurePayload(store, {
+    id: failureId,
     runId,
     stepId,
     ...(sessionId === undefined ? {} : { sessionId }),
+    stepType: "session_request",
+    attempt,
+    summary: message,
     classification: rejected ? "session_request_policy" : "session_request_failure",
-    message,
     retryable,
-    payload: error
+    outcome,
+    indexPayload: error
   });
-  store.appendRunEvent(runId, { type: rejected ? "step.rejected" : "step.failed", stepId, payload: error });
+  const indexedError = { ...persisted.indexPayload, ...failureReference(persisted) };
+  store.upsertStep({
+    runId,
+    stepId,
+    attempt,
+    ...(sessionId === undefined ? {} : { sessionId }),
+    status: "failed",
+    error: indexedError
+  });
+  store.appendRunEvent(runId, {
+    type: rejected ? "step.rejected" : "step.failed",
+    stepId,
+    payload: indexedError
+  });
 }
 
 function resolveOutputPath(repoRoot: string, declaredPath: string): string | undefined {
@@ -2397,6 +2582,17 @@ function failureMessage(result: CommandAttemptResult): string {
   if (result.message !== undefined) return result.message;
   if (result.signal !== null) return `Command terminated by signal ${result.signal}.`;
   return `Command exited with status ${String(result.exitCode)}.`;
+}
+
+function failureReference(
+  result: PersistAgentflowFailurePayloadResult
+): Record<string, AgentflowRunStateValue> {
+  return {
+    failurePath: result.path,
+    ...(result.persistenceError === null
+      ? {}
+      : { failurePayloadPersistenceError: result.persistenceError })
+  };
 }
 
 function requiredStepId(step: AgentflowWorkflowStep): string {

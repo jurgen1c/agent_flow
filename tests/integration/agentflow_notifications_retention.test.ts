@@ -92,6 +92,47 @@ retention:
     store.close();
   });
 
+  test("keeps indexed failure payloads and attachments through broad failure retention", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentflowWorkflowOrThrow(`
+name: retained-failure-payload
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: check, type: command, command: "printf evidence >&2; exit 4", on_failure: { then: fail } }
+retention:
+  on_failure:
+    delete: ["**"]
+`);
+    const store = await openAgentflowRunState({ cwd: repoRoot });
+    createAgentflowLifecycleRun(store, { id: "retained-failure-payload", workflow });
+    store.writeArtifact({
+      id: "user-debug",
+      runId: "retained-failure-payload",
+      path: "failures/debug.log",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "temporary user output"
+    });
+
+    expect((await executeAgentflowCommandPipeline(store, "retained-failure-payload", workflow)).status)
+      .toBe("failed");
+    const failure = store.listFailures("retained-failure-payload")[0]!;
+    const payload = JSON.parse(
+      store.readArtifact("retained-failure-payload", failure.payloadPath!).content.toString("utf8")
+    );
+    expect(payload.artifacts.available.length).toBeGreaterThan(0);
+    for (const artifactPath of payload.artifacts.available as string[]) {
+      expect(store.readArtifact("retained-failure-payload", artifactPath).artifact.status).toBe("available");
+    }
+    expect(store.listArtifacts("retained-failure-payload")
+      .filter((artifact) => artifact.kind === "command_log")
+      .every((artifact) => artifact.status === "missing")).toBe(true);
+    expect(store.getArtifact("retained-failure-payload", "failures/debug.log")?.status).toBe("missing");
+    store.close();
+  });
+
   test("records optional delivery failures without failing the pipeline", async () => {
     const repoRoot = temporaryRepo();
     const workflow = parseAgentflowWorkflowOrThrow(`
@@ -959,6 +1000,20 @@ notify:
       decision: "notification_failure"
     });
     database.close();
+    const failure = store.listFailures("required-gate-notification")[0]!;
+    const failurePath = failure.payloadPath;
+    expect(failure).toMatchObject({
+      stepId: "approve",
+      classification: "notification_failure",
+      payloadPath: expect.any(String)
+    });
+    expect(JSON.parse(
+      store.readArtifact("required-gate-notification", failurePath!).content.toString("utf8")
+    )).toMatchObject({
+      step_id: "approve",
+      step_type: "manual_gate",
+      classification: "notification_failure"
+    });
     store.close();
   });
 

@@ -10,6 +10,13 @@ export {
   openAgentflowRunState
 } from "./run_state";
 export {
+  AGENTFLOW_FAILURE_REDACTION_MARKER,
+  MAX_AGENTFLOW_FAILURE_ATTACHMENT_COUNT,
+  MAX_AGENTFLOW_FAILURE_ATTACHMENT_SCAN_BYTES,
+  MAX_AGENTFLOW_FAILURE_TOTAL_ATTACHMENT_BYTES,
+  persistAgentflowFailurePayload
+} from "./failure_payload";
+export {
   AgentflowWorkflowParseError,
   formatWorkflowParseIssues,
   parseAgentflowWorkflow,
@@ -98,6 +105,11 @@ export {
   applyAgentflowRetention,
   writeAgentflowFinalSummary
 } from "./retention";
+export type {
+  AgentflowFailurePayload,
+  PersistAgentflowFailurePayloadInput,
+  PersistAgentflowFailurePayloadResult
+} from "./failure_payload";
 export type {
   AgentflowWorkflow,
   AgentflowWorkflowParseFailure,

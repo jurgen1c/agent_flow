@@ -51,7 +51,12 @@ A durable file or structured output used as the contract between steps. Artifact
 
 ### Failure Payload
 
-A structured artifact that describes a failed step, including command, exit code, logs, classification, and remediation status.
+A structured JSON artifact that describes a failed executable step, including
+its stable failure and step IDs, step type, attempt, command and exit code when
+applicable, safe log and artifact references, classification, remediation
+status, and redaction metadata. The run-state failure index exposes the
+payload's declared `failures/*.json` path so recovery routing does not depend on
+session history.
 
 ### Policy
 

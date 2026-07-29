@@ -423,7 +423,25 @@ steps:
 
     expect(result).toMatchObject({ status: "paused", failedStep: "draft" });
     expect(result.message).toContain("no response for step draft");
-    expect(store.listArtifacts("missing-fixture").map((artifact) => artifact.declaredPath)).toEqual(["request.md"]);
+    expect(store.listArtifacts("missing-fixture")
+      .filter((artifact) => artifact.kind !== "failure_payload")
+      .map((artifact) => artifact.declaredPath)).toEqual(["request.md"]);
+    const failure = store.listFailures("missing-fixture")[0]!;
+    expect(failure.payloadPath).toMatch(/^failures\/.+\.json$/);
+    expect(JSON.parse(store.readArtifact("missing-fixture", failure.payloadPath!).content.toString("utf8")))
+      .toMatchObject({
+        id: failure.id,
+        step_id: "draft",
+        step_type: "session_request",
+        status: "failed",
+        attempt: 1,
+        exit_code: null,
+        command: null,
+        logs: { stdout: null, stderr: null },
+        classification: "session_request_failure",
+        remediation_status: null,
+        path: failure.payloadPath
+      });
     store.close();
   });
 
@@ -779,10 +797,17 @@ steps:
     const providers = createAgentflowSessionProviderRegistry().register("fixture", (request) => {
       externalIds.push(request.externalSessionId);
       if (request.externalSessionId === undefined) {
-        return { externalSessionId: "provider-session", outputs: { "first.md": "First", "second.md": "Second" } };
+        return {
+          externalSessionId: "provider-session",
+          outputs: { "first.md": "First", "second.md": "Second" },
+          metadata: { stage: "safe-first-attempt" }
+        };
       }
       request.externalSessionId = "mutated-session";
-      return { outputs: { "first.md": "First", "second.md": "Second" } };
+      return {
+        outputs: { "first.md": "First", "second.md": "Second" },
+        metadata: { api_token: "secret-from-second-attempt" }
+      };
     });
     const writeArtifact = store.writeArtifact.bind(store);
     let failedSecondOutput = false;
@@ -802,7 +827,20 @@ steps:
     expect(store.readArtifact("retry-session", "second.md").content.toString()).toBe("Second");
     const requestArtifact = store.listArtifacts("retry-session").find((artifact) => artifact.kind === "session_request")!;
     expect(JSON.parse(store.readArtifact("retry-session", requestArtifact.declaredPath).content.toString()))
-      .toMatchObject({ externalSessionId: "provider-session" });
+      .toMatchObject({
+        externalSessionId: "provider-session",
+        providerMetadata: { api_token: "secret-from-second-attempt" }
+      });
+    const failure = store.listFailures("retry-session")[0]!;
+    const failurePayload = JSON.parse(
+      store.readArtifact("retry-session", failure.payloadPath!).content.toString("utf8")
+    );
+    const requestSnapshotPath = (failurePayload.artifacts.available as string[])
+      .find((artifactPath) => artifactPath.endsWith(path.posix.basename(requestArtifact.declaredPath)));
+    expect(requestSnapshotPath).toMatch(/^failures\/.+\/attachments\//);
+    const requestSnapshot = store.readArtifact("retry-session", requestSnapshotPath!).content.toString("utf8");
+    expect(requestSnapshot).toContain("safe-first-attempt");
+    expect(requestSnapshot).not.toContain("secret-from-second-attempt");
     store.close();
   });
 

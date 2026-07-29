@@ -64,6 +64,7 @@ export interface AgentflowSessionRequestExecutionResult {
 }
 
 export interface ExecuteAgentflowSessionRequestOptions {
+  attempt?: number;
   beforePublish?: () => void;
   stopStatus?: () => AgentflowRunStopStatus | undefined;
 }
@@ -347,7 +348,12 @@ export async function executeAgentflowSessionRequest(
     overwrite: store.getArtifact(runId, requestPath) !== null,
     requiredRunStatus: "running",
     requiredArtifacts: inputs.map((input) => ({ path: input.path, checksum: input.checksum })),
-    metadata: { sessionId, provider, resume }
+    metadata: {
+      sessionId,
+      provider,
+      resume,
+      ...(options.attempt === undefined ? {} : { attempt: options.attempt })
+    }
   });
   const inputPathSet = new Set(inputPaths);
   const publicationOrder = [
@@ -371,7 +377,12 @@ export async function executeAgentflowSessionRequest(
       requiredArtifacts: inputs
         .filter((input) => !overwrittenInputs.has(input.path))
         .map((input) => ({ path: input.path, checksum: input.checksum })),
-      metadata: { sessionId, provider, requestArtifact: requestPath }
+      metadata: {
+        sessionId,
+        provider,
+        requestArtifact: requestPath,
+        ...(options.attempt === undefined ? {} : { attempt: options.attempt })
+      }
     };
     if (inputPathSet.has(outputPath)) overwrittenInputs.add(outputPath);
     return publication;
