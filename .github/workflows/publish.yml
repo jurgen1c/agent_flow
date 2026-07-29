@@ -12,6 +12,8 @@ jobs:
   publish:
     if: startsWith(github.event.release.tag_name, 'v')
     runs-on: ubuntu-latest
+    env:
+      NPM_TOKEN_CONFIGURED: ${{ secrets.NPM_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
@@ -25,6 +27,11 @@ jobs:
       - run: node scripts/verify-release.mjs
       - run: bun run ci
       - run: bun run verify:package
-      - run: npm publish --provenance --access public
+      - name: Publish with bootstrap token
+        if: env.NPM_TOKEN_CONFIGURED == 'true'
+        run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish with Trusted Publishing
+        if: env.NPM_TOKEN_CONFIGURED != 'true'
+        run: npm publish --provenance --access public
