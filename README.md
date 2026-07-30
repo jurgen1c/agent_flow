@@ -13,7 +13,7 @@ and records artifacts, failures, notifications, and retention outcomes.
 npm install @jurgen1c/agent-flow
 ```
 
-Node.js 25 or newer is required. Bun is used for development and testing.
+Node.js 25.9.0 or newer is required. Bun is used for development and testing.
 
 ## CLI
 

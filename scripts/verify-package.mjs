@@ -160,7 +160,7 @@ function run(command, args, cwd = repositoryRoot) {
     if (result.error) console.error(`${command} failed to start: ${result.error.message}`);
     process.stderr.write(result.stdout ?? "");
     process.stderr.write(result.stderr ?? "");
-    process.exit(result.status ?? 1);
+    process.exit(result.error ? 1 : result.status ?? 1);
   }
 
   return result.stdout.length > 0 ? result.stdout : result.stderr;
