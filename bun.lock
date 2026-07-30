@@ -41,7 +41,7 @@
 
     "@humanwhocodes/retry": ["@humanwhocodes/retry@0.4.3", "", {}, "sha512-bV0Tgo9K4hfPCek+aMAn81RppFKv2ySDQeMoSZuvTASywNTnVJCArCZE2FWqpvIatKu7VMRLWlR1EazvVhDyhQ=="],
 
-    "@jurgen1c/agent-core": ["@jurgen1c/agent-core@0.1.0", "", { "dependencies": { "is-path-inside": "^4.0.0", "yaml": "^2.9.0" } }, "sha512-3RgtljYD8PxKFwLhjgM0H6paYpAvw5Ji85ZFYA7QiASjCAp4jne3i7EWsrB3aaKZkJd38c5+AurT6h+Ev7zDTA=="],
+    "@jurgen1c/agent-core": ["@jurgen1c/agent-core@0.1.0", "", { "dependencies": { "is-path-inside": "^4.0.0", "yaml": "^2.9.0" } }, "sha512-036a6Ra+Yf3/CoVW5/1m/NJGgNJc7oGyDnYp/doN4dBNoNi39PAQpOAmsgu7e6LilBDsS9Q5brBdQT84HKPXDA=="],
 
     "@types/bun": ["@types/bun@1.3.14", "", { "dependencies": { "bun-types": "1.3.14" } }, "sha512-h1hFqFVcvAvD9j9K7ZW7vd82aSA+rTdznZa+5bwvCwqSB1jmmfLcbIWhOLx1/+boy/xmjgCs/OMUL8hRJSmnPw=="],
 
