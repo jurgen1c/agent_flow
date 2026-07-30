@@ -12,6 +12,7 @@ describe("standalone Agent Flow architecture", () => {
       name: string;
       bin?: Record<string, string>;
       dependencies?: Record<string, string>;
+      engines?: { node?: string };
       exports?: Record<string, unknown>;
     };
 
@@ -20,6 +21,7 @@ describe("standalone Agent Flow architecture", () => {
     expect(packageJson.dependencies).toEqual({
       "@jurgen1c/agent-core": "^0.1.0"
     });
+    expect(packageJson.engines?.node).toBe(">=25.9.0");
     expect(Object.keys(packageJson.exports ?? {}).sort()).toEqual([
       ".",
       "./cli",
