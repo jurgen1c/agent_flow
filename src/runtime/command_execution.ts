@@ -2366,12 +2366,38 @@ function remapRecoveryArtifactContent(
 ): Buffer {
   const mediaType = contentType.split(";", 1)[0]!.trim().toLowerCase();
   if (mediaType !== "application/json" && !mediaType.endsWith("+json")) return content;
+  const source = content.toString("utf8");
   try {
-    const value = JSON.parse(content.toString("utf8")) as AgentFlowRunStateValue;
-    return Buffer.from(`${JSON.stringify(remapRecoveryArtifactPaths(value, pathMap), null, 2)}\n`, "utf8");
+    JSON.parse(source);
   } catch {
     return content;
   }
+  let changed = false;
+  let rewritten = "";
+  let cursor = 0;
+  for (let index = 0; index < source.length; index += 1) {
+    if (source[index] !== "\"") continue;
+    let closing = index + 1;
+    for (; closing < source.length; closing += 1) {
+      if (source[closing] === "\\") {
+        closing += 1;
+        continue;
+      }
+      if (source[closing] === "\"") break;
+    }
+    const token = source.slice(index, closing + 1);
+    let next = closing + 1;
+    while (/\s/.test(source[next] ?? "")) next += 1;
+    const value = JSON.parse(token) as string;
+    const mapped = source[next] === ":" ? undefined : remappedRecoveryArtifactPath(value, pathMap);
+    if (mapped !== undefined && mapped !== value) {
+      rewritten += source.slice(cursor, index) + JSON.stringify(mapped);
+      cursor = closing + 1;
+      changed = true;
+    }
+    index = closing;
+  }
+  return changed ? Buffer.from(rewritten + source.slice(cursor), "utf8") : content;
 }
 
 function remapRecoveryArtifactPaths<T extends AgentFlowRunStateValue>(
@@ -2379,15 +2405,7 @@ function remapRecoveryArtifactPaths<T extends AgentFlowRunStateValue>(
   pathMap: Map<string, string>
 ): T {
   if (typeof value === "string") {
-    let mapped = pathMap.get(value);
-    if (mapped === undefined) {
-      try {
-        mapped = pathMap.get(normalizeAgentFlowArtifactPath(value));
-      } catch {
-        // Literal recovery input strings do not have to be artifact paths.
-      }
-    }
-    return (mapped ?? value) as T;
+    return (remappedRecoveryArtifactPath(value, pathMap) ?? value) as T;
   }
   if (Array.isArray(value)) {
     return value.map((entry) => remapRecoveryArtifactPaths(entry, pathMap)) as T;
@@ -2399,6 +2417,17 @@ function remapRecoveryArtifactPaths<T extends AgentFlowRunStateValue>(
     ])) as T;
   }
   return value;
+}
+
+function remappedRecoveryArtifactPath(value: string, pathMap: Map<string, string>): string | undefined {
+  const direct = pathMap.get(value);
+  if (direct !== undefined) return direct;
+  try {
+    return pathMap.get(normalizeAgentFlowArtifactPath(value));
+  } catch {
+    // Literal recovery input strings do not have to be artifact paths.
+    return undefined;
+  }
 }
 
 function collectRecoveryFailureArtifactPaths(

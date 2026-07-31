@@ -866,15 +866,15 @@ steps:
       path: requestPath,
       kind: "input",
       contentType: "application/problem+json; charset=utf-8",
-      content: JSON.stringify({ path: inputAlias })
+      content: `{"count":9007199254740993,"path":${JSON.stringify(inputAlias)}}`
     });
     let calls = 0;
     const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => {
       calls += 1;
       expect(request.inputs[0]?.path).toMatch(/^recovery-inputs\//);
-      expect(JSON.parse(Buffer.from(request.inputs[0]!.content).toString())).toEqual({
-        path: request.inputs[0]!.path
-      });
+      expect(Buffer.from(request.inputs[0]!.content).toString()).toBe(
+        `{"count":9007199254740993,"path":${JSON.stringify(request.inputs[0]!.path)}}`
+      );
       return { outputs: { "repaired.txt": "repaired" } };
     });
 
