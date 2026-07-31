@@ -230,6 +230,11 @@ Recovery routes declare exactly one static target:
 - `route_to.workflow` names a workflow registered with
   `AgentFlowWorkflowRegistry`. The runtime creates a linked child run, copies
   referenced parent artifacts into that run, and handles its `result` status.
+  Copied failure artifacts and inputs that overlap child runtime-managed paths
+  are remapped beneath `recovery-inputs/`; the persisted child inputs and JSON
+  artifact references contain the remapped paths. Other artifacts retain their
+  declared path so static child steps can consume them. Copied artifacts carry
+  explicit `recovery_input` provenance, independent of authored step IDs.
   When the child returns `remediated`, its written, declared step outputs are
   atomically promoted into the parent run before child retention and the parent
   outcome handler execute; existing parent artifacts at those paths are

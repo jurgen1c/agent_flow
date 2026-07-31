@@ -327,7 +327,8 @@ steps:
       recoveryOfRunId: "parent-run",
       output: { resultStatus: "remediated", returnTo: "check" }
     });
-    expect(store.getArtifact(recoveryRun!.id, store.listFailures("parent-run")[0]!.payloadPath!)).not.toBeNull();
+    expect(recoveryRun!.inputs.failure_payload).toEqual(expect.stringMatching(/^recovery-inputs\//));
+    expect(store.getArtifact(recoveryRun!.id, recoveryRun!.inputs.failure_payload as string)).not.toBeNull();
     expect(store.listEvents("parent-run").map((event) => event.type)).toEqual(expect.arrayContaining([
       "recovery.routed",
       "recovery.completed"
@@ -639,6 +640,197 @@ steps:
     expect(store.readArtifact("skipped-artifact-parent", "source.txt").content.toString()).toBe("broken\n");
     expect(store.listEvents("skipped-artifact-parent").map((event) => event.type))
       .not.toContain("recovery.outputs.promoted");
+    store.close();
+  });
+
+  test("namespaces copied failure artifacts away from nested command log paths", async () => {
+    const root = temporaryRepo();
+    const collidingLogPath = `logs/check-${createHash("sha256").update("check").digest("hex").slice(0, 8)}/attempt-1/stdout.log`;
+    const parent = parseAgentFlowWorkflowOrThrow(`name: colliding-log-parent
+version: 1
+style: recovery_pipeline
+maturity: experimental
+inputs: { log_path: { required: true } }
+steps:
+  - id: check
+    type: command
+    command: printf diagnostic; exit 1
+    on_failure:
+      route_to:
+        workflow: colliding-log-child
+        inputs:
+          diagnostic: "{{ inputs.log_path }}"
+          failure_payload: "{{ failure.path }}"
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+    const child = parseAgentFlowWorkflowOrThrow(`name: colliding-log-child
+version: 1
+style: recovery_pipeline
+maturity: experimental
+inputs:
+  diagnostic: { required: true }
+  failure_payload: { required: true }
+steps:
+  - { id: check, type: command, command: printf repaired }
+  - { id: done, type: result, status: remediated }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, {
+      id: "colliding-log-parent",
+      workflow: parent,
+      inputs: { log_path: collidingLogPath }
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      "colliding-log-parent",
+      parent,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      createAgentFlowWorkflowRegistry().register("colliding-log-child", child)
+    );
+
+    expect(result.status).toBe("completed");
+    const failure = store.listFailures("colliding-log-parent")[0]!;
+    const recoveryRunId = (failure.payload as { recovery: { recoveryRunId: string } }).recovery.recoveryRunId;
+    const recoveryRun = store.getRun(recoveryRunId)!;
+    const failureInputPath = recoveryRun.inputs.failure_payload as string;
+    expect(failureInputPath).toMatch(/^recovery-inputs\//);
+    const copiedFailure = JSON.parse(store.readArtifact(recoveryRunId, failureInputPath).content.toString()) as {
+      logs: { stdout: string };
+    };
+    expect(copiedFailure.logs.stdout).toMatch(/^recovery-inputs\//);
+    const copiedLog = store.getArtifact(recoveryRunId, copiedFailure.logs.stdout)!;
+    expect(copiedLog.kind).toBe("recovery_input");
+    expect(recoveryRun.inputs.diagnostic).toMatch(/^recovery-inputs\//);
+    expect(store.getArtifact(recoveryRunId, recoveryRun.inputs.diagnostic as string)?.metadata.sourcePath)
+      .toBe(collidingLogPath);
+    expect(store.getArtifact(recoveryRunId, collidingLogPath)?.kind).toBe("command_log");
+    store.close();
+  });
+
+  test("promotes outputs authored by a nested step named recovery-input", async () => {
+    const root = temporaryRepo();
+    const parent = parseAgentFlowWorkflowOrThrow(`name: recovery-input-step-parent
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - id: check
+    type: command
+    command: exit 1
+    on_failure:
+      route_to: { workflow: recovery-input-step-child }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+    const child = parseAgentFlowWorkflowOrThrow(`name: recovery-input-step-child
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - id: recovery-input
+    type: command
+    command: printf repaired > repaired.txt
+    outputs: [repaired.txt]
+  - { id: done, type: result, status: remediated }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "recovery-input-step-parent", workflow: parent });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      "recovery-input-step-parent",
+      parent,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      createAgentFlowWorkflowRegistry().register("recovery-input-step-child", child)
+    );
+
+    expect(result.status).toBe("completed");
+    expect(store.readArtifact("recovery-input-step-parent", "repaired.txt").content.toString()).toBe("repaired");
+    store.close();
+  });
+
+  test("remaps copied JSON inputs away from nested session metadata paths", async () => {
+    const root = temporaryRepo();
+    fs.writeFileSync(path.join(root, "fix.md"), "Fix the failure.\n");
+    const requestPath = `session-requests/fix-${createHash("sha256").update("fix").digest("hex").slice(0, 12)}.json`;
+    const parent = parseAgentFlowWorkflowOrThrow(`name: session-metadata-collision-parent
+version: 1
+style: recovery_pipeline
+maturity: experimental
+inputs: { source: { required: true } }
+steps:
+  - id: check
+    type: command
+    command: exit 1
+    on_failure:
+      route_to:
+        workflow: session-metadata-collision-child
+        inputs: { source: "{{ inputs.source }}" }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+    const child = parseAgentFlowWorkflowOrThrow(`name: session-metadata-collision-child
+version: 1
+style: recovery_pipeline
+maturity: experimental
+inputs: { source: { required: true } }
+sessions: { fixer: { provider: fixture } }
+steps:
+  - id: fix
+    type: session_request
+    session: fixer
+    prompt: fix.md
+    inputs: ["{{ inputs.source }}"]
+    outputs: [repaired.txt]
+  - { id: done, type: result, status: remediated }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, {
+      id: "session-metadata-collision-parent",
+      workflow: parent,
+      inputs: { source: requestPath }
+    });
+    store.writeArtifact({
+      id: "colliding-session-input",
+      runId: "session-metadata-collision-parent",
+      path: requestPath,
+      kind: "input",
+      contentType: "application/problem+json; charset=utf-8",
+      content: JSON.stringify({ path: requestPath })
+    });
+    let calls = 0;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => {
+      calls += 1;
+      expect(request.inputs[0]?.path).toMatch(/^recovery-inputs\//);
+      expect(JSON.parse(Buffer.from(request.inputs[0]!.content).toString())).toEqual({
+        path: request.inputs[0]!.path
+      });
+      return { outputs: { "repaired.txt": "repaired" } };
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      "session-metadata-collision-parent",
+      parent,
+      undefined,
+      providers,
+      undefined,
+      undefined,
+      createAgentFlowWorkflowRegistry().register("session-metadata-collision-child", child)
+    );
+
+    expect(result.status).toBe("completed");
+    expect(calls).toBe(1);
+    expect(store.readArtifact("session-metadata-collision-parent", "repaired.txt").content.toString())
+      .toBe("repaired");
     store.close();
   });
 

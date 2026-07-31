@@ -1746,7 +1746,16 @@ async function executeNestedRecoveryWorkflow(
   const parent = store.getRun(parentRunId)!;
   assertRecoveryWorkflowNotInLineage(store, parentRunId, nestedWorkflow);
   const failure = store.listFailures(parentRunId).find((entry) => entry.id === failureId)!;
-  const inputs = resolveRecoveryInputs(route.inputs, parent.inputs, stepId, failure.payloadPath);
+  const resolvedInputs = resolveRecoveryInputs(route.inputs, parent.inputs, stepId, failure.payloadPath);
+  const preparedInputs = prepareNestedRecoveryInputs(
+    store,
+    parentRunId,
+    failureId,
+    resolvedInputs,
+    failure.payloadPath,
+    nestedWorkflow
+  );
+  const inputs = preparedInputs.inputs;
   assertNestedRecoveryRequiredInputs(nestedWorkflow, inputs);
   const recoveryRunId = `${parentRunId}:recovery:${safeId(stepId)}:attempt-${attempt}`;
   const existing = store.getRun(recoveryRunId);
@@ -1783,7 +1792,7 @@ async function executeNestedRecoveryWorkflow(
       recoveryOfRunId: parentRunId
     });
     if (result.changed) {
-      copyRecoveryInputArtifacts(store, parentRunId, recoveryRunId, inputs, failure.payloadPath);
+      copyRecoveryInputArtifacts(store, parentRunId, recoveryRunId, preparedInputs);
     }
     return result;
   });
@@ -1886,7 +1895,7 @@ function promoteNestedRecoveryOutputs(
     if (existing?.metadata.recoveryRunId === recoveryRunId) continue;
     const childArtifact = store.getArtifact(recoveryRunId, declaredPath);
     if (childArtifact === null || childArtifact.writtenAt === null) continue;
-    if (childArtifact.kind === "recovery_input" || childArtifact.producerStepId === "recovery-input") continue;
+    if (childArtifact.kind === "recovery_input") continue;
     const content = store.readArtifact(recoveryRunId, declaredPath).content;
     const parentPublication = parentOutputPublication(parentStep, declaredPath);
     writes.push({
@@ -2256,31 +2265,130 @@ function persistRecoverySessionInputs(
   return artifactPath;
 }
 
+interface PreparedNestedRecoveryInputs {
+  inputs: Record<string, AgentFlowRunStateValue>;
+  copies: Array<{ sourcePath: string; targetPath: string }>;
+  pathMap: Map<string, string>;
+}
+
+function prepareNestedRecoveryInputs(
+  store: AgentFlowRunStateStore,
+  parentRunId: string,
+  failureId: string,
+  inputs: Record<string, AgentFlowRunStateValue>,
+  failurePath: string | null,
+  workflow: AgentFlowWorkflow
+): PreparedNestedRecoveryInputs {
+  const paths = new Set<string>();
+  collectRecoveryArtifactPaths(store, parentRunId, inputs, paths);
+  const failurePaths = new Set<string>();
+  if (failurePath !== null && recoveryValueReferencesPath(inputs, failurePath)) {
+    collectRecoveryFailureArtifactPaths(store, parentRunId, failurePath, failurePaths);
+    failurePaths.forEach((artifactPath) => paths.add(artifactPath));
+  }
+  const reservedOutputs = new Set(nestedWorkflowOutputPaths(workflow.steps));
+  const commandLogPrefixes = nestedWorkflowCommandLogPrefixes(workflow.steps);
+  const assignedTargets = new Set<string>();
+  const pathMap = new Map<string, string>();
+  for (const sourcePath of [...paths].sort()) {
+    let targetPath = sourcePath;
+    if (failurePaths.has(sourcePath)
+        || nestedWorkflowRuntimeArtifactCollision(workflow, sourcePath, commandLogPrefixes)) {
+      const digest = createHash("sha256").update(`${failureId}\0${sourcePath}`).digest("hex");
+      const basename = sourcePath.split("/").at(-1) ?? "input";
+      let suffix = 0;
+      do {
+        targetPath = `recovery-inputs/${digest}${suffix === 0 ? "" : `-${suffix}`}/${basename}`;
+        suffix += 1;
+      } while (reservedOutputs.has(targetPath) || assignedTargets.has(targetPath) || paths.has(targetPath));
+    }
+    pathMap.set(sourcePath, targetPath);
+    assignedTargets.add(targetPath);
+  }
+  return {
+    inputs: remapRecoveryArtifactPaths(inputs, pathMap),
+    copies: [...pathMap].map(([sourcePath, targetPath]) => ({ sourcePath, targetPath })),
+    pathMap
+  };
+}
+
+function nestedWorkflowCommandLogPrefixes(steps: AgentFlowWorkflowStep[]): string[] {
+  const prefixes: string[] = [];
+  const visit = (step: AgentFlowWorkflowStep): void => {
+    if (normalizedTarget(step.type) === "command" && typeof step.id === "string") {
+      prefixes.push(`logs/${safeId(step.id.trim())}/`);
+    }
+    for (const field of ["body", "steps", "branches"]) {
+      const nested = step[field];
+      if (Array.isArray(nested)) nested.filter(isWorkflowStep).forEach(visit);
+    }
+  };
+  steps.forEach(visit);
+  return prefixes;
+}
+
+function nestedWorkflowRuntimeArtifactCollision(
+  workflow: AgentFlowWorkflow,
+  sourcePath: string,
+  commandLogPrefixes: string[]
+): boolean {
+  if (["failures/", "recoveries/", "session-requests/", "mcp-calls/"]
+    .some((prefix) => sourcePath.startsWith(prefix))) return true;
+  if (workflow.style === "pipeline" && sourcePath === AGENT_FLOW_FINAL_SUMMARY_PATH) return true;
+  return commandLogPrefixes.some((prefix) => sourcePath.startsWith(prefix));
+}
+
 function copyRecoveryInputArtifacts(
   store: AgentFlowRunStateStore,
   parentRunId: string,
   recoveryRunId: string,
-  inputs: Record<string, AgentFlowRunStateValue>,
-  failurePath: string | null
+  prepared: PreparedNestedRecoveryInputs
 ): void {
-  const paths = new Set<string>();
-  collectRecoveryArtifactPaths(store, parentRunId, inputs, paths);
-  if (failurePath !== null && recoveryValueReferencesPath(inputs, failurePath)) {
-    collectRecoveryFailureArtifactPaths(store, parentRunId, failurePath, paths);
-  }
-  for (const artifactPath of [...paths].sort()) {
-    const source = store.readArtifact(parentRunId, artifactPath);
+  for (const { sourcePath, targetPath } of prepared.copies) {
+    const source = store.readArtifact(parentRunId, sourcePath);
+    const content = remapRecoveryArtifactContent(source.content, source.artifact.contentType, prepared.pathMap);
     store.writeArtifact({
-      id: `recovery-input:${createHash("sha256").update(artifactPath).digest("hex")}`,
+      id: `recovery-input:${createHash("sha256").update(targetPath).digest("hex")}`,
       runId: recoveryRunId,
-      stepId: "recovery-input",
-      path: artifactPath,
+      path: targetPath,
       kind: "recovery_input",
       contentType: source.artifact.contentType,
-      content: source.content,
-      metadata: { parentRunId, sourceArtifactId: source.artifact.id }
+      content,
+      metadata: { parentRunId, sourceArtifactId: source.artifact.id, sourcePath }
     });
   }
+}
+
+function remapRecoveryArtifactContent(
+  content: Buffer,
+  contentType: string,
+  pathMap: Map<string, string>
+): Buffer {
+  const mediaType = contentType.split(";", 1)[0]!.trim().toLowerCase();
+  if (mediaType !== "application/json" && !mediaType.endsWith("+json")) return content;
+  try {
+    const value = JSON.parse(content.toString("utf8")) as AgentFlowRunStateValue;
+    return Buffer.from(`${JSON.stringify(remapRecoveryArtifactPaths(value, pathMap), null, 2)}\n`, "utf8");
+  } catch {
+    return content;
+  }
+}
+
+function remapRecoveryArtifactPaths<T extends AgentFlowRunStateValue>(
+  value: T,
+  pathMap: Map<string, string>
+): T {
+  if (typeof value === "string") return (pathMap.get(value) ?? value) as T;
+  if (Array.isArray(value)) {
+    return value.map((entry) => remapRecoveryArtifactPaths(entry, pathMap)) as T;
+  }
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, entry]) => [
+      key,
+      remapRecoveryArtifactPaths(entry, pathMap)
+    ])) as T;
+  }
+  return value;
 }
 
 function collectRecoveryFailureArtifactPaths(
