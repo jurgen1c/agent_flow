@@ -1803,6 +1803,14 @@ async function executeNestedRecoveryWorkflow(
     }
   };
   propagateParentStop();
+  const childBeforeStart = store.getRun(recoveryRunId);
+  if (childBeforeStart !== null && childBeforeStart.status !== "pending") {
+    return {
+      status: "unresolved",
+      runId: recoveryRunId,
+      message: `Recovery run ${recoveryRunId} was ${childBeforeStart.status} before execution started.`
+    };
+  }
   const stopMonitor = setInterval(propagateParentStop, 25);
   let result: AgentFlowCommandPipelineResult;
   try {
