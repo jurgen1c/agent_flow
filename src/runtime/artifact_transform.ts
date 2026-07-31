@@ -139,7 +139,8 @@ export function executeAgentFlowArtifactTransform(
     kind: "artifact_transform",
     contentType: output.contentType,
     content: output.content,
-    overwrite: step.overwrite === true,
+    overwrite: step.overwrite === true || (options.attempt !== undefined && options.attempt > 1
+      && existingOutput?.producerStepId === stepId),
     requiredRunStatus: "running",
     requiredArtifacts: [{ path: inputPath, checksum: input.artifact.checksum! }],
     metadata: {

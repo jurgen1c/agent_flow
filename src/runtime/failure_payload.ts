@@ -15,6 +15,10 @@ export const MAX_AGENT_FLOW_FAILURE_TOTAL_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 const SECRET_KEY_PATTERN = /^(?:auth|(?:proxy_?)?authorization|(?:set_?)?cookie|pgpassword|mysql_?pwd|(?:[a-z0-9]+_)*(?:api_?(?:key|token)|access_?token|auth_?token|client_?secret|credential(?:s)?|key|passphrase|private_?key|password|passwd|secret|token)(?:_[a-z0-9]+)*)$/;
 const SHELL_WORD_PATTERN = String.raw`(?:(?:\\[^\r\n])|'[^'\r\n]*'|"(?:\\[^\r\n]|[^"\\\r\n])*"|[^\s"'\\;&|()<>])+`;
 
+export function redactAgentFlowSensitiveText(value: string): string {
+  return redactSensitiveText(value).value;
+}
+
 export interface AgentFlowFailurePayload {
   id: string;
   step_id: string;

@@ -27,6 +27,8 @@ export interface CreateAgentFlowLifecycleRunInput {
   id: string;
   workflow: AgentFlowWorkflow;
   inputs?: Record<string, AgentFlowRunStateValue>;
+  parentRunId?: string;
+  recoveryOfRunId?: string;
 }
 
 export function createAgentFlowLifecycleRun(
@@ -44,7 +46,13 @@ export function createAgentFlowLifecycleRun(
   const existing = store.getRun(input.id);
 
   if (existing !== null) {
-    if (!matchesWorkflow(existing, input.workflow, input.inputs ?? {})) {
+    if (!matchesWorkflow(
+      existing,
+      input.workflow,
+      input.inputs ?? {},
+      input.parentRunId ?? null,
+      input.recoveryOfRunId ?? null
+    )) {
       throw new AgentFlowRunStateError(
         `Agent Flow run ${input.id} already exists for ${existing.workflowName} version ${existing.workflowVersion}. Choose a different run ID.`,
         "AGENT_FLOW_RUN_COLLISION"
@@ -69,13 +77,21 @@ export function createAgentFlowLifecycleRun(
         maturity: input.workflow.maturity
       },
       context: { workflow: input.workflow as unknown as AgentFlowRunStateValue },
-      inputs: input.inputs
+      inputs: input.inputs,
+      ...(input.parentRunId === undefined ? {} : { parentRunId: input.parentRunId }),
+      ...(input.recoveryOfRunId === undefined ? {} : { recoveryOfRunId: input.recoveryOfRunId })
     }, { type: "run.created", payload: { status: "pending" } });
     return { changed: true, run };
   } catch (error) {
     if (error instanceof AgentFlowRunStateError && error.code === "AGENT_FLOW_RUN_COLLISION") {
       const raced = store.getRun(input.id);
-      if (raced !== null && raced.status === "pending" && matchesWorkflow(raced, input.workflow, input.inputs ?? {})) {
+      if (raced !== null && raced.status === "pending" && matchesWorkflow(
+        raced,
+        input.workflow,
+        input.inputs ?? {},
+        input.parentRunId ?? null,
+        input.recoveryOfRunId ?? null
+      )) {
         return { changed: false, run: raced };
       }
     }
@@ -440,12 +456,16 @@ function transitionRule(
 function matchesWorkflow(
   run: AgentFlowRunRecord,
   workflow: AgentFlowWorkflow,
-  inputs: Record<string, AgentFlowRunStateValue>
+  inputs: Record<string, AgentFlowRunStateValue>,
+  parentRunId: string | null,
+  recoveryOfRunId: string | null
 ): boolean {
   return run.workflowName === workflow.name
     && run.workflowVersion === workflow.version
     && run.workflowStyle === workflow.style
     && run.workflowMaturity === workflow.maturity
+    && run.parentRunId === parentRunId
+    && run.recoveryOfRunId === recoveryOfRunId
     && isDeepStrictEqual(run.context.workflow, workflow)
     && isDeepStrictEqual(run.inputs, inputs);
 }

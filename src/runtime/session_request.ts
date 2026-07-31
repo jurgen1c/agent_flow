@@ -201,7 +201,7 @@ export async function executeAgentFlowSessionRequest(
   const resume = session.resume === true;
   const previous = store.getSession(runId, sessionId);
   const priorExternalSessionId = resume ? previous?.externalSessionId ?? undefined : undefined;
-  const prompt = readPrompt(store.repoRoot, requiredName(step.prompt, `Session request ${stepId} prompt`));
+  const prompt = readAgentFlowSessionPrompt(store.repoRoot, requiredName(step.prompt, `Session request ${stepId} prompt`));
   const inputPaths = normalizedArtifactPaths(
     resolveSessionInputPaths(step.inputs, run.inputs, stepId),
     `Session request ${stepId} inputs`
@@ -216,7 +216,7 @@ export async function executeAgentFlowSessionRequest(
   const inputs: AgentFlowSessionRequestArtifact[] = [];
   let totalInputBytes = 0;
   for (const inputPath of inputPaths) {
-    const input = readInput(store, runId, stepId, inputPath);
+    const input = readAgentFlowSessionInput(store, runId, stepId, inputPath);
     totalInputBytes += input.content.byteLength;
     if (totalInputBytes > MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES) {
       throw new AgentFlowSessionRequestError(
@@ -253,7 +253,7 @@ export async function executeAgentFlowSessionRequest(
     state: { resume, lastStepId: stepId }
   });
   try {
-    reserveModelCallBudgets(store, runId, workflow, stepId, sessionId, provider);
+    reserveAgentFlowSessionModelCallBudgets(store, runId, workflow, stepId, sessionId, provider);
   } catch (error) {
     store.upsertSession({
       id: sessionId,
@@ -270,7 +270,7 @@ export async function executeAgentFlowSessionRequest(
   let response: AgentFlowSessionProviderResponse;
   let effectiveExternalSessionId = priorExternalSessionId;
   try {
-    response = await invokeProvider(adapter, request, options.stopStatus);
+    response = await invokeAgentFlowSessionProvider(adapter, request, options.stopStatus);
   } catch (error) {
     const stopped = error instanceof AgentFlowSessionRequestInterruptedError
       ? error.status
@@ -322,8 +322,8 @@ export async function executeAgentFlowSessionRequest(
     externalSessionId: externalSessionId ?? null,
     state: { resume, lastStepId: stepId, providerResponded: true }
   });
-  const outputs = validateResponse(stepId, outputPaths, response);
-  const providerMetadata = validateProviderMetadata(stepId, response.metadata);
+  const outputs = validateAgentFlowSessionProviderResponse(stepId, outputPaths, response);
+  const providerMetadata = validateAgentFlowSessionProviderMetadata(stepId, response.metadata);
   options.beforePublish?.();
 
   const requestMetadata = {
@@ -434,7 +434,7 @@ export async function executeAgentFlowSessionRequest(
   }
 }
 
-async function invokeProvider(
+export async function invokeAgentFlowSessionProvider(
   adapter: AgentFlowSessionProviderAdapter,
   request: AgentFlowSessionProviderRequest,
   stopStatus: ExecuteAgentFlowSessionRequestOptions["stopStatus"]
@@ -461,7 +461,7 @@ async function invokeProvider(
   }
 }
 
-function reserveModelCallBudgets(
+export function reserveAgentFlowSessionModelCallBudgets(
   store: AgentFlowRunStateStore,
   runId: string,
   workflow: AgentFlowWorkflow,
@@ -493,7 +493,10 @@ function reserveModelCallBudgets(
   }));
 }
 
-function readPrompt(repoRoot: string, declaredPath: string): AgentFlowSessionProviderRequest["prompt"] {
+export function readAgentFlowSessionPrompt(
+  repoRoot: string,
+  declaredPath: string
+): AgentFlowSessionProviderRequest["prompt"] {
   const resolved = resolveRepoFile(repoRoot, declaredPath);
   let descriptor: number;
   try {
@@ -544,7 +547,7 @@ function promptTooLarge(declaredPath: string): AgentFlowSessionRequestError {
   );
 }
 
-function readInput(
+export function readAgentFlowSessionInput(
   store: AgentFlowRunStateStore,
   runId: string,
   stepId: string,
@@ -570,7 +573,7 @@ function readInput(
   }
 }
 
-function validateResponse(
+export function validateAgentFlowSessionProviderResponse(
   stepId: string,
   outputPaths: string[],
   response: AgentFlowSessionProviderResponse
@@ -827,7 +830,7 @@ function stableJson(value: unknown): string {
   return JSON.stringify(sortJson(value));
 }
 
-function validateProviderMetadata(
+export function validateAgentFlowSessionProviderMetadata(
   stepId: string,
   metadata: Record<string, unknown> | undefined
 ): Record<string, AgentFlowRunStateValue> | undefined {

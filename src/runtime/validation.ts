@@ -77,6 +77,7 @@ const STEP_TYPES = new Set([
 
 const TERMINAL_TARGETS = new Set(["cancel", "complete", "completed", "continue", "fail", "ignore", "pause"]);
 const TARGET_FIELDS = new Set(["else", "goto", "on_approve", "on_cancel", "on_reject", "return_to", "then"]);
+const RECOVERY_ROUTE_STEP_TYPES = new Set(["artifact_transform", "command", "mcp_call", "session_request"]);
 const SECRET_PATH = /(^|[/._-])(\.env|credentials|id_rsa|id_ed25519|private[_-]?key|secrets?)([/._-]|$)/i;
 const SHELL_EXECUTABLES = new Set(["bash", "dash", "ksh", "sh", "zsh"]);
 const SHELL_ANALYSIS_BUDGET = 65_536;
@@ -102,26 +103,33 @@ const STEP_REQUIREMENTS: Readonly<Record<string, ReadonlyArray<readonly [string,
 export function validateAgentFlowWorkflow(workflow: AgentFlowWorkflow): AgentFlowWorkflowValidationResult {
   const errors: AgentFlowWorkflowIssue[] = [];
   const contexts = collectStepContexts(workflow.steps);
-  const ids = new Set(contexts.flatMap((context) => context.id === undefined ? [] : [context.id]));
+  const directBranchContexts = collectDirectParallelBranchContexts(workflow.steps);
+  const runtimeContexts = [...contexts, ...directBranchContexts];
+  const executableContexts = [
+    ...contexts,
+    ...directBranchContexts.filter((context) => context.type !== undefined)
+  ];
+  const ids = new Set(executableContexts.flatMap((context) => context.id === undefined ? [] : [context.id]));
 
   validateSessionDefinitions(workflow, errors);
   errors.push(...validateAgentFlowPolicyPrimitives(workflow));
   errors.push(...validateAgentFlowNotifications(workflow));
-  validateStepShapes(contexts, errors);
+  validateStepShapes(executableContexts, errors);
+  validateRecoveryRoutes(workflow, runtimeContexts, errors);
   validateNestedStepShapes(workflow.steps, errors);
   validateDynamicReferences(workflow, errors);
-  validateTargetShapes(contexts, errors);
-  validateTargets(contexts, ids, errors);
-  validateCommands(workflow, contexts, errors);
-  validateSessionReferences(workflow, contexts, errors);
-  validateControlStepShapes(workflow, contexts, errors);
-  validateConditionExpressions(workflow, contexts, errors);
-  validateLoopBounds(contexts, errors);
-  validateControlFlowCycles(workflow, contexts, errors);
+  validateTargetShapes(executableContexts, errors);
+  validateTargets(executableContexts, ids, errors);
+  validateCommands(workflow, executableContexts, errors);
+  validateSessionReferences(workflow, runtimeContexts, errors);
+  validateControlStepShapes(workflow, executableContexts, errors);
+  validateConditionExpressions(workflow, executableContexts, errors);
+  validateLoopBounds(executableContexts, errors);
+  validateControlFlowCycles(workflow, executableContexts, errors);
   validateInputReferences(workflow, contexts, errors);
-  validateArtifactPaths(contexts, errors);
+  validateArtifactPaths(executableContexts, errors);
   validateArtifactOutputs(workflow, contexts, errors);
-  validateApprovals(contexts, errors);
+  validateApprovals(executableContexts, errors);
   validateParallelWriters(workflow, contexts, errors);
   validateCollaborativeReviewBounds(workflow, contexts, errors);
 
@@ -549,8 +557,237 @@ function validateRequiredStepFields(context: StepContext, errors: AgentFlowWorkf
 function unsupportedTransformFailureTarget(onFailure: AgentFlowYamlMapping): string | undefined {
   const then = nonEmptyString(onFailure.then);
   if (then !== undefined && !["continue", "ignore", "fail", "pause"].includes(then)) return "then";
-  return ["goto", "route_to", "on_remediated", "on_unresolved", "return_to"]
+  return ["goto", "return_to"]
     .find((field) => onFailure[field] !== undefined);
+}
+
+function validateRecoveryRoutes(
+  workflow: AgentFlowWorkflow,
+  contexts: StepContext[],
+  errors: AgentFlowWorkflowIssue[]
+): void {
+  const resultStatuses = new Set([
+    "cancelled", "completed", "continue", "failed", "paused", "remediated", "unresolved"
+  ]);
+  for (const context of contexts) {
+    if (context.type === "result") {
+      const status = nonEmptyString(context.step.status);
+      if (status !== undefined && !resultStatuses.has(status)) {
+        addStepIssue(
+          errors,
+          context,
+          "workflow.result.status.unsupported",
+          "status",
+          `Result status must be one of: ${[...resultStatuses].join(", ")}.`
+        );
+      }
+    }
+
+    const onFailure = isRecord(context.step.on_failure) ? context.step.on_failure : undefined;
+    const orphanHandler = onFailure?.route_to === undefined
+      ? ["on_remediated", "on_unresolved"].find((field) => isRecord(onFailure?.[field]))
+      : undefined;
+    if (orphanHandler !== undefined) {
+      addStepIssue(
+        errors,
+        context,
+        "workflow.recovery.route.required",
+        `on_failure.${orphanHandler}`,
+        `Recovery handler ${orphanHandler} requires on_failure.route_to.`
+      );
+    }
+    if (onFailure?.route_to === undefined) continue;
+    if (!RECOVERY_ROUTE_STEP_TYPES.has(context.type ?? "")) {
+      addStepIssue(
+        errors,
+        context,
+        "workflow.recovery.step.unsupported",
+        "on_failure.route_to",
+        `Recovery routes are not supported for ${context.type ?? "unknown"} steps.`
+      );
+    }
+    const legacyTarget = ["then", "goto"].find((field) => onFailure[field] !== undefined);
+    if (legacyTarget !== undefined) {
+      addStepIssue(
+        errors,
+        context,
+        "workflow.recovery.route.ambiguous",
+        `on_failure.${legacyTarget}`,
+        `Recovery route_to cannot be combined with legacy on_failure.${legacyTarget}; use on_remediated and on_unresolved handlers.`
+      );
+    }
+    if (workflow.style !== "recovery_pipeline") {
+      addStepIssue(
+        errors,
+        context,
+        "workflow.recovery.style.required",
+        "on_failure.route_to",
+        "Recovery routes require workflow style recovery_pipeline."
+      );
+    }
+    if (!isRecord(onFailure.route_to)) {
+      addStepIssue(
+        errors,
+        context,
+        "workflow.recovery.route.shape",
+        "on_failure.route_to",
+        "Recovery route_to must be a mapping."
+      );
+      continue;
+    }
+    const route = onFailure.route_to;
+    const session = nonEmptyString(route.session);
+    const nestedWorkflow = nonEmptyString(route.workflow);
+    if ((session === undefined) === (nestedWorkflow === undefined)) {
+      addStepIssue(
+        errors,
+        context,
+        "workflow.recovery.route.target",
+        "on_failure.route_to",
+        "Recovery route_to must declare exactly one non-empty session or workflow target."
+      );
+    }
+    for (const [field, value] of [["session", session], ["workflow", nestedWorkflow]] as const) {
+      if (value !== undefined && isDynamicReference(value)) {
+        addStepIssue(
+          errors,
+          context,
+          "workflow.recovery.route.dynamic",
+          `on_failure.route_to.${field}`,
+          `Recovery ${field} targets must be static so adapters and nested workflows are inspectable.`
+        );
+      }
+    }
+    if (session !== undefined) {
+      const prompt = nonEmptyString(route.prompt);
+      if (prompt === undefined) {
+        addStepIssue(
+          errors,
+          context,
+          "workflow.recovery.session.prompt.required",
+          "on_failure.route_to.prompt",
+          "Session recovery routes require a non-empty prompt path."
+        );
+      } else {
+        const normalizedPrompt = path.posix.normalize(prompt);
+        if (prompt.includes("{{") || prompt.includes("}}") || prompt.includes("\\")
+            || path.posix.isAbsolute(prompt) || path.win32.isAbsolute(prompt)
+            || normalizedPrompt !== prompt || normalizedPrompt === "." || normalizedPrompt === ".."
+            || normalizedPrompt.startsWith("../") || prompt.endsWith("/")) {
+          addStepIssue(
+            errors,
+            context,
+            "workflow.recovery.session.prompt.invalid",
+            "on_failure.route_to.prompt",
+            `Recovery session prompt "${prompt}" must be a normalized static repo-relative file path.`
+          );
+        }
+      }
+    }
+    if (route.inputs !== undefined && !isRecord(route.inputs)) {
+      addStepIssue(
+        errors,
+        context,
+        "workflow.recovery.inputs.shape",
+        "on_failure.route_to.inputs",
+        "Recovery route inputs must be a mapping when present."
+      );
+    } else if (isRecord(route.inputs)) {
+      visitValue(route.inputs, `${context.path}.on_failure.route_to.inputs`, (value, valuePath) => {
+        if (typeof value !== "string" || (!value.includes("{{") && !value.includes("}}"))) return;
+        if (/^\{\{\s*(?:failure\.path|step\.id|inputs\.[A-Za-z_][A-Za-z0-9_-]*)\s*}}$/.test(value)) return;
+        errors.push({
+          code: "workflow.recovery.inputs.expression.unsupported",
+          message: "Recovery route input expressions must use failure.path, step.id, or a declared inputs.<name> reference.",
+          path: valuePath,
+          ...(context.id === undefined ? {} : { stepId: context.id })
+        });
+      });
+    }
+    for (const handlerName of ["on_remediated", "on_unresolved"] as const) {
+      const handler = onFailure[handlerName];
+      if (!isRecord(handler)) {
+        addStepIssue(
+          errors,
+          context,
+          "workflow.recovery.outcome.required",
+          `on_failure.${handlerName}`,
+          `Recovery routes must handle ${handlerName === "on_remediated" ? "remediated" : "unresolved"} results with a mapping.`
+        );
+        continue;
+      }
+      const then = nonEmptyString(handler.then);
+      const returnTo = nonEmptyString(handler.return_to);
+      for (const [field, target] of [["then", then], ["return_to", returnTo]] as const) {
+        if (target !== undefined && isDynamicReference(target)) {
+          addStepIssue(
+            errors,
+            context,
+            "workflow.recovery.outcome.dynamic",
+            `on_failure.${handlerName}.${field}`,
+            `Recovery handler ${handlerName} ${field} target must be static.`
+          );
+        }
+      }
+      if ((then === undefined) === (returnTo === undefined)) {
+        addStepIssue(
+          errors,
+          context,
+          "workflow.recovery.outcome.target",
+          `on_failure.${handlerName}`,
+          `Recovery handler ${handlerName} must declare exactly one then or return_to target.`
+        );
+      }
+      if (handlerName === "on_unresolved" && returnTo !== undefined && !isDynamicReference(returnTo)) {
+        addStepIssue(
+          errors,
+          context,
+          "workflow.recovery.unresolved.return_to",
+          "on_failure.on_unresolved.return_to",
+          "Unresolved recovery results cannot return to the failed step."
+        );
+      }
+      if (handlerName === "on_remediated" && returnTo !== undefined
+          && !isDynamicReference(returnTo) && returnTo !== context.id) {
+        addStepIssue(
+          errors,
+          context,
+          "workflow.recovery.remediated.return_to",
+          "on_failure.on_remediated.return_to",
+          "Remediated recovery results must return to the failed step."
+        );
+      }
+    }
+  }
+}
+
+function collectDirectParallelBranchContexts(steps: AgentFlowWorkflowStep[]): StepContext[] {
+  const contexts: StepContext[] = [];
+  const visit = (step: AgentFlowWorkflowStep, stepPath: string, depth: number): void => {
+    for (const field of ["body", "steps"] as const) {
+      const nested = step[field];
+      if (!Array.isArray(nested)) continue;
+      nested.forEach((entry, index) => {
+        if (isRecord(entry)) visit(entry as AgentFlowWorkflowStep, `${stepPath}.${field}[${index}]`, depth + 1);
+      });
+    }
+    if (nonEmptyString(step.type) !== "parallel" || !Array.isArray(step.branches)) return;
+    step.branches.forEach((entry, index) => {
+      if (!isRecord(entry)) return;
+      const branch = entry as AgentFlowWorkflowStep;
+      const path = `${stepPath}.branches[${index}]`;
+      contexts.push({
+        step: branch,
+        path,
+        id: nonEmptyString(branch.id),
+        type: nonEmptyString(branch.type),
+        depth: depth + 1
+      });
+      visit(branch, path, depth + 1);
+    });
+  };
+  steps.forEach((step, index) => visit(step, `steps[${index}]`, 0));
+  return contexts;
 }
 
 function validateArtifactFieldShapes(context: StepContext, errors: AgentFlowWorkflowIssue[]): void {
@@ -793,16 +1030,18 @@ function validateSessionReferences(
       }
     }
 
-    visitValue(context.step.on_failure, `${context.path}.on_failure`, (value, path, key) => {
-      if (key === "session" && typeof value === "string" && !isDynamicReference(value) && !sessions.has(value)) {
-        errors.push({
-          code: "workflow.session.undeclared",
-          message: `Session "${value}" is referenced but not declared in workflow sessions.`,
-          path,
-          ...(context.id === undefined ? {} : { stepId: context.id })
-        });
-      }
-    });
+    const route = isRecord(context.step.on_failure) && isRecord(context.step.on_failure.route_to)
+      ? context.step.on_failure.route_to
+      : undefined;
+    const recoverySession = nonEmptyString(route?.session);
+    if (recoverySession !== undefined && !isDynamicReference(recoverySession) && !sessions.has(recoverySession)) {
+      errors.push({
+        code: "workflow.session.undeclared",
+        message: `Session "${recoverySession}" is referenced but not declared in workflow sessions.`,
+        path: `${context.path}.on_failure.route_to.session`,
+        ...(context.id === undefined ? {} : { stepId: context.id })
+      });
+    }
   }
 }
 

@@ -223,6 +223,37 @@ on_remediated:
   return_to: ci
 ```
 
+### Runtime Recovery Contract
+
+Recovery routes declare exactly one static target:
+
+- `route_to.workflow` names a workflow registered with
+  `AgentFlowWorkflowRegistry`. The runtime creates a linked child run, copies
+  referenced parent artifacts into that run, and handles its `result` status.
+  When the child returns `remediated`, its written, declared step outputs are
+  atomically promoted into the parent run before child retention and the parent
+  outcome handler execute; existing parent artifacts at those paths are
+  overwritten with recovery provenance metadata so a `return_to` retry reads
+  the repaired content. All child inputs marked `required: true` must be present
+  in the resolved `route_to.inputs` mapping before the child can be created.
+- `route_to.session` names a declared session and requires `route_to.prompt`.
+  When `route_to.inputs` is present, the runtime resolves and supplies the
+  complete mapping as a persisted JSON input alongside referenced artifacts.
+  Its provider response must return no undeclared outputs and must include
+  `metadata.recovery_status` set to `remediated` or `unresolved`.
+
+Both routes must declare `on_remediated` and `on_unresolved`. A nested workflow
+that returns `remediated` follows the former handler. `unresolved`, failed,
+paused, cancelled, missing, or unsupported recovery results follow the latter.
+Only a remediated result may resolve the indexed parent failure.
+An `on_remediated.return_to` target must name the failed step so the runtime
+reruns the operation that originally failed.
+
+The runtime persists `recovery.routed` and `recovery.completed` events, writes a
+`recovery_decision` artifact, and records the route, target, result, and child
+run ID (when applicable) in the failure index. Child runs use `parent_run_id`
+and `recovery_of_run_id` to preserve the recovery relationship.
+
 ## 8. Limits
 
 Recovery workflows must prevent endless repair loops.
