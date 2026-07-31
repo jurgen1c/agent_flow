@@ -757,10 +757,72 @@ steps:
     store.close();
   });
 
+  test("preserves nonconflicting copied paths for static child artifact consumers", async () => {
+    const root = temporaryRepo();
+    const parent = parseAgentFlowWorkflowOrThrow(`name: static-artifact-parent
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - id: check
+    type: command
+    command: exit 1
+    on_failure:
+      route_to:
+        workflow: static-artifact-child
+        inputs: { ticket: ticket.json }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+    const child = parseAgentFlowWorkflowOrThrow(`name: static-artifact-child
+version: 1
+style: recovery_pipeline
+maturity: experimental
+inputs: { ticket: { required: true } }
+steps:
+  - id: render
+    type: artifact_transform
+    input: ticket.json
+    output: ticket.md
+    transform: jira_ticket_to_markdown
+  - { id: done, type: result, status: remediated }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "static-artifact-parent", workflow: parent });
+    store.writeArtifact({
+      id: "ticket-input",
+      runId: "static-artifact-parent",
+      path: "ticket.json",
+      kind: "input",
+      contentType: "application/json",
+      content: JSON.stringify({ key: "AM-32", fields: { summary: "Recovery", description: "Route failure" } })
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      "static-artifact-parent",
+      parent,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      createAgentFlowWorkflowRegistry().register("static-artifact-child", child)
+    );
+
+    expect(result.status).toBe("completed");
+    const failure = store.listFailures("static-artifact-parent")[0]!;
+    const recoveryRunId = (failure.payload as { recovery: { recoveryRunId: string } }).recovery.recoveryRunId;
+    expect(store.getRun(recoveryRunId)?.inputs.ticket).toBe("ticket.json");
+    expect(store.getArtifact(recoveryRunId, "ticket.md")).not.toBeNull();
+    expect(store.getArtifact("static-artifact-parent", "ticket.md")).not.toBeNull();
+    store.close();
+  });
+
   test("remaps copied JSON inputs away from nested session metadata paths", async () => {
     const root = temporaryRepo();
     fs.writeFileSync(path.join(root, "fix.md"), "Fix the failure.\n");
     const requestPath = `session-requests/fix-${createHash("sha256").update("fix").digest("hex").slice(0, 12)}.json`;
+    const inputAlias = `alias/../${requestPath}`;
     const parent = parseAgentFlowWorkflowOrThrow(`name: session-metadata-collision-parent
 version: 1
 style: recovery_pipeline
@@ -796,7 +858,7 @@ steps:
     createAgentFlowLifecycleRun(store, {
       id: "session-metadata-collision-parent",
       workflow: parent,
-      inputs: { source: requestPath }
+      inputs: { source: inputAlias }
     });
     store.writeArtifact({
       id: "colliding-session-input",
@@ -804,7 +866,7 @@ steps:
       path: requestPath,
       kind: "input",
       contentType: "application/problem+json; charset=utf-8",
-      content: JSON.stringify({ path: requestPath })
+      content: JSON.stringify({ path: inputAlias })
     });
     let calls = 0;
     const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => {

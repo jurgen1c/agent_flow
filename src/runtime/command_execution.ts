@@ -2286,7 +2286,7 @@ function prepareNestedRecoveryInputs(
     collectRecoveryFailureArtifactPaths(store, parentRunId, failurePath, failurePaths);
     failurePaths.forEach((artifactPath) => paths.add(artifactPath));
   }
-  const reservedOutputs = new Set(nestedWorkflowOutputPaths(workflow.steps));
+  const reservedOutputs = new Set(nestedWorkflowOutputPaths(workflow.steps).map(normalizeAgentFlowArtifactPath));
   const commandLogPrefixes = nestedWorkflowCommandLogPrefixes(workflow.steps);
   const assignedTargets = new Set<string>();
   const pathMap = new Map<string, string>();
@@ -2378,7 +2378,17 @@ function remapRecoveryArtifactPaths<T extends AgentFlowRunStateValue>(
   value: T,
   pathMap: Map<string, string>
 ): T {
-  if (typeof value === "string") return (pathMap.get(value) ?? value) as T;
+  if (typeof value === "string") {
+    let mapped = pathMap.get(value);
+    if (mapped === undefined) {
+      try {
+        mapped = pathMap.get(normalizeAgentFlowArtifactPath(value));
+      } catch {
+        // Literal recovery input strings do not have to be artifact paths.
+      }
+    }
+    return (mapped ?? value) as T;
+  }
   if (Array.isArray(value)) {
     return value.map((entry) => remapRecoveryArtifactPaths(entry, pathMap)) as T;
   }
@@ -2440,7 +2450,7 @@ function collectRecoveryArtifactPaths(
 ): void {
   if (typeof value === "string") {
     try {
-      if (store.getArtifact(runId, value) !== null) paths.add(value);
+      if (store.getArtifact(runId, value) !== null) paths.add(normalizeAgentFlowArtifactPath(value));
     } catch {
       // Literal recovery inputs do not have to be artifact paths.
     }
