@@ -202,6 +202,11 @@ export interface UpsertAgentFlowSessionInput {
   state?: Record<string, AgentFlowRunStateValue>;
 }
 
+interface SettleAgentFlowSessionInput extends Omit<UpsertAgentFlowSessionInput, "status" | "state"> {
+  waitingState: Record<string, AgentFlowRunStateValue>;
+  interruptedState: Record<string, AgentFlowRunStateValue>;
+}
+
 export interface AgentFlowSessionRecord {
   id: string;
   runId: string;
@@ -226,6 +231,13 @@ export interface RecordAgentFlowFailureInput {
   retryable?: boolean;
   payload?: AgentFlowRunStateValue;
   resolvedAt?: string;
+}
+
+export interface UpdateAgentFlowFailureRecoveryInput {
+  status: "remediated" | "unresolved";
+  route: "session" | "workflow";
+  target: string;
+  recoveryRunId?: string;
 }
 
 export interface AgentFlowFailureRecord {
@@ -439,14 +451,15 @@ export class AgentFlowRunStateStore {
 
   createRunWithEvent(input: CreateAgentFlowRunInput, event: AgentFlowRunEventInput): AgentFlowRunRecord {
     this.assertOpen();
-    this.database.exec("BEGIN IMMEDIATE");
+    const manageTransaction = !this.finalizationTransactionActive;
+    if (manageTransaction) this.database.exec("BEGIN IMMEDIATE");
     try {
       const run = this.createRun(input);
       this.appendNextEvent(run.id, event);
-      this.database.exec("COMMIT");
+      if (manageTransaction) this.database.exec("COMMIT");
       return run;
     } catch (error) {
-      rollback(this.database);
+      if (manageTransaction) rollback(this.database);
       if (error instanceof AgentFlowRunStateError) throw error;
       throw runStateWriteError("create run with event", error);
     }
@@ -797,7 +810,11 @@ export class AgentFlowRunStateStore {
       }
       const existing = this.database.get<ArtifactRow>("SELECT * FROM artifacts WHERE run_id = ? AND id = ?", [runId, id]);
       const pathOwner = this.database.get<ArtifactRow>("SELECT * FROM artifacts WHERE run_id = ? AND path = ?", [runId, declaredPath]);
-      if (pathOwner !== null && pathOwner.id !== id) {
+      const recoveryInputTakeover = pathOwner !== null
+        && pathOwner.id !== id
+        && pathOwner.kind === "recovery_input"
+        && input.overwrite === true;
+      if (pathOwner !== null && pathOwner.id !== id && !recoveryInputTakeover) {
         throw new AgentFlowRunStateError(
           `Artifact path ${declaredPath} is already registered as ${pathOwner.id} for run ${runId}.`,
           "AGENT_FLOW_ARTIFACT_COLLISION"
@@ -852,9 +869,12 @@ export class AgentFlowRunStateStore {
         throw new AgentFlowRunStateError(`Artifact target is not a regular file: ${target}`, "AGENT_FLOW_ARTIFACT_PATH");
       }
       const targetChecksum = targetExistedBeforeWrite ? artifactChecksum(target) : null;
+      const priorArtifact = existing ?? (recoveryInputTakeover ? pathOwner : null);
       const retryingPublishedContent = targetChecksum === checksum
         && (existing === null || existing.checksum === checksum || existing.written_at === null);
-      const replacingPublishedContent = existing !== null && existing.written_at !== null && existing.checksum !== checksum;
+      const replacingPublishedContent = priorArtifact !== null
+        && priorArtifact.written_at !== null
+        && priorArtifact.checksum !== checksum;
       if (replacingPublishedContent && input.overwrite !== true) {
         throw new AgentFlowRunStateError(
           `Artifact ${declaredPath} was already published for run ${runId}; pass overwrite: true to replace it.`,
@@ -879,6 +899,9 @@ export class AgentFlowRunStateStore {
           }
         }
         fs.renameSync(temporaryPath, target);
+      }
+      if (recoveryInputTakeover) {
+        this.database.run("DELETE FROM artifacts WHERE run_id = ? AND id = ?", [runId, pathOwner!.id]);
       }
       this.database.run(`INSERT INTO artifacts (
         run_id, id, step_id, path, kind, content_type, checksum, size_bytes, status, previous_checksum,
@@ -909,7 +932,7 @@ export class AgentFlowRunStateStore {
           ? "overwritten"
           : existing?.status === "overwritten" ? "overwritten" : "available",
         (targetExistedBeforeWrite && !retryingPublishedContent) || replacingPublishedContent
-          ? existing?.checksum ?? targetChecksum
+          ? priorArtifact?.checksum ?? targetChecksum
           : existing?.previous_checksum ?? null,
         metadataJson,
         timestamp,
@@ -959,6 +982,9 @@ export class AgentFlowRunStateStore {
     const paths = inputs.map((input) => normalizeAgentFlowArtifactPath(input.path));
     if (new Set(paths).size !== paths.length) {
       throw new AgentFlowRunStateError("Atomic artifact batches must not contain duplicate paths.", "AGENT_FLOW_ARTIFACT_INVALID");
+    }
+    if (this.finalizationTransactionActive) {
+      return inputs.map((input) => this.writeArtifact(input));
     }
     let snapshots: Array<{ declaredPath: string; row: ArtifactRow | null; targetExisted: boolean }> = [];
     this.database.exec("BEGIN IMMEDIATE");
@@ -1407,6 +1433,33 @@ export class AgentFlowRunStateStore {
     ]);
   }
 
+  settleSessionForRun(input: SettleAgentFlowSessionInput): AgentFlowRunStopStatus | undefined {
+    this.assertOpen();
+    const runId = requiredString(input.runId, "Run ID");
+    const manageTransaction = !this.finalizationTransactionActive;
+    if (manageTransaction) this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const runStatus = this.requireRun(runId).status;
+      const stopped = runStatus === "paused" || runStatus === "failed" || runStatus === "cancelled"
+        ? runStatus
+        : undefined;
+      this.upsertSession({
+        id: input.id,
+        runId,
+        ...(input.stepId === undefined ? {} : { stepId: input.stepId }),
+        provider: input.provider,
+        ...(input.externalSessionId === undefined ? {} : { externalSessionId: input.externalSessionId }),
+        status: stopped ?? "waiting",
+        state: stopped === undefined ? input.waitingState : { ...input.interruptedState, interrupted: stopped }
+      });
+      if (manageTransaction) this.database.exec("COMMIT");
+      return stopped;
+    } catch (error) {
+      if (manageTransaction) rollback(this.database);
+      throw error;
+    }
+  }
+
   claimSession(input: UpsertAgentFlowSessionInput): void {
     this.assertOpen();
     const runId = requiredString(input.runId, "Run ID");
@@ -1532,6 +1585,46 @@ export class AgentFlowRunStateStore {
       "UPDATE failures SET resolved_at = COALESCE(resolved_at, ?) WHERE run_id = ? AND id = ?",
       [timestamp, normalizedRunId, normalizedFailureId]
     );
+  }
+
+  updateFailureRecovery(
+    runId: string,
+    failureId: string,
+    input: UpdateAgentFlowFailureRecoveryInput
+  ): void {
+    this.assertOpen();
+    const normalizedRunId = requiredString(runId, "Run ID");
+    const normalizedFailureId = requiredString(failureId, "Failure ID");
+    const existing = this.database.get<{ payload_json: string | null }>(
+      "SELECT payload_json FROM failures WHERE run_id = ? AND id = ?",
+      [normalizedRunId, normalizedFailureId]
+    );
+    if (existing === null) {
+      throw new AgentFlowRunStateError(
+        `Agent Flow failure ${normalizedFailureId} was not found for run ${normalizedRunId}.`,
+        "AGENT_FLOW_FAILURE_NOT_FOUND"
+      );
+    }
+    const parsedPayload = existing.payload_json === null
+      ? {}
+      : JSON.parse(existing.payload_json) as AgentFlowRunStateValue;
+    const payload = parsedPayload !== null && typeof parsedPayload === "object" && !Array.isArray(parsedPayload)
+      ? parsedPayload
+      : {};
+    const recovery: Record<string, AgentFlowRunStateValue> = {
+      status: input.status,
+      route: input.route,
+      target: requiredString(input.target, "Recovery target"),
+      ...(input.recoveryRunId === undefined
+        ? {}
+        : { recoveryRunId: requiredString(input.recoveryRunId, "Recovery run ID") })
+    };
+    this.write(
+      "update failure recovery",
+      "UPDATE failures SET payload_json = ? WHERE run_id = ? AND id = ?",
+      [stableJson({ ...payload, recovery }), normalizedRunId, normalizedFailureId]
+    );
+    if (input.status === "remediated") this.resolveFailure(normalizedRunId, normalizedFailureId);
   }
 
   upsertApproval(input: UpsertAgentFlowApprovalInput): void {

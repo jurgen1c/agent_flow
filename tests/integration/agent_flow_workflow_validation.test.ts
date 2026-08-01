@@ -447,6 +447,8 @@ steps:
         file_scope: { include: [src/**] }
         on_failure:
           route_to: { session: fixer, prompt: Fix the failure }
+          on_remediated: { then: complete }
+          on_unresolved: { then: pause }
       - { id: right, type: command, session: worker, command: echo ok }
 `;
     const scoped = parseAgentFlowWorkflowOrThrow(source);
@@ -1857,6 +1859,7 @@ steps:
 `);
 
     expect(validateAgentFlowWorkflow(workflow).errors.map((issue) => issue.code)).toEqual([
+      "workflow.recovery.route.required",
       "workflow.step.on_failure.shape",
       "workflow.step.on_failure.shape",
       "workflow.step.on_failure.shape"

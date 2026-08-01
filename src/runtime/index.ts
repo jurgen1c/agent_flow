@@ -49,6 +49,10 @@ export {
   resumeAgentFlowCommandPipeline
 } from "./command_execution";
 export {
+  AgentFlowWorkflowRegistry,
+  createAgentFlowWorkflowRegistry
+} from "./recovery";
+export {
   AgentFlowConditionError,
   agentFlowConditionExpressionIsSimple,
   evaluateAgentFlowCondition,
@@ -151,6 +155,7 @@ export type {
   AgentFlowCommandPipelineResult,
   AgentFlowPipelineResumeInput
 } from "./command_execution";
+export type { AgentFlowRecoveryStatus } from "./recovery";
 export type { AgentFlowConditionSelection } from "./condition";
 export type {
   AgentFlowBinaryArtifactValue,
@@ -206,6 +211,7 @@ export type {
   ReadAgentFlowArtifactOptions,
   RecordAgentFlowFailureInput,
   TransitionAgentFlowRunWithEventInput,
+  UpdateAgentFlowFailureRecoveryInput,
   UpdateAgentFlowRunInput,
   UpsertAgentFlowApprovalInput,
   UpsertAgentFlowArtifactInput,
