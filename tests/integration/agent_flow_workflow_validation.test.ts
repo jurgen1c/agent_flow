@@ -1859,6 +1859,7 @@ steps:
 `);
 
     expect(validateAgentFlowWorkflow(workflow).errors.map((issue) => issue.code)).toEqual([
+      "workflow.recovery.route.required",
       "workflow.step.on_failure.shape",
       "workflow.step.on_failure.shape",
       "workflow.step.on_failure.shape"

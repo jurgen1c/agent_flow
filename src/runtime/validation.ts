@@ -585,7 +585,7 @@ function validateRecoveryRoutes(
 
     const onFailure = isRecord(context.step.on_failure) ? context.step.on_failure : undefined;
     const orphanHandler = onFailure?.route_to === undefined
-      ? ["on_remediated", "on_unresolved"].find((field) => isRecord(onFailure?.[field]))
+      ? ["on_remediated", "on_unresolved"].find((field) => onFailure?.[field] !== undefined)
       : undefined;
     if (orphanHandler !== undefined) {
       addStepIssue(

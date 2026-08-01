@@ -139,10 +139,26 @@ steps:
     on_failure:
       on_remediated: { then: complete }
       on_unresolved: { then: pause }
+  - id: malformed-remediated
+    type: command
+    command: exit 1
+    on_failure:
+      on_remediated: complete
+  - id: malformed-unresolved
+    type: command
+    command: exit 1
+    on_failure:
+      on_unresolved: pause
 `);
 
     expect(validateAgentFlowWorkflow(workflow).errors
-      .filter((issue) => issue.code === "workflow.recovery.route.required")).toHaveLength(2);
+      .filter((issue) => issue.code === "workflow.recovery.route.required")
+      .map((issue) => issue.path)).toEqual([
+      "steps[0].on_failure.on_remediated",
+      "steps[1].on_failure.on_remediated",
+      "steps[2].on_failure.on_remediated",
+      "steps[3].on_failure.on_unresolved"
+    ]);
   });
 
   test("treats nested session fields in recovery inputs as ordinary payload data", () => {
