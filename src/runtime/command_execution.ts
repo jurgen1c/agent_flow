@@ -335,6 +335,10 @@ async function runAgentFlowCommandPipeline(
         }
       }
       if (failure === undefined) {
+        const recoveryFailure = resolveReturnedRecoveryFailures(
+          store, runId, completedSteps, stepId, routingBudget.attempts.get(stepId)!, routingBudget.terminalEffects
+        );
+        if (recoveryFailure !== undefined) return recoveryFailure;
         const routed = routeAfterSuccessfulStep(store, runId, completedSteps, stepId, step, currentSteps, stepIndex, stepLocations, routingBudget);
         if ("result" in routed) return routed.result;
         currentSteps = routed.steps;
@@ -390,6 +394,10 @@ async function runAgentFlowCommandPipeline(
       }
       if (failure === undefined) {
         completedSteps.push(stepId);
+        const recoveryFailure = resolveReturnedRecoveryFailures(
+          store, runId, completedSteps, stepId, routingBudget.attempts.get(stepId)!, routingBudget.terminalEffects
+        );
+        if (recoveryFailure !== undefined) return recoveryFailure;
         const routed = routeAfterSuccessfulStep(store, runId, completedSteps, stepId, step, currentSteps, stepIndex, stepLocations, routingBudget);
         if ("result" in routed) return routed.result;
         currentSteps = routed.steps;
@@ -543,6 +551,10 @@ async function runAgentFlowCommandPipeline(
         }
       }
       if (failure === undefined) {
+        const recoveryFailure = resolveReturnedRecoveryFailures(
+          store, runId, completedSteps, stepId, routingBudget.attempts.get(stepId)!, routingBudget.terminalEffects
+        );
+        if (recoveryFailure !== undefined) return recoveryFailure;
         const routed = routeAfterSuccessfulStep(store, runId, completedSteps, stepId, step, currentSteps, stepIndex, stepLocations, routingBudget);
         if ("result" in routed) return routed.result;
         currentSteps = routed.steps;
@@ -845,6 +857,10 @@ async function runAgentFlowCommandPipeline(
       }, failureStatus(step), routingBudget.terminalEffects);
     }
 
+    const recoveryFailure = resolveReturnedRecoveryFailures(
+      store, runId, completedSteps, stepId, routingBudget.attempts.get(stepId)!, routingBudget.terminalEffects
+    );
+    if (recoveryFailure !== undefined) return recoveryFailure;
     const routed = routeAfterSuccessfulStep(store, runId, completedSteps, stepId, step, currentSteps, stepIndex, stepLocations, routingBudget);
     if ("result" in routed) return routed.result;
     currentSteps = routed.steps;
@@ -1657,6 +1673,12 @@ async function routeAfterFailedStep(
     message = redactAgentFlowSensitiveText(error instanceof Error ? error.message : String(error));
   }
 
+  const handler = mapping(onFailure?.[status === "remediated" ? "on_remediated" : "on_unresolved"]);
+  const returnTo = normalizedTarget(handler?.return_to);
+  if (returnTo !== undefined && returnTo !== stepId) {
+    throw invalidRuntimeRecoveryRoute(stepId, "on_remediated.return_to must name the failed step");
+  }
+
   let recoveryPersisted: boolean;
   try {
     recoveryPersisted = store.withRunFinalizationTransaction(runId, () => {
@@ -1665,7 +1687,8 @@ async function routeAfterFailedStep(
         status,
         route: routeKind,
         target,
-        ...(recoveryRunId === undefined ? {} : { recoveryRunId })
+        ...(recoveryRunId === undefined ? {} : { recoveryRunId }),
+        ...(returnTo === undefined ? {} : { deferResolution: true })
       });
       persistRecoveryDecision(store, runId, stepId, failure.id, {
         status,
@@ -1701,11 +1724,6 @@ async function routeAfterFailedStep(
   if (!recoveryPersisted) {
     return { result: stoppedPipelineResult(store, runId, completedSteps)! };
   }
-  const handler = mapping(onFailure?.[status === "remediated" ? "on_remediated" : "on_unresolved"]);
-  const returnTo = normalizedTarget(handler?.return_to);
-  if (returnTo !== undefined && returnTo !== stepId) {
-    throw invalidRuntimeRecoveryRoute(stepId, "on_remediated.return_to must name the failed step");
-  }
   const handlerTarget = returnTo ?? normalizedTarget(handler?.then);
   return routeAfterSuccessfulStep(
     store,
@@ -1719,6 +1737,44 @@ async function routeAfterFailedStep(
     budget,
     handlerTarget
   );
+}
+
+function resolveReturnedRecoveryFailures(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  completedSteps: string[],
+  stepId: string,
+  successfulAttempt: number,
+  terminalEffects: AgentFlowPipelineTerminalEffects
+): AgentFlowCommandPipelineResult | undefined {
+  try {
+    store.withRunFinalizationTransaction(runId, () => {
+      for (const failure of store.listFailures(runId)) {
+        const recovery = mapping(mapping(failure.payload)?.recovery);
+        if (failure.stepId !== stepId
+            || failure.resolvedAt !== null
+            || failure.attempt === null
+            || failure.attempt >= successfulAttempt
+            || recovery?.status !== "remediated") {
+          continue;
+        }
+        store.resolveFailure(runId, failure.id);
+        store.appendRunEvent(runId, {
+          type: "recovery.returned",
+          stepId,
+          payload: { failureId: failure.id, failedAttempt: failure.attempt, successfulAttempt }
+        });
+      }
+    });
+    return undefined;
+  } catch (error) {
+    const message = `Could not persist return-to recovery completion for step ${stepId}: ${error instanceof Error ? error.message : String(error)}`;
+    return finishFailure(store, runId, completedSteps, stepId, {
+      exitCode: null,
+      timedOut: false,
+      message
+    }, "failed", terminalEffects);
+  }
 }
 
 async function executeNestedRecoveryWorkflow(

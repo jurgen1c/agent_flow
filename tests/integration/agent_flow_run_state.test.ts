@@ -12,6 +12,46 @@ import {
 const FIXED_TIME = "2026-07-15T12:00:00.000Z";
 
 describe("Agent Flow run-state SQLite store", () => {
+  test("preserves immediate recovery resolution unless callers explicitly defer it", async () => {
+    const repoRoot = temporaryRepo();
+    const store = await openAgentFlowRunState({ cwd: repoRoot, now: () => FIXED_TIME });
+    store.createRun({
+      id: "recovery-resolution",
+      workflow: { name: "recovery-resolution", version: 1, style: "recovery_pipeline", maturity: "experimental" }
+    });
+    for (const id of ["immediate", "deferred"]) {
+      store.recordFailure({
+        id,
+        runId: "recovery-resolution",
+        stepId: "check",
+        classification: "command_failure",
+        message: "failed"
+      });
+    }
+
+    store.updateFailureRecovery("recovery-resolution", "immediate", {
+      status: "remediated",
+      route: "session",
+      target: "fixer"
+    });
+    store.updateFailureRecovery("recovery-resolution", "deferred", {
+      status: "remediated",
+      route: "session",
+      target: "fixer",
+      deferResolution: true
+    });
+
+    expect(store.listFailures("recovery-resolution").map((failure) => ({
+      id: failure.id,
+      resolvedAt: failure.resolvedAt,
+      recovery: (failure.payload as { recovery: unknown }).recovery
+    }))).toEqual([
+      { id: "immediate", resolvedAt: FIXED_TIME, recovery: { status: "remediated", route: "session", target: "fixer" } },
+      { id: "deferred", resolvedAt: null, recovery: { status: "remediated", route: "session", target: "fixer" } }
+    ]);
+    store.close();
+  });
+
   test("exposes only failure payload paths with a currently readable backing", async () => {
     const repoRoot = temporaryRepo();
     const store = await openAgentFlowRunState({ cwd: repoRoot, now: () => FIXED_TIME });

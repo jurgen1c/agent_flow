@@ -1234,6 +1234,16 @@ steps:
       if (calls === 1) expect(request.externalSessionId).toBeUndefined();
       if (calls === 2) {
         expect(request.externalSessionId).toBe("recovery-session-1");
+        expect(store.listFailures("repeated-session-recovery")).toEqual([
+          expect.objectContaining({
+            attempt: 1,
+            resolvedAt: null,
+            payload: expect.objectContaining({
+              recovery: expect.objectContaining({ status: "remediated" })
+            })
+          }),
+          expect.objectContaining({ attempt: 2, resolvedAt: null })
+        ]);
         fs.writeFileSync(path.join(root, "fixed.txt"), "fixed\n");
       }
       return {
@@ -1254,6 +1264,88 @@ steps:
       externalSessionId: "recovery-session-2"
     });
     expect(store.listFailures("repeated-session-recovery").every((failure) => failure.resolvedAt !== null)).toBe(true);
+    expect(store.listEvents("repeated-session-recovery")
+      .filter((event) => event.type === "step.started" && event.stepId === "check")
+      .map((event) => (event.payload as { attempt: number }).attempt)).toEqual([1, 2, 3]);
+    expect(store.listEvents("repeated-session-recovery")
+      .filter((event) => event.type === "recovery.completed")).toHaveLength(2);
+    expect(store.listEvents("repeated-session-recovery")
+      .filter((event) => event.type === "recovery.returned")
+      .map((event) => event.payload)).toEqual([
+      expect.objectContaining({ failedAttempt: 1, successfulAttempt: 3 }),
+      expect.objectContaining({ failedAttempt: 2, successfulAttempt: 3 })
+    ]);
+    store.close();
+  });
+
+  test("does not retry a successful returned provider call when recovery bookkeeping fails", async () => {
+    const root = temporaryRepo();
+    fs.writeFileSync(path.join(root, "work.md"), "Do the work.\n");
+    fs.writeFileSync(path.join(root, "fix.md"), "Fix the failure.\n");
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: recovery-bookkeeping-failure
+version: 1
+style: recovery_pipeline
+maturity: experimental
+limits: { max_recovery_cycles: 1, max_step_attempts: { work: 2 } }
+sessions:
+  worker: { provider: fixture }
+  fixer: { provider: fixture }
+steps:
+  - id: work
+    type: session_request
+    session: worker
+    prompt: work.md
+    inputs: [request.txt]
+    outputs: [result.txt]
+    on_failure:
+      route_to: { session: fixer, prompt: fix.md }
+      on_remediated: { return_to: work }
+      on_unresolved: { then: pause }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "recovery-bookkeeping-failure", workflow });
+    store.writeArtifact({
+      id: "request",
+      runId: "recovery-bookkeeping-failure",
+      path: "request.txt",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "request"
+    });
+    let workCalls = 0;
+    let recoveryCalls = 0;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => {
+      if (request.stepId === "work:recovery") {
+        recoveryCalls += 1;
+        return { outputs: {}, metadata: { recovery_status: "remediated" } };
+      }
+      workCalls += 1;
+      if (workCalls === 1) throw new Error("provider failed");
+      return { outputs: { "result.txt": "done" } };
+    });
+    const appendRunEvent = store.appendRunEvent.bind(store);
+    store.appendRunEvent = (runId, event) => {
+      if (event.type === "recovery.returned") throw new Error("bookkeeping unavailable");
+      return appendRunEvent(runId, event);
+    };
+
+    const result = await executeAgentFlowCommandPipeline(
+      store, "recovery-bookkeeping-failure", workflow, undefined, providers
+    );
+
+    expect(result).toMatchObject({
+      status: "failed",
+      completedSteps: ["work"],
+      message: expect.stringContaining("Could not persist return-to recovery completion")
+    });
+    expect(workCalls).toBe(2);
+    expect(recoveryCalls).toBe(1);
+    expect(store.listEvents("recovery-bookkeeping-failure")).toContainEqual(expect.objectContaining({
+      type: "step.completed",
+      stepId: "work",
+      payload: expect.objectContaining({ attempt: 2 })
+    }));
+    expect(store.listFailures("recovery-bookkeeping-failure")[0]?.resolvedAt).toBeNull();
     store.close();
   });
 
@@ -1295,6 +1387,17 @@ steps:
     expect(calls).toBe(1);
     expect(store.listArtifacts("bounded-recovery-invocation")
       .filter((artifact) => artifact.kind === "recovery_decision")).toHaveLength(1);
+    expect(store.listFailures("bounded-recovery-invocation")).toEqual([
+      expect.objectContaining({
+        attempt: 1,
+        resolvedAt: null,
+        payload: expect.objectContaining({
+          recovery: expect.objectContaining({ status: "remediated" })
+        })
+      }),
+      expect.objectContaining({ attempt: 2, resolvedAt: null }),
+      expect.objectContaining({ classification: "routing_limit", resolvedAt: null })
+    ]);
     store.close();
   });
 
@@ -1332,6 +1435,10 @@ steps:
 
     expect(result.status).toBe("completed");
     expect(calls).toBe(1);
+    expect(store.listFailures("selected-handler-budget")[0]).toMatchObject({
+      resolvedAt: expect.any(String),
+      payload: { recovery: { status: "remediated" } }
+    });
     store.close();
   });
 

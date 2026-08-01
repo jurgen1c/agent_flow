@@ -238,6 +238,7 @@ export interface UpdateAgentFlowFailureRecoveryInput {
   route: "session" | "workflow";
   target: string;
   recoveryRunId?: string;
+  deferResolution?: boolean;
 }
 
 export interface AgentFlowFailureRecord {
@@ -1624,7 +1625,9 @@ export class AgentFlowRunStateStore {
       "UPDATE failures SET payload_json = ? WHERE run_id = ? AND id = ?",
       [stableJson({ ...payload, recovery }), normalizedRunId, normalizedFailureId]
     );
-    if (input.status === "remediated") this.resolveFailure(normalizedRunId, normalizedFailureId);
+    if (input.status === "remediated" && input.deferResolution !== true) {
+      this.resolveFailure(normalizedRunId, normalizedFailureId);
+    }
   }
 
   upsertApproval(input: UpsertAgentFlowApprovalInput): void {
