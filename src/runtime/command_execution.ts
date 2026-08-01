@@ -1749,15 +1749,7 @@ function resolveReturnedRecoveryFailures(
 ): AgentFlowCommandPipelineResult | undefined {
   try {
     store.withRunFinalizationTransaction(runId, () => {
-      for (const failure of store.listFailures(runId)) {
-        const recovery = mapping(mapping(failure.payload)?.recovery);
-        if (failure.stepId !== stepId
-            || failure.resolvedAt !== null
-            || failure.attempt === null
-            || failure.attempt >= successfulAttempt
-            || recovery?.status !== "remediated") {
-          continue;
-        }
+      for (const failure of store.listPendingReturnedRecoveryFailures(runId, stepId, successfulAttempt)) {
         store.resolveFailure(runId, failure.id);
         store.appendRunEvent(runId, {
           type: "recovery.returned",

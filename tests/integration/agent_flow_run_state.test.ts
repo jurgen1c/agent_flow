@@ -41,6 +41,9 @@ describe("Agent Flow run-state SQLite store", () => {
       deferResolution: true
     });
 
+    expect(store.listPendingReturnedRecoveryFailures("recovery-resolution", "check", 2)
+      .map((failure) => failure.id)).toEqual([]);
+
     expect(store.listFailures("recovery-resolution").map((failure) => ({
       id: failure.id,
       resolvedAt: failure.resolvedAt,
@@ -49,6 +52,40 @@ describe("Agent Flow run-state SQLite store", () => {
       { id: "immediate", resolvedAt: FIXED_TIME, recovery: { status: "remediated", route: "session", target: "fixer" } },
       { id: "deferred", resolvedAt: null, recovery: { status: "remediated", route: "session", target: "fixer" } }
     ]);
+    store.close();
+  });
+
+  test("queries only unresolved remediated failures from earlier attempts without artifact inspection", async () => {
+    const repoRoot = temporaryRepo();
+    const store = await openAgentFlowRunState({ cwd: repoRoot, now: () => FIXED_TIME });
+    store.createRun({
+      id: "returned-recovery-query",
+      workflow: { name: "returned-recovery-query", version: 1, style: "recovery_pipeline", maturity: "experimental" }
+    });
+    for (const [id, stepId, attempt] of [
+      ["eligible", "check", 1],
+      ["current", "check", 3],
+      ["other-step", "other", 1]
+    ] as const) {
+      store.recordFailure({
+        id,
+        runId: "returned-recovery-query",
+        stepId,
+        classification: "command_failure",
+        message: "failed",
+        payload: { attempt, failurePayloadPath: `missing/${id}.json` }
+      });
+      store.updateFailureRecovery("returned-recovery-query", id, {
+        status: "remediated",
+        route: "session",
+        target: "fixer",
+        deferResolution: true
+      });
+    }
+    store.resolveFailure("returned-recovery-query", "other-step");
+
+    expect(store.listPendingReturnedRecoveryFailures("returned-recovery-query", "check", 3))
+      .toEqual([expect.objectContaining({ id: "eligible", attempt: 1, payloadPath: "missing/eligible.json" })]);
     store.close();
   });
 
