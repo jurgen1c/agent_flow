@@ -118,7 +118,10 @@ steps:
       const responses = Object.fromEntries(Object.entries(fixture.steps ?? {}).flatMap(([stepId, step]) => {
         if (step.outputs === undefined || Array.isArray(step.outputs)) return [];
         return [[stepId, {
-          outputs: Object.fromEntries(Object.entries(step.outputs).map(([key, value]) => [key, JSON.stringify(value)]))
+          outputs: Object.fromEntries(Object.entries(step.outputs).map(([key, value]) => [
+            key,
+            typeof value === "string" ? value : JSON.stringify(value)
+          ]))
         }]];
       }));
       const providers = createAgentFlowSessionProviderRegistry().register(
@@ -144,6 +147,10 @@ steps:
         "recovery.routed",
         "recovery.completed"
       ]));
+      if (name === "implementation") {
+        expect(store.readArtifact(`parent-${name}`, "implementation-summary.md").content.toString())
+          .toBe("Fixture FM applied the smallest safe implementation fix.\n");
+      }
       store.close();
     }
   });

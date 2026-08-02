@@ -33,6 +33,7 @@ environment, unknown, and user-required classifications. From the repository
 root, validate and simulate one with:
 
 ```sh
+bun run build
 bun run dist/agent-flow.js validate examples/workflows/ci-triage.yml
 bun run dist/agent-flow.js simulate examples/workflows/ci-triage.yml \
   --fixture examples/fixtures/ci-triage/flake.json
