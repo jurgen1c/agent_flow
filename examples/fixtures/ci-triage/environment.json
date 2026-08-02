@@ -1,0 +1,25 @@
+{
+  "inputs": {
+    "failure_payload": "failures/ci.json",
+    "failed_step": "ci"
+  },
+  "artifacts": {
+    "failures/ci.json": {
+      "summary": "The CI runner could not reach a required service."
+    }
+  },
+  "steps": {
+    "classify": {
+      "outputs": {
+        "ci/failure-classification.json": {
+          "kind": "environment_error",
+          "confidence": "high",
+          "summary": "The failure belongs to the CI environment.",
+          "recommended_owner": "platform_owner",
+          "safe_to_retry": false,
+          "requires_user": false
+        }
+      }
+    }
+  }
+}

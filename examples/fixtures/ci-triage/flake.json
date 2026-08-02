@@ -1,0 +1,25 @@
+{
+  "inputs": {
+    "failure_payload": "failures/ci.json",
+    "failed_step": "ci"
+  },
+  "artifacts": {
+    "failures/ci.json": {
+      "summary": "A test failed intermittently."
+    }
+  },
+  "steps": {
+    "classify": {
+      "outputs": {
+        "ci/failure-classification.json": {
+          "kind": "flake",
+          "confidence": "high",
+          "summary": "The failure is transient and safe to retry.",
+          "recommended_owner": "workflow_owner",
+          "safe_to_retry": true,
+          "requires_user": false
+        }
+      }
+    }
+  }
+}

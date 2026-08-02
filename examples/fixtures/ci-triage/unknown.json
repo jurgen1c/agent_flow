@@ -1,0 +1,25 @@
+{
+  "inputs": {
+    "failure_payload": "failures/ci.json",
+    "failed_step": "ci"
+  },
+  "artifacts": {
+    "failures/ci.json": {
+      "summary": "The fixture does not contain enough evidence to classify the failure."
+    }
+  },
+  "steps": {
+    "classify": {
+      "outputs": {
+        "ci/failure-classification.json": {
+          "kind": "unknown",
+          "confidence": "low",
+          "summary": "The failure cannot be routed safely.",
+          "recommended_owner": "workflow_owner",
+          "safe_to_retry": false,
+          "requires_user": false
+        }
+      }
+    }
+  }
+}

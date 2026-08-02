@@ -1,0 +1,25 @@
+{
+  "inputs": {
+    "failure_payload": "failures/ci.json",
+    "failed_step": "ci"
+  },
+  "artifacts": {
+    "failures/ci.json": {
+      "summary": "The failing expectation depends on an unstated product requirement."
+    }
+  },
+  "steps": {
+    "classify": {
+      "outputs": {
+        "ci/failure-classification.json": {
+          "kind": "missing_requirement",
+          "confidence": "high",
+          "summary": "Product guidance is required before remediation.",
+          "recommended_owner": "product_owner",
+          "safe_to_retry": false,
+          "requires_user": true
+        }
+      }
+    }
+  }
+}
