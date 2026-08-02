@@ -238,6 +238,7 @@ export interface UpdateAgentFlowFailureRecoveryInput {
   route: "session" | "workflow";
   target: string;
   recoveryRunId?: string;
+  deferResolution?: boolean;
 }
 
 export interface AgentFlowFailureRecord {
@@ -1565,6 +1566,29 @@ export class AgentFlowRunStateStore {
     });
   }
 
+  listPendingReturnedRecoveryFailures(
+    runId: string,
+    stepId: string,
+    successfulAttempt: number
+  ): AgentFlowFailureRecord[] {
+    this.assertOpen();
+    const normalizedRunId = requiredString(runId, "Run ID");
+    this.requireRun(normalizedRunId);
+    const normalizedStepId = requiredString(stepId, "Step ID");
+    if (!Number.isSafeInteger(successfulAttempt) || successfulAttempt < 1) {
+      throw new AgentFlowRunStateError(
+        "Successful recovery attempt must be a positive integer.",
+        "AGENT_FLOW_FAILURE_INVALID"
+      );
+    }
+    return this.database.all<FailureRow>(`SELECT * FROM failures
+      WHERE run_id = ? AND step_id = ? AND resolved_at IS NULL
+        AND json_extract(payload_json, '$.recovery.status') = 'remediated'
+        AND json_extract(payload_json, '$.attempt') < ?
+      ORDER BY created_at ASC, rowid ASC`, [normalizedRunId, normalizedStepId, successfulAttempt])
+      .map(hydrateFailure);
+  }
+
   resolveFailure(runId: string, failureId: string, resolvedAt?: string): void {
     this.assertOpen();
     const normalizedRunId = requiredString(runId, "Run ID");
@@ -1624,7 +1648,9 @@ export class AgentFlowRunStateStore {
       "UPDATE failures SET payload_json = ? WHERE run_id = ? AND id = ?",
       [stableJson({ ...payload, recovery }), normalizedRunId, normalizedFailureId]
     );
-    if (input.status === "remediated") this.resolveFailure(normalizedRunId, normalizedFailureId);
+    if (input.status === "remediated" && input.deferResolution !== true) {
+      this.resolveFailure(normalizedRunId, normalizedFailureId);
+    }
   }
 
   upsertApproval(input: UpsertAgentFlowApprovalInput): void {

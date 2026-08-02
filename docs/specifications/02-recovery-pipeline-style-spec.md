@@ -214,7 +214,15 @@ steps:
 2. Remediation steps may modify files or artifacts.
 3. The engine reruns the failed step after remediation.
 4. The rerun increments attempt count.
-5. If the step passes, the workflow continues after the original failed step.
+5. A remediated failure remains unresolved until the returned step succeeds.
+6. If the step passes, the workflow resolves the remediated failure and
+   continues after the original failed step.
+
+Each rerun keeps its own persisted step-attempt row and `step.started` event.
+Every remediation cycle keeps its recovery decision and routed/completed
+events. A successful returned attempt adds a `recovery.returned` event for each
+remediated failure it resolves; if the rerun fails or a configured recovery or
+attempt limit stops execution, those failures remain unresolved.
 
 Example:
 
