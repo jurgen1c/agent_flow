@@ -40,7 +40,8 @@ import {
   readAgentFlowSessionPrompt,
   reserveAgentFlowSessionModelCallBudgets,
   validateAgentFlowSessionProviderMetadata,
-  validateAgentFlowSessionProviderResponse
+  validateAgentFlowSessionProviderResponse,
+  type AgentFlowSessionRequestArtifact
 } from "./session_request";
 import {
   AgentFlowMcpCallError,
@@ -85,10 +86,15 @@ import {
   createAgentFlowWorkflowRegistry,
   type AgentFlowRecoveryStatus
 } from "./recovery";
+import {
+  captureAgentFlowWorkspaceSnapshot,
+  changedAgentFlowWorkspacePaths
+} from "./workspace";
 import { AgentFlowFailureClassificationError } from "./failure_classification";
 import { createAgentFlowLifecycleRun, transitionAgentFlowLifecycleRun } from "./lifecycle";
 
 const MAX_CAPTURE_BYTES = 10 * 1024 * 1024;
+const RECOVERY_CONTEXT_INPUT_PATH = "recovery-context/injected.md";
 
 export interface AgentFlowCommandPipelineResult {
   status: Extract<AgentFlowRunStatus, "completed" | "failed" | "paused" | "cancelled">;
@@ -1662,6 +1668,21 @@ async function routeAfterFailedStep(
     budget
   );
   if (routeBudgetFailure !== undefined) return { result: routeBudgetFailure };
+  let workspaceBefore: ReturnType<typeof captureAgentFlowWorkspaceSnapshot>;
+  try {
+    workspaceBefore = captureAgentFlowWorkspaceSnapshot(store.repoRoot);
+  } catch (error) {
+    const message = redactAgentFlowSensitiveText(error instanceof Error ? error.message : String(error));
+    return {
+      result: finishRecoveryGuardFailure(store, runId, workflow, completedSteps, stepId, budget.terminalEffects, {
+        eventType: "recovery.workspace_snapshot_failed",
+        classification: "recovery_workspace_snapshot",
+        message,
+        payload: {},
+        forcePause: true
+      })
+    };
+  }
   store.appendRunEvent(runId, {
     type: "recovery.routed",
     stepId,
@@ -1671,6 +1692,7 @@ async function routeAfterFailedStep(
   let status: AgentFlowRecoveryStatus = "unresolved";
   let recoveryRunId: string | undefined;
   let message: string | undefined;
+  let recoveryPolicyError: AgentFlowSessionPolicyError | undefined;
   try {
     if (routeKind === "workflow") {
       const nested = await executeNestedRecoveryWorkflow(
@@ -1689,17 +1711,81 @@ async function routeAfterFailedStep(
     }
   } catch (error) {
     if (error instanceof AgentFlowSessionPolicyError) {
-      recordModelLimitDecision(store, runId, stepId, workflow, error);
-      return {
-        result: finishFailure(store, runId, completedSteps, stepId, {
-          exitCode: null,
-          timedOut: false,
-          message: error.message
-        }, error.status === "pause" ? "paused" : "failed", budget.terminalEffects)
-      };
+      recoveryPolicyError = error;
+    } else {
+      status = "unresolved";
+      message = redactAgentFlowSensitiveText(error instanceof Error ? error.message : String(error));
     }
-    status = "unresolved";
-    message = redactAgentFlowSensitiveText(error instanceof Error ? error.message : String(error));
+  }
+
+  let changedPaths: string[];
+  try {
+    changedPaths = changedAgentFlowWorkspacePaths(
+      workspaceBefore,
+      captureAgentFlowWorkspaceSnapshot(store.repoRoot)
+    );
+  } catch (error) {
+    const snapshotMessage = redactAgentFlowSensitiveText(error instanceof Error ? error.message : String(error));
+    return {
+      result: finishRecoveryGuardFailure(store, runId, workflow, completedSteps, stepId, budget.terminalEffects, {
+        eventType: "recovery.workspace_snapshot_failed",
+        classification: "recovery_workspace_snapshot",
+        message: snapshotMessage,
+        payload: {},
+        forcePause: true
+      })
+    };
+  }
+  const routeFileScope = mapping(route.file_scope);
+  const operationScopes = [
+    ...recoveryOperationFileScopes(workflow.steps, step),
+    ...(routeFileScope === undefined ? [] : [routeFileScope])
+  ];
+  const operationExcludes = operationScopes.flatMap((scope) => stringList(scope.exclude));
+  const includeScopes = operationScopes.filter((scope) => stringList(scope.include).length > 0);
+  const deniedPaths = changedPaths.filter((changedPath) => {
+    const scopeLayers = includeScopes.length > 0 ? includeScopes : [undefined];
+    return scopeLayers.some((scope) => {
+      const includes = stringList(scope?.include);
+      return evaluateAgentFlowPolicy(workflow, {
+        kind: "file_write",
+        rootPath: store.repoRoot,
+        ...(routeKind === "session" ? { session: target } : {}),
+        path: changedPath,
+        ...(operationScopes.length === 0 ? {} : {
+          fileScope: {
+            ...(includes.length === 0 ? {} : { include: includes }),
+            ...(operationExcludes.length === 0 ? {} : { exclude: operationExcludes })
+          }
+        })
+      }).status !== "allow";
+    });
+  });
+  if (deniedPaths.length > 0) {
+    const displayed = deniedPaths.slice(0, 20);
+    const suffix = deniedPaths.length > displayed.length
+      ? ` (and ${deniedPaths.length - displayed.length} more)`
+      : "";
+    const scopeMessage = `Recovery remediation for step ${stepId} changed files outside its authorized scope: ${displayed.join(", ")}${suffix}.`;
+    return {
+      result: finishRecoveryGuardFailure(store, runId, workflow, completedSteps, stepId, budget.terminalEffects, {
+        eventType: "recovery.workspace_scope_violated",
+        classification: "recovery_unrelated_files",
+        message: scopeMessage,
+        payload: { changedPaths, deniedPaths, route: routeKind, target },
+        forcePause: true
+      })
+    };
+  }
+  if (recoveryPolicyError !== undefined) {
+    recordModelLimitDecision(store, runId, stepId, workflow, recoveryPolicyError);
+    return {
+      result: finishFailure(store, runId, completedSteps, stepId, {
+        exitCode: null,
+        timedOut: false,
+        message: recoveryPolicyError.message
+      }, recoveryPolicyError.status === "pause" ? "paused" : "failed", budget.terminalEffects)
+    };
   }
 
   const handler = mapping(onFailure?.[status === "remediated" ? "on_remediated" : "on_unresolved"]);
@@ -1766,6 +1852,28 @@ async function routeAfterFailedStep(
     budget,
     handlerTarget
   );
+}
+
+function recoveryOperationFileScopes(
+  steps: AgentFlowWorkflowStep[],
+  target: AgentFlowWorkflowStep,
+  inherited: AgentFlowYamlMapping[] = []
+): AgentFlowYamlMapping[] {
+  for (const step of steps) {
+    const ownScope = mapping(step.file_scope);
+    const scopes = ownScope === undefined ? inherited : [...inherited, ownScope];
+    if (step === target) return scopes;
+    const fields = normalizedTarget(step.type) === "parallel"
+      ? ["branches", "body", "steps"]
+      : ["body", "steps"];
+    for (const field of fields) {
+      const nested = step[field];
+      if (!Array.isArray(nested)) continue;
+      const found = recoveryOperationFileScopes(nested.filter(isWorkflowStep), target, scopes);
+      if (found.length > 0) return found;
+    }
+  }
+  return [];
 }
 
 function recoveryGuardFailure(
@@ -2005,11 +2113,18 @@ function finishRecoveryGuardFailure(
   stepId: string,
   terminalEffects: AgentFlowPipelineTerminalEffects,
   decision: {
-    eventType: "recovery.limit_reached" | "recovery.short_circuited" | "recovery.short_circuit_failed";
+    eventType:
+      | "recovery.limit_reached"
+      | "recovery.short_circuited"
+      | "recovery.short_circuit_failed"
+      | "recovery.workspace_scope_violated"
+      | "recovery.workspace_snapshot_failed";
     classification:
       | "recovery_duration_limit"
       | "recovery_short_circuit"
       | "recovery_short_circuit_evaluation"
+      | "recovery_unrelated_files"
+      | "recovery_workspace_snapshot"
       | "failure_classification_invalid"
       | "failure_classification_unknown";
     message: string;
@@ -2481,6 +2596,12 @@ async function executeRecoverySession(
     }
     inputs.push(input);
   }
+  if (inputs.some((input) => input.path === RECOVERY_CONTEXT_INPUT_PATH)) {
+    throw new AgentFlowSessionRequestError(
+      `Recovery input path ${RECOVERY_CONTEXT_INPUT_PATH} is reserved for injected context.`,
+      "AGENT_FLOW_RECOVERY_CONTEXT_INVALID"
+    );
+  }
   const resume = session.resume === true;
   const previous = store.getSession(runId, sessionId);
   const priorExternalSessionId = resume ? previous?.externalSessionId ?? undefined : undefined;
@@ -2497,57 +2618,107 @@ async function executeRecoverySession(
   let metadata: AgentFlowYamlMapping | undefined;
   let status: AgentFlowRecoveryStatus;
   let externalSessionId = priorExternalSessionId;
+  let appliedContextRevision = 0;
+  let contextInput: AgentFlowSessionRequestArtifact | undefined;
   try {
-    reserveAgentFlowSessionModelCallBudgets(
-      store, runId, workflow, recoveryStepId, sessionId, provider
-    );
-    response = await invokeAgentFlowSessionProvider(adapter, {
-      runId,
-      stepId: recoveryStepId,
-      sessionId,
-      provider,
-      resume,
-      ...(priorExternalSessionId === undefined ? {} : { externalSessionId: priorExternalSessionId }),
-      prompt,
-      inputs,
-      outputs: [],
-      signal: new AbortController().signal
-    }, () => activeStopStatus(store, runId));
-    const returnedExternalSessionId = response.externalSessionId;
-    if (returnedExternalSessionId !== undefined &&
-        (typeof returnedExternalSessionId !== "string" || returnedExternalSessionId.trim().length === 0)) {
-      throw new AgentFlowSessionRequestError(
-        `Session provider external session ID for step ${recoveryStepId} must be a non-empty string.`,
-        "AGENT_FLOW_SESSION_RESPONSE_INVALID"
+    while (true) {
+      const activeSession = store.getSession(runId, sessionId)!;
+      const activeRevision = recoveryContextRevision(activeSession.state);
+      let rerunRevision: number | undefined;
+      if (activeRevision > appliedContextRevision) {
+        appliedContextRevision = activeRevision;
+        rerunRevision = appliedContextRevision;
+        contextInput = recoveryContextInputArtifact(activeSession.state);
+        if (inputs.length + 1 > MAX_AGENT_FLOW_SESSION_INPUTS
+            || totalInputBytes + contextInput.content.byteLength > MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES) {
+          throw new AgentFlowSessionRequestError(
+            `Recovery session ${recoveryStepId} inputs exceed their configured limits after context injection.`,
+            "AGENT_FLOW_SESSION_INPUT_LIMIT"
+          );
+        }
+      }
+      reserveAgentFlowSessionModelCallBudgets(
+        store, runId, workflow, recoveryStepId, sessionId, provider
       );
-    }
-    externalSessionId = returnedExternalSessionId?.trim() ?? priorExternalSessionId;
-    const stoppedAfterResponse = activeStopStatus(store, runId);
-    if (stoppedAfterResponse !== undefined) {
-      throw new AgentFlowSessionRequestInterruptedError(stoppedAfterResponse);
-    }
-    store.upsertSession({
-      id: sessionId,
-      runId,
-      stepId: recoveryStepId,
-      provider,
-      status: "running",
-      externalSessionId: externalSessionId ?? null,
-      state: { resume, recoveryOfStepId: stepId, failureId, providerResponded: true }
-    });
-    validateAgentFlowSessionProviderResponse(recoveryStepId, [], response);
-    metadata = validateAgentFlowSessionProviderMetadata(recoveryStepId, response.metadata);
-    const declaredStatus = normalizedTarget(metadata?.recovery_status);
-    if (declaredStatus !== "remediated" && declaredStatus !== "unresolved") {
-      throw new AgentFlowRunStateError(
-        "Recovery session metadata.recovery_status must be remediated or unresolved.",
-        "AGENT_FLOW_RECOVERY_STATUS"
-      );
-    }
-    status = declaredStatus;
-    const stoppedBeforeWaiting = activeStopStatus(store, runId);
-    if (stoppedBeforeWaiting !== undefined) {
-      throw new AgentFlowSessionRequestInterruptedError(stoppedBeforeWaiting);
+      if (rerunRevision !== undefined) {
+        store.appendRunEvent(runId, {
+          type: "recovery.context.rerun",
+          stepId: recoveryStepId,
+          payload: { sessionId, revision: rerunRevision }
+        });
+      }
+      try {
+        response = await invokeAgentFlowSessionProvider(adapter, {
+          runId,
+          stepId: recoveryStepId,
+          sessionId,
+          provider,
+          resume,
+          ...(externalSessionId === undefined ? {} : { externalSessionId }),
+          prompt,
+          inputs: contextInput === undefined ? inputs : [...inputs, contextInput],
+          outputs: [],
+          signal: new AbortController().signal
+        }, () => activeStopStatus(store, runId));
+      } catch (error) {
+        if (activeStopStatus(store, runId) === undefined
+            && recoveryContextRevision(store.getSession(runId, sessionId)?.state ?? {}) !== appliedContextRevision) {
+          continue;
+        }
+        throw error;
+      }
+      const stoppedAfterResponse = activeStopStatus(store, runId);
+      const returnedSessionId = response !== null && typeof response === "object"
+        && typeof response.externalSessionId === "string" && response.externalSessionId.trim().length > 0
+        ? response.externalSessionId.trim()
+        : undefined;
+      if (stoppedAfterResponse !== undefined) {
+        externalSessionId = returnedSessionId ?? externalSessionId;
+        throw new AgentFlowSessionRequestInterruptedError(stoppedAfterResponse);
+      }
+      if (recoveryContextRevision(store.getSession(runId, sessionId)?.state ?? {}) !== appliedContextRevision) {
+        if (resume) externalSessionId = returnedSessionId ?? externalSessionId;
+        continue;
+      }
+      const returnedExternalSessionId = response.externalSessionId;
+      if (returnedExternalSessionId !== undefined &&
+          (typeof returnedExternalSessionId !== "string" || returnedExternalSessionId.trim().length === 0)) {
+        throw new AgentFlowSessionRequestError(
+          `Session provider external session ID for step ${recoveryStepId} must be a non-empty string.`,
+          "AGENT_FLOW_SESSION_RESPONSE_INVALID"
+        );
+      }
+      externalSessionId = returnedExternalSessionId?.trim() ?? externalSessionId;
+      validateAgentFlowSessionProviderResponse(recoveryStepId, [], response);
+      metadata = validateAgentFlowSessionProviderMetadata(recoveryStepId, response.metadata);
+      const declaredStatus = normalizedTarget(metadata?.recovery_status);
+      if (declaredStatus !== "remediated" && declaredStatus !== "unresolved") {
+        throw new AgentFlowRunStateError(
+          "Recovery session metadata.recovery_status must be remediated or unresolved.",
+          "AGENT_FLOW_RECOVERY_STATUS"
+        );
+      }
+      status = declaredStatus;
+      const settled = store.settleRecoverySessionForRunAtContextRevision({
+        id: sessionId,
+        runId,
+        stepId: recoveryStepId,
+        provider,
+        externalSessionId: externalSessionId ?? null,
+        waitingState: {
+          resume,
+          recoveryOfStepId: stepId,
+          failureId,
+          providerResponded: true,
+          recoveryStatus: status
+        },
+        interruptedState: { resume, recoveryOfStepId: stepId, failureId }
+      }, appliedContextRevision);
+      if (!settled.settled) continue;
+      if (settled.stopped !== undefined) {
+        throw new AgentFlowSessionRequestInterruptedError(settled.stopped);
+      }
+      break;
     }
   } catch (error) {
     const stopped = error instanceof AgentFlowSessionRequestInterruptedError
@@ -2562,6 +2733,7 @@ async function executeRecoverySession(
       status: stopped ?? (failedByPolicy ? "failed" : "paused"),
       externalSessionId: externalSessionId ?? null,
       state: {
+        ...(store.getSession(runId, sessionId)?.state ?? {}),
         resume,
         recoveryOfStepId: stepId,
         failureId,
@@ -2572,21 +2744,46 @@ async function executeRecoverySession(
     });
     throw error;
   }
-  const stoppedWhileSettling = store.settleSessionForRun({
-    id: sessionId,
-    runId,
-    stepId: recoveryStepId,
-    provider,
-    externalSessionId: externalSessionId ?? null,
-    waitingState: { resume, recoveryOfStepId: stepId, failureId, recoveryStatus: status },
-    interruptedState: { resume, recoveryOfStepId: stepId, failureId }
-  });
-  if (stoppedWhileSettling !== undefined) {
-    throw new AgentFlowSessionRequestInterruptedError(stoppedWhileSettling);
-  }
   return {
     status,
     ...(typeof metadata?.message === "string" ? { message: metadata.message } : {})
+  };
+}
+
+function recoveryContextRevision(state: Record<string, AgentFlowRunStateValue>): number {
+  return typeof state.contextRevision === "number"
+    && Number.isSafeInteger(state.contextRevision)
+    && state.contextRevision >= 0
+    ? state.contextRevision
+    : 0;
+}
+
+function recoveryContextInputArtifact(
+  state: Record<string, AgentFlowRunStateValue>
+): AgentFlowSessionRequestArtifact {
+  const injections = Array.isArray(state.contextInjections)
+    ? state.contextInjections.flatMap((entry) => {
+      const record = mapping(entry);
+      return typeof record?.context === "string" && record.context.trim().length > 0
+        ? [record.context]
+        : [];
+    })
+    : [];
+  if (injections.length === 0) {
+    throw new AgentFlowRunStateError(
+      "Recovery session context revision has no persisted injected context.",
+      "AGENT_FLOW_RECOVERY_CONTEXT_INVALID"
+    );
+  }
+  const content = Buffer.from(
+    injections.map((entry, index) => `## Injected context ${index + 1}\n\n${entry}\n`).join("\n"),
+    "utf8"
+  );
+  return {
+    path: RECOVERY_CONTEXT_INPUT_PATH,
+    content,
+    contentType: "text/markdown; charset=utf-8",
+    checksum: createHash("sha256").update(content).digest("hex")
   };
 }
 

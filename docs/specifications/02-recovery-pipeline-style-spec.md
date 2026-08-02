@@ -278,6 +278,25 @@ Recovery routes declare exactly one static target:
   Its provider response must return no undeclared outputs and must include
   `metadata.recovery_status` set to `remediated` or `unresolved`.
 
+Routed remediation is guarded by a before-and-after snapshot of Git-visible
+repository files. Every changed path must satisfy all declared layers of the
+existing file-write policy. Session routes require
+`authority.can_modify_files: true`; `policies.file_scope`, the session's
+`file_scope`, and `route_to.file_scope` intersect when present. Workflow routes
+may authorize their expected remediation paths directly on `route_to`:
+
+```yaml
+route_to:
+  workflow: repair
+  file_scope:
+    include: [src/**, tests/**]
+```
+
+If any changed path is outside the authorized scope, the parent pauses,
+persists a `recovery_unrelated_files` failure, and emits
+`recovery.workspace_scope_violated`. Snapshot failures also pause rather than
+letting ambiguous remediation continue.
+
 Both routes must declare `on_remediated` and `on_unresolved`. A nested workflow
 that returns `remediated` follows the former handler. `unresolved`, failed,
 paused, cancelled, missing, or unsupported recovery results follow the latter.
@@ -289,6 +308,16 @@ The runtime persists `recovery.routed` and `recovery.completed` events, writes a
 `recovery_decision` artifact, and records the route, target, result, and child
 run ID (when applicable) in the failure index. Child runs use `parent_run_id`
 and `recovery_of_run_id` to preserve the recovery relationship.
+
+While a routed recovery session is running, callers may use
+`injectAgentFlowRecoveryContext` or
+`agent-flow inject <run-id> <session-name> <context>`. The injection is
+persisted with a monotonic revision, marks the remediation session dirty, and
+emits `recovery.context.injected`. After the in-flight provider call returns,
+the runtime reruns remediation with all injected context in
+`recovery-context/injected.md`, emits `recovery.context.rerun`, and clears the
+dirty marker only when no newer revision raced with the acknowledgement. Each
+rerun consumes the normal model-call budgets.
 
 ## 8. Limits
 
@@ -405,13 +434,13 @@ notify:
 
 | Edge Case | Required Behavior |
 |---|---|
-| Remediation changes unrelated files | Pause or revert only if explicitly allowed |
+| Remediation changes unrelated files | Pause unless every changed path is explicitly authorized by layered file scope |
 | Same failure repeats | Stop after max cycles |
 | Triage cannot classify | Pause |
 | FM fix creates new failure | Continue until recovery limit, then pause |
 | Failure log contains secrets | Redact before session input |
 | Nested workflow fails | Parent follows `on_unresolved` |
-| User injects context during recovery | Mark current remediation step dirty and rerun if needed |
+| User injects context during recovery | Persist the context, mark remediation dirty, and rerun with revision-safe acknowledgement |
 
 ## 13. Validation Rules
 

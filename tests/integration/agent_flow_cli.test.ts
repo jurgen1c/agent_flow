@@ -63,6 +63,10 @@ describe("Agent Flow CLI", () => {
       exitCode: 0,
       stdout: "agent-flow run\n\nUsage: agent-flow run <workflow> --id <run-id> [--fixture <file>]"
     });
+    expect(dispatch(["help", "inject"])).toEqual({
+      exitCode: 0,
+      stdout: "agent-flow inject\n\nUsage: agent-flow inject <run-id> <session-name> <context>"
+    });
     expect(dispatch(["help", "missing"])).toEqual({
       exitCode: 7,
       stderr: "Unknown Agent Flow help topic: missing\nRun `agent-flow help` to see available commands."

@@ -50,7 +50,9 @@ export {
 } from "./command_execution";
 export {
   AgentFlowWorkflowRegistry,
-  createAgentFlowWorkflowRegistry
+  MAX_AGENT_FLOW_RECOVERY_CONTEXT_BYTES,
+  createAgentFlowWorkflowRegistry,
+  injectAgentFlowRecoveryContext
 } from "./recovery";
 export {
   AGENT_FLOW_FAILURE_CLASSIFICATION_CONFIDENCES,
