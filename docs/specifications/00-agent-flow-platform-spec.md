@@ -205,6 +205,7 @@ limits:
   max_frontier_calls: 4
   max_model_calls: 8
   max_step_attempts: { implementer: 3 }
+  max_duration_minutes: 120
 
 policies:
   model_usage:
@@ -212,6 +213,7 @@ policies:
   approvals:
     required_for: [publish]
   cleanup: require_approval
+  recovery_limits: pause
   unsafe_operations: deny
 
 sessions:

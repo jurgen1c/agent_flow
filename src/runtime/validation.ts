@@ -113,6 +113,7 @@ export function validateAgentFlowWorkflow(workflow: AgentFlowWorkflow): AgentFlo
 
   validateSessionDefinitions(workflow, errors);
   errors.push(...validateAgentFlowPolicyPrimitives(workflow));
+  validateRecoveryLimits(workflow, runtimeContexts, errors);
   errors.push(...validateAgentFlowNotifications(workflow));
   validateStepShapes(executableContexts, errors);
   validateRecoveryRoutes(workflow, runtimeContexts, errors);
@@ -134,6 +135,95 @@ export function validateAgentFlowWorkflow(workflow: AgentFlowWorkflow): AgentFlo
   validateCollaborativeReviewBounds(workflow, contexts, errors);
 
   return { valid: errors.length === 0, errors };
+}
+
+function validateRecoveryLimits(
+  workflow: AgentFlowWorkflow,
+  contexts: StepContext[],
+  errors: AgentFlowWorkflowIssue[]
+): void {
+  const limits = isRecord(workflow.limits) ? workflow.limits : undefined;
+  if (limits?.max_duration_seconds !== undefined && limits.max_duration_minutes !== undefined) {
+    errors.push({
+      code: "workflow.recovery.duration.ambiguous",
+      message: "Recovery duration must use either limits.max_duration_seconds or limits.max_duration_minutes, not both.",
+      path: "limits"
+    });
+  }
+
+  const declarations: Array<{ value: AgentFlowYamlValue | undefined; path: string; stepId?: string }> = [
+    { value: workflow.short_circuit_if, path: "short_circuit_if" },
+    ...contexts.map((context) => ({
+      value: context.step.short_circuit_if,
+      path: `${context.path}.short_circuit_if`,
+      ...(context.id === undefined ? {} : { stepId: context.id })
+    }))
+  ];
+  if (workflow.style !== "recovery_pipeline") {
+    for (const declaration of declarations.filter((entry) => entry.value !== undefined)) {
+      errors.push({
+        code: "workflow.recovery.short_circuit.style",
+        message: "Recovery short_circuit_if is only supported by recovery_pipeline workflows.",
+        path: declaration.path,
+        ...(declaration.stepId === undefined ? {} : { stepId: declaration.stepId })
+      });
+    }
+  }
+  for (const declaration of declarations) {
+    if (declaration.value === undefined) continue;
+    if (!Array.isArray(declaration.value) || declaration.value.length === 0 ||
+        declaration.value.some((entry) => typeof entry !== "string" || entry.trim().length === 0)) {
+      errors.push({
+        code: "workflow.recovery.short_circuit.invalid",
+        message: "Recovery short_circuit_if must be a non-empty list of condition expressions.",
+        path: declaration.path,
+        ...(declaration.stepId === undefined ? {} : { stepId: declaration.stepId })
+      });
+      continue;
+    }
+    declaration.value.forEach((entry, index) => {
+      const expression = entry as string;
+      if (!agentFlowConditionExpressionIsSimple(expression)) {
+        errors.push({
+          code: "workflow.recovery.short_circuit.expression.unsupported",
+          message: "Recovery short circuits support one input, artifact, budget, or failure reference with an optional scalar comparison.",
+          path: `${declaration.path}[${index}]`,
+          ...(declaration.stepId === undefined ? {} : { stepId: declaration.stepId })
+        });
+        return;
+      }
+      const reference = agentFlowConditionReference(expression);
+      const inputName = reference?.scope === "inputs" ? reference.segments[0] : undefined;
+      if (inputName !== undefined && !Object.hasOwn(workflow.inputs ?? {}, inputName)) {
+        errors.push({
+          code: "workflow.input.undeclared",
+          message: `Input ${JSON.stringify(inputName)} is referenced but not declared in workflow inputs.`,
+          path: `${declaration.path}[${index}]`,
+          ...(declaration.stepId === undefined ? {} : { stepId: declaration.stepId })
+        });
+      }
+    });
+  }
+
+  if (workflow.style === "recovery_pipeline") {
+    const checkedOutputs = new Set<string>();
+    for (const context of contexts) {
+      for (const { output, outputContext } of stepOutputContexts(context)) {
+        const key = `${outputContext.path}\0${output}`;
+        if (checkedOutputs.has(key)) continue;
+        checkedOutputs.add(key);
+        const namespace = agentFlowConditionArtifactAlias(normalizeArtifactPath(output))[0];
+        if (namespace !== "budget" && namespace !== "failures") continue;
+        addStepIssue(
+          errors,
+          outputContext,
+          "workflow.recovery.short_circuit.namespace.reserved",
+          outputField(outputContext.step),
+          `Artifact output ${JSON.stringify(output)} uses reserved recovery short-circuit namespace ${namespace}.`
+        );
+      }
+    }
+  }
 }
 
 function validateConditionExpressions(
@@ -2153,7 +2243,7 @@ function stepInputs(step: AgentFlowWorkflowStep): string[] {
 function stepOutputs(step: AgentFlowWorkflowStep): string[] {
   const outputs = stringList(step.outputs);
   const output = nonEmptyString(step.output);
-  const saveAs = step.type === "input_request" ? nonEmptyString(step.save_as) : undefined;
+  const saveAs = nonEmptyString(step.type) === "input_request" ? nonEmptyString(step.save_as) : undefined;
   return [...outputs, ...(output === undefined ? [] : [output]), ...(saveAs === undefined ? [] : [saveAs])];
 }
 
@@ -2181,7 +2271,7 @@ function outputField(step: AgentFlowWorkflowStep): string {
   if (nonEmptyString(step.output) !== undefined) {
     return "output";
   }
-  return step.type === "input_request" && nonEmptyString(step.save_as) !== undefined ? "save_as" : "outputs";
+  return nonEmptyString(step.type) === "input_request" && nonEmptyString(step.save_as) !== undefined ? "save_as" : "outputs";
 }
 
 function directTargets(step: AgentFlowWorkflowStep): string[] {
