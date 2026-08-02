@@ -1836,14 +1836,18 @@ function recoveryGuardFailure(
 function runtimeRecoveryLimitConfigurationIssue(
   workflow: AgentFlowWorkflow
 ): { code: string; path: string; message: string } | undefined {
-  if (workflow.style !== "recovery_pipeline" &&
-      (workflow.short_circuit_if !== undefined || runtimeRecoveryLimitSteps(workflow.steps)
-        .some(({ step }) => step.short_circuit_if !== undefined))) {
-    return {
-      code: "workflow.recovery.short_circuit.style",
-      path: "short_circuit_if",
-      message: "Recovery short_circuit_if is only supported by recovery_pipeline workflows."
-    };
+  if (workflow.style !== "recovery_pipeline") {
+    const invalidPath = workflow.short_circuit_if !== undefined
+      ? "short_circuit_if"
+      : runtimeRecoveryLimitSteps(workflow.steps)
+        .find(({ step }) => step.short_circuit_if !== undefined)?.path;
+    if (invalidPath !== undefined) {
+      return {
+        code: "workflow.recovery.short_circuit.style",
+        path: invalidPath === "short_circuit_if" ? invalidPath : `${invalidPath}.short_circuit_if`,
+        message: "Recovery short_circuit_if is only supported by recovery_pipeline workflows."
+      };
+    }
   }
   if (workflow.style !== "recovery_pipeline") return undefined;
   const limits = mapping(workflow.limits);
@@ -1883,21 +1887,25 @@ function runtimeRecoveryLimitConfigurationIssue(
     const saveAs = normalizedTarget(step.type) === "input_request" && typeof step.save_as === "string" && step.save_as.trim().length > 0
       ? step.save_as.trim()
       : undefined;
-    const outputs = [...stringList(step.outputs), ...(output === undefined ? [] : [output]), ...(saveAs === undefined ? [] : [saveAs])];
+    const outputs = [
+      ...stringList(step.outputs).map((value) => ({ value, field: "outputs" })),
+      ...(output === undefined ? [] : [{ value: output, field: "output" }]),
+      ...(saveAs === undefined ? [] : [{ value: saveAs, field: "save_as" }])
+    ];
     const reserved = outputs.find((candidate) => {
       try {
-        const namespace = agentFlowConditionArtifactAlias(normalizeAgentFlowArtifactPath(candidate))[0];
+        const namespace = agentFlowConditionArtifactAlias(normalizeAgentFlowArtifactPath(candidate.value))[0];
         return namespace === "budget" || namespace === "failures";
       } catch {
         return false;
       }
     });
     if (reserved !== undefined) {
-      const namespace = agentFlowConditionArtifactAlias(normalizeAgentFlowArtifactPath(reserved))[0];
+      const namespace = agentFlowConditionArtifactAlias(normalizeAgentFlowArtifactPath(reserved.value))[0];
       return {
         code: "workflow.recovery.short_circuit.namespace.reserved",
-        path: `${path}.outputs`,
-        message: `Artifact output ${JSON.stringify(reserved)} uses reserved recovery short-circuit namespace ${namespace}.`
+        path: `${path}.${reserved.field}`,
+        message: `Artifact output ${JSON.stringify(reserved.value)} uses reserved recovery short-circuit namespace ${namespace}.`
       };
     }
   }

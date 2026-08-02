@@ -767,11 +767,14 @@ steps:
       context: { workflow }
     });
     await expect(executeAgentFlowCommandPipeline(store, "reserved-recovery-namespace", workflow))
-      .rejects.toMatchObject({ code: "AGENT_FLOW_WORKFLOW_INVALID" });
+      .rejects.toMatchObject({
+        code: "AGENT_FLOW_WORKFLOW_INVALID",
+        message: expect.stringContaining("steps[0].save_as")
+      });
     store.close();
   });
 
-  test("validates short circuits on direct parallel branch descriptors", () => {
+  test("validates short circuits on direct parallel branch descriptors", async () => {
     const workflow = parseAgentFlowWorkflowOrThrow(`name: direct-branch-short-circuit
 version: 1
 style: pipeline
@@ -789,6 +792,24 @@ steps:
       code: "workflow.recovery.short_circuit.style",
       path: "steps[0].branches[0].short_circuit_if"
     }));
+
+    const store = await openAgentFlowRunState({ cwd: temporaryRepo() });
+    store.createRun({
+      id: "direct-branch-short-circuit",
+      workflow: {
+        name: workflow.name,
+        version: workflow.version,
+        style: workflow.style,
+        maturity: workflow.maturity
+      },
+      context: { workflow }
+    });
+    await expect(executeAgentFlowCommandPipeline(store, "direct-branch-short-circuit", workflow))
+      .rejects.toMatchObject({
+        code: "AGENT_FLOW_WORKFLOW_INVALID",
+        message: expect.stringContaining("steps[0].branches[0].short_circuit_if")
+      });
+    store.close();
   });
 
   test("rejects undeclared input references in recovery short circuits", async () => {
