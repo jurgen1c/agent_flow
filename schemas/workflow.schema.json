@@ -12,9 +12,18 @@
     "sessions": { "type": "object" },
     "artifacts": { "type": "object" },
     "steps": { "type": "array", "items": { "type": "object" } },
+    "short_circuit_if": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
     "limits": {
       "type": "object",
       "properties": {
+        "max_duration_minutes": { "type": "number", "exclusiveMinimum": 0 },
+        "max_duration_seconds": { "type": "number", "exclusiveMinimum": 0 },
+        "max_frontier_calls": { "type": "number", "exclusiveMinimum": 0 },
+        "max_recovery_cycles": { "type": "integer", "minimum": 1 },
         "max_step_attempts": {
           "type": "object",
           "minProperties": 1,
@@ -22,6 +31,13 @@
           "additionalProperties": { "type": "number", "exclusiveMinimum": 0 }
         }
       },
+      "allOf": [
+        {
+          "not": {
+            "required": ["max_duration_seconds", "max_duration_minutes"]
+          }
+        }
+      ],
       "patternProperties": {
         "^max_(?!step_attempts$)": { "type": "number", "exclusiveMinimum": 0 }
       },
@@ -54,6 +70,7 @@
           },
           "additionalProperties": true
         },
+        "recovery_limits": { "enum": ["pause", "fail"] },
         "unsafe_operations": { "$ref": "#/$defs/policyMode" }
       },
       "additionalProperties": true
@@ -71,6 +88,15 @@
   },
   "additionalProperties": true,
   "allOf": [
+    {
+      "if": {
+        "properties": { "style": { "not": { "const": "recovery_pipeline" } } },
+        "required": ["style"]
+      },
+      "then": {
+        "properties": { "short_circuit_if": false }
+      }
+    },
     {
       "if": {
         "properties": { "style": { "const": "pipeline" } },

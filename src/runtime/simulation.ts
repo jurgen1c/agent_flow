@@ -13,7 +13,13 @@ import {
 } from "./artifact_transform";
 import { normalizeAgentFlowArtifactPath, type AgentFlowRunStateValue } from "./run_state";
 import { resolveAgentFlowMcpArguments } from "./mcp_call";
-import { selectAgentFlowConditionTargetFromValues } from "./condition";
+import {
+  AgentFlowConditionError,
+  agentFlowConditionArtifactAlias,
+  evaluateAgentFlowConditionWithResolver,
+  resolveAgentFlowConditionReferenceFromValues,
+  selectAgentFlowConditionTargetFromValues
+} from "./condition";
 import {
   agentFlowAmbiguousSuccessTargetMessage,
   collectAgentFlowAmbiguousSuccessTargets
@@ -81,6 +87,7 @@ export type AgentFlowSimulationFixtureParseResult =
   | { ok: false; error: string };
 
 interface SimulationState {
+  workflow: AgentFlowWorkflow;
   workflowStyle: AgentFlowWorkflow["style"];
   fixture: AgentFlowSimulationFixture;
   artifacts: Set<string>;
@@ -96,6 +103,9 @@ interface SimulationState {
   missingInputs: string[];
   visits: Map<string, number>;
   retryAttempts: Map<string, number>;
+  immediateRetries: Set<string>;
+  failureAttempts: Map<string, number>;
+  modelBudgetUsage: Map<string, number>;
   recoveryCycles: Map<string, number>;
   maxRecoveryCycles?: number;
   stepAttemptLimits: Map<string, number>;
@@ -187,6 +197,7 @@ export function simulateAgentFlowWorkflow(
 ): AgentFlowSimulationResult {
   const fixtureArtifacts = canonicalFixtureArtifacts(fixture.artifacts ?? {});
   const state: SimulationState = {
+    workflow,
     workflowStyle: workflow.style,
     fixture,
     artifacts: new Set([...fixtureArtifacts.values.keys(), ...fixtureArtifacts.collisions]),
@@ -202,6 +213,9 @@ export function simulateAgentFlowWorkflow(
     missingInputs: requiredWorkflowInputs(workflow).filter((name) => !Object.hasOwn(fixture.inputs ?? {}, name)),
     visits: new Map(),
     retryAttempts: new Map(),
+    immediateRetries: new Set(),
+    failureAttempts: new Map(),
+    modelBudgetUsage: new Map(),
     recoveryCycles: new Map(),
     maxRecoveryCycles: workflowRecoveryLimit(workflow),
     stepAttemptLimits: workflowStepAttemptLimits(workflow),
@@ -361,11 +375,17 @@ function runSequence(
 function runStep(step: AgentFlowWorkflowStep, state: SimulationState, insideLoop: boolean): SequenceControl {
   const id = nonEmptyString(step.id) ?? "(unnamed)";
   const type = nonEmptyString(step.type) ?? "unknown";
+  const immediateRetry = state.immediateRetries.delete(id);
+  if (!immediateRetry) {
+    const guardControl = simulationRecoveryGuard(step, id, state);
+    if (guardControl !== undefined) return guardControl;
+  }
   const visit = state.visits.get(id) ?? 0;
   const attemptLimit = state.stepAttemptLimits.get(id);
   if (attemptLimit !== undefined && visit + 1 > attemptLimit) {
-    state.terminalStates.push({ stepId: id, status: "paused" });
-    return { kind: "terminal", status: "paused" };
+    const status = simulationRecoveryLimitStatus(state);
+    state.terminalStates.push({ stepId: id, status });
+    return { kind: "terminal", status };
   }
   state.visits.set(id, visit + 1);
   const stepFixture = state.fixture.steps?.[id] ?? {};
@@ -374,12 +394,21 @@ function runStep(step: AgentFlowWorkflowStep, state: SimulationState, insideLoop
   state.visitedSteps.push({ id, type, outcome: type === "condition" && outcome === "succeeded" ? "selected" : outcome });
   checkInputs(step, id, state);
 
+  if (type === "parallel_branch" && nonEmptyString(step.session) !== undefined) {
+    const budgetControl = simulationModelBudgetControl(step, id, state);
+    if (budgetControl !== undefined) {
+      state.visitedSteps.at(-1)!.outcome = "failed";
+      return budgetControl;
+    }
+  }
+
   if (outcome === "failed") {
+    state.failureAttempts.set(id, Math.max(state.failureAttempts.get(id) ?? 0, visit + 1));
     if (type === "artifact_transform") {
       return failureControl(step, stepFixture, id, state);
     }
     if (type === "session_request") {
-      return simulatedSessionFailure(step, stepFixture, id, state, "Fixture marks the session request as failed.");
+      return simulateSessionRequestStep(step, stepFixture, id, state, true);
     }
     if (type === "mcp_call") {
       return simulatedSessionFailure(step, stepFixture, id, state, "Fixture marks the MCP call as failed.");
@@ -392,7 +421,7 @@ function runStep(step: AgentFlowWorkflowStep, state: SimulationState, insideLoop
     if (transformControl.kind !== "done") return transformControl;
     state.retryAttempts.delete(id);
   } else if (type === "session_request") {
-    const sessionControl = simulateSessionRequestStep(step, stepFixture, id, state);
+    const sessionControl = simulateSessionRequestStep(step, stepFixture, id, state, false);
     if (sessionControl.kind !== "done") return sessionControl;
     state.retryAttempts.delete(id);
   } else if (type === "mcp_call") {
@@ -446,6 +475,92 @@ function runStep(step: AgentFlowWorkflowStep, state: SimulationState, insideLoop
 
   const target = staticTarget(step.then) ?? staticTarget(step.goto);
   return target === undefined ? { kind: "done" } : controlForTarget(target, id, state);
+}
+
+function simulationRecoveryGuard(
+  step: AgentFlowWorkflowStep,
+  stepId: string,
+  state: SimulationState
+): SequenceControl | undefined {
+  if (state.workflowStyle !== "recovery_pipeline") return undefined;
+  const expressions = [state.workflow.short_circuit_if, step.short_circuit_if]
+    .flatMap((value) => Array.isArray(value) ? value : [])
+    .filter((value): value is string => typeof value === "string");
+  for (const expression of expressions) {
+    let matched: boolean;
+    try {
+      matched = evaluateAgentFlowConditionWithResolver(expression, (scope, segments) => {
+        if (scope === "artifacts" && segments[0] === "budget") {
+          return simulationBudgetReference(state, segments.slice(1));
+        }
+        if (scope === "artifacts" && segments[0] === "failures") {
+          return segments.length >= 3 && segments.at(-1) === "attempts"
+            ? state.failureAttempts.get(segments.slice(1, -1).join("."))
+            : undefined;
+        }
+        assertSimulationArtifactValueAvailable(state, scope, segments);
+        return resolveAgentFlowConditionReferenceFromValues(
+          state.fixture.inputs ?? {}, state.artifactValues, scope, segments
+        );
+      });
+    } catch (error) {
+      if (error instanceof AgentFlowConditionError &&
+          (error.message.includes("does not match a published JSON artifact") ||
+           error.message.includes("did not resolve to a value"))) {
+        continue;
+      }
+      state.terminalStates.push({ stepId, status: "paused" });
+      return { kind: "terminal", status: "paused" };
+    }
+    if (matched) {
+      state.terminalStates.push({ stepId, status: "paused" });
+      return { kind: "terminal", status: "paused" };
+    }
+  }
+  return undefined;
+}
+
+function simulationModelBudgetControl(
+  step: AgentFlowWorkflowStep,
+  stepId: string,
+  state: SimulationState
+): SequenceControl | undefined {
+  return simulationSessionBudgetControl(nonEmptyString(step.session), stepId, state);
+}
+
+function simulationSessionBudgetControl(
+  sessionId: string | undefined,
+  stepId: string,
+  state: SimulationState
+): SequenceControl | undefined {
+  const session = sessionId === undefined || !isRecord(state.workflow.sessions?.[sessionId])
+    ? undefined
+    : state.workflow.sessions[sessionId];
+  const provider = isRecord(session) ? nonEmptyString(session.provider) : undefined;
+  const kinds = ["model_calls", ...(provider === "frontier" ? ["frontier_calls"] : [])];
+  const limits = isRecord(state.workflow.limits) ? state.workflow.limits : undefined;
+  for (const kind of kinds) {
+    const limit = limits?.[`max_${kind}`];
+    if (limit === undefined && kind !== "frontier_calls") continue;
+    if (typeof limit !== "number" || (state.modelBudgetUsage.get(kind) ?? 0) + 1 > limit) {
+      const status = simulationRecoveryLimitStatus(state);
+      state.terminalStates.push({ stepId, status });
+      return { kind: "terminal", status };
+    }
+  }
+  for (const kind of kinds) {
+    const limit = limits?.[`max_${kind}`];
+    if (typeof limit === "number") state.modelBudgetUsage.set(kind, (state.modelBudgetUsage.get(kind) ?? 0) + 1);
+  }
+  return undefined;
+}
+
+function simulationBudgetReference(state: SimulationState, segments: string[]): AgentFlowYamlValue | undefined {
+  if (segments.length !== 1 || !segments[0]!.endsWith("_remaining")) return undefined;
+  const kind = segments[0]!.slice(0, -"_remaining".length);
+  const limits = isRecord(state.workflow.limits) ? state.workflow.limits : undefined;
+  const limit = limits?.[`max_${kind}`];
+  return typeof limit === "number" ? Math.max(0, limit - (state.modelBudgetUsage.get(kind) ?? 0)) : undefined;
 }
 
 function canonicalFixtureOutputValues(
@@ -550,6 +665,7 @@ function simulatedMcpContractFailure(
 ): SequenceControl {
   const visit = state.visitedSteps.at(-1);
   if (visit?.id === stepId && visit.outcome === "succeeded") visit.outcome = "failed";
+  recordSimulationFailure(state, stepId);
   if (!isRecord(step.on_failure)) {
     state.terminalStates.push({ stepId, status: "paused" });
     return { kind: "terminal", status: "paused" };
@@ -571,7 +687,8 @@ function simulateSessionRequestStep(
   step: AgentFlowWorkflowStep,
   fixture: AgentFlowSimulationStepFixture,
   stepId: string,
-  state: SimulationState
+  state: SimulationState,
+  providerOutcomeFailed: boolean
 ): SequenceControl {
   const resolvedInputs: string[] = [];
   for (const value of Array.isArray(step.inputs) ? step.inputs : []) {
@@ -613,6 +730,28 @@ function simulateSessionRequestStep(
       .flatMap((output) => nonEmptyString(output) ?? [])
       .map(canonicalArtifactName)
   );
+  for (const output of Array.isArray(step.outputs) ? step.outputs : []) {
+    const name = nonEmptyString(output);
+    if (name === undefined) continue;
+    const artifact = canonicalArtifactName(name);
+    if (state.artifacts.has(artifact) && state.artifactProducers.get(artifact) !== stepId && step.overwrite !== true) {
+      return simulatedSessionFailure(
+        step,
+        fixture,
+        stepId,
+        state,
+        `Artifact ${artifact} already exists; declare overwrite: true to replace it during simulation.`
+      );
+    }
+  }
+  const budgetControl = simulationModelBudgetControl(step, stepId, state);
+  if (budgetControl !== undefined) {
+    state.visitedSteps.at(-1)!.outcome = "failed";
+    return budgetControl;
+  }
+  if (providerOutcomeFailed) {
+    return simulatedSessionFailure(step, fixture, stepId, state, "Fixture marks the session request as failed.");
+  }
   const providedOutputs = Array.isArray(fixture.outputs)
     ? canonicalFixtureArtifactNames(fixture.outputs)
     : canonicalFixtureArtifacts(fixture.outputs ?? {});
@@ -628,21 +767,6 @@ function simulateSessionRequestStep(
       `Session fixture outputs must match declared outputs exactly; invalid output ${invalidOutput}.`
     );
   }
-
-  for (const output of Array.isArray(step.outputs) ? step.outputs : []) {
-    const name = nonEmptyString(output);
-    if (name === undefined) continue;
-    const artifact = canonicalArtifactName(name);
-    if (state.artifacts.has(artifact) && state.artifactProducers.get(artifact) !== stepId && step.overwrite !== true) {
-      return simulatedSessionFailure(
-        step,
-        fixture,
-        stepId,
-        state,
-        `Artifact ${artifact} already exists; declare overwrite: true to replace it during simulation.`
-      );
-    }
-  }
   recordOutputs(step, fixture, stepId, state);
   return { kind: "done" };
 }
@@ -654,6 +778,7 @@ function simulatedSessionFailure(
   state: SimulationState,
   message: string
 ): SequenceControl {
+  recordSimulationFailure(state, stepId);
   if (isRecord(step.on_failure)) return simulatedTransformFailure(step, fixture, stepId, state, message);
   const visit = state.visitedSteps.at(-1);
   if (visit?.id === stepId && visit.outcome === "succeeded") visit.outcome = "failed";
@@ -756,6 +881,10 @@ function loopControl(
 
   const body = Array.isArray(step.body) ? step.body.filter(isRecord) as AgentFlowWorkflowStep[] : [];
   for (let iteration = 0; iteration < iterations; iteration += 1) {
+    if (iteration > 0) {
+      const guardControl = simulationRecoveryGuard(step, id, state);
+      if (guardControl !== undefined) return guardControl;
+    }
     const control = runSequence(body, state, true);
     if (control.kind === "break_loop") continue;
     if (control.kind !== "done") return control;
@@ -867,6 +996,7 @@ function failureControl(
   const retryAttempt = state.retryAttempts.get(id) ?? 0;
   if (retryAttempt < retries) {
     state.retryAttempts.set(id, retryAttempt + 1);
+    state.immediateRetries.add(id);
     return { kind: "target", target: id, budgetChecked: true };
   }
   state.retryAttempts.delete(id);
@@ -875,6 +1005,14 @@ function failureControl(
   if (target !== undefined) return controlForTarget(target, id, state);
 
   if (onFailure?.route_to !== undefined) {
+    const guardControl = simulationRecoveryGuard(step, id, state);
+    if (guardControl !== undefined) return guardControl;
+    const route = isRecord(onFailure.route_to) ? onFailure.route_to : undefined;
+    const routeSession = nonEmptyString(route?.session);
+    if (routeSession !== undefined) {
+      const budgetControl = simulationSessionBudgetControl(routeSession, id, state);
+      if (budgetControl !== undefined) return budgetControl;
+    }
     if (stepFixture.recovery === undefined) {
       addUnresolved(state, id, "Fixture does not select a routed recovery outcome.");
       return { kind: "terminal", status: "unresolved" };
@@ -1015,6 +1153,7 @@ function simulatedTransformFailure(
 ): SequenceControl {
   const visit = state.visitedSteps.at(-1);
   if (visit?.id === stepId && visit.outcome === "succeeded") visit.outcome = "failed";
+  recordSimulationFailure(state, stepId);
   if (isRecord(step.on_failure)) {
     const control = failureControl(step, stepFixture, stepId, state);
     const hasExplicitTarget = nonEmptyString(step.on_failure.then) !== undefined
@@ -1162,8 +1301,9 @@ function nestedArtifactNames(value: AgentFlowYamlValue | undefined, state: Simul
 function checkTargetBudget(control: Extract<SequenceControl, { kind: "target" }>, state: SimulationState): SequenceControl {
   const attemptLimit = state.stepAttemptLimits.get(control.target);
   if (attemptLimit !== undefined && (state.visits.get(control.target) ?? 0) + 1 > attemptLimit) {
-    state.terminalStates.push({ stepId: control.target, status: "paused" });
-    return { kind: "terminal", status: "paused" };
+    const status = simulationRecoveryLimitStatus(state);
+    state.terminalStates.push({ stepId: control.target, status });
+    return { kind: "terminal", status };
   }
   if (control.budgetChecked || state.maxRecoveryCycles === undefined || (state.visits.get(control.target) ?? 0) === 0) {
     return { ...control, budgetChecked: true };
@@ -1173,8 +1313,41 @@ function checkTargetBudget(control: Extract<SequenceControl, { kind: "target" }>
   state.recoveryCycles.set(control.target, cycles);
   if (cycles <= state.maxRecoveryCycles) return { ...control, budgetChecked: true };
 
-  addUnresolved(state, control.target, `Simulation exceeded limits.max_recovery_cycles ${state.maxRecoveryCycles}.`);
-  return { kind: "terminal", status: "unresolved" };
+  const status = simulationRecoveryLimitStatus(state);
+  state.terminalStates.push({ stepId: control.target, status });
+  return { kind: "terminal", status };
+}
+
+function simulationRecoveryLimitStatus(state: SimulationState): "failed" | "paused" {
+  return state.workflowStyle === "recovery_pipeline"
+    && isRecord(state.workflow.policies) && state.workflow.policies.recovery_limits === "fail"
+    ? "failed"
+    : "paused";
+}
+
+function recordSimulationFailure(state: SimulationState, stepId: string): void {
+  state.failureAttempts.set(stepId, Math.max(state.failureAttempts.get(stepId) ?? 0, state.visits.get(stepId) ?? 1));
+}
+
+function assertSimulationArtifactValueAvailable(
+  state: SimulationState,
+  scope: "inputs" | "artifacts",
+  segments: string[]
+): void {
+  if (scope !== "artifacts") return;
+  const published = [...state.artifacts]
+    .map((artifact) => ({ artifact, alias: agentFlowConditionArtifactAlias(artifact) }))
+    .filter(({ alias }) => {
+      return segments.slice(0, alias.length).join(".") === alias.join(".");
+    })
+    .sort((left, right) => right.alias.length - left.alias.length);
+  const selectedAliasLength = published[0]?.alias.length;
+  const selected = published.filter(({ alias }) => alias.length === selectedAliasLength);
+  if (selected.some(({ artifact }) => !state.artifactValues.has(artifact))) {
+    throw new AgentFlowConditionError(
+      `Condition artifact reference artifacts.${segments.join(".")} matches a published artifact without an evaluable fixture value.`
+    );
+  }
 }
 
 function workflowStepAttemptLimits(workflow: AgentFlowWorkflow): Map<string, number> {

@@ -278,9 +278,21 @@ limits:
     ci: 4
   max_frontier_calls: 5
   max_duration_minutes: 120
+
+policies:
+  recovery_limits: pause
 ```
 
-When a limit is reached, the workflow should pause or fail according to policy.
+`max_duration_seconds` may be used instead of `max_duration_minutes`; declaring
+both is invalid. The duration is measured from the persisted run start time and
+checked before each subsequent step. Model budgets are reserved atomically
+before provider invocation, so an exhausted frontier budget cannot start
+another remediation call.
+
+When a recovery, step-attempt, model-call, or duration limit is reached, the
+workflow pauses by default. Set `policies.recovery_limits: fail` to fail instead.
+The runtime writes a structured failure and a `recovery.limit_reached` event
+with the limit, message, and selected outcome before terminal finalization.
 
 ## 9. Failure Classification
 
@@ -319,6 +331,20 @@ short_circuit_if:
   - budget.frontier_calls_remaining == 0
   - failures.ci.attempts >= 4
 ```
+
+Short circuits may be declared for the workflow or an individual step and are
+evaluated before that step starts. Ordinary input and JSON-artifact condition
+references remain available. The runtime also exposes remaining persisted
+model budgets through `budget.<kind>_remaining` and the highest indexed failure
+attempt through `failures.<step>.attempts`. Missing references do not match.
+Artifact aliases rooted at `budget` or `failures` are reserved in recovery
+pipelines so explicit artifacts cannot shadow these virtual safety namespaces.
+A matched short circuit always pauses before further automation, persists a
+`recovery_short_circuit` failure, and emits `recovery.short_circuited`, even
+when the general recovery-limit policy is `fail`. If an available artifact is
+malformed or otherwise cannot be evaluated safely, the runtime also pauses,
+persists `recovery_short_circuit_evaluation`, and emits
+`recovery.short_circuit_failed`.
 
 ## 11. Notifications
 

@@ -1008,7 +1008,7 @@ steps:
         message: "Step work cannot start because limits.max_step_attempts allows 0.5 attempt(s)."
       });
       expect(store.listEvents(`bounded-${kind}-preflight`).map((event) => event.type)).toEqual([
-        "run.created", "run.started", "run.paused"
+        "run.created", "run.started", "recovery.limit_reached", "run.paused"
       ]);
       expect(store.listFailures(`bounded-${kind}-preflight`)).toMatchObject([{
         classification: "step_attempt_limit",

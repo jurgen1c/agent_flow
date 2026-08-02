@@ -125,13 +125,20 @@ function checkBudget(
   }
 
   if (used + amount > limit) {
-    return pause(
+    return recoveryLimitDecision(
+      workflow,
       "policy.budget.exhausted",
       `Budget "${budget}" would exceed its limit of ${limit} (${used} used, ${amount} requested).`
     );
   }
 
   return allow();
+}
+
+function recoveryLimitDecision(workflow: AgentFlowWorkflow, code: string, message: string): AgentFlowPolicyDecision {
+  return workflow.style === "recovery_pipeline" && mapping(workflow.policies)?.recovery_limits === "fail"
+    ? fail(code, message)
+    : pause(code, message);
 }
 
 function checkModelUsage(

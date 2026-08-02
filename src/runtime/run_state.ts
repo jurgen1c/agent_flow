@@ -399,6 +399,11 @@ export class AgentFlowRunStateStore {
     this.now = input.now;
   }
 
+  currentTimestamp(): string {
+    this.assertOpen();
+    return currentTimestamp(this.now);
+  }
+
   createRun(input: CreateAgentFlowRunInput): AgentFlowRunRecord {
     this.assertOpen();
     const id = requiredString(input.id, "Run ID");

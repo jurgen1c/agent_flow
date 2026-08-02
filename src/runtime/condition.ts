@@ -120,6 +120,24 @@ export function evaluateAgentFlowCondition(
   );
 }
 
+export function resolveAgentFlowConditionReference(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  scope: "inputs" | "artifacts",
+  segments: string[]
+): AgentFlowYamlValue | undefined {
+  return scope === "inputs" ? resolveInput(store, runId, segments) : resolveArtifact(store, runId, segments);
+}
+
+export function resolveAgentFlowConditionReferenceFromValues(
+  inputs: AgentFlowYamlMapping,
+  artifacts: ReadonlyMap<string, AgentFlowYamlValue>,
+  scope: "inputs" | "artifacts",
+  segments: string[]
+): AgentFlowYamlValue | undefined {
+  return scope === "inputs" ? propertyAt(inputs, segments) : resolveArtifactValue(artifacts, segments);
+}
+
 export function evaluateAgentFlowConditionWithResolver(
   source: string,
   resolve: AgentFlowConditionReferenceResolver

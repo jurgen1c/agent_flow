@@ -255,12 +255,13 @@ export async function executeAgentFlowSessionRequest(
   try {
     reserveAgentFlowSessionModelCallBudgets(store, runId, workflow, stepId, sessionId, provider);
   } catch (error) {
+    const status = error instanceof AgentFlowSessionPolicyError && error.status === "fail" ? "failed" : "paused";
     store.upsertSession({
       id: sessionId,
       runId,
       stepId,
       provider,
-      status: "paused",
+      status,
       externalSessionId: priorExternalSessionId ?? null,
       state: { resume, lastStepId: stepId, error: errorMessage(error) }
     });

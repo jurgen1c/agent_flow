@@ -1033,11 +1033,9 @@ steps:
 `);
     const result = simulateAgentFlowWorkflow(workflow, { inputs: { retry: true } });
 
-    expect(result.status).toBe("unresolved");
+    expect(result.status).toBe("paused");
     expect(result.visitedSteps).toHaveLength(3);
-    expect(result.unresolvedBranches).toEqual([
-      { stepId: "retry", reason: "Simulation exceeded limits.max_recovery_cycles 2." }
-    ]);
+    expect(result.terminalStates).toEqual([{ stepId: "retry", status: "paused" }]);
   });
 
   test("counts implicit fallthrough edges in simulated recovery cycles", () => {
@@ -1054,11 +1052,9 @@ steps:
 
     const result = simulateAgentFlowWorkflow(workflow, {});
 
-    expect(result.status).toBe("unresolved");
+    expect(result.status).toBe("paused");
     expect(result.visitedSteps.map((step) => step.id)).toEqual(["start", "third", "second", "third", "second"]);
-    expect(result.unresolvedBranches).toEqual([
-      { stepId: "third", reason: "Simulation exceeded limits.max_recovery_cycles 1." }
-    ]);
+    expect(result.terminalStates).toEqual([{ stepId: "third", status: "paused" }]);
   });
 
   test("applies per-step attempt limits to condition routes", () => {

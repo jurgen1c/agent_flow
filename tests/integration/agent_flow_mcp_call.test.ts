@@ -736,7 +736,7 @@ steps:
       message: "Step fetch cannot start because limits.max_step_attempts allows 0.5 attempt(s)."
     });
     expect(store.listEvents("bounded-mcp-preflight").map((event) => event.type)).toEqual([
-      "run.created", "run.started", "run.paused"
+      "run.created", "run.started", "recovery.limit_reached", "run.paused"
     ]);
     store.close();
   });

@@ -51,7 +51,15 @@ import {
   validateAgentFlowMcpArgumentExpressions,
   validateAgentFlowMcpOutputPaths
 } from "./mcp_call";
-import { selectAgentFlowConditionTarget } from "./condition";
+import {
+  AgentFlowConditionError,
+  agentFlowConditionArtifactAlias,
+  agentFlowConditionExpressionIsSimple,
+  agentFlowConditionReference,
+  evaluateAgentFlowConditionWithResolver,
+  resolveAgentFlowConditionReference,
+  selectAgentFlowConditionTarget
+} from "./condition";
 import { assertAgentFlowSuccessTargetsAreUnambiguous } from "./success_routing";
 import {
   createAgentFlowNotificationRegistry,
@@ -205,6 +213,13 @@ async function runAgentFlowCommandPipeline(
       "AGENT_FLOW_WORKFLOW_INVALID"
     );
   }
+  const recoveryLimitIssue = runtimeRecoveryLimitConfigurationIssue(workflow);
+  if (recoveryLimitIssue !== undefined) {
+    throw new AgentFlowRunStateError(
+      `Agent Flow run ${runId} cannot execute invalid recovery limits: ${recoveryLimitIssue.code} (${recoveryLimitIssue.path}): ${recoveryLimitIssue.message}`,
+      "AGENT_FLOW_WORKFLOW_INVALID"
+    );
+  }
   validateRuntimeInteractionSteps(workflow.steps, workflow.style === "pipeline");
   const stepLocations = collectRuntimeStepLocations(workflow.steps);
   validateRuntimeRecoveryTargets(
@@ -259,6 +274,8 @@ async function runAgentFlowCommandPipeline(
     const stoppedBeforeStep = stoppedPipelineResult(store, runId, completedSteps);
     if (stoppedBeforeStep !== undefined) return stoppedBeforeStep;
     const stepId = requiredStepId(step);
+    const recoveryGuard = recoveryGuardFailure(store, runId, workflow, completedSteps, stepId, step, routingBudget);
+    if (recoveryGuard !== undefined) return recoveryGuard;
     routingBudget.visits.set(stepId, (routingBudget.visits.get(stepId) ?? 0) + 1);
     const stepType = normalizedTarget(step.type);
     if (stepType === "mcp_call") {
@@ -493,7 +510,11 @@ async function runAgentFlowCommandPipeline(
           if (error instanceof AgentFlowSessionPolicyError) {
             failure = error.message;
             const outcome = error.status === "pause" ? "pause" : "fail";
-            persistSessionRequestFailure(store, runId, stepId, sessionId, failure, false, outcome, true, attempt);
+            persistSessionRequestFailure(
+              store, runId, stepId, sessionId, failure, false, outcome, true, attempt,
+              modelLimitDetails(error)
+            );
+            recordModelLimitDecision(store, runId, stepId, workflow, error, false);
             return finishFailure(store, runId, completedSteps, stepId, {
               exitCode: null,
               timedOut: false,
@@ -1617,6 +1638,8 @@ async function routeAfterFailedStep(
   const onFailure = mapping(step.on_failure);
   const route = mapping(onFailure?.route_to);
   if (route === undefined) return undefined;
+  const recoveryGuard = recoveryGuardFailure(store, runId, workflow, completedSteps, stepId, step, budget);
+  if (recoveryGuard !== undefined) return { result: recoveryGuard };
   const failure = [...store.listFailures(runId)].reverse().find((entry) => entry.stepId === stepId);
   if (failure === undefined) {
     throw new AgentFlowRunStateError(
@@ -1661,6 +1684,7 @@ async function routeAfterFailedStep(
     }
   } catch (error) {
     if (error instanceof AgentFlowSessionPolicyError) {
+      recordModelLimitDecision(store, runId, stepId, workflow, error);
       return {
         result: finishFailure(store, runId, completedSteps, stepId, {
           exitCode: null,
@@ -1737,6 +1761,319 @@ async function routeAfterFailedStep(
     budget,
     handlerTarget
   );
+}
+
+function recoveryGuardFailure(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  workflow: AgentFlowWorkflow,
+  completedSteps: string[],
+  stepId: string,
+  step: AgentFlowWorkflowStep,
+  budget: SuccessfulRoutingBudget
+): AgentFlowCommandPipelineResult | undefined {
+  if (workflow.style !== "recovery_pipeline") return undefined;
+  const run = store.getRun(runId)!;
+  const limits = mapping(workflow.limits);
+  const duration = typeof limits?.max_duration_seconds === "number"
+    ? { name: "max_duration_seconds", value: limits.max_duration_seconds, milliseconds: limits.max_duration_seconds * 1_000 }
+    : typeof limits?.max_duration_minutes === "number"
+      ? { name: "max_duration_minutes", value: limits.max_duration_minutes, milliseconds: limits.max_duration_minutes * 60_000 }
+      : undefined;
+  if (duration !== undefined && run.startedAt !== null &&
+      Date.parse(store.currentTimestamp()) - Date.parse(run.startedAt) >= duration.milliseconds) {
+    return finishRecoveryGuardFailure(store, runId, workflow, completedSteps, stepId, budget.terminalEffects, {
+      eventType: "recovery.limit_reached",
+      classification: "recovery_duration_limit",
+      message: `Recovery duration exceeded limits.${duration.name} ${duration.value}.`,
+      payload: { limit: duration.name, configured: duration.value }
+    });
+  }
+
+  const declarations = [workflow.short_circuit_if, step.short_circuit_if]
+    .flatMap((value) => Array.isArray(value) ? value : [])
+    .filter((value): value is string => typeof value === "string");
+  for (const expression of declarations) {
+    let matched = false;
+    try {
+      matched = evaluateAgentFlowConditionWithResolver(expression, (scope, segments) => {
+        if (scope === "artifacts" && segments[0] === "budget") {
+          return recoveryBudgetReference(store, runId, workflow, segments.slice(1));
+        }
+        if (scope === "artifacts" && segments[0] === "failures") {
+          return recoveryFailureReference(store, runId, segments.slice(1));
+        }
+        return resolveAgentFlowConditionReference(store, runId, scope, segments);
+      });
+    } catch (error) {
+      if (error instanceof AgentFlowConditionError &&
+          (error.message.includes("does not match a published JSON artifact") ||
+           error.message.includes("did not resolve to a value"))) {
+        continue;
+      }
+      const evaluationError = redactAgentFlowSensitiveText(error instanceof Error ? error.message : String(error));
+      return finishRecoveryGuardFailure(store, runId, workflow, completedSteps, stepId, budget.terminalEffects, {
+        eventType: "recovery.short_circuit_failed",
+        classification: "recovery_short_circuit_evaluation",
+        message: `Recovery short circuit ${JSON.stringify(expression)} could not be evaluated: ${evaluationError}`,
+        payload: { expression, error: evaluationError },
+        forcePause: true
+      });
+    }
+    if (matched) {
+      return finishRecoveryGuardFailure(store, runId, workflow, completedSteps, stepId, budget.terminalEffects, {
+        eventType: "recovery.short_circuited",
+        classification: "recovery_short_circuit",
+        message: `Recovery short circuit matched ${JSON.stringify(expression)}.`,
+        payload: { expression },
+        forcePause: true
+      });
+    }
+  }
+  return undefined;
+}
+
+function runtimeRecoveryLimitConfigurationIssue(
+  workflow: AgentFlowWorkflow
+): { code: string; path: string; message: string } | undefined {
+  if (workflow.style !== "recovery_pipeline" &&
+      (workflow.short_circuit_if !== undefined || runtimeRecoveryLimitSteps(workflow.steps)
+        .some(({ step }) => step.short_circuit_if !== undefined))) {
+    return {
+      code: "workflow.recovery.short_circuit.style",
+      path: "short_circuit_if",
+      message: "Recovery short_circuit_if is only supported by recovery_pipeline workflows."
+    };
+  }
+  if (workflow.style !== "recovery_pipeline") return undefined;
+  const limits = mapping(workflow.limits);
+  if (limits?.max_duration_seconds !== undefined && limits.max_duration_minutes !== undefined) {
+    return {
+      code: "workflow.recovery.duration.ambiguous",
+      path: "limits",
+      message: "Recovery duration must use either limits.max_duration_seconds or limits.max_duration_minutes, not both."
+    };
+  }
+  for (const field of ["max_duration_seconds", "max_duration_minutes"] as const) {
+    const value = limits?.[field];
+    if (value !== undefined && (typeof value !== "number" || !Number.isFinite(value) || value <= 0)) {
+      return {
+        code: "workflow.policy.budget.invalid",
+        path: `limits.${field}`,
+        message: `Budget limit limits.${field} must be a positive finite number.`
+      };
+    }
+  }
+  const recoveryLimitPolicy = mapping(workflow.policies)?.recovery_limits;
+  if (recoveryLimitPolicy !== undefined && recoveryLimitPolicy !== "pause" && recoveryLimitPolicy !== "fail") {
+    return {
+      code: "workflow.policy.recovery_limits.invalid",
+      path: "policies.recovery_limits",
+      message: "Recovery-limit policy must be pause or fail."
+    };
+  }
+
+  const declarations = [
+    { value: workflow.short_circuit_if, path: "short_circuit_if" },
+    ...runtimeRecoveryLimitSteps(workflow.steps)
+      .map(({ step, path }) => ({ value: step.short_circuit_if, path: `${path}.short_circuit_if` }))
+  ];
+  for (const { step, path } of runtimeRecoveryLimitSteps(workflow.steps)) {
+    const output = typeof step.output === "string" && step.output.trim().length > 0 ? step.output.trim() : undefined;
+    const saveAs = normalizedTarget(step.type) === "input_request" && typeof step.save_as === "string" && step.save_as.trim().length > 0
+      ? step.save_as.trim()
+      : undefined;
+    const outputs = [...stringList(step.outputs), ...(output === undefined ? [] : [output]), ...(saveAs === undefined ? [] : [saveAs])];
+    const reserved = outputs.find((candidate) => {
+      try {
+        const namespace = agentFlowConditionArtifactAlias(normalizeAgentFlowArtifactPath(candidate))[0];
+        return namespace === "budget" || namespace === "failures";
+      } catch {
+        return false;
+      }
+    });
+    if (reserved !== undefined) {
+      const namespace = agentFlowConditionArtifactAlias(normalizeAgentFlowArtifactPath(reserved))[0];
+      return {
+        code: "workflow.recovery.short_circuit.namespace.reserved",
+        path: `${path}.outputs`,
+        message: `Artifact output ${JSON.stringify(reserved)} uses reserved recovery short-circuit namespace ${namespace}.`
+      };
+    }
+  }
+  for (const declaration of declarations) {
+    if (declaration.value === undefined) continue;
+    if (!Array.isArray(declaration.value) || declaration.value.length === 0 ||
+        declaration.value.some((entry) => typeof entry !== "string" || entry.trim().length === 0)) {
+      return {
+        code: "workflow.recovery.short_circuit.invalid",
+        path: declaration.path,
+        message: "Recovery short_circuit_if must be a non-empty list of condition expressions."
+      };
+    }
+    const unsupportedIndex = declaration.value.findIndex((entry) =>
+      !agentFlowConditionExpressionIsSimple(entry as string)
+    );
+    if (unsupportedIndex >= 0) {
+      return {
+        code: "workflow.recovery.short_circuit.expression.unsupported",
+        path: `${declaration.path}[${unsupportedIndex}]`,
+        message: "Recovery short circuits support one input, artifact, budget, or failure reference with an optional scalar comparison."
+      };
+    }
+    const undeclaredInputIndex = declaration.value.findIndex((entry) => {
+      const reference = agentFlowConditionReference(entry as string);
+      return reference?.scope === "inputs" && !Object.hasOwn(workflow.inputs ?? {}, reference.segments[0]!);
+    });
+    if (undeclaredInputIndex >= 0) {
+      const reference = agentFlowConditionReference(declaration.value[undeclaredInputIndex] as string)!;
+      return {
+        code: "workflow.input.undeclared",
+        path: `${declaration.path}[${undeclaredInputIndex}]`,
+        message: `Input ${JSON.stringify(reference.segments[0])} is referenced but not declared in workflow inputs.`
+      };
+    }
+  }
+  return undefined;
+}
+
+function runtimeRecoveryLimitSteps(
+  steps: AgentFlowWorkflowStep[],
+  basePath = "steps"
+): Array<{ step: AgentFlowWorkflowStep; path: string }> {
+  const result: Array<{ step: AgentFlowWorkflowStep; path: string }> = [];
+  steps.forEach((step, index) => {
+    const path = `${basePath}[${index}]`;
+    result.push({ step, path });
+    for (const field of ["body", "steps", "branches"] as const) {
+      const nested = step[field];
+      if (Array.isArray(nested)) {
+        result.push(...runtimeRecoveryLimitSteps(nested.filter(isWorkflowStep), `${path}.${field}`));
+      }
+    }
+  });
+  return result;
+}
+
+function recoveryBudgetReference(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  workflow: AgentFlowWorkflow,
+  segments: string[]
+): AgentFlowRunStateValue | undefined {
+  if (segments.length !== 1 || !segments[0]!.endsWith("_remaining")) return undefined;
+  const kind = segments[0]!.slice(0, -"_remaining".length);
+  const configured = mapping(workflow.limits)?.[`max_${kind}`];
+  if (typeof configured !== "number" || !Number.isFinite(configured)) return undefined;
+  return Math.max(0, configured - (store.getBudget(runId, `model:${kind}`)?.used ?? 0));
+}
+
+function recoveryFailureReference(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  segments: string[]
+): AgentFlowRunStateValue | undefined {
+  if (segments.length < 2 || segments.at(-1) !== "attempts") return undefined;
+  const stepId = segments.slice(0, -1).join(".");
+  const attempts = store.listFailures(runId)
+    .filter((failure) => failure.stepId === stepId)
+    .map((failure) => failure.attempt ?? 1);
+  return attempts.length === 0 ? undefined : Math.max(...attempts);
+}
+
+function finishRecoveryGuardFailure(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  workflow: AgentFlowWorkflow,
+  completedSteps: string[],
+  stepId: string,
+  terminalEffects: AgentFlowPipelineTerminalEffects,
+  decision: {
+    eventType: "recovery.limit_reached" | "recovery.short_circuited" | "recovery.short_circuit_failed";
+    classification: "recovery_duration_limit" | "recovery_short_circuit" | "recovery_short_circuit_evaluation";
+    message: string;
+    payload: Record<string, AgentFlowRunStateValue>;
+    forcePause?: boolean;
+  }
+): AgentFlowCommandPipelineResult {
+  const outcome = decision.forcePause === true ? "pause" : recoveryLimitOutcome(workflow);
+  const attempt = Math.max(1, store.listFailures(runId).filter((failure) => failure.stepId === stepId).length + 1);
+  persistAgentFlowFailurePayload(store, {
+    id: `recovery:${safeId(stepId)}:${safeId(decision.classification)}:attempt-${attempt}`,
+    runId,
+    stepId,
+    stepType: "recovery_guard",
+    attempt,
+    exitCode: null,
+    summary: decision.message,
+    classification: decision.classification,
+    retryable: false,
+    outcome,
+    indexPayload: { attempt, ...decision.payload, message: decision.message, outcome }
+  });
+  store.appendRunEvent(runId, {
+    type: decision.eventType,
+    stepId,
+    payload: { ...decision.payload, message: decision.message, outcome }
+  });
+  return finishFailure(store, runId, completedSteps, stepId, {
+    exitCode: null,
+    timedOut: false,
+    message: decision.message
+  }, outcome === "fail" ? "failed" : "paused", terminalEffects);
+}
+
+function recoveryLimitOutcome(workflow: AgentFlowWorkflow): "pause" | "fail" {
+  return workflow.style === "recovery_pipeline" && mapping(workflow.policies)?.recovery_limits === "fail"
+    ? "fail"
+    : "pause";
+}
+
+function recordModelLimitDecision(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  stepId: string,
+  workflow: AgentFlowWorkflow,
+  error: AgentFlowSessionPolicyError,
+  persistFailure = true
+): void {
+  if (workflow.style !== "recovery_pipeline" || error.code !== "policy.budget.exhausted") return;
+  const details = modelLimitDetails(error)!;
+  if (persistFailure) {
+    const attempt = Math.max(1, store.listFailures(runId).filter((failure) => failure.stepId === stepId).length + 1);
+    persistAgentFlowFailurePayload(store, {
+      id: `recovery:${safeId(stepId)}:recovery-model-limit:attempt-${attempt}`,
+      runId,
+      stepId,
+      stepType: "recovery_guard",
+      attempt,
+      exitCode: null,
+      summary: error.message,
+      classification: "recovery_model_limit",
+      retryable: false,
+      outcome: details.outcome,
+      indexPayload: { attempt, ...details }
+    });
+  }
+  store.appendRunEvent(runId, {
+    type: "recovery.limit_reached",
+    stepId,
+    payload: details
+  });
+}
+
+function modelLimitDetails(error: AgentFlowSessionPolicyError): {
+  limit: string;
+  message: string;
+  outcome: "pause" | "fail";
+} | undefined {
+  if (error.code !== "policy.budget.exhausted") return undefined;
+  const budget = /Budget "([^"]+)"/.exec(error.message)?.[1] ?? "model_calls";
+  return {
+    limit: `max_${budget}`,
+    message: error.message,
+    outcome: error.status === "fail" ? "fail" : "pause"
+  };
 }
 
 function resolveReturnedRecoveryFailures(
@@ -2195,12 +2532,13 @@ async function executeRecoverySession(
     const stopped = error instanceof AgentFlowSessionRequestInterruptedError
       ? error.status
       : activeStopStatus(store, runId);
+    const failedByPolicy = error instanceof AgentFlowSessionPolicyError && error.status === "fail";
     store.upsertSession({
       id: sessionId,
       runId,
       stepId: recoveryStepId,
       provider,
-      status: stopped ?? "paused",
+      status: stopped ?? (failedByPolicy ? "failed" : "paused"),
       externalSessionId: externalSessionId ?? null,
       state: {
         resume,
@@ -2768,7 +3106,7 @@ function successfulTransitionFailure(
       exitCode: null,
       timedOut: false,
       message: `Step ${stepId} cannot route to ${target} because limits.max_step_attempts allows ${attemptLimit} attempt(s).`
-    }, budget);
+    }, budget, "max_step_attempts");
   }
   if ((budget.visits.get(target) ?? 0) === 0) return undefined;
   if (budget.maxRecoveryCycles === undefined) {
@@ -2776,7 +3114,7 @@ function successfulTransitionFailure(
       exitCode: null,
       timedOut: false,
       message: `Step ${stepId} repeated route target ${target} without a positive executable limits.max_recovery_cycles bound.`
-    }, budget);
+    }, budget, "max_recovery_cycles");
   }
   const cycles = (budget.recoveryCycles.get(target) ?? 0) + 1;
   budget.recoveryCycles.set(target, cycles);
@@ -2785,7 +3123,7 @@ function successfulTransitionFailure(
     exitCode: null,
     timedOut: false,
     message: `Step ${stepId} exceeded limits.max_recovery_cycles ${budget.maxRecoveryCycles} while routing to ${target}.`
-  }, budget);
+  }, budget, "max_recovery_cycles");
 }
 
 function recoveryInvocationBudgetFailure(
@@ -2801,7 +3139,7 @@ function recoveryInvocationBudgetFailure(
       exitCode: null,
       timedOut: false,
       message: `Step ${stepId} cannot start recovery because it would exceed limits.max_recovery_cycles ${budget.maxRecoveryCycles}.`
-    }, budget);
+    }, budget, "max_recovery_cycles");
   }
   budget.recoveryInvocations.set(stepId, invocations + 1);
   return undefined;
@@ -2814,9 +3152,11 @@ function finishRoutingFailure(
   stepId: string,
   target: string,
   failure: { exitCode: null; timedOut: false; message: string },
-  budget: SuccessfulRoutingBudget
+  budget: SuccessfulRoutingBudget,
+  limitName: "max_recovery_cycles" | "max_step_attempts"
 ): AgentFlowCommandPipelineResult {
   const attempt = Math.max(1, budget.attempts.get(stepId) ?? 0);
+  const outcome = recoveryLimitOutcome(budget.terminalEffects.workflow);
   persistAgentFlowFailurePayload(store, {
     id: `routing:${safeId(stepId)}:to-${safeId(target)}:attempt-${attempt}`,
     runId,
@@ -2827,8 +3167,13 @@ function finishRoutingFailure(
     summary: failure.message,
     classification: "routing_limit",
     retryable: false,
-    outcome: "pause",
-    indexPayload: { attempt, target, message: failure.message, outcome: "pause" }
+    outcome,
+    indexPayload: { attempt, target, limit: limitName, message: failure.message, outcome }
+  });
+  store.appendRunEvent(runId, {
+    type: "recovery.limit_reached",
+    stepId,
+    payload: { target, limit: limitName, message: failure.message, outcome }
   });
   return finishFailure(
     store,
@@ -2836,7 +3181,7 @@ function finishRoutingFailure(
     completedSteps,
     stepId,
     failure,
-    "paused",
+    outcome === "fail" ? "failed" : "paused",
     budget.terminalEffects
   );
 }
@@ -2939,6 +3284,7 @@ function stepAttemptLimitResult(
     timedOut: false,
     message: `Step ${stepId} cannot start because limits.max_step_attempts allows ${limit} attempt(s).`
   };
+  const outcome = recoveryLimitOutcome(budget.terminalEffects.workflow);
   persistAgentFlowFailurePayload(store, {
     id: `routing:${safeId(stepId)}:attempt-${attempt}:limit`,
     runId,
@@ -2949,10 +3295,18 @@ function stepAttemptLimitResult(
     summary: failure.message,
     classification: "step_attempt_limit",
     retryable: false,
-    outcome: "pause",
-    indexPayload: { attempt, limit, message: failure.message, outcome: "pause" }
+    outcome,
+    indexPayload: { attempt, limit, message: failure.message, outcome }
   });
-  return finishFailure(store, runId, completedSteps, stepId, failure, "paused", budget.terminalEffects);
+  store.appendRunEvent(runId, {
+    type: "recovery.limit_reached",
+    stepId,
+    payload: { limit: "max_step_attempts", configured: limit, message: failure.message, outcome }
+  });
+  return finishFailure(
+    store, runId, completedSteps, stepId, failure,
+    outcome === "fail" ? "failed" : "paused", budget.terminalEffects
+  );
 }
 
 function finishCompleted(
@@ -3827,9 +4181,10 @@ function persistSessionRequestFailure(
   retryable: boolean,
   outcome: AgentFlowFailureOutcome,
   rejected: boolean,
-  attempt = 1
+  attempt = 1,
+  details?: { limit: string; message: string; outcome: "pause" | "fail" }
 ): void {
-  const error = { attempt, message, outcome };
+  const error = { attempt, message, outcome, ...details };
   const failureId = `session-request:${safeId(stepId)}:attempt-${attempt}`;
   const persisted = persistAgentFlowFailurePayload(store, {
     id: failureId,
