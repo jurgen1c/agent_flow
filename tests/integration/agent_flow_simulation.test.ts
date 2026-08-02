@@ -53,7 +53,18 @@ describe("Agent Flow workflow simulation", () => {
         failed_step: "local_ci"
       },
       steps: {
-        classify: { outputs: { "ci/failure-classification.json": { kind: "flake" } } }
+        classify: {
+          outputs: {
+            "ci/failure-classification.json": {
+              kind: "flake",
+              confidence: "high",
+              summary: "Transient test failure.",
+              recommended_owner: "workflow_owner",
+              safe_to_retry: true,
+              requires_user: false
+            }
+          }
+        }
       }
     });
 

@@ -296,7 +296,9 @@ with the limit, message, and selected outcome before terminal finalization.
 
 ## 9. Failure Classification
 
-Recommended classification schema:
+Failure classification artifacts use the public
+`@jurgen1c/agent-flow/schemas/failure-classification` JSON schema and this
+stable shape:
 
 ```json
 {
@@ -320,6 +322,19 @@ Known kinds:
 | `missing_requirement` | Ask user |
 | `unsafe_change` | Pause |
 | `unknown` | Pause |
+
+All six fields are required. `confidence` is `low`, `medium`, or `high`;
+`summary` and `recommended_owner` are non-empty strings; and the two safety
+flags are booleans. Additional fields are rejected so classifiers and routers
+cannot silently disagree about the contract.
+
+Before a condition uses an artifact named `failure-classification.json`, the
+runtime validates the complete artifact. Invalid JSON, invalid shapes, and the
+`unknown` kind pause the run and persist a `failure_classification_invalid` or
+`failure_classification_unknown` failure. This guard runs before branch
+selection, so an unsafe `else` branch cannot consume an untrusted
+classification. The other known kinds follow the workflow's explicit routes;
+the defaults above remain guidance rather than hidden control flow.
 
 ## 10. Short Circuits
 
@@ -383,6 +398,7 @@ Recovery validation should enforce:
 - `return_to` targets an existing step.
 - Nested workflow result statuses are handled.
 - Failure payload references are valid.
+- Failure classification artifacts match the public schema before routing.
 - Failure routes do not create unbounded cycles.
 - Model sessions used for remediation are defined.
 - User escalation exists for unresolved failures.

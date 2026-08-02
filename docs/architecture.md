@@ -25,7 +25,8 @@ The optional Memory-to-Flow adapter belongs to
 
 - `src/runtime/` owns workflow and run behavior.
 - `src/cli/` is a thin command parser and process entrypoint.
-- `schemas/` contains the public config and workflow JSON schemas.
+- `schemas/` contains the public config, workflow, and failure-classification
+  JSON schemas.
 - `examples/` contains non-runtime workflow, prompt, and template examples.
 - `docs/specifications/` preserves the detailed workflow specifications and
   their filtered repository history.
@@ -35,7 +36,8 @@ The optional Memory-to-Flow adapter belongs to
 
 The root export exposes the runtime API and generated declarations. The
 `./cli` subpath exposes programmatic CLI dispatch. JSON schemas are available
-from `./schemas/config` and `./schemas/workflow`.
+from `./schemas/config`, `./schemas/failure-classification`, and
+`./schemas/workflow`.
 
 The package installs one executable:
 

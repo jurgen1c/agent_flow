@@ -53,6 +53,14 @@ export {
   createAgentFlowWorkflowRegistry
 } from "./recovery";
 export {
+  AGENT_FLOW_FAILURE_CLASSIFICATION_CONFIDENCES,
+  AGENT_FLOW_FAILURE_CLASSIFICATION_KINDS,
+  AgentFlowFailureClassificationError,
+  assertAgentFlowFailureClassificationRoutable,
+  isAgentFlowFailureClassificationPath,
+  parseAgentFlowFailureClassification
+} from "./failure_classification";
+export {
   AgentFlowConditionError,
   agentFlowConditionExpressionIsSimple,
   evaluateAgentFlowCondition,
@@ -156,6 +164,11 @@ export type {
   AgentFlowPipelineResumeInput
 } from "./command_execution";
 export type { AgentFlowRecoveryStatus } from "./recovery";
+export type {
+  AgentFlowFailureClassification,
+  AgentFlowFailureClassificationConfidence,
+  AgentFlowFailureClassificationKind
+} from "./failure_classification";
 export type { AgentFlowConditionSelection } from "./condition";
 export type {
   AgentFlowBinaryArtifactValue,
