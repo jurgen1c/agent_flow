@@ -1,5 +1,10 @@
 import type { AgentFlowRunStateStore, AgentFlowRunStateValue } from "./run_state";
 import type { AgentFlowWorkflowStep, AgentFlowYamlMapping, AgentFlowYamlValue } from "./workflow";
+import {
+  AgentFlowFailureClassificationError,
+  assertAgentFlowFailureClassificationRoutable,
+  isAgentFlowFailureClassificationPath
+} from "./failure_classification";
 
 const MAX_CONDITION_ARTIFACT_BYTES = 10 * 1024 * 1024;
 const EXPRESSION = /^(?:(inputs|artifacts)\.)?([A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)*)\s*(==|!=|>=|<=|>|<)\s*(.+)$/;
@@ -91,6 +96,20 @@ export function selectAgentFlowConditionTargetWithResolver(
       };
     });
     const elseTarget = step.else === undefined ? undefined : requiredString(step.else, "Condition else");
+    for (const { expression } of normalizedBranches) {
+      const reference = agentFlowConditionReference(expression);
+      if (reference?.scope !== "artifacts" || !isFailureClassificationReference(reference.segments)) continue;
+      try {
+        resolve(reference.scope, reference.segments);
+      } catch (error) {
+        if (error instanceof AgentFlowFailureClassificationError) throw error;
+        if (!isFailureClassificationFieldReference(reference.segments)) continue;
+        throw new AgentFlowFailureClassificationError(
+          `Agent Flow failure classification could not be resolved: ${error instanceof Error ? error.message : String(error)}`,
+          "AGENT_FLOW_FAILURE_CLASSIFICATION_INVALID"
+        );
+      }
+    }
     for (const { expression, target } of normalizedBranches) {
       if (evaluateAgentFlowConditionWithResolver(expression, resolve)) {
         return { target, expression, matched: true };
@@ -223,29 +242,68 @@ function resolveArtifact(
   const candidates = store.listArtifactMetadata(runId)
     .filter((artifact) => artifact.writtenAt !== null)
     .map((artifact) => ({ artifact, alias: agentFlowConditionArtifactAlias(artifact.declaredPath) }))
-    .filter(({ alias }) => segments.slice(0, alias.length).join(".") === alias.join("."))
+    .filter(({ alias }) => artifactAliasMatches(segments, alias))
     .sort((left, right) => right.alias.length - left.alias.length);
-  const candidate = candidates[0];
+  const classificationCandidates = candidates
+    .filter(({ artifact }) => isAgentFlowFailureClassificationPath(artifact.declaredPath));
+  const classificationNamespace = candidates.some(({ alias }) =>
+    alias.some((segment) => segment.toLowerCase() === "failure_classification")
+  );
+  const classificationRequested = segments.some((segment) => segment.toLowerCase() === "failure_classification");
+  if ((classificationNamespace || (classificationRequested && candidates.length === 0)) &&
+      classificationCandidates.length === 0) {
+    throw new AgentFlowFailureClassificationError(
+      `Condition artifact reference artifacts.${segments.join(".")} requires a published failure-classification.json artifact.`,
+      "AGENT_FLOW_FAILURE_CLASSIFICATION_INVALID"
+    );
+  }
+  const candidate = classificationCandidates[0] ?? candidates[0];
   if (candidate === undefined) {
     throw new AgentFlowConditionError(`Condition artifact reference artifacts.${segments.join(".")} does not match a published JSON artifact.`);
   }
-  const ambiguous = candidates.filter(({ alias }) => alias.join(".") === candidate.alias.join("."));
+  const ambiguous = candidates.filter(({ alias }) => artifactAliasesEqual(alias, candidate.alias));
   if (ambiguous.length > 1) {
+    if (classificationCandidates.length > 0) {
+      throw new AgentFlowFailureClassificationError(
+        `Agent Flow failure classification reference artifacts.${segments.join(".")} matches multiple published artifacts: ${ambiguous.map(({ artifact }) => artifact.declaredPath).join(", ")}.`,
+        "AGENT_FLOW_FAILURE_CLASSIFICATION_INVALID"
+      );
+    }
     throw new AgentFlowConditionError(
       `Condition artifact reference artifacts.${segments.join(".")} matches multiple published artifacts: ${ambiguous.map(({ artifact }) => artifact.declaredPath).join(", ")}.`
     );
   }
 
-  const { content } = store.readArtifact(runId, candidate.artifact.declaredPath, {
-    maxBytes: MAX_CONDITION_ARTIFACT_BYTES
-  });
+  let content: Buffer;
+  try {
+    ({ content } = store.readArtifact(runId, candidate.artifact.declaredPath, {
+      maxBytes: MAX_CONDITION_ARTIFACT_BYTES
+    }));
+  } catch (error) {
+    if (isAgentFlowFailureClassificationPath(candidate.artifact.declaredPath)) {
+      throw new AgentFlowFailureClassificationError(
+        `Agent Flow failure classification could not be read: ${error instanceof Error ? error.message : String(error)}`,
+        "AGENT_FLOW_FAILURE_CLASSIFICATION_INVALID"
+      );
+    }
+    throw error;
+  }
   let value: AgentFlowRunStateValue;
   try {
     value = JSON.parse(content.toString("utf8")) as AgentFlowRunStateValue;
   } catch (error) {
+    if (isAgentFlowFailureClassificationPath(candidate.artifact.declaredPath)) {
+      throw new AgentFlowFailureClassificationError(
+        `Agent Flow failure classification must contain valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+        "AGENT_FLOW_FAILURE_CLASSIFICATION_INVALID"
+      );
+    }
     throw new AgentFlowConditionError(
       `Condition artifact ${candidate.artifact.declaredPath} must contain valid JSON: ${error instanceof Error ? error.message : String(error)}`
     );
+  }
+  if (isAgentFlowFailureClassificationPath(candidate.artifact.declaredPath)) {
+    value = assertAgentFlowFailureClassificationRoutable(value);
   }
   return propertyAt(value, segments.slice(candidate.alias.length));
 }
@@ -256,14 +314,33 @@ function resolveArtifactValue(
 ): AgentFlowYamlValue | undefined {
   const candidates = [...artifacts]
     .map(([declaredPath, value]) => ({ declaredPath, value, alias: agentFlowConditionArtifactAlias(declaredPath) }))
-    .filter(({ alias }) => segments.slice(0, alias.length).join(".") === alias.join("."))
+    .filter(({ alias }) => artifactAliasMatches(segments, alias))
     .sort((left, right) => right.alias.length - left.alias.length);
-  const candidate = candidates[0];
+  const classificationCandidates = candidates
+    .filter(({ declaredPath }) => isAgentFlowFailureClassificationPath(declaredPath));
+  const classificationNamespace = candidates.some(({ alias }) =>
+    alias.some((segment) => segment.toLowerCase() === "failure_classification")
+  );
+  const classificationRequested = segments.some((segment) => segment.toLowerCase() === "failure_classification");
+  if ((classificationNamespace || (classificationRequested && candidates.length === 0)) &&
+      classificationCandidates.length === 0) {
+    throw new AgentFlowFailureClassificationError(
+      `Condition artifact reference artifacts.${segments.join(".")} requires a published failure-classification.json artifact.`,
+      "AGENT_FLOW_FAILURE_CLASSIFICATION_INVALID"
+    );
+  }
+  const candidate = classificationCandidates[0] ?? candidates[0];
   if (candidate === undefined) {
     throw new AgentFlowConditionError(`Condition artifact reference artifacts.${segments.join(".")} does not match a published JSON artifact.`);
   }
-  const ambiguous = candidates.filter(({ alias }) => alias.join(".") === candidate.alias.join("."));
+  const ambiguous = candidates.filter(({ alias }) => artifactAliasesEqual(alias, candidate.alias));
   if (ambiguous.length > 1) {
+    if (classificationCandidates.length > 0) {
+      throw new AgentFlowFailureClassificationError(
+        `Agent Flow failure classification reference artifacts.${segments.join(".")} matches multiple published artifacts: ${ambiguous.map(({ declaredPath }) => declaredPath).join(", ")}.`,
+        "AGENT_FLOW_FAILURE_CLASSIFICATION_INVALID"
+      );
+    }
     throw new AgentFlowConditionError(
       `Condition artifact reference artifacts.${segments.join(".")} matches multiple published artifacts: ${ambiguous.map(({ declaredPath }) => declaredPath).join(", ")}.`
     );
@@ -271,6 +348,12 @@ function resolveArtifactValue(
   let value = candidate.value;
   const serialized = typeof value === "string" ? value : JSON.stringify(value);
   if (Buffer.byteLength(serialized, "utf8") > MAX_CONDITION_ARTIFACT_BYTES) {
+    if (isAgentFlowFailureClassificationPath(candidate.declaredPath)) {
+      throw new AgentFlowFailureClassificationError(
+        `Agent Flow failure classification exceeds the ${MAX_CONDITION_ARTIFACT_BYTES}-byte read limit.`,
+        "AGENT_FLOW_FAILURE_CLASSIFICATION_INVALID"
+      );
+    }
     throw new AgentFlowConditionError(
       `Condition artifact ${candidate.declaredPath} exceeds the ${MAX_CONDITION_ARTIFACT_BYTES}-byte read limit.`
     );
@@ -279,10 +362,19 @@ function resolveArtifactValue(
     try {
       value = JSON.parse(value) as AgentFlowYamlValue;
     } catch (error) {
+      if (isAgentFlowFailureClassificationPath(candidate.declaredPath)) {
+        throw new AgentFlowFailureClassificationError(
+          `Agent Flow failure classification must contain valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+          "AGENT_FLOW_FAILURE_CLASSIFICATION_INVALID"
+        );
+      }
       throw new AgentFlowConditionError(
         `Condition artifact ${candidate.declaredPath} must contain valid JSON: ${error instanceof Error ? error.message : String(error)}`
       );
     }
+  }
+  if (isAgentFlowFailureClassificationPath(candidate.declaredPath)) {
+    value = assertAgentFlowFailureClassificationRoutable(value);
   }
   return propertyAt(value, segments.slice(candidate.alias.length));
 }
@@ -293,6 +385,38 @@ export function agentFlowConditionArtifactAlias(declaredPath: string): string[] 
     .split("/")
     .flatMap((segment) => segment.split("."))
     .map((segment) => segment.replace(/-/g, "_"));
+}
+
+function artifactAliasMatches(segments: string[], alias: string[]): boolean {
+  return alias.every((segment, index) => segment.toLowerCase() === "failure_classification"
+    ? segments[index]?.toLowerCase() === "failure_classification"
+    : segments[index] === segment);
+}
+
+function artifactAliasesEqual(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((segment, index) => {
+    const other = right[index]!;
+    return segment.toLowerCase() === "failure_classification" || other.toLowerCase() === "failure_classification"
+      ? segment.toLowerCase() === other.toLowerCase()
+      : segment === other;
+  });
+}
+
+function isFailureClassificationFieldReference(segments: string[]): boolean {
+  const classificationIndex = segments.findIndex((segment) => segment.toLowerCase() === "failure_classification");
+  return classificationIndex >= 0 && [
+    "kind",
+    "confidence",
+    "summary",
+    "recommended_owner",
+    "safe_to_retry",
+    "requires_user"
+  ].includes(segments[classificationIndex + 1] ?? "");
+}
+
+function isFailureClassificationReference(segments: string[]): boolean {
+  const classificationIndex = segments.findIndex((segment) => segment.toLowerCase() === "failure_classification");
+  return classificationIndex === segments.length - 1 || isFailureClassificationFieldReference(segments);
 }
 
 function propertyAt(value: AgentFlowYamlValue, segments: string[]): AgentFlowYamlValue | undefined {

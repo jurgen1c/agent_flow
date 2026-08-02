@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/jurgen1c/agent_flow/schemas/failure-classification.schema.json",
+  "title": "Agent Flow Failure Classification",
+  "type": "object",
+  "required": [
+    "kind",
+    "confidence",
+    "summary",
+    "recommended_owner",
+    "safe_to_retry",
+    "requires_user"
+  ],
+  "properties": {
+    "kind": {
+      "enum": [
+        "flake",
+        "implementation_error",
+        "formatting_error",
+        "environment_error",
+        "missing_requirement",
+        "unsafe_change",
+        "unknown"
+      ]
+    },
+    "confidence": { "enum": ["low", "medium", "high"] },
+    "summary": { "type": "string", "pattern": "\\S" },
+    "recommended_owner": { "type": "string", "pattern": "\\S" },
+    "safe_to_retry": { "type": "boolean" },
+    "requires_user": { "type": "boolean" }
+  },
+  "additionalProperties": false
+}

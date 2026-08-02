@@ -301,7 +301,14 @@ steps:
       path: "ci/failure-classification.json",
       kind: "fixture",
       contentType: "application/json; charset=utf-8",
-      content: JSON.stringify({ kind: "flake", requires_user: false })
+      content: JSON.stringify({
+        kind: "flake",
+        confidence: "high",
+        summary: "Transient test failure.",
+        recommended_owner: "workflow_owner",
+        safe_to_retry: true,
+        requires_user: false
+      })
     });
     store.listArtifacts = () => {
       throw new Error("condition lookup must not inspect every artifact");

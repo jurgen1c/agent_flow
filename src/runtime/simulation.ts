@@ -20,6 +20,7 @@ import {
   resolveAgentFlowConditionReferenceFromValues,
   selectAgentFlowConditionTargetFromValues
 } from "./condition";
+import { AgentFlowFailureClassificationError } from "./failure_classification";
 import {
   agentFlowAmbiguousSuccessTargetMessage,
   collectAgentFlowAmbiguousSuccessTargets
@@ -806,6 +807,10 @@ function conditionControl(
     ).target;
   } catch (error) {
     markConditionVisitFailed(state, id);
+    if (error instanceof AgentFlowFailureClassificationError) {
+      state.terminalStates.push({ stepId: id, status: "paused" });
+      return { kind: "terminal", status: "paused" };
+    }
     addUnresolved(state, id, error instanceof Error ? error.message : String(error));
     return { kind: "terminal", status: "unresolved" };
   }

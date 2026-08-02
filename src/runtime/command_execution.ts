@@ -85,6 +85,7 @@ import {
   createAgentFlowWorkflowRegistry,
   type AgentFlowRecoveryStatus
 } from "./recovery";
+import { AgentFlowFailureClassificationError } from "./failure_classification";
 import { createAgentFlowLifecycleRun, transitionAgentFlowLifecycleRun } from "./lifecycle";
 
 const MAX_CAPTURE_BYTES = 10 * 1024 * 1024;
@@ -654,8 +655,10 @@ async function runAgentFlowCommandPipeline(
           return interruptedPipelineResult(store, runId, completedSteps, stopped);
         }
         const message = error instanceof Error ? error.message : String(error);
+        const classificationError = error instanceof AgentFlowFailureClassificationError ? error : undefined;
+        const failureOutcome = classificationError === undefined ? "fail" as const : "pause" as const;
         const failureId = `condition:${safeId(stepId)}:evaluation`;
-        const failure = { attempt, message, outcome: "fail" as const };
+        const failure = { attempt, message, outcome: failureOutcome };
         const persisted = persistAgentFlowFailurePayload(store, {
           id: failureId,
           runId,
@@ -663,9 +666,11 @@ async function runAgentFlowCommandPipeline(
           stepType: "condition",
           attempt,
           summary: message,
-          classification: "condition_evaluation",
+          classification: classificationError?.code === "AGENT_FLOW_FAILURE_CLASSIFICATION_UNKNOWN"
+            ? "failure_classification_unknown"
+            : classificationError === undefined ? "condition_evaluation" : "failure_classification_invalid",
           retryable: false,
-          outcome: "fail",
+          outcome: failureOutcome,
           indexPayload: failure
         });
         const indexedFailure = { ...persisted.indexPayload, ...failureReference(persisted) };
@@ -675,7 +680,7 @@ async function runAgentFlowCommandPipeline(
           exitCode: null,
           timedOut: false,
           message
-        }, "failed", routingBudget.terminalEffects);
+        }, classificationError === undefined ? "failed" : "paused", routingBudget.terminalEffects);
       }
     }
     if (stepType === "manual_gate" || stepType === "input_request") {
@@ -1811,10 +1816,13 @@ function recoveryGuardFailure(
            error.message.includes("did not resolve to a value"))) {
         continue;
       }
+      const classificationError = error instanceof AgentFlowFailureClassificationError ? error : undefined;
       const evaluationError = redactAgentFlowSensitiveText(error instanceof Error ? error.message : String(error));
       return finishRecoveryGuardFailure(store, runId, workflow, completedSteps, stepId, budget.terminalEffects, {
         eventType: "recovery.short_circuit_failed",
-        classification: "recovery_short_circuit_evaluation",
+        classification: classificationError?.code === "AGENT_FLOW_FAILURE_CLASSIFICATION_UNKNOWN"
+          ? "failure_classification_unknown"
+          : classificationError === undefined ? "recovery_short_circuit_evaluation" : "failure_classification_invalid",
         message: `Recovery short circuit ${JSON.stringify(expression)} could not be evaluated: ${evaluationError}`,
         payload: { expression, error: evaluationError },
         forcePause: true
@@ -1998,7 +2006,12 @@ function finishRecoveryGuardFailure(
   terminalEffects: AgentFlowPipelineTerminalEffects,
   decision: {
     eventType: "recovery.limit_reached" | "recovery.short_circuited" | "recovery.short_circuit_failed";
-    classification: "recovery_duration_limit" | "recovery_short_circuit" | "recovery_short_circuit_evaluation";
+    classification:
+      | "recovery_duration_limit"
+      | "recovery_short_circuit"
+      | "recovery_short_circuit_evaluation"
+      | "failure_classification_invalid"
+      | "failure_classification_unknown";
     message: string;
     payload: Record<string, AgentFlowRunStateValue>;
     forcePause?: boolean;

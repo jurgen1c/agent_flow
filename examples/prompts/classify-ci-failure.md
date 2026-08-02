@@ -8,6 +8,10 @@ Return JSON with:
 - safe_to_retry
 - requires_user
 
+Return exactly these six fields. Use `low`, `medium`, or `high` for confidence,
+non-empty text for summary and recommended_owner, and JSON booleans for
+safe_to_retry and requires_user.
+
 Known kinds:
 - flake
 - formatting_error
@@ -16,4 +20,3 @@ Known kinds:
 - missing_requirement
 - unsafe_change
 - unknown
-

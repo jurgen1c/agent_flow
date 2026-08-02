@@ -40,6 +40,7 @@ Repository-local state is stored in `.agent-flow/`. Do not commit it.
 import {
   createAgentFlowWorkflowRegistry,
   openAgentFlowRunState,
+  parseAgentFlowFailureClassification,
   parseAgentFlowWorkflowOrThrow,
   validateAgentFlowWorkflow
 } from "@jurgen1c/agent-flow";
@@ -47,6 +48,7 @@ import {
 const workflow = parseAgentFlowWorkflowOrThrow(source);
 const ciTriageWorkflow = parseAgentFlowWorkflowOrThrow(ciTriageSource);
 const validation = validateAgentFlowWorkflow(workflow);
+const classification = parseAgentFlowFailureClassification(classifierOutput);
 const store = await openAgentFlowRunState({ cwd: process.cwd() });
 const recoveryWorkflows = createAgentFlowWorkflowRegistry()
   .register("ci-triage", ciTriageWorkflow);
@@ -57,7 +59,8 @@ argument when a workflow uses `route_to.workflow`. Recovery session providers
 report `metadata.recovery_status` as `remediated` or `unresolved`.
 
 Programmatic CLI routing is exported from `@jurgen1c/agent-flow/cli`.
-Schemas are exported from `@jurgen1c/agent-flow/schemas/config` and
+Schemas are exported from `@jurgen1c/agent-flow/schemas/config`,
+`@jurgen1c/agent-flow/schemas/failure-classification`, and
 `@jurgen1c/agent-flow/schemas/workflow`.
 
 ## Architecture

@@ -26,6 +26,7 @@ describe("standalone Agent Flow architecture", () => {
       ".",
       "./cli",
       "./schemas/config",
+      "./schemas/failure-classification",
       "./schemas/workflow"
     ]);
     for (const range of Object.values(packageJson.dependencies ?? {})) {
