@@ -76,7 +76,7 @@ export function assertAgentFlowFailureClassificationRoutable(value: unknown): Ag
   const classification = parseAgentFlowFailureClassification(value);
   if (classification.kind === "unknown") {
     throw new AgentFlowFailureClassificationError(
-      "Failure classification kind unknown cannot be routed automatically; pause for review.",
+      "Agent Flow failure classification kind \"unknown\" cannot be routed automatically; pause for review.",
       "AGENT_FLOW_FAILURE_CLASSIFICATION_UNKNOWN"
     );
   }

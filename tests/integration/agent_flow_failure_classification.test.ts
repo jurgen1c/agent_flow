@@ -103,7 +103,9 @@ steps:
 
       expect(result.status).toBe(expectations.get(kind));
       if (kind === "unknown") {
-        expect(result.message).toContain("cannot be routed automatically");
+        expect(result.message).toContain(
+          "Agent Flow failure classification kind \"unknown\" cannot be routed automatically"
+        );
       }
       store.close();
     }
