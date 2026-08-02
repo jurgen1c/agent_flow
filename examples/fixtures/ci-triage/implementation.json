@@ -1,0 +1,30 @@
+{
+  "inputs": {
+    "failure_payload": "failures/ci.json",
+    "failed_step": "ci"
+  },
+  "artifacts": {
+    "failures/ci.json": {
+      "summary": "A deterministic implementation test failed."
+    }
+  },
+  "steps": {
+    "classify": {
+      "outputs": {
+        "ci/failure-classification.json": {
+          "kind": "implementation_error",
+          "confidence": "high",
+          "summary": "The implementation needs a scoped code fix.",
+          "recommended_owner": "frontier_model",
+          "safe_to_retry": false,
+          "requires_user": false
+        }
+      }
+    },
+    "fix_with_fm": {
+      "outputs": {
+        "implementation-summary.md": "Fixture FM applied the smallest safe implementation fix.\n"
+      }
+    }
+  }
+}

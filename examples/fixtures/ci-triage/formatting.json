@@ -1,0 +1,30 @@
+{
+  "inputs": {
+    "failure_payload": "failures/ci.json",
+    "failed_step": "ci"
+  },
+  "artifacts": {
+    "failures/ci.json": {
+      "summary": "The formatter reported style violations."
+    }
+  },
+  "steps": {
+    "classify": {
+      "outputs": {
+        "ci/failure-classification.json": {
+          "kind": "formatting_error",
+          "confidence": "high",
+          "summary": "The failure can be repaired by the repository formatter.",
+          "recommended_owner": "workflow_owner",
+          "safe_to_retry": true,
+          "requires_user": false
+        }
+      }
+    },
+    "fix_formatting": {
+      "outputs": [
+        "ci/formatting-fix.log"
+      ]
+    }
+  }
+}

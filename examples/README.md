@@ -28,6 +28,31 @@ These examples show how Agent Flow workflows can start simple and grow into reco
 Fixture simulation can provide `ticket.json` and inspect the derived `ticket.md`
 without network access or free-form scripting.
 
+`ci-triage.yml` has offline fixtures for flake, formatting, implementation,
+environment, unknown, and user-required classifications. From the repository
+root, validate and simulate one with:
+
+```sh
+bun run dist/agent-flow.js validate examples/workflows/ci-triage.yml
+bun run dist/agent-flow.js simulate examples/workflows/ci-triage.yml \
+  --fixture examples/fixtures/ci-triage/flake.json
+```
+
+The example's `fixture` session providers also support controlled execution:
+
+```sh
+bun run dist/agent-flow.js run examples/workflows/ci-triage.yml \
+  --id ci-triage-demo \
+  --fixture examples/fixtures/ci-triage/implementation.json
+```
+
+The formatting path runs `examples/scripts/fix-formatting.sh`, which prefers a
+repository `bin/rubocop -A` command and otherwise uses `bun run lint --fix`.
+Unknown classifications pause before automatic routing. User-required
+classifications pause at `ask_user`; environment failures return `unresolved`.
+Flake, formatting, and fixture-backed FM remediation return `remediated` so a
+parent workflow can retry its failed CI step.
+
 These files are examples, not guaranteed to run unchanged in every repo. Users should adapt:
 
 - CI commands.

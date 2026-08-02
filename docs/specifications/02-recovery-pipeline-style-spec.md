@@ -147,17 +147,17 @@ inputs:
 
 sessions:
   lm:
-    provider: local
+    provider: fixture
     resume: true
   fm:
-    provider: frontier
+    provider: fixture
     resume: true
 
 steps:
   - id: classify
     type: session_request
     session: lm
-    prompt: prompts/classify-ci-failure.md
+    prompt: examples/prompts/classify-ci-failure.md
     inputs:
       - "{{ inputs.failure_payload }}"
     outputs:
@@ -166,22 +166,45 @@ steps:
   - id: route
     type: condition
     branches:
+      - if: artifacts.ci.failure_classification.requires_user == true
+        then: ask_user
       - if: artifacts.ci.failure_classification.kind == "flake"
         then: return_remediated
+      - if: artifacts.ci.failure_classification.kind == "formatting_error"
+        then: fix_formatting
       - if: artifacts.ci.failure_classification.kind == "implementation_error"
         then: fix_with_fm
       - if: artifacts.ci.failure_classification.kind == "environment_error"
         then: return_unresolved
+    else: return_unresolved
+
+  - id: fix_formatting
+    type: command
+    command: sh examples/scripts/fix-formatting.sh
+    outputs:
+      - ci/formatting-fix.log
+    on_failure:
+      then: return_unresolved
+    then: return_remediated
 
   - id: fix_with_fm
     type: session_request
     session: fm
-    prompt: prompts/fix-ci-failure.md
+    prompt: examples/prompts/fix-ci-failure.md
     inputs:
       - "{{ inputs.failure_payload }}"
       - ci/failure-classification.json
     outputs:
       - implementation-summary.md
+    on_failure:
+      then: pause
+    then: return_remediated
+
+  - id: ask_user
+    type: input_request
+    question: "CI failure requires product or environment judgment. How should Agent Flow proceed?"
+    save_as: user-input/ci-decision.md
+    then: return_unresolved
 
   - id: return_remediated
     type: result
