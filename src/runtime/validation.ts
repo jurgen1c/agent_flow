@@ -566,7 +566,8 @@ function validateCollaborationAuthority(
   contexts: StepContext[],
   errors: AgentFlowWorkflowIssue[]
 ): void {
-  if (workflow.style !== "collaborative") return;
+  if (workflow.style !== "collaborative" || !isRecord(workflow.collaboration) ||
+      workflow.collaboration.enabled !== true) return;
 
   for (const context of contexts) {
     const requirements: Array<{ session?: string; capability: string; field: string; action: string }> = [];

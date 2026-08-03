@@ -2864,6 +2864,16 @@ collaboration: { enabled: invalid }
 sessions: {}
 steps: []
 `);
+    const disabled = parseAgentFlowWorkflowOrThrow(`name: disabled-collaboration-authority
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: false }
+sessions:
+  advisor: { provider: local, role: advisor, authority: { can_advise: false } }
+steps:
+  - { id: consult, type: consult, from: advisor, to: advisor, question: Review, blocking: false }
+`);
 
     expect(validateAgentFlowWorkflow(invalidRoot).errors).toEqual([{
       code: "workflow.collaboration.invalid",
@@ -2873,6 +2883,11 @@ steps: []
     expect(validateAgentFlowWorkflow(invalidEnabled).errors).toEqual([{
       code: "workflow.collaboration.enabled.invalid",
       message: "Collaboration enabled must be a boolean.",
+      path: "collaboration.enabled"
+    }]);
+    expect(validateAgentFlowWorkflow(disabled).errors).toEqual([{
+      code: "workflow.collaboration.enabled.required",
+      message: "Collaborative workflows must explicitly declare collaboration.enabled: true.",
       path: "collaboration.enabled"
     }]);
   });

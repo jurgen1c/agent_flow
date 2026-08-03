@@ -537,10 +537,12 @@ function collaborationSession(
   const invalidFileScope = fileScopeValue !== undefined && fileScope === undefined
     ? [invalidInspectionValue(fileScopeValue)]
     : [];
+  const provider = inspectableString(session.provider);
+  const role = inspectableString(session.role);
   return {
     name,
-    ...(inspectableString(session.provider) === undefined ? {} : { provider: inspectableString(session.provider) }),
-    ...(inspectableString(session.role) === undefined ? {} : { role: inspectableString(session.role) }),
+    ...(provider === undefined ? {} : { provider }),
+    ...(role === undefined ? {} : { role }),
     owns: inspectableStringList(session.owns),
     authority: uniqueSorted([...(advisoryDefault ? ["advisory"] : explicitAuthority), ...invalidAuthority]),
     fileScope: {
