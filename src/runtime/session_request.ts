@@ -696,9 +696,11 @@ function preflightOutputCollisions(
   outputKind: "review_output" | "session_output",
   requestIdPrefix: "review-request" | "session-request"
 ): void {
+  const outputLabel = requestKind === "review_request" ? "Review output" : "Session output";
+  const requestLabel = requestKind === "review_request" ? "Review request" : "Session request";
   if (outputPaths.includes(requestPath)) {
     throw new AgentFlowSessionRequestError(
-      `Session output ${requestPath} conflicts with the runtime request metadata artifact.`,
+      `${outputLabel} ${requestPath} conflicts with the runtime request metadata artifact.`,
       "AGENT_FLOW_SESSION_OUTPUT_COLLISION"
     );
   }
@@ -706,7 +708,7 @@ function preflightOutputCollisions(
   if (requestArtifact !== null &&
       (requestArtifact.kind !== requestKind || requestArtifact.id !== `${requestIdPrefix}:${digest(requestPath)}`)) {
     throw new AgentFlowSessionRequestError(
-      `Session request metadata path ${requestPath} is already owned by another artifact.`,
+      `${requestLabel} metadata path ${requestPath} is already owned by another artifact.`,
       "AGENT_FLOW_SESSION_OUTPUT_COLLISION"
     );
   }
@@ -717,7 +719,7 @@ function preflightOutputCollisions(
   });
   if (collision !== undefined) {
     throw new AgentFlowSessionRequestError(
-      `Session output ${collision} already exists; declare overwrite: true to replace it.`,
+      `${outputLabel} ${collision} already exists; declare overwrite: true to replace it.`,
       "AGENT_FLOW_SESSION_OUTPUT_COLLISION"
     );
   }

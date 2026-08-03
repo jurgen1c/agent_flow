@@ -698,8 +698,9 @@ function simulateSessionRequestStep(
   providerOutcomeFailed: boolean
 ): SequenceControl {
   const isReview = step.type === "review";
+  const declaredInputs = isReview ? step.artifacts : step.inputs;
   const resolvedInputs: string[] = [];
-  for (const value of Array.isArray(isReview ? step.artifacts : step.inputs) ? (isReview ? step.artifacts : step.inputs) as AgentFlowYamlValue[] : []) {
+  for (const value of Array.isArray(declaredInputs) ? declaredInputs as AgentFlowYamlValue[] : []) {
     const name = nonEmptyString(value);
     const reference = name === undefined ? null : /^\{\{\s*inputs\.([A-Za-z0-9_-]+)\s*}}$/.exec(name);
     if (reference === null) {
