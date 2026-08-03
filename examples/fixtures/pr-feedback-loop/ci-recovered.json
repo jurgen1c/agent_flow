@@ -1,0 +1,17 @@
+{
+  "inputs": { "pr_url": "https://github.test/example/pull/38" },
+  "steps": {
+    "wait_for_review": { "iterations": 1, "loop_termination": "condition_met" },
+    "collect_pr_state": {
+      "outputs": { "github/pr-state.json": { "checks_passed": false } }
+    },
+    "classify_comments": {
+      "outputs": { "github/actionable-comments.json": { "count": 1 } }
+    },
+    "resolve_comments": {
+      "outputs": { "implementation-summary.md": "Fixture FM resolved feedback before CI recovery.\n" }
+    },
+    "rerun_ci": { "outcome": ["failed", "succeeded"], "recovery": "remediated" },
+    "push_fixes": { "outcome": "succeeded" }
+  }
+}

@@ -26,7 +26,7 @@ import {
   collectAgentFlowAmbiguousSuccessTargets
 } from "./success_routing";
 
-export type AgentFlowSimulationStatus = "completed" | "failed" | "paused" | "cancelled" | "unresolved";
+export type AgentFlowSimulationStatus = "completed" | "failed" | "paused" | "cancelled" | "timed_out" | "unresolved";
 export type AgentFlowSimulationStepOutcome = "succeeded" | "failed";
 export type AgentFlowSimulationVisitedOutcome = AgentFlowSimulationStepOutcome | "selected";
 
@@ -35,6 +35,7 @@ export interface AgentFlowSimulationStepFixture {
   outputs?: string[] | Record<string, AgentFlowYamlValue>;
   choice?: string | string[];
   iterations?: number;
+  loop_termination?: "condition_met" | "max_iterations" | "max_duration";
   input?: AgentFlowYamlValue;
   recovery?: "remediated" | "unresolved";
 }
@@ -165,7 +166,7 @@ export function parseAgentFlowSimulationFixture(source: string): AgentFlowSimula
       if (!isRecord(stepFixture)) {
         return { ok: false, error: `Simulation fixture step ${stepId} must be an object.` };
       }
-      const stepFields = new Set(["outcome", "outputs", "choice", "iterations", "input", "recovery"]);
+      const stepFields = new Set(["outcome", "outputs", "choice", "iterations", "loop_termination", "input", "recovery"]);
       const unknownStepField = Object.keys(stepFixture).find((field) => !stepFields.has(field));
       if (unknownStepField !== undefined) {
         return { ok: false, error: `Unknown simulation fixture field steps.${stepId}.${unknownStepField}.` };
@@ -181,6 +182,10 @@ export function parseAgentFlowSimulationFixture(source: string): AgentFlowSimula
       }
       if (stepFixture.iterations !== undefined && (!Number.isSafeInteger(stepFixture.iterations) || Number(stepFixture.iterations) < 0)) {
         return { ok: false, error: `Simulation fixture step ${stepId}.iterations must be a non-negative integer.` };
+      }
+      if (stepFixture.loop_termination !== undefined &&
+          !["condition_met", "max_iterations", "max_duration"].includes(String(stepFixture.loop_termination))) {
+        return { ok: false, error: `Simulation fixture step ${stepId}.loop_termination must be condition_met, max_iterations, or max_duration.` };
       }
       if (stepFixture.recovery !== undefined && !["remediated", "unresolved"].includes(String(stepFixture.recovery))) {
         return { ok: false, error: `Simulation fixture step ${stepId}.recovery must be remediated or unresolved.` };
@@ -884,6 +889,21 @@ function loopControl(
     return { kind: "terminal", status: "unresolved" };
   }
 
+  const termination = stepFixture.loop_termination ?? "condition_met";
+  if (termination === "max_iterations" && typeof step.max_iterations !== "number") {
+    addUnresolved(state, id, "Fixture selects max_iterations termination for a loop without max_iterations.");
+    return { kind: "terminal", status: "unresolved" };
+  }
+  if (termination === "max_iterations" && iterations !== step.max_iterations) {
+    addUnresolved(state, id, `Fixture selects max_iterations termination but requests ${iterations} of ${step.max_iterations} iterations.`);
+    return { kind: "terminal", status: "unresolved" };
+  }
+  if (termination === "max_duration" &&
+      typeof step.max_duration_seconds !== "number" && typeof step.max_duration_minutes !== "number") {
+    addUnresolved(state, id, "Fixture selects max_duration termination for a loop without a duration bound.");
+    return { kind: "terminal", status: "unresolved" };
+  }
+
   const body = Array.isArray(step.body) ? step.body.filter(isRecord) as AgentFlowWorkflowStep[] : [];
   for (let iteration = 0; iteration < iterations; iteration += 1) {
     if (iteration > 0) {
@@ -893,6 +913,10 @@ function loopControl(
     const control = runSequence(body, state, true);
     if (control.kind === "break_loop") continue;
     if (control.kind !== "done") return control;
+  }
+  if (termination !== "condition_met") {
+    state.terminalStates.push({ stepId: id, status: termination });
+    return { kind: "terminal", status: "timed_out" };
   }
   return { kind: "done" };
 }

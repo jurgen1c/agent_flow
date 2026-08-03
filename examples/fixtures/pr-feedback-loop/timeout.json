@@ -1,0 +1,12 @@
+{
+  "inputs": { "pr_url": "https://github.test/example/pull/38" },
+  "steps": {
+    "wait_for_review": { "iterations": 24, "loop_termination": "max_iterations" },
+    "collect_pr_state": {
+      "outputs": { "github/pr-state.json": { "checks_passed": false } }
+    },
+    "classify_comments": {
+      "outputs": { "github/actionable-comments.json": { "count": 0, "comments": [] } }
+    }
+  }
+}

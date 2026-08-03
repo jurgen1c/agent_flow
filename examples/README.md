@@ -54,6 +54,25 @@ classifications pause at `ask_user`; environment failures return `unresolved`.
 Flake, formatting, and fixture-backed FM remediation return `remediated` so a
 parent workflow can retry its failed CI step.
 
+`pr-feedback-loop.yml` also has fully offline simulation fixtures for a clean
+completion, actionable-comment remediation, recovered and unresolved CI,
+high-risk and frontier-budget short circuits, and bounded-loop timeout. For
+example:
+
+```sh
+bun run dist/agent-flow.js validate examples/workflows/pr-feedback-loop.yml
+bun run dist/agent-flow.js simulate examples/workflows/pr-feedback-loop.yml \
+  --fixture examples/fixtures/pr-feedback-loop/remediated.json
+bun run dist/agent-flow.js simulate examples/workflows/pr-feedback-loop.yml \
+  --fixture examples/fixtures/pr-feedback-loop/timeout.json
+```
+
+Simulation fixtures declare how a loop ended with `loop_termination`:
+`condition_met`, `max_iterations`, or `max_duration`. Exhausting either bound
+reports `timed_out` and does not fall through to the workflow's completion
+step. The fixtures provide PR state, classified comments, CI outcomes, and
+push outcomes without contacting GitHub or another network service.
+
 These files are examples, not guaranteed to run unchanged in every repo. Users should adapt:
 
 - CI commands.
