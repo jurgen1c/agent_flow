@@ -286,7 +286,7 @@ style: collaborative
 maturity: draft
 collaboration: { enabled: true, max_review_cycles: 1 }
 sessions:
-  reviewer: { provider: local, role: reviewer }
+  reviewer: { provider: local, role: reviewer, authority: { can_approve: true } }
 steps:
   - { id: approve, type: approval, reviewer: reviewer, artifacts: [result.md] }
 `);
@@ -301,7 +301,10 @@ style: collaborative
 maturity: draft
 collaboration: { enabled: true }
 sessions:
-  author: { provider: local, role: author }
+  author:
+    provider: local
+    role: author
+    authority: { can_request_changes: true, can_approve: true }
 steps:
   - id: consult
     type: consult
@@ -2592,7 +2595,10 @@ maturity: draft
 collaboration: { enabled: true }
 limits: { max_recovery_cycles: 2 }
 sessions:
-  reviewer: { provider: local, role: reviewer }
+  reviewer:
+    provider: local
+    role: reviewer
+    authority: { can_request_changes: true, can_approve: true }
 steps:
   - { id: review, type: review, reviewer: reviewer, subject: reviewer, artifacts: [result.md] }
   - { id: first, type: command, command: echo first }
@@ -2617,6 +2623,336 @@ steps: []
       message: "Collaborative workflows must explicitly declare collaboration.enabled: true.",
       path: "collaboration.enabled"
     }]);
+  });
+
+  test("defaults collaborative sessions to advisory authority", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: advisory-collaboration
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: true }
+sessions:
+  advisor:
+    provider: local
+    role: advisor
+    owns: [recommendations]
+steps:
+  - id: consult
+    type: consult
+    from: advisor
+    to: advisor
+    question: Review the plan
+    blocking: false
+`);
+
+    expect(validateAgentFlowWorkflow(workflow)).toEqual({ valid: true, errors: [] });
+  });
+
+  test("retains advisory authority when only stronger capabilities are disabled", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: advisory-with-disabled-blocking
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: true }
+sessions:
+  advisor:
+    provider: local
+    role: advisor
+    authority: { can_block: false }
+steps:
+  - id: consult
+    type: consult
+    from: advisor
+    to: advisor
+    question: Review the plan
+    blocking: false
+`);
+
+    expect(validateAgentFlowWorkflow(workflow)).toEqual({ valid: true, errors: [] });
+  });
+
+  test("honors explicit denial of advisory authority", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: denied-advice
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: true }
+sessions:
+  requester: { provider: local, role: requester }
+  advisor:
+    provider: local
+    role: advisor
+    authority: { can_advise: false }
+steps:
+  - id: consult
+    type: consult
+    from: requester
+    to: advisor
+    question: Review the plan
+    blocking: false
+`);
+
+    expect(validateAgentFlowWorkflow(workflow).errors).toEqual([{
+      code: "workflow.collaboration.authority.can_advise.required",
+      message: 'Session "advisor" must explicitly declare authority.can_advise: true to provide consultation advice.',
+      path: "steps[0].to",
+      stepId: "consult"
+    }]);
+  });
+
+  test("requires explicit authority for blocking, modifying, and approving collaboration", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: unauthorized-collaboration
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: true }
+sessions:
+  advisor: { provider: local, role: advisor }
+  writer:
+    provider: local
+    role: writer
+    file_scope: { include: [src/**] }
+  reviewer: { provider: local, role: reviewer }
+steps:
+  - id: consult
+    type: consult
+    from: writer
+    to: advisor
+    question: Review the plan
+    blocking: true
+  - id: write
+    type: session_request
+    session: writer
+    prompt: prompts/write.md
+    inputs: [brief.md]
+    outputs: [result.md]
+  - id: review
+    type: review
+    reviewer: reviewer
+    subject: writer
+    artifacts: [result.md]
+  - id: approve
+    type: approval
+    reviewer: reviewer
+    artifacts: [result.md]
+`);
+
+    expect(validateAgentFlowWorkflow(workflow).errors).toEqual([
+      {
+        code: "workflow.collaboration.authority.can_modify_files.required",
+        message: 'Session "writer" must explicitly declare authority.can_modify_files: true when a file scope is declared.',
+        path: "sessions.writer.authority.can_modify_files"
+      },
+      {
+        code: "workflow.collaboration.authority.can_block.required",
+        message: 'Session "advisor" must explicitly declare authority.can_block: true for blocking collaboration.',
+        path: "steps[0].blocking",
+        stepId: "consult"
+      },
+      {
+        code: "workflow.collaboration.authority.can_request_changes.required",
+        message: 'Session "reviewer" must explicitly declare authority.can_request_changes: true to perform reviews.',
+        path: "steps[2].reviewer",
+        stepId: "review"
+      },
+      {
+        code: "workflow.collaboration.authority.can_approve.required",
+        message: 'Session "reviewer" must explicitly declare authority.can_approve: true to approve reviews.',
+        path: "steps[2].reviewer",
+        stepId: "review"
+      },
+      {
+        code: "workflow.collaboration.authority.can_approve.required",
+        message: 'Session "reviewer" must explicitly declare authority.can_approve: true to perform approvals.',
+        path: "steps[3].reviewer",
+        stepId: "approve"
+      }
+    ]);
+  });
+
+  test("rejects dynamic authority actors and malformed blocking declarations", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: dynamic-collaboration-authority
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: true }
+inputs: { actor: {} }
+sessions:
+  advisor: { provider: local, role: advisor, authority: { can_advise: false } }
+steps:
+  - id: consult
+    type: consult
+    from: advisor
+    to: advisor
+    question: Review the plan
+    blocking: "true"
+  - id: dynamic_consult
+    type: consult
+    from: advisor
+    to: "{{ inputs.actor }}"
+    question: Review the plan
+    blocking: true
+  - id: approve
+    type: approval
+    reviewer: "{{ inputs.actor }}"
+    artifacts: [result.md]
+`);
+
+    expect(validateAgentFlowWorkflow(workflow).errors).toEqual([
+      {
+        code: "workflow.collaboration.blocking.invalid",
+        message: "Consult blocking must be a boolean when declared.",
+        path: "steps[0].blocking",
+        stepId: "consult"
+      },
+      {
+        code: "workflow.collaboration.authority.actor.dynamic",
+        message: "Blocking consultation target must be a static declared session so can_block authority can be validated.",
+        path: "steps[1].to",
+        stepId: "dynamic_consult"
+      },
+      {
+        code: "workflow.collaboration.authority.actor.dynamic",
+        message: "Approval reviewer must be a static declared session so can_approve authority can be validated.",
+        path: "steps[2].reviewer",
+        stepId: "approve"
+      }
+    ]);
+  });
+
+  test("rejects malformed collaboration configuration at runtime", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: malformed-collaboration
+version: 1
+style: collaborative
+maturity: draft
+collaboration:
+  enabled: true
+  max_review_cycles: two
+  on_disagreement: []
+sessions: {}
+steps: []
+`);
+
+    expect(validateAgentFlowWorkflow(workflow).errors).toEqual([
+      {
+        code: "workflow.collaboration.max_review_cycles.invalid",
+        message: "Collaboration max_review_cycles must be a positive integer when declared.",
+        path: "collaboration.max_review_cycles"
+      },
+      {
+        code: "workflow.collaboration.on_disagreement.invalid",
+        message: "Collaboration on_disagreement must be a non-empty strategy name or a mapping.",
+        path: "collaboration.on_disagreement"
+      }
+    ]);
+  });
+
+  test("does not cascade collaboration enablement errors from malformed configuration", () => {
+    const invalidRoot = parseAgentFlowWorkflowOrThrow(`name: malformed-collaboration-root
+version: 1
+style: collaborative
+maturity: draft
+collaboration: invalid
+sessions: {}
+steps: []
+`);
+    const invalidEnabled = parseAgentFlowWorkflowOrThrow(`name: malformed-collaboration-enabled
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: invalid }
+sessions: {}
+steps: []
+`);
+    const disabled = parseAgentFlowWorkflowOrThrow(`name: disabled-collaboration-authority
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: false }
+sessions:
+  advisor: { provider: local, role: advisor, authority: { can_advise: false } }
+steps:
+  - { id: consult, type: consult, from: advisor, to: advisor, question: Review, blocking: false }
+`);
+
+    expect(validateAgentFlowWorkflow(invalidRoot).errors).toEqual([{
+      code: "workflow.collaboration.invalid",
+      message: "Collaboration configuration must be a mapping.",
+      path: "collaboration"
+    }]);
+    expect(validateAgentFlowWorkflow(invalidEnabled).errors).toEqual([{
+      code: "workflow.collaboration.enabled.invalid",
+      message: "Collaboration enabled must be a boolean.",
+      path: "collaboration.enabled"
+    }]);
+    expect(validateAgentFlowWorkflow(disabled).errors).toEqual([{
+      code: "workflow.collaboration.enabled.required",
+      message: "Collaborative workflows must explicitly declare collaboration.enabled: true.",
+      path: "collaboration.enabled"
+    }]);
+  });
+
+  test("rejects malformed ownership and unknown authority capabilities", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: malformed-collaboration-metadata
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: true }
+sessions:
+  malformed:
+    provider: local
+    role: reviewer
+    owns: [decisions, ""]
+    authority: { can_veto: true }
+steps: []
+`);
+
+    expect(validateAgentFlowWorkflow(workflow).errors).toEqual([
+      {
+        code: "workflow.session.ownership.invalid",
+        message: "Session ownership must be a non-empty list of unique non-empty strings.",
+        path: "sessions.malformed.owns"
+      },
+      {
+        code: "workflow.session.authority.unsupported",
+        message: 'Session authority capability "can_veto" is not supported.',
+        path: "sessions.malformed.authority.can_veto"
+      }
+    ]);
+  });
+
+  test("publishes collaboration roles, ownership, authority, and file scopes in the workflow schema", () => {
+    const schema = JSON.parse(fs.readFileSync(path.join(repoRoot, "schemas/workflow.schema.json"), "utf8")) as {
+      properties: Record<string, unknown>;
+      $defs: Record<string, { properties?: Record<string, unknown>; additionalProperties?: unknown }>;
+    };
+
+    expect(schema.properties.collaboration).toEqual({ $ref: "#/$defs/collaboration" });
+    expect(schema.properties.sessions).toEqual({
+      type: "object",
+      additionalProperties: { $ref: "#/$defs/session" }
+    });
+    expect(schema.$defs.collaboration.properties).toMatchObject({
+      on_disagreement: {
+        oneOf: expect.arrayContaining([{ type: "string", minLength: 1, pattern: "\\S" }])
+      }
+    });
+    expect(Object.keys(schema.$defs.session.properties ?? {}).sort()).toEqual([
+      "authority", "file_scope", "owns", "provider", "resume", "role"
+    ]);
+    expect(schema.$defs.session.properties).toMatchObject({
+      provider: { type: "string", minLength: 1, pattern: "\\S" },
+      role: { type: "string", minLength: 1, pattern: "\\S" },
+      owns: { items: { type: "string", minLength: 1, pattern: "\\S" } }
+    });
+    expect(Object.keys(schema.$defs.sessionAuthority.properties ?? {}).sort()).toEqual([
+      "can_advise", "can_approve", "can_block", "can_merge", "can_modify_files", "can_pause", "can_request_changes"
+    ]);
+    expect(schema.$defs.sessionAuthority.additionalProperties).toBe(false);
+    expect(schema.$defs.fileScope.properties).toMatchObject({
+      include: { items: { type: "string", minLength: 1, pattern: "\\S" } },
+      exclude: { items: { type: "string", minLength: 1, pattern: "\\S" } }
+    });
   });
 });
 

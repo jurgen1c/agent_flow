@@ -142,7 +142,8 @@ export type {
 export type {
   AgentFlowWorkflowGraph,
   AgentFlowWorkflowGraphEdge,
-  AgentFlowWorkflowGraphNode
+  AgentFlowWorkflowGraphNode,
+  AgentFlowWorkflowGraphSession
 } from "./inspection";
 export type {
   AgentFlowSimulationFixture,

@@ -1,4 +1,4 @@
-import { lintAgentFlowWorkflow } from "./validation";
+import { AGENT_FLOW_COLLABORATION_AUTHORITY_CAPABILITIES, lintAgentFlowWorkflow } from "./validation";
 import type {
   AgentFlowWorkflow,
   AgentFlowWorkflowStep,
@@ -6,6 +6,7 @@ import type {
   AgentFlowYamlValue
 } from "./workflow";
 import { assertAgentFlowSuccessTargetsAreUnambiguous } from "./success_routing";
+import { normalizeRepoPattern } from "./policy_utils";
 
 export interface AgentFlowWorkflowGraphNode {
   id: string;
@@ -21,6 +22,18 @@ export interface AgentFlowWorkflowGraphEdge {
   label?: string;
 }
 
+export interface AgentFlowWorkflowGraphSession {
+  name: string;
+  provider?: string;
+  role?: string;
+  owns: string[];
+  authority: string[];
+  fileScope: {
+    include: string[];
+    exclude: string[];
+  };
+}
+
 export interface AgentFlowWorkflowGraph {
   workflow: {
     name: string;
@@ -30,6 +43,7 @@ export interface AgentFlowWorkflowGraph {
   };
   nodes: AgentFlowWorkflowGraphNode[];
   edges: AgentFlowWorkflowGraphEdge[];
+  sessions: AgentFlowWorkflowGraphSession[];
 }
 
 export class AgentFlowWorkflowGraphError extends Error {
@@ -66,7 +80,7 @@ export function explainAgentFlowWorkflow(workflow: AgentFlowWorkflow): string {
   lines.push("", "Inputs:");
   appendNamedValues(lines, workflow.inputs);
   lines.push("", "Sessions:");
-  appendSessions(lines, workflow.sessions);
+  appendSessions(lines, workflow.sessions, workflow.style);
 
   const collaboration = record(workflow.collaboration);
   if (collaboration !== undefined) {
@@ -170,7 +184,8 @@ export function buildAgentFlowWorkflowGraph(workflow: AgentFlowWorkflow): AgentF
       maturity: workflow.maturity
     },
     nodes: stableUniqueNodes(nodes),
-    edges: stableUniqueEdges(edges)
+    edges: stableUniqueEdges(edges),
+    sessions: collaborationSessions(workflow.sessions, workflow.style)
   };
 }
 
@@ -181,8 +196,28 @@ export function renderAgentFlowWorkflowGraph(workflow: AgentFlowWorkflow): strin
     `Style: ${graph.workflow.style}`,
     `Maturity: ${graph.workflow.maturity}`,
     "",
-    "Nodes:"
+    "Sessions:"
   ];
+
+  if (graph.sessions.length === 0) {
+    lines.push("  (none)");
+  } else {
+    graph.sessions.forEach((session) => {
+      const details = [
+        ...(session.role === undefined ? [] : [`role=${session.role}`]),
+        `authority=${session.authority.length === 0 ? "none" : session.authority.join(",")}`,
+        ...(session.owns.length === 0 ? [] : [`owns=${session.owns.join(",")}`]),
+        ...(session.fileScope.include.length === 0 ? [] : [`file_scope.include=${session.fileScope.include.join(",")}`]),
+        ...(session.fileScope.exclude.length === 0 ? [] : [`file_scope.exclude=${session.fileScope.exclude.join(",")}`])
+      ];
+      lines.push(`  ${session.name}: ${details.join("; ")}`);
+    });
+  }
+
+  lines.push(
+    "",
+    "Nodes:"
+  );
 
   if (graph.nodes.length === 0) {
     lines.push("  (none)");
@@ -434,16 +469,112 @@ function appendNamedValues(lines: string[], values: Record<string, AgentFlowYaml
   Object.keys(values).sort().forEach((name) => lines.push(`  ${name}: ${stableInline(values[name])}`));
 }
 
-function appendSessions(lines: string[], sessions: Record<string, AgentFlowYamlValue> | undefined): void {
+function appendSessions(
+  lines: string[],
+  sessions: Record<string, AgentFlowYamlValue> | undefined,
+  style: AgentFlowWorkflow["style"]
+): void {
   if (sessions === undefined || Object.keys(sessions).length === 0) {
     lines.push("  (none)");
     return;
   }
   Object.keys(sessions).sort().forEach((name) => {
     const value = sessions[name];
-    const details = isRecord(value) ? namedScalarDetails(value, ["provider", "role", "resume"]) : [];
+    const metadata = collaborationSession(name, value, style);
+    const details = [
+      ...(metadata.provider === undefined ? [] : [`provider=${metadata.provider}`]),
+      ...(metadata.role === undefined ? [] : [`role=${metadata.role}`]),
+      ...(isRecord(value) ? namedScalarDetails(value, ["resume"]) : []),
+      ...(metadata.owns.length === 0 ? [] : [`owns=${metadata.owns.join(",")}`]),
+      `authority=${metadata.authority.length === 0 ? "none" : metadata.authority.join(",")}`,
+      ...(metadata.fileScope.include.length === 0 ? [] : [`file_scope.include=${metadata.fileScope.include.join(",")}`]),
+      ...(metadata.fileScope.exclude.length === 0 ? [] : [`file_scope.exclude=${metadata.fileScope.exclude.join(",")}`])
+    ];
     lines.push(`  ${name}${details.length === 0 ? "" : `: ${details.join("; ")}`}`);
   });
+}
+
+function collaborationSessions(
+  sessions: Record<string, AgentFlowYamlValue> | undefined,
+  style: AgentFlowWorkflow["style"]
+): AgentFlowWorkflowGraphSession[] {
+  return Object.entries(sessions ?? {})
+    .map(([name, session]) => collaborationSession(name, session, style))
+    .sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function collaborationSession(
+  name: string,
+  value: AgentFlowYamlValue | undefined,
+  style: AgentFlowWorkflow["style"]
+): AgentFlowWorkflowGraphSession {
+  if (!isRecord(value)) {
+    return {
+      name,
+      owns: [],
+      authority: [`invalid_session:${JSON.stringify(value)}`],
+      fileScope: { include: [], exclude: [] }
+    };
+  }
+  const session = value as AgentFlowYamlMapping;
+  const authorityValue = session.authority;
+  const authority = record(authorityValue);
+  const supportedAuthority = new Set<string>(AGENT_FLOW_COLLABORATION_AUTHORITY_CAPABILITIES);
+  const explicitAuthority = authority === undefined ? [] : Object.entries(authority)
+    .filter(([capability, enabled]) => supportedAuthority.has(capability) && enabled === true)
+    .map(([capability]) => capability)
+    .sort();
+  const invalidAuthority = authorityValue !== undefined && authority === undefined
+    ? [invalidInspectionValue(authorityValue)]
+    : Object.entries(authority ?? {})
+      .filter(([capability, enabled]) => !supportedAuthority.has(capability) || typeof enabled !== "boolean")
+      .map(([capability, enabled]) => invalidInspectionValue({ [capability]: enabled }));
+  const hasEnabledAuthority = authority !== undefined && Object.values(authority).some((enabled) => enabled === true);
+  const advisoryDefault = style === "collaborative" &&
+    (authorityValue === undefined || authority !== undefined && authority.can_advise !== false && !hasEnabledAuthority);
+  const fileScopeValue = session.file_scope;
+  const fileScope = record(fileScopeValue);
+  const invalidFileScope = fileScopeValue !== undefined && fileScope === undefined
+    ? [invalidInspectionValue(fileScopeValue)]
+    : [];
+  const provider = inspectableString(session.provider);
+  const role = inspectableString(session.role);
+  return {
+    name,
+    ...(provider === undefined ? {} : { provider }),
+    ...(role === undefined ? {} : { role }),
+    owns: inspectableStringList(session.owns),
+    authority: uniqueSorted([...(advisoryDefault ? ["advisory"] : explicitAuthority), ...invalidAuthority]),
+    fileScope: {
+      include: uniqueSorted([...invalidFileScope, ...normalizedFileScopePatterns(fileScope?.include)]),
+      exclude: normalizedFileScopePatterns(fileScope?.exclude)
+    }
+  };
+}
+
+function inspectableString(value: AgentFlowYamlValue | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  return nonEmptyString(value) ?? invalidInspectionValue(value);
+}
+
+function inspectableStringList(value: AgentFlowYamlValue | undefined): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) return [invalidInspectionValue(value)];
+  return uniqueSorted(value.map((entry) => inspectableString(entry) ?? invalidInspectionValue(entry)));
+}
+
+function normalizedFileScopePatterns(value: AgentFlowYamlValue | undefined): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) return [invalidInspectionValue(value)];
+  return uniqueSorted(value.map((pattern) =>
+    typeof pattern !== "string"
+      ? invalidInspectionValue(pattern)
+      : normalizeRepoPattern(pattern) ?? invalidInspectionValue(pattern)
+  ));
+}
+
+function invalidInspectionValue(value: AgentFlowYamlValue | undefined): string {
+  return `invalid:${JSON.stringify(value)}`;
 }
 
 function stableUniqueNodes(nodes: AgentFlowWorkflowGraphNode[]): AgentFlowWorkflowGraphNode[] {

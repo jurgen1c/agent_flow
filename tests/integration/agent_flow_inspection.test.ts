@@ -116,9 +116,17 @@ sessions:
   writer:
     provider: frontier
     role: writer
+    owns: [" implementation "]
+    authority:
+      can_modify_files: true
+    file_scope:
+      include: [./src/**]
   reviewer:
     provider: local
     role: reviewer
+    authority:
+      can_request_changes: true
+      can_approve: true
 steps:
   - id: split
     type: parallel
@@ -130,6 +138,8 @@ steps:
             type: session_request
             session: writer
             prompt: prompts/write.md
+            inputs: [brief.md]
+            outputs: [draft.md]
       - id: advise
         session: reviewer
   - id: approve
@@ -148,8 +158,190 @@ steps:
       { from: "split", to: "approve", kind: "next" }
     ]));
     expect(explanation).toContain("Collaboration: enabled; max_review_cycles=2");
+    expect(explanation).toContain("writer: provider=frontier; role=writer; owns=implementation; authority=can_modify_files; file_scope.include=src/**");
+    expect(explanation).toContain("reviewer: provider=local; role=reviewer; authority=can_approve,can_request_changes");
     expect(explanation).toContain("branch draft — session=writer");
     expect(explanation).toContain("approve [approval] — reviewer=reviewer");
+    expect(graph.sessions).toEqual([
+      {
+        name: "reviewer",
+        provider: "local",
+        role: "reviewer",
+        owns: [],
+        authority: ["can_approve", "can_request_changes"],
+        fileScope: { include: [], exclude: [] }
+      },
+      {
+        name: "writer",
+        provider: "frontier",
+        role: "writer",
+        owns: ["implementation"],
+        authority: ["can_modify_files"],
+        fileScope: { include: ["src/**"], exclude: [] }
+      }
+    ]);
+    expect(renderAgentFlowWorkflowGraph(workflow)).toContain(
+      "writer: role=writer; authority=can_modify_files; owns=implementation; file_scope.include=src/**"
+    );
+  });
+
+  test("renders advisory authority for sessions without stronger grants", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: advisory
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: true }
+sessions:
+  advisor: { provider: local, role: " advisor ", authority: { can_block: false } }
+steps: []
+`);
+
+    expect(explainAgentFlowWorkflow(workflow)).toContain("advisor: provider=local; role=advisor; authority=advisory");
+    expect(buildAgentFlowWorkflowGraph(workflow).sessions[0]?.authority).toEqual(["advisory"]);
+    expect(renderAgentFlowWorkflowGraph(workflow)).toContain("advisor: role=advisor; authority=advisory");
+  });
+
+  test("preserves explicit denial of advisory authority", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: denied-advice
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: true }
+sessions:
+  advisor:
+    provider: local
+    role: advisor
+    authority: { can_advise: false }
+steps: []
+`);
+
+    expect(explainAgentFlowWorkflow(workflow)).toContain("advisor: provider=local; role=advisor; authority=none");
+    expect(buildAgentFlowWorkflowGraph(workflow).sessions[0]?.authority).toEqual([]);
+    expect(renderAgentFlowWorkflowGraph(workflow)).toContain("advisor: role=advisor; authority=none");
+  });
+
+  test("does not grant advisory authority outside collaborative workflows", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: ordinary-pipeline
+version: 1
+style: pipeline
+maturity: draft
+sessions:
+  worker: { provider: local }
+steps: []
+`);
+
+    expect(explainAgentFlowWorkflow(workflow)).toContain("worker: provider=local; authority=none");
+    expect(buildAgentFlowWorkflowGraph(workflow).sessions[0]?.authority).toEqual([]);
+    expect(renderAgentFlowWorkflowGraph(workflow)).toContain("worker: authority=none");
+  });
+
+  test("surfaces invalid declared file scopes instead of silently dropping them", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: invalid-scope-inspection
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: true }
+sessions:
+  writer:
+    provider: local
+    role: writer
+    authority: { can_modify_files: true }
+    file_scope: { include: [.] }
+steps: []
+`);
+
+    expect(explainAgentFlowWorkflow(workflow)).toContain('file_scope.include=invalid:"."');
+    expect(buildAgentFlowWorkflowGraph(workflow).sessions[0]?.fileScope.include).toEqual(['invalid:"."']);
+    expect(renderAgentFlowWorkflowGraph(workflow)).toContain('file_scope.include=invalid:"."');
+  });
+
+  test("marks unsupported enabled authority without advertising it as a capability", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: invalid-authority-inspection
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: true }
+sessions:
+  reviewer:
+    provider: local
+    role: reviewer
+    authority: { can_veto: true }
+steps: []
+`);
+
+    expect(explainAgentFlowWorkflow(workflow)).toContain('authority=invalid:{"can_veto":true}');
+    expect(buildAgentFlowWorkflowGraph(workflow).sessions[0]?.authority).toEqual([
+      'invalid:{"can_veto":true}'
+    ]);
+    expect(renderAgentFlowWorkflowGraph(workflow)).toContain('authority=invalid:{"can_veto":true}');
+  });
+
+  test("surfaces malformed supported authority and non-string file scopes", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: malformed-session-inspection
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: true }
+sessions:
+  reviewer:
+    provider: local
+    role: reviewer
+    authority: { can_block: "true" }
+    file_scope: { include: [42] }
+steps: []
+`);
+
+    const session = buildAgentFlowWorkflowGraph(workflow).sessions[0];
+    expect(session?.authority).toEqual(["advisory", 'invalid:{"can_block":"true"}']);
+    expect(session?.fileScope.include).toEqual(["invalid:42"]);
+    expect(explainAgentFlowWorkflow(workflow)).toContain('authority=advisory,invalid:{"can_block":"true"}');
+    expect(renderAgentFlowWorkflowGraph(workflow)).toContain("file_scope.include=invalid:42");
+  });
+
+  test("surfaces malformed session metadata roots", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: malformed-session-roots
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: true }
+sessions:
+  reviewer:
+    provider: 42
+    role: " "
+    owns: invalid
+    authority: invalid
+    file_scope: invalid
+steps: []
+`);
+
+    expect(buildAgentFlowWorkflowGraph(workflow).sessions[0]).toEqual({
+      name: "reviewer",
+      provider: "invalid:42",
+      role: 'invalid:" "',
+      owns: ['invalid:"invalid"'],
+      authority: ['invalid:"invalid"'],
+      fileScope: { include: ['invalid:"invalid"'], exclude: [] }
+    });
+  });
+
+  test("preserves malformed session declarations in inspection", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: malformed-session-declaration
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: true }
+sessions: { reviewer: invalid }
+steps: []
+`);
+
+    expect(buildAgentFlowWorkflowGraph(workflow).sessions).toEqual([{
+      name: "reviewer",
+      owns: [],
+      authority: ['invalid_session:"invalid"'],
+      fileScope: { include: [], exclude: [] }
+    }]);
+    expect(explainAgentFlowWorkflow(workflow)).toContain('reviewer: authority=invalid_session:"invalid"');
+    expect(renderAgentFlowWorkflowGraph(workflow)).toContain('reviewer: authority=invalid_session:"invalid"');
   });
 
   test("preserves validator fallthrough semantics and terminal gate outcomes", () => {
