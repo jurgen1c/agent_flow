@@ -235,6 +235,26 @@ steps: []
     expect(renderAgentFlowWorkflowGraph(workflow)).toContain("worker: authority=none");
   });
 
+  test("surfaces invalid declared file scopes instead of silently dropping them", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: invalid-scope-inspection
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: true }
+sessions:
+  writer:
+    provider: local
+    role: writer
+    authority: { can_modify_files: true }
+    file_scope: { include: [.] }
+steps: []
+`);
+
+    expect(explainAgentFlowWorkflow(workflow)).toContain('file_scope.include=invalid:"."');
+    expect(buildAgentFlowWorkflowGraph(workflow).sessions[0]?.fileScope.include).toEqual(['invalid:"."']);
+    expect(renderAgentFlowWorkflowGraph(workflow)).toContain('file_scope.include=invalid:"."');
+  });
+
   test("preserves validator fallthrough semantics and terminal gate outcomes", () => {
     const workflow = parseAgentFlowWorkflowOrThrow(`
 name: fallthrough

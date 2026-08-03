@@ -533,10 +533,9 @@ function collaborationSession(
 }
 
 function normalizedFileScopePatterns(value: AgentFlowYamlValue | undefined): string[] {
-  return uniqueSorted(stringValues(value).flatMap((pattern) => {
-    const normalized = normalizeRepoPattern(pattern);
-    return normalized === undefined ? [] : [normalized];
-  }));
+  return uniqueSorted(stringValues(value).map((pattern) =>
+    normalizeRepoPattern(pattern) ?? `invalid:${JSON.stringify(pattern)}`
+  ));
 }
 
 function stableUniqueNodes(nodes: AgentFlowWorkflowGraphNode[]): AgentFlowWorkflowGraphNode[] {
