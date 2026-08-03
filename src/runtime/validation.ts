@@ -584,6 +584,13 @@ function validateCollaborationAuthority(
         field: "blocking",
         action: "for blocking collaboration"
       });
+    } else if (context.type === "consult") {
+      requirements.push({
+        session: nonEmptyString(context.step.to),
+        capability: "can_advise",
+        field: "to",
+        action: "to provide consultation advice"
+      });
     }
     if (context.type === "review") {
       requirements.push(
@@ -613,17 +620,27 @@ function validateCollaborationAuthority(
     for (const requirement of requirements) {
       if (requirement.session === undefined) continue;
       if (isDynamicReference(requirement.session)) {
+        const actorField = context.type === "consult" && requirement.capability === "can_block"
+          ? "to"
+          : requirement.field;
         addStepIssue(
           errors,
           context,
           "workflow.collaboration.authority.actor.dynamic",
-          requirement.field,
-          `${collaborationStepActor(context.type, requirement.field)} must be a static declared session so ${requirement.capability} authority can be validated.`
+          actorField,
+          `${collaborationStepActor(context.type, actorField, requirement.capability)} must be a static declared session so ${requirement.capability} authority can be validated.`
         );
         continue;
       }
       const session = workflow.sessions?.[requirement.session];
-      if (!isRecord(session) || isRecord(session.authority) && session.authority[requirement.capability] === true) {
+      const authority = isRecord(session) && isRecord(session.authority) ? session.authority : undefined;
+      const hasEnabledAuthority = authority !== undefined && Object.values(authority).some((enabled) => enabled === true);
+      const hasEffectiveAdvisoryAuthority = requirement.capability === "can_advise" && isRecord(session) &&
+        (session.authority === undefined || authority?.can_advise === true ||
+          authority !== undefined && authority.can_advise !== false && !hasEnabledAuthority);
+      if (!isRecord(session) ||
+          hasEffectiveAdvisoryAuthority ||
+          authority?.[requirement.capability] === true) {
         continue;
       }
       addStepIssue(
@@ -637,9 +654,10 @@ function validateCollaborationAuthority(
   }
 }
 
-function collaborationStepActor(type: string | undefined, field: string): string {
+function collaborationStepActor(type: string | undefined, field: string, capability: string): string {
   if (type === "approval" && field === "reviewer") return "Approval reviewer";
   if (type === "review" && field === "reviewer") return "Review reviewer";
+  if (capability === "can_advise") return "Consultation target";
   return "Blocking consultation target";
 }
 

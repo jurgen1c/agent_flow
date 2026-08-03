@@ -2648,6 +2648,58 @@ steps:
     expect(validateAgentFlowWorkflow(workflow)).toEqual({ valid: true, errors: [] });
   });
 
+  test("retains advisory authority when only stronger capabilities are disabled", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: advisory-with-disabled-blocking
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: true }
+sessions:
+  advisor:
+    provider: local
+    role: advisor
+    authority: { can_block: false }
+steps:
+  - id: consult
+    type: consult
+    from: advisor
+    to: advisor
+    question: Review the plan
+    blocking: false
+`);
+
+    expect(validateAgentFlowWorkflow(workflow)).toEqual({ valid: true, errors: [] });
+  });
+
+  test("honors explicit denial of advisory authority", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: denied-advice
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: true }
+sessions:
+  requester: { provider: local, role: requester }
+  advisor:
+    provider: local
+    role: advisor
+    authority: { can_advise: false }
+steps:
+  - id: consult
+    type: consult
+    from: requester
+    to: advisor
+    question: Review the plan
+    blocking: false
+`);
+
+    expect(validateAgentFlowWorkflow(workflow).errors).toEqual([{
+      code: "workflow.collaboration.authority.can_advise.required",
+      message: 'Session "advisor" must explicitly declare authority.can_advise: true to provide consultation advice.',
+      path: "steps[0].to",
+      stepId: "consult"
+    }]);
+  });
+
   test("requires explicit authority for blocking, modifying, and approving collaboration", () => {
     const workflow = parseAgentFlowWorkflowOrThrow(`name: unauthorized-collaboration
 version: 1
@@ -2734,6 +2786,12 @@ steps:
     to: advisor
     question: Review the plan
     blocking: "true"
+  - id: dynamic_consult
+    type: consult
+    from: advisor
+    to: "{{ inputs.actor }}"
+    question: Review the plan
+    blocking: true
   - id: approve
     type: approval
     reviewer: "{{ inputs.actor }}"
@@ -2749,8 +2807,14 @@ steps:
       },
       {
         code: "workflow.collaboration.authority.actor.dynamic",
+        message: "Blocking consultation target must be a static declared session so can_block authority can be validated.",
+        path: "steps[1].to",
+        stepId: "dynamic_consult"
+      },
+      {
+        code: "workflow.collaboration.authority.actor.dynamic",
         message: "Approval reviewer must be a static declared session so can_approve authority can be validated.",
-        path: "steps[1].reviewer",
+        path: "steps[2].reviewer",
         stepId: "approve"
       }
     ]);

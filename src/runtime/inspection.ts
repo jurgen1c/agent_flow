@@ -80,7 +80,7 @@ export function explainAgentFlowWorkflow(workflow: AgentFlowWorkflow): string {
   lines.push("", "Inputs:");
   appendNamedValues(lines, workflow.inputs);
   lines.push("", "Sessions:");
-  appendSessions(lines, workflow.sessions);
+  appendSessions(lines, workflow.sessions, workflow.style);
 
   const collaboration = record(workflow.collaboration);
   if (collaboration !== undefined) {
@@ -185,7 +185,7 @@ export function buildAgentFlowWorkflowGraph(workflow: AgentFlowWorkflow): AgentF
     },
     nodes: stableUniqueNodes(nodes),
     edges: stableUniqueEdges(edges),
-    sessions: collaborationSessions(workflow.sessions)
+    sessions: collaborationSessions(workflow.sessions, workflow.style)
   };
 }
 
@@ -205,7 +205,7 @@ export function renderAgentFlowWorkflowGraph(workflow: AgentFlowWorkflow): strin
     graph.sessions.forEach((session) => {
       const details = [
         ...(session.role === undefined ? [] : [`role=${session.role}`]),
-        `authority=${session.authority.join(",")}`,
+        `authority=${session.authority.length === 0 ? "none" : session.authority.join(",")}`,
         ...(session.owns.length === 0 ? [] : [`owns=${session.owns.join(",")}`]),
         ...(session.fileScope.include.length === 0 ? [] : [`file_scope.include=${session.fileScope.include.join(",")}`]),
         ...(session.fileScope.exclude.length === 0 ? [] : [`file_scope.exclude=${session.fileScope.exclude.join(",")}`])
@@ -469,18 +469,24 @@ function appendNamedValues(lines: string[], values: Record<string, AgentFlowYaml
   Object.keys(values).sort().forEach((name) => lines.push(`  ${name}: ${stableInline(values[name])}`));
 }
 
-function appendSessions(lines: string[], sessions: Record<string, AgentFlowYamlValue> | undefined): void {
+function appendSessions(
+  lines: string[],
+  sessions: Record<string, AgentFlowYamlValue> | undefined,
+  style: AgentFlowWorkflow["style"]
+): void {
   if (sessions === undefined || Object.keys(sessions).length === 0) {
     lines.push("  (none)");
     return;
   }
   Object.keys(sessions).sort().forEach((name) => {
     const value = sessions[name];
-    const metadata = isRecord(value) ? collaborationSession(name, value) : undefined;
+    const metadata = isRecord(value) ? collaborationSession(name, value, style) : undefined;
     const details = isRecord(value) ? [
-      ...namedScalarDetails(value, ["provider", "role", "resume"]),
+      ...(metadata?.provider === undefined ? [] : [`provider=${metadata.provider}`]),
+      ...(metadata?.role === undefined ? [] : [`role=${metadata.role}`]),
+      ...namedScalarDetails(value, ["resume"]),
       ...(metadata === undefined || metadata.owns.length === 0 ? [] : [`owns=${metadata.owns.join(",")}`]),
-      ...(metadata === undefined ? [] : [`authority=${metadata.authority.join(",")}`]),
+      ...(metadata === undefined ? [] : [`authority=${metadata.authority.length === 0 ? "none" : metadata.authority.join(",")}`]),
       ...(metadata === undefined || metadata.fileScope.include.length === 0 ? [] : [`file_scope.include=${metadata.fileScope.include.join(",")}`]),
       ...(metadata === undefined || metadata.fileScope.exclude.length === 0 ? [] : [`file_scope.exclude=${metadata.fileScope.exclude.join(",")}`])
     ] : [];
@@ -489,20 +495,26 @@ function appendSessions(lines: string[], sessions: Record<string, AgentFlowYamlV
 }
 
 function collaborationSessions(
-  sessions: Record<string, AgentFlowYamlValue> | undefined
+  sessions: Record<string, AgentFlowYamlValue> | undefined,
+  style: AgentFlowWorkflow["style"]
 ): AgentFlowWorkflowGraphSession[] {
   return Object.entries(sessions ?? {})
     .filter((entry): entry is [string, AgentFlowYamlMapping] => isRecord(entry[1]))
-    .map(([name, session]) => collaborationSession(name, session))
+    .map(([name, session]) => collaborationSession(name, session, style))
     .sort((left, right) => left.name.localeCompare(right.name));
 }
 
-function collaborationSession(name: string, session: AgentFlowYamlMapping): AgentFlowWorkflowGraphSession {
+function collaborationSession(
+  name: string,
+  session: AgentFlowYamlMapping,
+  style: AgentFlowWorkflow["style"]
+): AgentFlowWorkflowGraphSession {
   const authority = record(session.authority);
   const explicitAuthority = authority === undefined ? [] : Object.entries(authority)
     .filter(([, enabled]) => enabled === true)
     .map(([capability]) => capability)
     .sort();
+  const advisoryDefault = style === "collaborative" && authority?.can_advise !== false && explicitAuthority.length === 0;
   const fileScope = record(session.file_scope);
   return {
     name,
@@ -512,7 +524,7 @@ function collaborationSession(name: string, session: AgentFlowYamlMapping): Agen
       const normalized = nonEmptyString(value);
       return normalized === undefined ? [] : [normalized];
     })),
-    authority: explicitAuthority.length === 0 ? ["advisory"] : explicitAuthority,
+    authority: advisoryDefault ? ["advisory"] : explicitAuthority,
     fileScope: {
       include: normalizedFileScopePatterns(fileScope?.include),
       exclude: normalizedFileScopePatterns(fileScope?.exclude)

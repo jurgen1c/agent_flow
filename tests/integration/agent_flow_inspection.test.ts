@@ -192,13 +192,47 @@ style: collaborative
 maturity: draft
 collaboration: { enabled: true }
 sessions:
-  advisor: { provider: local, role: advisor }
+  advisor: { provider: local, role: " advisor ", authority: { can_block: false } }
 steps: []
 `);
 
     expect(explainAgentFlowWorkflow(workflow)).toContain("advisor: provider=local; role=advisor; authority=advisory");
     expect(buildAgentFlowWorkflowGraph(workflow).sessions[0]?.authority).toEqual(["advisory"]);
     expect(renderAgentFlowWorkflowGraph(workflow)).toContain("advisor: role=advisor; authority=advisory");
+  });
+
+  test("preserves explicit denial of advisory authority", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: denied-advice
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: true }
+sessions:
+  advisor:
+    provider: local
+    role: advisor
+    authority: { can_advise: false }
+steps: []
+`);
+
+    expect(explainAgentFlowWorkflow(workflow)).toContain("advisor: provider=local; role=advisor; authority=none");
+    expect(buildAgentFlowWorkflowGraph(workflow).sessions[0]?.authority).toEqual([]);
+    expect(renderAgentFlowWorkflowGraph(workflow)).toContain("advisor: role=advisor; authority=none");
+  });
+
+  test("does not grant advisory authority outside collaborative workflows", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: ordinary-pipeline
+version: 1
+style: pipeline
+maturity: draft
+sessions:
+  worker: { provider: local }
+steps: []
+`);
+
+    expect(explainAgentFlowWorkflow(workflow)).toContain("worker: provider=local; authority=none");
+    expect(buildAgentFlowWorkflowGraph(workflow).sessions[0]?.authority).toEqual([]);
+    expect(renderAgentFlowWorkflowGraph(workflow)).toContain("worker: authority=none");
   });
 
   test("preserves validator fallthrough semantics and terminal gate outcomes", () => {
