@@ -84,7 +84,7 @@ sessions:
 
 ## 5. Authority Model
 
-Authority must be explicit.
+Stronger, non-advisory authority must be explicit.
 
 | Authority | Meaning |
 |---|---|

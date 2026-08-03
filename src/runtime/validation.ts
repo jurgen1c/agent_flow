@@ -81,7 +81,7 @@ const RECOVERY_ROUTE_STEP_TYPES = new Set(["artifact_transform", "command", "mcp
 const SECRET_PATH = /(^|[/._-])(\.env|credentials|id_rsa|id_ed25519|private[_-]?key|secrets?)([/._-]|$)/i;
 const SHELL_EXECUTABLES = new Set(["bash", "dash", "ksh", "sh", "zsh"]);
 const SHELL_ANALYSIS_BUDGET = 65_536;
-const COLLABORATION_AUTHORITY_CAPABILITIES = new Set([
+export const AGENT_FLOW_COLLABORATION_AUTHORITY_CAPABILITIES = [
   "can_advise",
   "can_approve",
   "can_block",
@@ -89,7 +89,8 @@ const COLLABORATION_AUTHORITY_CAPABILITIES = new Set([
   "can_modify_files",
   "can_pause",
   "can_request_changes"
-]);
+] as const;
+const COLLABORATION_AUTHORITY_CAPABILITIES = new Set<string>(AGENT_FLOW_COLLABORATION_AUTHORITY_CAPABILITIES);
 export const MAX_AGENT_FLOW_COMMAND_RETRIES = 100;
 const STEP_REQUIREMENTS: Readonly<Record<string, ReadonlyArray<readonly [string, "string" | "array" | "mapping"]>>> = {
   approval: [["reviewer", "string"], ["artifacts", "array"]],

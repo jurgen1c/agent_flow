@@ -2917,6 +2917,11 @@ steps: []
       type: "object",
       additionalProperties: { $ref: "#/$defs/session" }
     });
+    expect(schema.$defs.collaboration.properties).toMatchObject({
+      on_disagreement: {
+        oneOf: expect.arrayContaining([{ type: "string", minLength: 1, pattern: "\\S" }])
+      }
+    });
     expect(Object.keys(schema.$defs.session.properties ?? {}).sort()).toEqual([
       "authority", "file_scope", "owns", "provider", "resume", "role"
     ]);
@@ -2929,6 +2934,10 @@ steps: []
       "can_advise", "can_approve", "can_block", "can_merge", "can_modify_files", "can_pause", "can_request_changes"
     ]);
     expect(schema.$defs.sessionAuthority.additionalProperties).toBe(false);
+    expect(schema.$defs.fileScope.properties).toMatchObject({
+      include: { items: { type: "string", minLength: 1, pattern: "\\S" } },
+      exclude: { items: { type: "string", minLength: 1, pattern: "\\S" } }
+    });
   });
 });
 

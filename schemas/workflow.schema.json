@@ -147,7 +147,7 @@
         "max_review_cycles": { "type": "integer", "minimum": 1 },
         "on_disagreement": {
           "oneOf": [
-            { "type": "string", "minLength": 1 },
+            { "type": "string", "minLength": 1, "pattern": "\\S" },
             { "type": "object" }
           ]
         }
@@ -212,12 +212,12 @@
         "include": {
           "type": "array",
           "minItems": 1,
-          "items": { "type": "string", "minLength": 1 }
+          "items": { "type": "string", "minLength": 1, "pattern": "\\S" }
         },
         "exclude": {
           "type": "array",
           "minItems": 1,
-          "items": { "type": "string", "minLength": 1 }
+          "items": { "type": "string", "minLength": 1, "pattern": "\\S" }
         }
       },
       "additionalProperties": true

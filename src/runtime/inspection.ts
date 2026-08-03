@@ -1,4 +1,4 @@
-import { lintAgentFlowWorkflow } from "./validation";
+import { AGENT_FLOW_COLLABORATION_AUTHORITY_CAPABILITIES, lintAgentFlowWorkflow } from "./validation";
 import type {
   AgentFlowWorkflow,
   AgentFlowWorkflowStep,
@@ -480,16 +480,16 @@ function appendSessions(
   }
   Object.keys(sessions).sort().forEach((name) => {
     const value = sessions[name];
-    const metadata = isRecord(value) ? collaborationSession(name, value, style) : undefined;
-    const details = isRecord(value) ? [
-      ...(metadata?.provider === undefined ? [] : [`provider=${metadata.provider}`]),
-      ...(metadata?.role === undefined ? [] : [`role=${metadata.role}`]),
-      ...namedScalarDetails(value, ["resume"]),
-      ...(metadata === undefined || metadata.owns.length === 0 ? [] : [`owns=${metadata.owns.join(",")}`]),
-      ...(metadata === undefined ? [] : [`authority=${metadata.authority.length === 0 ? "none" : metadata.authority.join(",")}`]),
-      ...(metadata === undefined || metadata.fileScope.include.length === 0 ? [] : [`file_scope.include=${metadata.fileScope.include.join(",")}`]),
-      ...(metadata === undefined || metadata.fileScope.exclude.length === 0 ? [] : [`file_scope.exclude=${metadata.fileScope.exclude.join(",")}`])
-    ] : [];
+    const metadata = collaborationSession(name, value, style);
+    const details = [
+      ...(metadata.provider === undefined ? [] : [`provider=${metadata.provider}`]),
+      ...(metadata.role === undefined ? [] : [`role=${metadata.role}`]),
+      ...(isRecord(value) ? namedScalarDetails(value, ["resume"]) : []),
+      ...(metadata.owns.length === 0 ? [] : [`owns=${metadata.owns.join(",")}`]),
+      `authority=${metadata.authority.length === 0 ? "none" : metadata.authority.join(",")}`,
+      ...(metadata.fileScope.include.length === 0 ? [] : [`file_scope.include=${metadata.fileScope.include.join(",")}`]),
+      ...(metadata.fileScope.exclude.length === 0 ? [] : [`file_scope.exclude=${metadata.fileScope.exclude.join(",")}`])
+    ];
     lines.push(`  ${name}${details.length === 0 ? "" : `: ${details.join("; ")}`}`);
   });
 }
@@ -499,43 +499,80 @@ function collaborationSessions(
   style: AgentFlowWorkflow["style"]
 ): AgentFlowWorkflowGraphSession[] {
   return Object.entries(sessions ?? {})
-    .filter((entry): entry is [string, AgentFlowYamlMapping] => isRecord(entry[1]))
     .map(([name, session]) => collaborationSession(name, session, style))
     .sort((left, right) => left.name.localeCompare(right.name));
 }
 
 function collaborationSession(
   name: string,
-  session: AgentFlowYamlMapping,
+  value: AgentFlowYamlValue | undefined,
   style: AgentFlowWorkflow["style"]
 ): AgentFlowWorkflowGraphSession {
-  const authority = record(session.authority);
+  if (!isRecord(value)) {
+    return {
+      name,
+      owns: [],
+      authority: [`invalid_session:${JSON.stringify(value)}`],
+      fileScope: { include: [], exclude: [] }
+    };
+  }
+  const session = value as AgentFlowYamlMapping;
+  const authorityValue = session.authority;
+  const authority = record(authorityValue);
+  const supportedAuthority = new Set<string>(AGENT_FLOW_COLLABORATION_AUTHORITY_CAPABILITIES);
   const explicitAuthority = authority === undefined ? [] : Object.entries(authority)
-    .filter(([, enabled]) => enabled === true)
+    .filter(([capability, enabled]) => supportedAuthority.has(capability) && enabled === true)
     .map(([capability]) => capability)
     .sort();
-  const advisoryDefault = style === "collaborative" && authority?.can_advise !== false && explicitAuthority.length === 0;
-  const fileScope = record(session.file_scope);
+  const invalidAuthority = authorityValue !== undefined && authority === undefined
+    ? [invalidInspectionValue(authorityValue)]
+    : Object.entries(authority ?? {})
+      .filter(([capability, enabled]) => !supportedAuthority.has(capability) || typeof enabled !== "boolean")
+      .map(([capability, enabled]) => invalidInspectionValue({ [capability]: enabled }));
+  const hasEnabledAuthority = authority !== undefined && Object.values(authority).some((enabled) => enabled === true);
+  const advisoryDefault = style === "collaborative" &&
+    (authorityValue === undefined || authority !== undefined && authority.can_advise !== false && !hasEnabledAuthority);
+  const fileScopeValue = session.file_scope;
+  const fileScope = record(fileScopeValue);
+  const invalidFileScope = fileScopeValue !== undefined && fileScope === undefined
+    ? [invalidInspectionValue(fileScopeValue)]
+    : [];
   return {
     name,
-    ...(nonEmptyString(session.provider) === undefined ? {} : { provider: nonEmptyString(session.provider) }),
-    ...(nonEmptyString(session.role) === undefined ? {} : { role: nonEmptyString(session.role) }),
-    owns: uniqueSorted(stringValues(session.owns).flatMap((value) => {
-      const normalized = nonEmptyString(value);
-      return normalized === undefined ? [] : [normalized];
-    })),
-    authority: advisoryDefault ? ["advisory"] : explicitAuthority,
+    ...(inspectableString(session.provider) === undefined ? {} : { provider: inspectableString(session.provider) }),
+    ...(inspectableString(session.role) === undefined ? {} : { role: inspectableString(session.role) }),
+    owns: inspectableStringList(session.owns),
+    authority: uniqueSorted([...(advisoryDefault ? ["advisory"] : explicitAuthority), ...invalidAuthority]),
     fileScope: {
-      include: normalizedFileScopePatterns(fileScope?.include),
+      include: uniqueSorted([...invalidFileScope, ...normalizedFileScopePatterns(fileScope?.include)]),
       exclude: normalizedFileScopePatterns(fileScope?.exclude)
     }
   };
 }
 
+function inspectableString(value: AgentFlowYamlValue | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  return nonEmptyString(value) ?? invalidInspectionValue(value);
+}
+
+function inspectableStringList(value: AgentFlowYamlValue | undefined): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) return [invalidInspectionValue(value)];
+  return uniqueSorted(value.map((entry) => inspectableString(entry) ?? invalidInspectionValue(entry)));
+}
+
 function normalizedFileScopePatterns(value: AgentFlowYamlValue | undefined): string[] {
-  return uniqueSorted(stringValues(value).map((pattern) =>
-    normalizeRepoPattern(pattern) ?? `invalid:${JSON.stringify(pattern)}`
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) return [invalidInspectionValue(value)];
+  return uniqueSorted(value.map((pattern) =>
+    typeof pattern !== "string"
+      ? invalidInspectionValue(pattern)
+      : normalizeRepoPattern(pattern) ?? invalidInspectionValue(pattern)
   ));
+}
+
+function invalidInspectionValue(value: AgentFlowYamlValue | undefined): string {
+  return `invalid:${JSON.stringify(value)}`;
 }
 
 function stableUniqueNodes(nodes: AgentFlowWorkflowGraphNode[]): AgentFlowWorkflowGraphNode[] {

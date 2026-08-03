@@ -255,6 +255,95 @@ steps: []
     expect(renderAgentFlowWorkflowGraph(workflow)).toContain('file_scope.include=invalid:"."');
   });
 
+  test("marks unsupported enabled authority without advertising it as a capability", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: invalid-authority-inspection
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: true }
+sessions:
+  reviewer:
+    provider: local
+    role: reviewer
+    authority: { can_veto: true }
+steps: []
+`);
+
+    expect(explainAgentFlowWorkflow(workflow)).toContain('authority=invalid:{"can_veto":true}');
+    expect(buildAgentFlowWorkflowGraph(workflow).sessions[0]?.authority).toEqual([
+      'invalid:{"can_veto":true}'
+    ]);
+    expect(renderAgentFlowWorkflowGraph(workflow)).toContain('authority=invalid:{"can_veto":true}');
+  });
+
+  test("surfaces malformed supported authority and non-string file scopes", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: malformed-session-inspection
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: true }
+sessions:
+  reviewer:
+    provider: local
+    role: reviewer
+    authority: { can_block: "true" }
+    file_scope: { include: [42] }
+steps: []
+`);
+
+    const session = buildAgentFlowWorkflowGraph(workflow).sessions[0];
+    expect(session?.authority).toEqual(["advisory", 'invalid:{"can_block":"true"}']);
+    expect(session?.fileScope.include).toEqual(["invalid:42"]);
+    expect(explainAgentFlowWorkflow(workflow)).toContain('authority=advisory,invalid:{"can_block":"true"}');
+    expect(renderAgentFlowWorkflowGraph(workflow)).toContain("file_scope.include=invalid:42");
+  });
+
+  test("surfaces malformed session metadata roots", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: malformed-session-roots
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: true }
+sessions:
+  reviewer:
+    provider: 42
+    role: " "
+    owns: invalid
+    authority: invalid
+    file_scope: invalid
+steps: []
+`);
+
+    expect(buildAgentFlowWorkflowGraph(workflow).sessions[0]).toEqual({
+      name: "reviewer",
+      provider: "invalid:42",
+      role: 'invalid:" "',
+      owns: ['invalid:"invalid"'],
+      authority: ['invalid:"invalid"'],
+      fileScope: { include: ['invalid:"invalid"'], exclude: [] }
+    });
+  });
+
+  test("preserves malformed session declarations in inspection", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: malformed-session-declaration
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: true }
+sessions: { reviewer: invalid }
+steps: []
+`);
+
+    expect(buildAgentFlowWorkflowGraph(workflow).sessions).toEqual([{
+      name: "reviewer",
+      owns: [],
+      authority: ['invalid_session:"invalid"'],
+      fileScope: { include: [], exclude: [] }
+    }]);
+    expect(explainAgentFlowWorkflow(workflow)).toContain('reviewer: authority=invalid_session:"invalid"');
+    expect(renderAgentFlowWorkflowGraph(workflow)).toContain('reviewer: authority=invalid_session:"invalid"');
+  });
+
   test("preserves validator fallthrough semantics and terminal gate outcomes", () => {
     const workflow = parseAgentFlowWorkflowOrThrow(`
 name: fallthrough
