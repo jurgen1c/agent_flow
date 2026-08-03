@@ -25,7 +25,7 @@ steps:
     every_seconds: 300
     max_iterations: 24
     max_duration_seconds: 86400
-    until: pr.checks_passed == true && pr.actionable_comments_count == 0
+    until: artifacts.github.pr_state.checks_passed == true && artifacts.github.actionable_comments.count == 0
     short_circuit_if:
       - budget.frontier_calls_remaining == 0
       - risk.high == true
@@ -57,7 +57,6 @@ steps:
         prompt: prompts/resolve-pr-comments.md
         inputs:
           - github/actionable-comments.json
-          - implementation-summary.md
         outputs:
           - implementation-summary.md
 

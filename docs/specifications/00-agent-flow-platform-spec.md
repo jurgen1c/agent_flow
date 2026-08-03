@@ -172,6 +172,13 @@ agent-flow simulate workflows/ticket-lifecycle.yml --fixture fixtures/ticket.jso
 agent-flow explain workflows/ticket-lifecycle.yml
 ```
 
+Loop simulation fixtures use `iterations` to select the number of body passes
+and `loop_termination` to state whether the loop condition matched or a bound
+was exhausted. Supported termination values are `condition_met`,
+`max_iterations`, and `max_duration`. Bound exhaustion produces a
+`timed_out` simulation result and records the exhausted bound as the loop's
+terminal state; it never falls through to later completion steps.
+
 Validation should catch:
 
 - Unknown step types.
