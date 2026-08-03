@@ -53,7 +53,9 @@ describe("Agent Flow workflow parser", () => {
     const loopStep = workflow.steps[0];
 
     expect(loopStep?.type).toBe("loop");
-    expect(loopStep?.until).toBe("pr.checks_passed == true && pr.actionable_comments_count == 0");
+    expect(loopStep?.until).toBe(
+      "artifacts.github.pr_state.checks_passed == true && artifacts.github.actionable_comments.count == 0"
+    );
     expect(loopStep?.body).toBeArray();
 
     const body = loopStep?.body as Array<Record<string, unknown>>;
