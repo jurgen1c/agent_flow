@@ -576,6 +576,7 @@ function validateCollaborationAuthority(
         "blocking",
         "Consult blocking must be a boolean when declared."
       );
+      continue;
     }
     if (context.type === "consult" && context.step.blocking === true) {
       requirements.push({
@@ -656,7 +657,7 @@ function validateCollaborationAuthority(
 
 function collaborationStepActor(type: string | undefined, field: string, capability: string): string {
   if (type === "approval" && field === "reviewer") return "Approval reviewer";
-  if (type === "review" && field === "reviewer") return "Review reviewer";
+  if (type === "review" && field === "reviewer") return "Review step reviewer";
   if (capability === "can_advise") return "Consultation target";
   return "Blocking consultation target";
 }

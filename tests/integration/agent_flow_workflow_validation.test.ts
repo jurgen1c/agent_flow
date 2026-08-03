@@ -2778,7 +2778,7 @@ maturity: draft
 collaboration: { enabled: true }
 inputs: { actor: {} }
 sessions:
-  advisor: { provider: local, role: advisor }
+  advisor: { provider: local, role: advisor, authority: { can_advise: false } }
 steps:
   - id: consult
     type: consult
