@@ -158,14 +158,14 @@
       "type": "object",
       "required": ["provider"],
       "properties": {
-        "provider": { "type": "string", "minLength": 1 },
-        "role": { "type": "string", "minLength": 1 },
+        "provider": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "role": { "type": "string", "minLength": 1, "pattern": "\\S" },
         "resume": { "type": "boolean" },
         "owns": {
           "type": "array",
           "minItems": 1,
           "uniqueItems": true,
-          "items": { "type": "string", "minLength": 1 }
+          "items": { "type": "string", "minLength": 1, "pattern": "\\S" }
         },
         "authority": { "$ref": "#/$defs/sessionAuthority" },
         "file_scope": { "$ref": "#/$defs/fileScope" }

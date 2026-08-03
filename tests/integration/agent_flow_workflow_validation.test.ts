@@ -2890,6 +2890,11 @@ steps: []
     expect(Object.keys(schema.$defs.session.properties ?? {}).sort()).toEqual([
       "authority", "file_scope", "owns", "provider", "resume", "role"
     ]);
+    expect(schema.$defs.session.properties).toMatchObject({
+      provider: { type: "string", minLength: 1, pattern: "\\S" },
+      role: { type: "string", minLength: 1, pattern: "\\S" },
+      owns: { items: { type: "string", minLength: 1, pattern: "\\S" } }
+    });
     expect(Object.keys(schema.$defs.sessionAuthority.properties ?? {}).sort()).toEqual([
       "can_advise", "can_approve", "can_block", "can_merge", "can_modify_files", "can_pause", "can_request_changes"
     ]);
