@@ -81,6 +81,15 @@ const RECOVERY_ROUTE_STEP_TYPES = new Set(["artifact_transform", "command", "mcp
 const SECRET_PATH = /(^|[/._-])(\.env|credentials|id_rsa|id_ed25519|private[_-]?key|secrets?)([/._-]|$)/i;
 const SHELL_EXECUTABLES = new Set(["bash", "dash", "ksh", "sh", "zsh"]);
 const SHELL_ANALYSIS_BUDGET = 65_536;
+const COLLABORATION_AUTHORITY_CAPABILITIES = new Set([
+  "can_advise",
+  "can_approve",
+  "can_block",
+  "can_merge",
+  "can_modify_files",
+  "can_pause",
+  "can_request_changes"
+]);
 export const MAX_AGENT_FLOW_COMMAND_RETRIES = 100;
 const STEP_REQUIREMENTS: Readonly<Record<string, ReadonlyArray<readonly [string, "string" | "array" | "mapping"]>>> = {
   approval: [["reviewer", "string"], ["artifacts", "array"]],
@@ -123,6 +132,7 @@ export function validateAgentFlowWorkflow(workflow: AgentFlowWorkflow): AgentFlo
   validateTargets(executableContexts, ids, errors);
   validateCommands(workflow, executableContexts, errors);
   validateSessionReferences(workflow, runtimeContexts, errors);
+  validateCollaborationAuthority(workflow, runtimeContexts, errors);
   validateControlStepShapes(workflow, executableContexts, errors);
   validateConditionExpressions(workflow, executableContexts, errors);
   validateLoopBounds(executableContexts, errors);
@@ -394,6 +404,40 @@ function collectStepContext(
 function validateSessionDefinitions(workflow: AgentFlowWorkflow, errors: AgentFlowWorkflowIssue[]): void {
   const collaboration = isRecord(workflow.collaboration) ? workflow.collaboration : undefined;
 
+  if (workflow.collaboration !== undefined && collaboration === undefined) {
+    errors.push({
+      code: "workflow.collaboration.invalid",
+      message: "Collaboration configuration must be a mapping.",
+      path: "collaboration"
+    });
+  }
+
+  if (collaboration?.enabled !== undefined && typeof collaboration.enabled !== "boolean") {
+    errors.push({
+      code: "workflow.collaboration.enabled.invalid",
+      message: "Collaboration enabled must be a boolean.",
+      path: "collaboration.enabled"
+    });
+  }
+
+  if (collaboration?.max_review_cycles !== undefined &&
+      !(Number.isSafeInteger(collaboration.max_review_cycles) && Number(collaboration.max_review_cycles) > 0)) {
+    errors.push({
+      code: "workflow.collaboration.max_review_cycles.invalid",
+      message: "Collaboration max_review_cycles must be a positive integer when declared.",
+      path: "collaboration.max_review_cycles"
+    });
+  }
+
+  if (collaboration?.on_disagreement !== undefined &&
+      nonEmptyString(collaboration.on_disagreement) === undefined && !isRecord(collaboration.on_disagreement)) {
+    errors.push({
+      code: "workflow.collaboration.on_disagreement.invalid",
+      message: "Collaboration on_disagreement must be a non-empty strategy name or a mapping.",
+      path: "collaboration.on_disagreement"
+    });
+  }
+
   if (workflow.style === "collaborative" && collaboration?.enabled !== true) {
     errors.push({
       code: "workflow.collaboration.enabled.required",
@@ -442,6 +486,18 @@ function validateSessionDefinitions(workflow: AgentFlowWorkflow, errors: AgentFl
         });
       }
 
+      if (value.owns !== undefined) {
+        const owns = stringList(value.owns);
+        if (!Array.isArray(value.owns) || owns.length === 0 || owns.length !== value.owns.length ||
+            new Set(owns).size !== owns.length) {
+          errors.push({
+            code: "workflow.session.ownership.invalid",
+            message: "Session ownership must be a non-empty list of unique non-empty strings.",
+            path: `sessions.${name}.owns`
+          });
+        }
+      }
+
       if (value.authority !== undefined && !isRecord(value.authority)) {
         errors.push({
           code: "workflow.session.authority.invalid",
@@ -450,7 +506,13 @@ function validateSessionDefinitions(workflow: AgentFlowWorkflow, errors: AgentFl
         });
       } else if (isRecord(value.authority)) {
         for (const [capability, enabled] of Object.entries(value.authority)) {
-          if (typeof enabled !== "boolean") {
+          if (!COLLABORATION_AUTHORITY_CAPABILITIES.has(capability)) {
+            errors.push({
+              code: "workflow.session.authority.unsupported",
+              message: `Session authority capability "${capability}" is not supported.`,
+              path: `sessions.${name}.authority.${capability}`
+            });
+          } else if (typeof enabled !== "boolean") {
             errors.push({
               code: "workflow.session.authority.invalid",
               message: `Session authority capability "${capability}" must be a boolean.`,
@@ -483,8 +545,102 @@ function validateSessionDefinitions(workflow: AgentFlowWorkflow, errors: AgentFl
           );
         }
       }
+
+      if (workflow.style === "collaborative" && value.file_scope !== undefined &&
+          (!isRecord(value.authority) || value.authority.can_modify_files !== true)) {
+        errors.push({
+          code: "workflow.collaboration.authority.can_modify_files.required",
+          message: `Session "${name}" must explicitly declare authority.can_modify_files: true when a file scope is declared.`,
+          path: `sessions.${name}.authority.can_modify_files`
+        });
+      }
     }
   }
+}
+
+function validateCollaborationAuthority(
+  workflow: AgentFlowWorkflow,
+  contexts: StepContext[],
+  errors: AgentFlowWorkflowIssue[]
+): void {
+  if (workflow.style !== "collaborative") return;
+
+  for (const context of contexts) {
+    const requirements: Array<{ session?: string; capability: string; field: string; action: string }> = [];
+    if (context.type === "consult" && context.step.blocking !== undefined &&
+        typeof context.step.blocking !== "boolean") {
+      addStepIssue(
+        errors,
+        context,
+        "workflow.collaboration.blocking.invalid",
+        "blocking",
+        "Consult blocking must be a boolean when declared."
+      );
+    }
+    if (context.type === "consult" && context.step.blocking === true) {
+      requirements.push({
+        session: nonEmptyString(context.step.to),
+        capability: "can_block",
+        field: "blocking",
+        action: "for blocking collaboration"
+      });
+    }
+    if (context.type === "review") {
+      requirements.push(
+        {
+          session: nonEmptyString(context.step.reviewer),
+          capability: "can_request_changes",
+          field: "reviewer",
+          action: "to perform reviews"
+        },
+        {
+          session: nonEmptyString(context.step.reviewer),
+          capability: "can_approve",
+          field: "reviewer",
+          action: "to approve reviews"
+        }
+      );
+    }
+    if (context.type === "approval") {
+      requirements.push({
+        session: nonEmptyString(context.step.reviewer),
+        capability: "can_approve",
+        field: "reviewer",
+        action: "to perform approvals"
+      });
+    }
+
+    for (const requirement of requirements) {
+      if (requirement.session === undefined) continue;
+      if (isDynamicReference(requirement.session)) {
+        addStepIssue(
+          errors,
+          context,
+          "workflow.collaboration.authority.actor.dynamic",
+          requirement.field,
+          `${collaborationStepActor(context.type, requirement.field)} must be a static declared session so ${requirement.capability} authority can be validated.`
+        );
+        continue;
+      }
+      const session = workflow.sessions?.[requirement.session];
+      if (!isRecord(session) || isRecord(session.authority) && session.authority[requirement.capability] === true) {
+        continue;
+      }
+      addStepIssue(
+        errors,
+        context,
+        `workflow.collaboration.authority.${requirement.capability}.required`,
+        requirement.field,
+        `Session "${requirement.session}" must explicitly declare authority.${requirement.capability}: true ${requirement.action}.`
+      );
+    }
+  }
+}
+
+function collaborationStepActor(type: string | undefined, field: string): string {
+  if (type === "approval" && field === "reviewer") return "Approval reviewer";
+  if (type === "review" && field === "reviewer") return "Review reviewer";
+  return "Blocking consultation target";
 }
 
 function validateStepShapes(contexts: StepContext[], errors: AgentFlowWorkflowIssue[]): void {

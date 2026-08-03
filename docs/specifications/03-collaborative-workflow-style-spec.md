@@ -97,6 +97,16 @@ Authority must be explicit.
 | `can_advise` | Session may give non-blocking recommendations |
 
 Default rule: sessions can only advise unless granted stronger authority.
+An omitted authority mapping therefore has effective `advisory` authority. A
+session that declares a `file_scope` must grant `can_modify_files: true`;
+blocking consultations must grant the consulted session `can_block: true`;
+formal reviewers must grant `can_request_changes: true` and `can_approve: true`;
+and approval actors must grant `can_approve: true`.
+
+`agent-flow explain` and `agent-flow graph` render each session's role,
+ownership, effective authority, and file scope. Programmatic graph output
+exposes the same normalized metadata in its top-level `sessions` list so
+inspection consumers do not need to reinterpret raw YAML.
 
 ## 6. Collaboration Step Types
 
@@ -119,6 +129,7 @@ These can be represented as specialized step types or as `session_request` steps
 name: implement-with-review
 version: 1
 style: collaborative
+maturity: experimental
 
 collaboration:
   enabled: true
@@ -128,11 +139,13 @@ collaboration:
 sessions:
   implementer:
     provider: frontier
+    role: code_implementer
     resume: true
     authority:
       can_modify_files: true
   reviewer:
     provider: frontier
+    role: code_reviewer
     resume: true
     authority:
       can_request_changes: true

@@ -71,6 +71,11 @@ Schemas are exported from `@jurgen1c/agent-flow/schemas/config`,
 `@jurgen1c/agent-flow/schemas/failure-classification`, and
 `@jurgen1c/agent-flow/schemas/workflow`.
 
+Collaborative workflows opt in with `collaboration.enabled: true`. Their
+sessions declare roles and may declare ownership, authority, and file scopes;
+sessions remain advisory unless stronger authority is explicit. Both `explain`
+and `graph` surface the normalized role and authority model.
+
 ## Architecture
 
 Agent Flow depends on `@jurgen1c/agent-core` for strict YAML, repository/path

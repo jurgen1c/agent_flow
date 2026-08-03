@@ -9,7 +9,11 @@
     "style": { "enum": ["pipeline", "recovery_pipeline", "collaborative"] },
     "maturity": { "enum": ["draft", "experimental", "stable", "trusted"] },
     "inputs": { "type": "object" },
-    "sessions": { "type": "object" },
+    "sessions": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/session" }
+    },
+    "collaboration": { "$ref": "#/$defs/collaboration" },
     "artifacts": { "type": "object" },
     "steps": { "type": "array", "items": { "type": "object" } },
     "short_circuit_if": {
@@ -90,6 +94,29 @@
   "allOf": [
     {
       "if": {
+        "properties": { "style": { "const": "collaborative" } },
+        "required": ["style"]
+      },
+      "then": {
+        "required": ["collaboration"],
+        "properties": {
+          "collaboration": {
+            "required": ["enabled"],
+            "properties": { "enabled": { "const": true } }
+          },
+          "sessions": {
+            "additionalProperties": {
+              "allOf": [
+                { "$ref": "#/$defs/session" },
+                { "required": ["role"] }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
         "properties": { "style": { "not": { "const": "recovery_pipeline" } } },
         "required": ["style"]
       },
@@ -113,6 +140,51 @@
     }
   ],
   "$defs": {
+    "collaboration": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "max_review_cycles": { "type": "integer", "minimum": 1 },
+        "on_disagreement": {
+          "oneOf": [
+            { "type": "string", "minLength": 1 },
+            { "type": "object" }
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "session": {
+      "type": "object",
+      "required": ["provider"],
+      "properties": {
+        "provider": { "type": "string", "minLength": 1 },
+        "role": { "type": "string", "minLength": 1 },
+        "resume": { "type": "boolean" },
+        "owns": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "authority": { "$ref": "#/$defs/sessionAuthority" },
+        "file_scope": { "$ref": "#/$defs/fileScope" }
+      },
+      "additionalProperties": true
+    },
+    "sessionAuthority": {
+      "type": "object",
+      "properties": {
+        "can_advise": { "type": "boolean" },
+        "can_approve": { "type": "boolean" },
+        "can_block": { "type": "boolean" },
+        "can_merge": { "type": "boolean" },
+        "can_modify_files": { "type": "boolean" },
+        "can_pause": { "type": "boolean" },
+        "can_request_changes": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
     "notificationRule": {
       "type": "object",
       "required": ["on", "channels"],

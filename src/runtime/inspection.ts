@@ -6,6 +6,7 @@ import type {
   AgentFlowYamlValue
 } from "./workflow";
 import { assertAgentFlowSuccessTargetsAreUnambiguous } from "./success_routing";
+import { normalizeRepoPattern } from "./policy_utils";
 
 export interface AgentFlowWorkflowGraphNode {
   id: string;
@@ -21,6 +22,18 @@ export interface AgentFlowWorkflowGraphEdge {
   label?: string;
 }
 
+export interface AgentFlowWorkflowGraphSession {
+  name: string;
+  provider?: string;
+  role?: string;
+  owns: string[];
+  authority: string[];
+  fileScope: {
+    include: string[];
+    exclude: string[];
+  };
+}
+
 export interface AgentFlowWorkflowGraph {
   workflow: {
     name: string;
@@ -30,6 +43,7 @@ export interface AgentFlowWorkflowGraph {
   };
   nodes: AgentFlowWorkflowGraphNode[];
   edges: AgentFlowWorkflowGraphEdge[];
+  sessions: AgentFlowWorkflowGraphSession[];
 }
 
 export class AgentFlowWorkflowGraphError extends Error {
@@ -170,7 +184,8 @@ export function buildAgentFlowWorkflowGraph(workflow: AgentFlowWorkflow): AgentF
       maturity: workflow.maturity
     },
     nodes: stableUniqueNodes(nodes),
-    edges: stableUniqueEdges(edges)
+    edges: stableUniqueEdges(edges),
+    sessions: collaborationSessions(workflow.sessions)
   };
 }
 
@@ -181,8 +196,28 @@ export function renderAgentFlowWorkflowGraph(workflow: AgentFlowWorkflow): strin
     `Style: ${graph.workflow.style}`,
     `Maturity: ${graph.workflow.maturity}`,
     "",
-    "Nodes:"
+    "Sessions:"
   ];
+
+  if (graph.sessions.length === 0) {
+    lines.push("  (none)");
+  } else {
+    graph.sessions.forEach((session) => {
+      const details = [
+        ...(session.role === undefined ? [] : [`role=${session.role}`]),
+        `authority=${session.authority.join(",")}`,
+        ...(session.owns.length === 0 ? [] : [`owns=${session.owns.join(",")}`]),
+        ...(session.fileScope.include.length === 0 ? [] : [`file_scope.include=${session.fileScope.include.join(",")}`]),
+        ...(session.fileScope.exclude.length === 0 ? [] : [`file_scope.exclude=${session.fileScope.exclude.join(",")}`])
+      ];
+      lines.push(`  ${session.name}: ${details.join("; ")}`);
+    });
+  }
+
+  lines.push(
+    "",
+    "Nodes:"
+  );
 
   if (graph.nodes.length === 0) {
     lines.push("  (none)");
@@ -441,9 +476,55 @@ function appendSessions(lines: string[], sessions: Record<string, AgentFlowYamlV
   }
   Object.keys(sessions).sort().forEach((name) => {
     const value = sessions[name];
-    const details = isRecord(value) ? namedScalarDetails(value, ["provider", "role", "resume"]) : [];
+    const metadata = isRecord(value) ? collaborationSession(name, value) : undefined;
+    const details = isRecord(value) ? [
+      ...namedScalarDetails(value, ["provider", "role", "resume"]),
+      ...(metadata === undefined || metadata.owns.length === 0 ? [] : [`owns=${metadata.owns.join(",")}`]),
+      ...(metadata === undefined ? [] : [`authority=${metadata.authority.join(",")}`]),
+      ...(metadata === undefined || metadata.fileScope.include.length === 0 ? [] : [`file_scope.include=${metadata.fileScope.include.join(",")}`]),
+      ...(metadata === undefined || metadata.fileScope.exclude.length === 0 ? [] : [`file_scope.exclude=${metadata.fileScope.exclude.join(",")}`])
+    ] : [];
     lines.push(`  ${name}${details.length === 0 ? "" : `: ${details.join("; ")}`}`);
   });
+}
+
+function collaborationSessions(
+  sessions: Record<string, AgentFlowYamlValue> | undefined
+): AgentFlowWorkflowGraphSession[] {
+  return Object.entries(sessions ?? {})
+    .filter((entry): entry is [string, AgentFlowYamlMapping] => isRecord(entry[1]))
+    .map(([name, session]) => collaborationSession(name, session))
+    .sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function collaborationSession(name: string, session: AgentFlowYamlMapping): AgentFlowWorkflowGraphSession {
+  const authority = record(session.authority);
+  const explicitAuthority = authority === undefined ? [] : Object.entries(authority)
+    .filter(([, enabled]) => enabled === true)
+    .map(([capability]) => capability)
+    .sort();
+  const fileScope = record(session.file_scope);
+  return {
+    name,
+    ...(nonEmptyString(session.provider) === undefined ? {} : { provider: nonEmptyString(session.provider) }),
+    ...(nonEmptyString(session.role) === undefined ? {} : { role: nonEmptyString(session.role) }),
+    owns: uniqueSorted(stringValues(session.owns).flatMap((value) => {
+      const normalized = nonEmptyString(value);
+      return normalized === undefined ? [] : [normalized];
+    })),
+    authority: explicitAuthority.length === 0 ? ["advisory"] : explicitAuthority,
+    fileScope: {
+      include: normalizedFileScopePatterns(fileScope?.include),
+      exclude: normalizedFileScopePatterns(fileScope?.exclude)
+    }
+  };
+}
+
+function normalizedFileScopePatterns(value: AgentFlowYamlValue | undefined): string[] {
+  return uniqueSorted(stringValues(value).flatMap((pattern) => {
+    const normalized = normalizeRepoPattern(pattern);
+    return normalized === undefined ? [] : [normalized];
+  }));
 }
 
 function stableUniqueNodes(nodes: AgentFlowWorkflowGraphNode[]): AgentFlowWorkflowGraphNode[] {

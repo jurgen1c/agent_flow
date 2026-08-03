@@ -116,9 +116,17 @@ sessions:
   writer:
     provider: frontier
     role: writer
+    owns: [" implementation "]
+    authority:
+      can_modify_files: true
+    file_scope:
+      include: [./src/**]
   reviewer:
     provider: local
     role: reviewer
+    authority:
+      can_request_changes: true
+      can_approve: true
 steps:
   - id: split
     type: parallel
@@ -130,6 +138,8 @@ steps:
             type: session_request
             session: writer
             prompt: prompts/write.md
+            inputs: [brief.md]
+            outputs: [draft.md]
       - id: advise
         session: reviewer
   - id: approve
@@ -148,8 +158,47 @@ steps:
       { from: "split", to: "approve", kind: "next" }
     ]));
     expect(explanation).toContain("Collaboration: enabled; max_review_cycles=2");
+    expect(explanation).toContain("writer: provider=frontier; role=writer; owns=implementation; authority=can_modify_files; file_scope.include=src/**");
+    expect(explanation).toContain("reviewer: provider=local; role=reviewer; authority=can_approve,can_request_changes");
     expect(explanation).toContain("branch draft — session=writer");
     expect(explanation).toContain("approve [approval] — reviewer=reviewer");
+    expect(graph.sessions).toEqual([
+      {
+        name: "reviewer",
+        provider: "local",
+        role: "reviewer",
+        owns: [],
+        authority: ["can_approve", "can_request_changes"],
+        fileScope: { include: [], exclude: [] }
+      },
+      {
+        name: "writer",
+        provider: "frontier",
+        role: "writer",
+        owns: ["implementation"],
+        authority: ["can_modify_files"],
+        fileScope: { include: ["src/**"], exclude: [] }
+      }
+    ]);
+    expect(renderAgentFlowWorkflowGraph(workflow)).toContain(
+      "writer: role=writer; authority=can_modify_files; owns=implementation; file_scope.include=src/**"
+    );
+  });
+
+  test("renders advisory authority for sessions without stronger grants", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: advisory
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: true }
+sessions:
+  advisor: { provider: local, role: advisor }
+steps: []
+`);
+
+    expect(explainAgentFlowWorkflow(workflow)).toContain("advisor: provider=local; role=advisor; authority=advisory");
+    expect(buildAgentFlowWorkflowGraph(workflow).sessions[0]?.authority).toEqual(["advisory"]);
+    expect(renderAgentFlowWorkflowGraph(workflow)).toContain("advisor: role=advisor; authority=advisory");
   });
 
   test("preserves validator fallthrough semantics and terminal gate outcomes", () => {
