@@ -245,6 +245,9 @@ async function executeAgentFlowSessionStep(
       outputPaths
     )
     : readAgentFlowSessionPrompt(store.repoRoot, requiredName(step.prompt, `Session request ${stepId} prompt`));
+  if (Buffer.byteLength(prompt.content, "utf8") > MAX_AGENT_FLOW_SESSION_PROMPT_BYTES) {
+    throw promptTooLarge(prompt.path);
+  }
   const inputPaths = normalizedArtifactPaths(
     options.review === true ? rawInputs : resolveSessionInputPaths(rawInputs, run.inputs, stepId),
     `${label} ${stepId} ${options.review === true ? "artifacts" : "inputs"}`

@@ -4309,8 +4309,7 @@ function validateReviewStep(workflow: AgentFlowWorkflow, step: AgentFlowWorkflow
   if (authority?.can_request_changes !== true || authority.can_approve !== true) {
     return "Reviewers must explicitly declare can_request_changes and can_approve authority.";
   }
-  const onFailure = mapping(step.on_failure);
-  if (onFailure !== undefined) {
+  if (step.on_failure !== undefined) {
     return "Review steps do not support on_failure policies in this runtime phase.";
   }
   return undefined;

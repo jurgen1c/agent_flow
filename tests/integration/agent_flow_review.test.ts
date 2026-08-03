@@ -6,10 +6,12 @@ import {
   createAgentFlowLifecycleRun,
   createAgentFlowSessionProviderRegistry,
   executeAgentFlowCommandPipeline,
+  MAX_AGENT_FLOW_SESSION_PROMPT_BYTES,
   openAgentFlowRunState,
   parseAgentFlowWorkflowOrThrow,
   simulateAgentFlowWorkflow,
   validateAgentFlowWorkflow,
+  type AgentFlowRunStateValue,
   type AgentFlowSessionProviderRequest
 } from "../../src/runtime";
 
@@ -152,6 +154,80 @@ describe("Agent Flow collaborative review steps", () => {
       code: "workflow.review.on_failure.unsupported",
       path: "steps[0].on_failure"
     }));
+  });
+
+  test("fails runtime preflight for non-mapping review failure policies in persisted workflows", async () => {
+    const root = temporaryRepo();
+    const parsed = reviewWorkflow();
+    const workflow = {
+      ...parsed,
+      steps: [{ ...parsed.steps[0]!, on_failure: "pause" }, ...parsed.steps.slice(1)]
+    } as unknown as typeof parsed;
+    const store = await openAgentFlowRunState({ cwd: root });
+    store.createRunWithEvent({
+      id: "persisted-review-policy",
+      workflow: {
+        name: workflow.name,
+        version: workflow.version,
+        style: workflow.style,
+        maturity: workflow.maturity
+      },
+      context: { workflow: workflow as unknown as AgentFlowRunStateValue }
+    }, { type: "run.created", payload: { status: "pending" } });
+    let called = false;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+      called = true;
+      return { outputs: {} };
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      "persisted-review-policy",
+      workflow,
+      undefined,
+      providers
+    );
+
+    expect(result).toMatchObject({ status: "failed", failedStep: "review" });
+    expect(result.message).toContain("do not support on_failure policies");
+    expect(called).toBe(false);
+    store.close();
+  });
+
+  test("rejects generated review prompts above the session prompt limit", async () => {
+    const root = temporaryRepo();
+    const workflow = reviewWorkflow();
+    const oversizedSubject = "x".repeat(MAX_AGENT_FLOW_SESSION_PROMPT_BYTES + 1);
+    workflow.sessions![oversizedSubject] = workflow.sessions!.implementer!;
+    workflow.steps[0]!.subject = oversizedSubject;
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "oversized-review-prompt", workflow });
+    store.writeArtifact({
+      id: "implementation",
+      runId: "oversized-review-prompt",
+      path: "implementation.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Implementation"
+    });
+    let called = false;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+      called = true;
+      return { outputs: {} };
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      "oversized-review-prompt",
+      workflow,
+      undefined,
+      providers
+    );
+
+    expect(result).toMatchObject({ status: "paused", failedStep: "review" });
+    expect(result.message).toContain("session prompt limit");
+    expect(called).toBe(false);
+    store.close();
   });
 });
 
