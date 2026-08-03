@@ -20,6 +20,8 @@ import {
 export const AGENT_FLOW_RUN_STATE_SCHEMA_VERSION = 3;
 export const DEFAULT_AGENT_FLOW_DATABASE_PATH = ".agent-flow/agent-flow.sqlite";
 export const AGENT_FLOW_FINAL_SUMMARY_PATH = "final-summary.md";
+export const MAX_AGENT_FLOW_RECOVERY_CONTEXT_BYTES = 64 * 1024;
+export const MAX_AGENT_FLOW_RECOVERY_CONTEXT_INJECTIONS = 128;
 
 export type AgentFlowRunStatus = "pending" | "running" | "waiting" | "paused" | "completed" | "failed" | "cancelled";
 export type AgentFlowRunStopStatus = Extract<AgentFlowRunStatus, "paused" | "failed" | "cancelled">;
@@ -1524,6 +1526,163 @@ export class AgentFlowRunStateStore {
     ).map(hydrateSession);
   }
 
+  injectRecoverySessionContext(runId: string, id: string, context: string): AgentFlowSessionRecord {
+    this.assertOpen();
+    const normalizedRunId = requiredString(runId, "Run ID");
+    const sessionId = requiredString(id, "Session ID");
+    if (typeof context !== "string" || context.trim().length === 0) {
+      throw new AgentFlowRunStateError(
+        "Injected recovery context must be non-empty text.",
+        "AGENT_FLOW_RECOVERY_CONTEXT_INVALID"
+      );
+    }
+    const injectedContext = context;
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const run = this.database.get<Pick<RunRow, "status">>(
+        "SELECT status FROM runs WHERE id = ?",
+        [normalizedRunId]
+      );
+      if (run === null) {
+        throw new AgentFlowRunStateError(
+          `Agent Flow run ${normalizedRunId} was not found.`,
+          "AGENT_FLOW_RUN_NOT_FOUND"
+        );
+      }
+      if (run.status !== "running") {
+        throw new AgentFlowRunStateError(
+          `Agent Flow run ${normalizedRunId} must be running before recovery context can be injected; current status is ${run.status}.`,
+          "AGENT_FLOW_RECOVERY_CONTEXT_STATUS"
+        );
+      }
+      const row = this.database.get<SessionRow>(
+        "SELECT * FROM sessions WHERE run_id = ? AND id = ?",
+        [normalizedRunId, sessionId]
+      );
+      if (row === null || row.status !== "running") {
+        throw new AgentFlowRunStateError(
+          `Session ${sessionId} is not the active recovery remediation session for run ${normalizedRunId}.`,
+          "AGENT_FLOW_RECOVERY_CONTEXT_SESSION"
+        );
+      }
+      const session = hydrateSession(row);
+      if (!isRecoveryRemediationState(session.state)) {
+        throw new AgentFlowRunStateError(
+          `Session ${sessionId} is not the active recovery remediation session for run ${normalizedRunId}.`,
+          "AGENT_FLOW_RECOVERY_CONTEXT_SESSION"
+        );
+      }
+      const priorInjections = Array.isArray(session.state.contextInjections)
+        ? session.state.contextInjections
+        : [];
+      const priorContextBytes = priorInjections.reduce<number>((total, entry) => {
+        if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return total;
+        return total + (typeof entry.context === "string" ? Buffer.byteLength(entry.context, "utf8") : 0);
+      }, 0);
+      if (priorInjections.length >= MAX_AGENT_FLOW_RECOVERY_CONTEXT_INJECTIONS
+          || priorContextBytes + Buffer.byteLength(injectedContext, "utf8") > MAX_AGENT_FLOW_RECOVERY_CONTEXT_BYTES) {
+        throw new AgentFlowRunStateError(
+          `Injected recovery context exceeds the aggregate limit of ${MAX_AGENT_FLOW_RECOVERY_CONTEXT_INJECTIONS} injections or ${MAX_AGENT_FLOW_RECOVERY_CONTEXT_BYTES} bytes.`,
+          "AGENT_FLOW_RECOVERY_CONTEXT_INVALID"
+        );
+      }
+      const priorRevision = typeof session.state.contextRevision === "number"
+        && Number.isSafeInteger(session.state.contextRevision)
+        && session.state.contextRevision >= 0
+        ? session.state.contextRevision
+        : 0;
+      const revision = priorRevision + 1;
+      const timestamp = currentTimestamp(this.now);
+      const state: Record<string, AgentFlowRunStateValue> = {
+        ...session.state,
+        dirty: true,
+        contextRevision: revision,
+        contextInjections: [
+          ...priorInjections,
+          { revision, context: injectedContext, injectedAt: timestamp }
+        ]
+      };
+      this.database.run(`UPDATE sessions
+        SET state_json = ?, updated_at = ?
+        WHERE run_id = ? AND id = ?`, [
+        stableJson(state), timestamp, normalizedRunId, sessionId
+      ]);
+      this.appendNextEvent(normalizedRunId, {
+        type: "recovery.context.injected",
+        stepId: session.stepId ?? undefined,
+        payload: { sessionId, revision }
+      });
+      this.database.exec("COMMIT");
+      return { ...session, state, updatedAt: timestamp };
+    } catch (error) {
+      rollback(this.database);
+      throw error;
+    }
+  }
+
+  settleRecoverySessionForRunAtContextRevision(
+    input: SettleAgentFlowSessionInput,
+    revision: number
+  ): { settled: boolean; stopped?: AgentFlowRunStopStatus } {
+    this.assertOpen();
+    const runId = requiredString(input.runId, "Run ID");
+    const sessionId = requiredString(input.id, "Session ID");
+    if (!Number.isSafeInteger(revision) || revision < 0) {
+      throw new AgentFlowRunStateError(
+        "Recovery context revision must be a non-negative integer.",
+        "AGENT_FLOW_RECOVERY_CONTEXT_INVALID"
+      );
+    }
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.database.get<SessionRow>(
+        "SELECT * FROM sessions WHERE run_id = ? AND id = ?",
+        [runId, sessionId]
+      );
+      if (row === null || row.status !== "running") {
+        rollback(this.database);
+        return { settled: false };
+      }
+      const state = JSON.parse(row.state_json) as Record<string, AgentFlowRunStateValue>;
+      if (!isRecoveryRemediationState(state)) {
+        rollback(this.database);
+        return { settled: false };
+      }
+      const currentRevision = typeof state.contextRevision === "number"
+        && Number.isSafeInteger(state.contextRevision)
+        && state.contextRevision >= 0
+        ? state.contextRevision
+        : 0;
+      if (currentRevision !== revision) {
+        rollback(this.database);
+        return { settled: false };
+      }
+      const runStatus = this.requireRun(runId).status;
+      const stopped = runStatus === "paused" || runStatus === "failed" || runStatus === "cancelled"
+        ? runStatus
+        : undefined;
+      this.upsertSession({
+        id: sessionId,
+        runId,
+        ...(input.stepId === undefined ? {} : { stepId: input.stepId }),
+        provider: input.provider,
+        ...(input.externalSessionId === undefined ? {} : { externalSessionId: input.externalSessionId }),
+        status: stopped ?? "waiting",
+        state: {
+          ...state,
+          ...(stopped === undefined ? input.waitingState : { ...input.interruptedState, interrupted: stopped }),
+          dirty: false,
+          appliedContextRevision: revision
+        }
+      });
+      this.database.exec("COMMIT");
+      return { settled: true, ...(stopped === undefined ? {} : { stopped }) };
+    } catch (error) {
+      rollback(this.database);
+      throw error;
+    }
+  }
+
   recordFailure(input: RecordAgentFlowFailureInput): void {
     this.assertOpen();
     const timestamp = currentTimestamp(this.now);
@@ -1924,6 +2083,11 @@ export class AgentFlowRunStateStore {
       throw new AgentFlowRunStateError("Agent Flow run-state store is closed.", "AGENT_FLOW_RUN_STATE_CLOSED");
     }
   }
+}
+
+function isRecoveryRemediationState(state: Record<string, AgentFlowRunStateValue>): boolean {
+  return typeof state.recoveryOfStepId === "string" && state.recoveryOfStepId.trim().length > 0
+    && typeof state.failureId === "string" && state.failureId.trim().length > 0;
 }
 
 export interface AgentFlowRunMutationResult {

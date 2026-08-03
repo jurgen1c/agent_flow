@@ -308,6 +308,7 @@ steps:
     on_failure:
       route_to:
         workflow: repair
+        file_scope: { include: [fixed.txt] }
         inputs:
           failure_payload: "{{ failure.path }}"
           failed_step: "{{ step.id }}"
@@ -380,7 +381,7 @@ steps:
     command: test -f fixed.txt
     outputs: [fixed.txt]
     on_failure:
-      route_to: { workflow: shared-output-repair }
+      route_to: { workflow: shared-output-repair, file_scope: { include: [fixed.txt] } }
       on_remediated: { return_to: check }
       on_unresolved: { then: pause }
 `);
@@ -430,7 +431,7 @@ steps:
     type: command
     command: test -f recovered.txt
     on_failure:
-      route_to: { workflow: repair-earlier-output }
+      route_to: { workflow: repair-earlier-output, file_scope: { include: [source.txt, recovered.txt] } }
       on_remediated: { then: seed }
       on_unresolved: { then: pause }
 `);
@@ -482,7 +483,7 @@ steps:
     output: result.txt
     transform: require-fixed
     on_failure:
-      route_to: { workflow: repair-artifact }
+      route_to: { workflow: repair-artifact, file_scope: { include: [source.txt] } }
       on_remediated: { return_to: transform }
       on_unresolved: { then: pause }
 `);
@@ -545,7 +546,7 @@ steps:
     type: command
     command: exit 1
     on_failure:
-      route_to: { workflow: promotion-failure-child }
+      route_to: { workflow: promotion-failure-child, file_scope: { include: [a.txt, b.txt] } }
       on_remediated: { then: complete }
       on_unresolved: { then: pause }
 `);
@@ -739,7 +740,7 @@ steps:
     type: command
     command: exit 1
     on_failure:
-      route_to: { workflow: recovery-input-step-child }
+      route_to: { workflow: recovery-input-step-child, file_scope: { include: [repaired.txt] } }
       on_remediated: { then: complete }
       on_unresolved: { then: pause }
 `);
@@ -1140,7 +1141,11 @@ limits: { max_recovery_cycles: 1, max_step_attempts: { check: 2 } }
 inputs:
   ticket_key: { required: true }
 sessions:
-  fixer: { provider: fixture, resume: true }
+  fixer:
+    provider: fixture
+    resume: true
+    authority: { can_modify_files: true }
+    file_scope: { include: [fixed.txt] }
 steps:
   - id: check
     type: command
@@ -1216,7 +1221,11 @@ style: recovery_pipeline
 maturity: experimental
 limits: { max_recovery_cycles: 2, max_step_attempts: { check: 3 } }
 sessions:
-  fixer: { provider: fixture, resume: true }
+  fixer:
+    provider: fixture
+    resume: true
+    authority: { can_modify_files: true }
+    file_scope: { include: [fixed.txt] }
 steps:
   - id: check
     type: command
@@ -1718,14 +1727,14 @@ steps:
     const workflow = sessionRecoveryWorkflow("cancel-while-settling", "fix.md");
     const store = await openAgentFlowRunState({ cwd: root });
     createAgentFlowLifecycleRun(store, { id: "cancel-while-settling", workflow });
-    const settleSessionForRun = store.settleSessionForRun.bind(store);
+    const settleRecoverySession = store.settleRecoverySessionForRunAtContextRevision.bind(store);
     let cancelled = false;
-    store.settleSessionForRun = (input) => {
+    store.settleRecoverySessionForRunAtContextRevision = (input, revision) => {
       if (!cancelled) {
         cancelled = true;
         transitionAgentFlowLifecycleRun(store, "cancel-while-settling", "cancel");
       }
-      return settleSessionForRun(input);
+      return settleRecoverySession(input, revision);
     };
     const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => ({
       outputs: {},

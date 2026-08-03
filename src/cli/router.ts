@@ -11,6 +11,7 @@ import {
   explainAgentFlowWorkflow,
   formatAgentFlowWorkflowIssues,
   formatWorkflowParseIssues,
+  injectAgentFlowRecoveryContext,
   lintAgentFlowWorkflow,
   normalizeAgentFlowArtifactPath,
   parseAgentFlowWorkflow,
@@ -40,7 +41,7 @@ export interface AgentFlowCliOptions {
   cwd?: string;
 }
 
-const ACTIVE_LIFECYCLE_COMMANDS = ["run", "resume", "status", "logs", "artifacts", "pause", "cancel"] as const;
+const ACTIVE_LIFECYCLE_COMMANDS = ["run", "resume", "inject", "status", "logs", "artifacts", "pause", "cancel"] as const;
 type ActiveLifecycleCommand = (typeof ACTIVE_LIFECYCLE_COMMANDS)[number];
 
 export async function runCli(
@@ -76,7 +77,8 @@ export function dispatch(args: string[]): AgentFlowCliResult {
   if (command === "help") {
     const topic = rest[0];
 
-    if (topic && !["help", "version", "validate", "lint", "explain", "graph", "simulate"].includes(topic) && !isPlannedRuntimeCommand(topic)) {
+    if (topic && !["help", "version", "validate", "lint", "explain", "graph", "simulate"].includes(topic)
+        && !isActiveLifecycleCommand(topic) && !isPlannedRuntimeCommand(topic)) {
       return {
         exitCode: 7,
         stderr: `Unknown Agent Flow help topic: ${topic}\nRun \`agent-flow help\` to see available commands.`
@@ -152,6 +154,7 @@ function renderHelp(topic?: string): string {
     "  agent-flow run <workflow> --id <run-id> --fixture <file>",
     "  agent-flow resume <run-id> --outcome <choice> [--fixture <file>]",
     "  agent-flow resume <run-id> --answer <value> [--fixture <file>]",
+    "  agent-flow inject <run-id> <session-name> <context>",
     "  agent-flow status <run-id>",
     "  agent-flow logs <run-id>",
     "  agent-flow artifacts <run-id>",
@@ -168,6 +171,7 @@ function renderHelp(topic?: string): string {
     "  simulate <workflow> --fixture <file>  Traverse a workflow from fixture data without executing steps.",
     "  run <workflow> --id <run-id> [--fixture <file>]  Execute command, artifact-transform, and fixture-backed session-request steps.",
     "  resume <run-id> (--outcome <choice> | --answer <value>) [--fixture <file>]  Resume a paused interaction.",
+    "  inject <run-id> <session-name> <context>  Inject context into active recovery remediation.",
     "  status <run-id>       Inspect persistent run state.",
     "  logs <run-id>         List ordered lifecycle events.",
     "  artifacts <run-id>    List registered run artifacts.",
@@ -315,6 +319,15 @@ async function runLifecycleCommand(
       };
     }
 
+    if (command === "inject") {
+      requireRun(store, runId);
+      const session = injectAgentFlowRecoveryContext(store, runId, args[1], args[2]);
+      return {
+        exitCode: 0,
+        stdout: `Injected recovery context into session ${session.id} for Agent Flow run ${runId}.\nSession dirty: ${session.state.dirty === true ? "yes" : "no"}`
+      };
+    }
+
     if (command === "resume") {
       const run = requireRun(store, runId);
       const workflow = run.context.workflow;
@@ -435,12 +448,16 @@ function validLifecycleArgs(command: ActiveLifecycleCommand, args: string[]): bo
       && ["--outcome", "--answer"].includes(args[1])
       && (args[1] === "--answer" || args[2].length > 0);
   }
+  if (command === "inject") {
+    return args.length === 3 && args.every((entry) => entry.length > 0);
+  }
   return args.length === 1 && args[0].length > 0;
 }
 
 function lifecycleUsage(topic: string): string | null {
   if (topic === "run") return "Usage: agent-flow run <workflow> --id <run-id> [--fixture <file>]";
   if (topic === "resume") return "Usage: agent-flow resume <run-id> (--outcome <choice> | --answer <value>) [--fixture <file>]";
+  if (topic === "inject") return "Usage: agent-flow inject <run-id> <session-name> <context>";
   if (isActiveLifecycleCommand(topic)) return `Usage: agent-flow ${topic} <run-id>`;
   return null;
 }

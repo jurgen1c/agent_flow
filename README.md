@@ -25,6 +25,7 @@ agent-flow explain workflow.yml
 agent-flow graph workflow.yml
 agent-flow simulate workflow.yml --fixture fixture.json
 agent-flow run workflow.yml --id example-run --fixture fixture.json
+agent-flow inject example-run fixer "Additional remediation context"
 agent-flow status example-run
 agent-flow logs example-run
 agent-flow artifacts example-run
@@ -39,6 +40,7 @@ Repository-local state is stored in `.agent-flow/`. Do not commit it.
 ```ts
 import {
   createAgentFlowWorkflowRegistry,
+  injectAgentFlowRecoveryContext,
   openAgentFlowRunState,
   parseAgentFlowFailureClassification,
   parseAgentFlowWorkflowOrThrow,
@@ -52,11 +54,17 @@ const classification = parseAgentFlowFailureClassification(classifierOutput);
 const store = await openAgentFlowRunState({ cwd: process.cwd() });
 const recoveryWorkflows = createAgentFlowWorkflowRegistry()
   .register("ci-triage", ciTriageWorkflow);
+// While a recovery provider is running:
+// injectAgentFlowRecoveryContext(store, runId, "fixer", "New user context");
 ```
 
 Pass the workflow registry as the final `executeAgentFlowCommandPipeline`
 argument when a workflow uses `route_to.workflow`. Recovery session providers
 report `metadata.recovery_status` as `remediated` or `unresolved`.
+Routed remediation that writes repository files must explicitly authorize them
+through the existing session authority and layered `file_scope` policy. Context
+injected into an active recovery session marks it dirty and reruns the provider
+with a persisted `recovery-context/injected.md` input.
 
 Programmatic CLI routing is exported from `@jurgen1c/agent-flow/cli`.
 Schemas are exported from `@jurgen1c/agent-flow/schemas/config`,
