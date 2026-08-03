@@ -12,6 +12,7 @@ import {
 } from "./run_state";
 import { evaluateAgentFlowPolicy } from "./policy";
 import type { AgentFlowWorkflow, AgentFlowWorkflowStep, AgentFlowYamlMapping } from "./workflow";
+import { createAgentFlowReviewPrompt, parseAgentFlowReviewResult } from "./review";
 
 export const MAX_AGENT_FLOW_SESSION_PROMPT_BYTES = 1024 * 1024;
 export const MAX_AGENT_FLOW_SESSION_INPUT_BYTES = 10 * 1024 * 1024;
@@ -67,6 +68,10 @@ export interface ExecuteAgentFlowSessionRequestOptions {
   attempt?: number;
   beforePublish?: () => void;
   stopStatus?: () => AgentFlowRunStopStatus | undefined;
+}
+
+interface ExecuteAgentFlowSessionStepOptions extends ExecuteAgentFlowSessionRequestOptions {
+  review?: true;
 }
 
 export class AgentFlowSessionRequestError extends Error {
@@ -163,6 +168,28 @@ export async function executeAgentFlowSessionRequest(
   registry: AgentFlowSessionProviderRegistry,
   options: ExecuteAgentFlowSessionRequestOptions = {}
 ): Promise<AgentFlowSessionRequestExecutionResult> {
+  return executeAgentFlowSessionStep(store, runId, workflow, step, registry, options);
+}
+
+export async function executeAgentFlowReview(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  workflow: AgentFlowWorkflow,
+  step: AgentFlowWorkflowStep,
+  registry: AgentFlowSessionProviderRegistry,
+  options: ExecuteAgentFlowSessionRequestOptions = {}
+): Promise<AgentFlowSessionRequestExecutionResult> {
+  return executeAgentFlowSessionStep(store, runId, workflow, step, registry, { ...options, review: true });
+}
+
+async function executeAgentFlowSessionStep(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  workflow: AgentFlowWorkflow,
+  step: AgentFlowWorkflowStep,
+  registry: AgentFlowSessionProviderRegistry,
+  options: ExecuteAgentFlowSessionStepOptions
+): Promise<AgentFlowSessionRequestExecutionResult> {
   const run = store.getRun(runId);
   if (run === null || run.status !== "running") {
     throw new AgentFlowSessionRequestError(
@@ -172,21 +199,26 @@ export async function executeAgentFlowSessionRequest(
       "AGENT_FLOW_SESSION_RUN_STATUS"
     );
   }
-  const stepId = requiredName(step.id, "Session request step ID");
+  const kind = options.review === true ? "review" : "session_request";
+  const requestKind = options.review === true ? "review_request" : "session_request";
+  const outputKind = options.review === true ? "review_output" : "session_output";
+  const requestIdPrefix = options.review === true ? "review-request" : "session-request";
+  const label = options.review === true ? "Review" : "Session request";
+  const stepId = requiredName(step.id, `${label} step ID`);
   const declaredStep = findWorkflowStep(workflow.steps, stepId);
-  if (requiredName(step.type, `Session request ${stepId} type`) !== "session_request"
+  if (requiredName(step.type, `${label} ${stepId} type`) !== kind
       || !isDeepStrictEqual(run.context.workflow, workflow)
       || declaredStep === undefined || !isDeepStrictEqual(declaredStep, step)) {
     throw new AgentFlowSessionRequestError(
-      `Session request ${stepId} must match a step in the workflow persisted for run ${runId}.`,
+      `${label} ${stepId} must match a step in the workflow persisted for run ${runId}.`,
       "AGENT_FLOW_SESSION_WORKFLOW_MISMATCH"
     );
   }
-  const sessionId = requiredName(step.session, `Session request ${stepId} session`);
+  const sessionId = requiredName(options.review === true ? step.reviewer : step.session, `${label} ${stepId} session`);
   const session = mapping(workflow.sessions?.[sessionId]);
   if (session === undefined) {
     throw new AgentFlowSessionRequestError(
-      `Session request ${stepId} references undeclared session ${sessionId}.`,
+      `${label} ${stepId} references undeclared session ${sessionId}.`,
       "AGENT_FLOW_SESSION_UNDECLARED"
     );
   }
@@ -201,18 +233,28 @@ export async function executeAgentFlowSessionRequest(
   const resume = session.resume === true;
   const previous = store.getSession(runId, sessionId);
   const priorExternalSessionId = resume ? previous?.externalSessionId ?? undefined : undefined;
-  const prompt = readAgentFlowSessionPrompt(store.repoRoot, requiredName(step.prompt, `Session request ${stepId} prompt`));
+  const rawInputs = options.review === true ? step.artifacts : step.inputs;
+  const rawOutputs = step.outputs;
+  const outputPaths = normalizedArtifactPaths(rawOutputs, `${label} ${stepId} outputs`);
+  const prompt = options.review === true
+    ? createAgentFlowReviewPrompt(
+      stepId,
+      sessionId,
+      requiredName(step.subject, `Review ${stepId} subject`),
+      normalizedArtifactPaths(rawInputs, `Review ${stepId} artifacts`),
+      outputPaths
+    )
+    : readAgentFlowSessionPrompt(store.repoRoot, requiredName(step.prompt, `Session request ${stepId} prompt`));
   const inputPaths = normalizedArtifactPaths(
-    resolveSessionInputPaths(step.inputs, run.inputs, stepId),
-    `Session request ${stepId} inputs`
+    options.review === true ? rawInputs : resolveSessionInputPaths(rawInputs, run.inputs, stepId),
+    `${label} ${stepId} ${options.review === true ? "artifacts" : "inputs"}`
   );
   if (inputPaths.length > MAX_AGENT_FLOW_SESSION_INPUTS) {
     throw new AgentFlowSessionRequestError(
-      `Session request ${stepId} declares ${inputPaths.length} inputs; at most ${MAX_AGENT_FLOW_SESSION_INPUTS} are allowed.`,
+      `${label} ${stepId} declares ${inputPaths.length} inputs; at most ${MAX_AGENT_FLOW_SESSION_INPUTS} are allowed.`,
       "AGENT_FLOW_SESSION_INPUT_LIMIT"
     );
   }
-  const outputPaths = normalizedArtifactPaths(step.outputs, `Session request ${stepId} outputs`);
   const inputs: AgentFlowSessionRequestArtifact[] = [];
   let totalInputBytes = 0;
   for (const inputPath of inputPaths) {
@@ -226,8 +268,9 @@ export async function executeAgentFlowSessionRequest(
     }
     inputs.push(input);
   }
-  const requestPath = `session-requests/${safePathSegment(stepId).slice(0, 200)}-${digest(stepId).slice(0, 12)}.json`;
-  preflightOutputCollisions(store, runId, step, outputPaths, requestPath);
+  const requestDirectory = options.review === true ? "review-requests" : "session-requests";
+  const requestPath = `${requestDirectory}/${safePathSegment(stepId).slice(0, 200)}-${digest(stepId).slice(0, 12)}.json`;
+  preflightOutputCollisions(store, runId, step, sessionId, outputPaths, requestPath, requestKind, outputKind, requestIdPrefix);
   const request: AgentFlowSessionProviderRequest = {
     runId,
     stepId,
@@ -324,6 +367,9 @@ export async function executeAgentFlowSessionRequest(
     state: { resume, lastStepId: stepId, providerResponded: true }
   });
   const outputs = validateAgentFlowSessionProviderResponse(stepId, outputPaths, response);
+  if (options.review === true) {
+    for (const outputPath of outputPaths) parseAgentFlowReviewResult(outputs.get(outputPath)!, outputPath);
+  }
   const providerMetadata = validateAgentFlowSessionProviderMetadata(stepId, response.metadata);
   options.beforePublish?.();
 
@@ -339,11 +385,11 @@ export async function executeAgentFlowSessionRequest(
     ...(providerMetadata === undefined ? {} : { providerMetadata })
   };
   const requestArtifact = store.writeArtifact({
-    id: `session-request:${digest(requestPath)}`,
+    id: `${requestIdPrefix}:${digest(requestPath)}`,
     runId,
     stepId,
     path: requestPath,
-    kind: "session_request",
+    kind: requestKind,
     contentType: "application/json; charset=utf-8",
     content: `${stableJson(requestMetadata)}\n`,
     overwrite: store.getArtifact(runId, requestPath) !== null,
@@ -370,10 +416,10 @@ export async function executeAgentFlowSessionRequest(
       runId,
       stepId,
       path: outputPath,
-      kind: "session_output",
+      kind: outputKind,
       contentType: output.contentType ?? contentTypeFor(outputPath),
       content: output.content,
-      overwrite: step.overwrite === true || ownedSessionOutput(existing, stepId, sessionId),
+      overwrite: step.overwrite === true || ownedSessionOutput(existing, stepId, sessionId, outputKind),
       requiredRunStatus: "running" as const,
       requiredArtifacts: inputs
         .filter((input) => !overwrittenInputs.has(input.path))
@@ -643,8 +689,12 @@ function preflightOutputCollisions(
   store: AgentFlowRunStateStore,
   runId: string,
   step: AgentFlowWorkflowStep,
+  sessionId: string,
   outputPaths: string[],
-  requestPath: string
+  requestPath: string,
+  requestKind: "review_request" | "session_request",
+  outputKind: "review_output" | "session_output",
+  requestIdPrefix: "review-request" | "session-request"
 ): void {
   if (outputPaths.includes(requestPath)) {
     throw new AgentFlowSessionRequestError(
@@ -654,7 +704,7 @@ function preflightOutputCollisions(
   }
   const requestArtifact = store.getArtifact(runId, requestPath);
   if (requestArtifact !== null &&
-      (requestArtifact.kind !== "session_request" || requestArtifact.id !== `session-request:${digest(requestPath)}`)) {
+      (requestArtifact.kind !== requestKind || requestArtifact.id !== `${requestIdPrefix}:${digest(requestPath)}`)) {
     throw new AgentFlowSessionRequestError(
       `Session request metadata path ${requestPath} is already owned by another artifact.`,
       "AGENT_FLOW_SESSION_OUTPUT_COLLISION"
@@ -663,7 +713,7 @@ function preflightOutputCollisions(
   if (step.overwrite === true) return;
   const collision = outputPaths.find((outputPath) => {
     const existing = store.getArtifact(runId, outputPath);
-    return existing !== null && !ownedSessionOutput(existing, requiredName(step.id, "Session request step ID"), requiredName(step.session, "Session request session ID"));
+    return existing !== null && !ownedSessionOutput(existing, requiredName(step.id, "Session request step ID"), sessionId, outputKind);
   });
   if (collision !== undefined) {
     throw new AgentFlowSessionRequestError(
@@ -676,9 +726,10 @@ function preflightOutputCollisions(
 function ownedSessionOutput(
   artifact: AgentFlowArtifactRecord | null,
   stepId: string,
-  sessionId: string
+  sessionId: string,
+  outputKind: "review_output" | "session_output"
 ): boolean {
-  return artifact?.kind === "session_output"
+  return artifact?.kind === outputKind
     && artifact.producerStepId === stepId
     && artifact.metadata.sessionId === sessionId;
 }

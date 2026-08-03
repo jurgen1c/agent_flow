@@ -316,6 +316,7 @@ steps:
     reviewer: author
     subject: author
     artifacts: [result.md]
+    outputs: [reviews/result.json]
     on_reject: revise
   - id: revise
     type: session_request
@@ -2050,9 +2051,9 @@ version: 1
 style: recovery_pipeline
 maturity: draft
 sessions:
-  reviewer: { provider: local, role: reviewer }
+  reviewer: { provider: local, role: reviewer, authority: { can_request_changes: true, can_approve: true } }
 steps:
-  - { id: first, type: review, reviewer: reviewer, subject: reviewer, artifacts: [result.md], then: second, max_cycles: 2 }
+  - { id: first, type: review, reviewer: reviewer, subject: reviewer, artifacts: [result.md], outputs: [reviews/result.json], then: second, max_cycles: 2 }
   - { id: second, type: command, command: echo second, then: first }
   - { id: third, type: command, command: echo third, then: fourth }
   - { id: fourth, type: command, command: echo fourth, then: third }
@@ -2071,9 +2072,9 @@ version: 1
 style: recovery_pipeline
 maturity: draft
 sessions:
-  reviewer: { provider: local, role: reviewer }
+  reviewer: { provider: local, role: reviewer, authority: { can_request_changes: true, can_approve: true } }
 steps:
-  - { id: review, type: review, reviewer: reviewer, subject: reviewer, artifacts: [result.md], on_reject: revise }
+  - { id: review, type: review, reviewer: reviewer, subject: reviewer, artifacts: [result.md], outputs: [reviews/result.json], on_reject: revise }
   - { id: revise, type: command, command: echo revise, then: review }
 `);
 
@@ -2600,7 +2601,7 @@ sessions:
     role: reviewer
     authority: { can_request_changes: true, can_approve: true }
 steps:
-  - { id: review, type: review, reviewer: reviewer, subject: reviewer, artifacts: [result.md] }
+  - { id: review, type: review, reviewer: reviewer, subject: reviewer, artifacts: [result.md], outputs: [reviews/result.json] }
   - { id: first, type: command, command: echo first }
   - { id: second, type: command, command: echo second, then: first }
 `);
@@ -2731,6 +2732,7 @@ steps:
     reviewer: reviewer
     subject: writer
     artifacts: [result.md]
+    outputs: [reviews/result.json]
   - id: approve
     type: approval
     reviewer: reviewer

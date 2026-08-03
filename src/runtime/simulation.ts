@@ -21,6 +21,7 @@ import {
   selectAgentFlowConditionTargetFromValues
 } from "./condition";
 import { AgentFlowFailureClassificationError } from "./failure_classification";
+import { parseAgentFlowReviewResult } from "./review";
 import {
   agentFlowAmbiguousSuccessTargetMessage,
   collectAgentFlowAmbiguousSuccessTargets
@@ -413,7 +414,7 @@ function runStep(step: AgentFlowWorkflowStep, state: SimulationState, insideLoop
     if (type === "artifact_transform") {
       return failureControl(step, stepFixture, id, state);
     }
-    if (type === "session_request") {
+    if (type === "session_request" || type === "review") {
       return simulateSessionRequestStep(step, stepFixture, id, state, true);
     }
     if (type === "mcp_call") {
@@ -426,7 +427,7 @@ function runStep(step: AgentFlowWorkflowStep, state: SimulationState, insideLoop
     const transformControl = simulateTransformStep(step, stepFixture, id, state);
     if (transformControl.kind !== "done") return transformControl;
     state.retryAttempts.delete(id);
-  } else if (type === "session_request") {
+  } else if (type === "session_request" || type === "review") {
     const sessionControl = simulateSessionRequestStep(step, stepFixture, id, state, false);
     if (sessionControl.kind !== "done") return sessionControl;
     state.retryAttempts.delete(id);
@@ -696,8 +697,9 @@ function simulateSessionRequestStep(
   state: SimulationState,
   providerOutcomeFailed: boolean
 ): SequenceControl {
+  const isReview = step.type === "review";
   const resolvedInputs: string[] = [];
-  for (const value of Array.isArray(step.inputs) ? step.inputs : []) {
+  for (const value of Array.isArray(isReview ? step.artifacts : step.inputs) ? (isReview ? step.artifacts : step.inputs) as AgentFlowYamlValue[] : []) {
     const name = nonEmptyString(value);
     const reference = name === undefined ? null : /^\{\{\s*inputs\.([A-Za-z0-9_-]+)\s*}}$/.exec(name);
     if (reference === null) {
@@ -756,7 +758,7 @@ function simulateSessionRequestStep(
     return budgetControl;
   }
   if (providerOutcomeFailed) {
-    return simulatedSessionFailure(step, fixture, stepId, state, "Fixture marks the session request as failed.");
+    return simulatedSessionFailure(step, fixture, stepId, state, `Fixture marks the ${isReview ? "review" : "session request"} as failed.`);
   }
   const providedOutputs = Array.isArray(fixture.outputs)
     ? canonicalFixtureArtifactNames(fixture.outputs)
@@ -772,6 +774,22 @@ function simulateSessionRequestStep(
       state,
       `Session fixture outputs must match declared outputs exactly; invalid output ${invalidOutput}.`
     );
+  }
+  if (isReview) {
+    for (const output of declaredOutputs) {
+      const value = providedOutputs.values.get(output);
+      try {
+        parseAgentFlowReviewResult(typeof value === "string" ? value : `${JSON.stringify(value)}\n`, output);
+      } catch (error) {
+        return simulatedSessionFailure(
+          step,
+          fixture,
+          stepId,
+          state,
+          error instanceof Error ? error.message : String(error)
+        );
+      }
+    }
   }
   recordOutputs(step, fixture, stepId, state);
   return { kind: "done" };

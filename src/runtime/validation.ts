@@ -105,7 +105,7 @@ const STEP_REQUIREMENTS: Readonly<Record<string, ReadonlyArray<readonly [string,
   manual_gate: [["message", "string"], ["options", "array"]],
   mcp_call: [["server", "string"], ["tool", "string"], ["arguments", "mapping"], ["outputs", "array"]],
   result: [["status", "string"]],
-  review: [["reviewer", "string"], ["subject", "string"], ["artifacts", "array"]],
+  review: [["reviewer", "string"], ["subject", "string"], ["artifacts", "array"], ["outputs", "array"]],
   session_request: [["session", "string"], ["prompt", "string"], ["inputs", "array"], ["outputs", "array"]],
   workflow: [["workflow", "string"]]
 };
@@ -140,6 +140,7 @@ export function validateAgentFlowWorkflow(workflow: AgentFlowWorkflow): AgentFlo
   validateControlFlowCycles(workflow, executableContexts, errors);
   validateInputReferences(workflow, contexts, errors);
   validateArtifactPaths(executableContexts, errors);
+  validateReviewArtifactPaths(executableContexts, errors);
   validateArtifactOutputs(workflow, contexts, errors);
   validateApprovals(executableContexts, errors);
   validateParallelWriters(workflow, contexts, errors);
@@ -566,11 +567,13 @@ function validateCollaborationAuthority(
   contexts: StepContext[],
   errors: AgentFlowWorkflowIssue[]
 ): void {
-  if (workflow.style !== "collaborative" || !isRecord(workflow.collaboration) ||
-      workflow.collaboration.enabled !== true) return;
+  const collaborationEnabled = workflow.style === "collaborative" &&
+    isRecord(workflow.collaboration) && workflow.collaboration.enabled === true;
+  if (!collaborationEnabled && !contexts.some((context) => context.type === "review")) return;
 
   for (const context of contexts) {
     const requirements: Array<{ session?: string; capability: string; field: string; action: string }> = [];
+    if (!collaborationEnabled && context.type !== "review") continue;
     if (context.type === "consult" && context.step.blocking !== undefined &&
         typeof context.step.blocking !== "boolean") {
       addStepIssue(
@@ -1777,6 +1780,72 @@ function validateArtifactPaths(contexts: StepContext[], errors: AgentFlowWorkflo
         field,
         `Artifact path "${value}" must be repo-relative and stay within the repository.`
       );
+    }
+  }
+}
+
+function validateReviewArtifactPaths(contexts: StepContext[], errors: AgentFlowWorkflowIssue[]): void {
+  for (const context of contexts) {
+    if (context.type !== "review") continue;
+    if (context.step.on_failure !== undefined) {
+      addStepIssue(
+        errors,
+        context,
+        "workflow.review.on_failure.unsupported",
+        "on_failure",
+        "Review steps do not support on_failure policies in this runtime phase."
+      );
+    }
+    for (const field of ["artifacts", "outputs"] as const) {
+      const seen = new Set<string>();
+      const values = stringList(context.step[field]);
+      if (field === "artifacts" && values.length > MAX_AGENT_FLOW_SESSION_INPUTS) {
+        addStepIssue(
+          errors,
+          context,
+          "workflow.review.artifacts.limit",
+          field,
+          `Reviews may declare at most ${MAX_AGENT_FLOW_SESSION_INPUTS} input artifacts.`
+        );
+      }
+      for (const [index, value] of values.entries()) {
+        let normalizedValue = "";
+        try {
+          normalizedValue = normalizeAgentFlowArtifactPath(value);
+        } catch {
+          // Report the review-specific artifact contract below.
+        }
+        if (value.includes("{{") || value.includes("}}") || normalizedValue.length === 0 ||
+            normalizedValue !== value.trim()) {
+          addStepIssue(
+            errors,
+            context,
+            "workflow.review.artifact.invalid",
+            `${field}[${index}]`,
+            `Review ${field.slice(0, -1)} "${value}" must be a normalized static repo-relative artifact path.`
+          );
+          continue;
+        }
+        if (field === "outputs" && !normalizedValue.endsWith(".json")) {
+          addStepIssue(
+            errors,
+            context,
+            "workflow.review.output.type",
+            `${field}[${index}]`,
+            `Review output "${value}" must use a .json artifact path.`
+          );
+        }
+        if (seen.has(normalizedValue)) {
+          addStepIssue(
+            errors,
+            context,
+            "workflow.review.artifact.duplicate",
+            `${field}[${index}]`,
+            `Review ${field} must not contain duplicate artifact path "${normalizedValue}".`
+          );
+        }
+        seen.add(normalizedValue);
+      }
     }
   }
 }

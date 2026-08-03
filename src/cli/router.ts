@@ -169,7 +169,7 @@ function renderHelp(topic?: string): string {
     "  explain <workflow>   Explain steps, artifacts, policies, and warnings.",
     "  graph <workflow>     Print a deterministic workflow graph.",
     "  simulate <workflow> --fixture <file>  Traverse a workflow from fixture data without executing steps.",
-    "  run <workflow> --id <run-id> [--fixture <file>]  Execute command, artifact-transform, and fixture-backed session-request steps.",
+    "  run <workflow> --id <run-id> [--fixture <file>]  Execute command, artifact-transform, session-request, and review steps.",
     "  resume <run-id> (--outcome <choice> | --answer <value>) [--fixture <file>]  Resume a paused interaction.",
     "  inject <run-id> <session-name> <context>  Inject context into active recovery remediation.",
     "  status <run-id>       Inspect persistent run state.",
@@ -181,7 +181,7 @@ function renderHelp(topic?: string): string {
     "Reserved placeholders:",
     `  ${plannedAgentFlowRuntimeCommands.filter((command) => !["validate", "lint", "explain", "graph", "simulate", ...ACTIVE_LIFECYCLE_COMMANDS].includes(command as ActiveLifecycleCommand)).join(", ")}`,
     "",
-    "Command and artifact-transform pipeline execution, including session-request steps, plus persistent lifecycle state are active."
+    "Command and artifact-transform pipeline execution, including session-request and review steps, plus persistent lifecycle state are active."
   ].join("\n");
 }
 
