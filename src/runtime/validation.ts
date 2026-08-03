@@ -438,7 +438,9 @@ function validateSessionDefinitions(workflow: AgentFlowWorkflow, errors: AgentFl
     });
   }
 
-  if (workflow.style === "collaborative" && collaboration?.enabled !== true) {
+  if (workflow.style === "collaborative" &&
+      (workflow.collaboration === undefined || collaboration !== undefined &&
+        (collaboration.enabled === undefined || collaboration.enabled === false))) {
     errors.push({
       code: "workflow.collaboration.enabled.required",
       message: "Collaborative workflows must explicitly declare collaboration.enabled: true.",

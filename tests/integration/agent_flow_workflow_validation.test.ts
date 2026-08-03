@@ -2847,6 +2847,36 @@ steps: []
     ]);
   });
 
+  test("does not cascade collaboration enablement errors from malformed configuration", () => {
+    const invalidRoot = parseAgentFlowWorkflowOrThrow(`name: malformed-collaboration-root
+version: 1
+style: collaborative
+maturity: draft
+collaboration: invalid
+sessions: {}
+steps: []
+`);
+    const invalidEnabled = parseAgentFlowWorkflowOrThrow(`name: malformed-collaboration-enabled
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: invalid }
+sessions: {}
+steps: []
+`);
+
+    expect(validateAgentFlowWorkflow(invalidRoot).errors).toEqual([{
+      code: "workflow.collaboration.invalid",
+      message: "Collaboration configuration must be a mapping.",
+      path: "collaboration"
+    }]);
+    expect(validateAgentFlowWorkflow(invalidEnabled).errors).toEqual([{
+      code: "workflow.collaboration.enabled.invalid",
+      message: "Collaboration enabled must be a boolean.",
+      path: "collaboration.enabled"
+    }]);
+  });
+
   test("rejects malformed ownership and unknown authority capabilities", () => {
     const workflow = parseAgentFlowWorkflowOrThrow(`name: malformed-collaboration-metadata
 version: 1
