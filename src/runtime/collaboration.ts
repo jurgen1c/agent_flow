@@ -155,6 +155,9 @@ function parseJsonObject(
   value: string | Uint8Array | CollaborationProviderOutput,
   outputPath: string
 ): Record<string, unknown> {
+  if (value === null) {
+    throw new AgentFlowCollaborationError(`${outputPath} must contain valid JSON.`);
+  }
   const content = typeof value === "object" && !(value instanceof Uint8Array) && "content" in value
     ? value.content
     : value;

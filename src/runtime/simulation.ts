@@ -703,6 +703,20 @@ function simulateSessionRequestStep(
 ): SequenceControl {
   const isReview = step.type === "review";
   const isExchange = step.type === "consult" || step.type === "challenge";
+  if (step.type === "consult" && step.blocking === true) {
+    const target = nonEmptyString(step.to);
+    const session = target === undefined ? undefined : state.workflow.sessions?.[target];
+    const authority = isRecord(session) && isRecord(session.authority) ? session.authority : undefined;
+    if (authority?.can_block !== true) {
+      return simulatedSessionFailure(
+        step,
+        fixture,
+        stepId,
+        state,
+        "Blocking consult simulation targets must explicitly declare can_block authority."
+      );
+    }
+  }
   const declaredInputs = isReview || isExchange ? step.artifacts : step.inputs;
   const resolvedInputs: string[] = [];
   for (const value of Array.isArray(declaredInputs) ? declaredInputs as AgentFlowYamlValue[] : []) {

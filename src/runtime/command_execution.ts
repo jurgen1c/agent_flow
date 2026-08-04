@@ -4373,7 +4373,12 @@ function validateCollaborationExchangeStep(
       || typeof step.output !== "string" || step.output.trim().length === 0) {
     return `${label} requires non-empty from and to sessions, one bounded question, an artifacts list, and one output.`;
   }
-  if (!step.output.trim().endsWith(".json")) return `${label} output must use a .json artifact path.`;
+  if (!normalizedStaticCollaborationArtifactPath(step.output) || !step.output.endsWith(".json")) {
+    return `${label} output must use a normalized static .json artifact path.`;
+  }
+  if (!(step.artifacts as string[]).every(normalizedStaticCollaborationArtifactPath)) {
+    return `${label} artifacts must use normalized static artifact paths.`;
+  }
   if (kind === "consult" && typeof step.blocking !== "boolean") {
     return "Consult requires an explicit boolean blocking flag.";
   }
@@ -4381,7 +4386,7 @@ function validateCollaborationExchangeStep(
   const questionMarks = [...question].filter((character) => character === "?").length;
   const wordCount = question.split(/\s+/).filter(Boolean).length;
   if (Buffer.byteLength(question, "utf8") > MAX_AGENT_FLOW_COLLABORATION_QUESTION_BYTES
-      || question.includes("{{") || question.includes("}}") || question.includes("\n")
+      || question.includes("{{") || question.includes("}}") || /[\r\n]/.test(question)
       || questionMarks !== 1 || !question.endsWith("?") || wordCount < 3) {
     return `${label} question must be one static, specific question ending in a single question mark within the ${MAX_AGENT_FLOW_COLLABORATION_QUESTION_BYTES}-byte limit.`;
   }
@@ -4401,6 +4406,15 @@ function validateCollaborationExchangeStep(
   }
   if (step.on_failure !== undefined) return `${label} steps do not support on_failure policies in this runtime phase.`;
   return undefined;
+}
+
+function normalizedStaticCollaborationArtifactPath(value: string): boolean {
+  if (value !== value.trim() || value.includes("{{") || value.includes("}}")) return false;
+  try {
+    return normalizeAgentFlowArtifactPath(value) === value;
+  } catch {
+    return false;
+  }
 }
 
 function validateMcpCallStep(step: AgentFlowWorkflowStep): string | undefined {

@@ -1869,7 +1869,7 @@ function validateCollaborationExchangeContracts(
           `${label} question exceeds the ${MAX_AGENT_FLOW_COLLABORATION_QUESTION_BYTES}-byte limit.`
         );
       } else if (question.includes("{{") || question.includes("}}") || questionMarks !== 1 ||
-          !question.endsWith("?") || wordCount < 3 || question.includes("\n")) {
+          !question.endsWith("?") || wordCount < 3 || /[\r\n]/.test(question)) {
         addStepIssue(
           errors, context, `workflow.${context.type}.question.vague`, "question",
           `${label} question must be one static, specific question ending in a single question mark.`

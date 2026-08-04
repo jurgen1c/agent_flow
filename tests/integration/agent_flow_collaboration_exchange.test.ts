@@ -3,10 +3,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  AgentFlowCollaborationError,
   createAgentFlowLifecycleRun,
   createAgentFlowSessionProviderRegistry,
   executeAgentFlowCommandPipeline,
   openAgentFlowRunState,
+  parseAgentFlowChallengeResult,
+  parseAgentFlowConsultResult,
   parseAgentFlowWorkflowOrThrow,
   simulateAgentFlowWorkflow,
   validateAgentFlowWorkflow,
@@ -221,6 +224,37 @@ describe("Agent Flow consult and challenge steps", () => {
     expect(malformed.availableArtifacts).not.toContain("challenges/exporter.json");
   });
 
+  test("fails closed when public collaboration parsers receive null", () => {
+    expect(() => parseAgentFlowConsultResult(null as never)).toThrow(AgentFlowCollaborationError);
+    expect(() => parseAgentFlowChallengeResult(null as never)).toThrow(AgentFlowCollaborationError);
+  });
+
+  test("rejects unauthorized blocking consultation during simulation", () => {
+    const workflow = exchangeWorkflow();
+    workflow.steps = [workflow.steps[0]!];
+    workflow.steps[0]!.blocking = true;
+
+    const result = simulateAgentFlowWorkflow(workflow, {
+      artifacts: { "implementation.md": "Implementation" },
+      steps: {
+        consult: {
+          outputs: {
+            "consultations/design.json": {
+              status: "blocked",
+              blocking: true,
+              summary: "Stop.",
+              recommendations: []
+            }
+          }
+        }
+      }
+    });
+
+    expect(result.status).toBe("paused");
+    expect(result.visitedSteps).toContainEqual(expect.objectContaining({ id: "consult", outcome: "failed" }));
+    expect(result.availableArtifacts).not.toContain("consultations/design.json");
+  });
+
   test("fails closed when a simulated exchange has no declared output", () => {
     const workflow = exchangeWorkflow();
     workflow.steps = [workflow.steps[0]!];
@@ -243,6 +277,11 @@ describe("Agent Flow consult and challenge steps", () => {
       expect.objectContaining({ code: "workflow.collaboration.authority.can_block.required" }),
       expect.objectContaining({ code: "workflow.consult.question.vague" })
     ]));
+
+    workflow.steps[0]!.question = "Does this\rhandle errors?";
+    expect(validateAgentFlowWorkflow(workflow).errors).toContainEqual(expect.objectContaining({
+      code: "workflow.consult.question.vague"
+    }));
   });
 
   test("rejects non-static or non-normalized exchange artifact paths", () => {
@@ -280,6 +319,34 @@ describe("Agent Flow consult and challenge steps", () => {
         id: "unbounded-question",
         mutate: (workflow: ReturnType<typeof exchangeWorkflow>) => { workflow.steps[0]!.question = "Thoughts?"; },
         message: "one static, specific question"
+      },
+      {
+        id: "carriage-return-question",
+        mutate: (workflow: ReturnType<typeof exchangeWorkflow>) => {
+          workflow.steps[0]!.question = "Does this\rhandle errors?";
+        },
+        message: "one static, specific question"
+      },
+      {
+        id: "non-normalized-output",
+        mutate: (workflow: ReturnType<typeof exchangeWorkflow>) => {
+          workflow.steps[0]!.output = "./consultations/design.json";
+        },
+        message: "normalized static .json artifact path"
+      },
+      {
+        id: "dynamic-output",
+        mutate: (workflow: ReturnType<typeof exchangeWorkflow>) => {
+          workflow.steps[0]!.output = "{{ inputs.output }}.json";
+        },
+        message: "normalized static .json artifact path"
+      },
+      {
+        id: "padded-artifact",
+        mutate: (workflow: ReturnType<typeof exchangeWorkflow>) => {
+          workflow.steps[0]!.artifacts = [" implementation.md "];
+        },
+        message: "normalized static artifact paths"
       }
     ];
 
