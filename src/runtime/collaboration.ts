@@ -119,7 +119,8 @@ export function parseAgentFlowConsultResult(
       throw new AgentFlowCollaborationError(`${outputPath} recommendation ${index + 1} must be an object.`);
     }
     requireNonEmptyString(recommendation.recommendation, `${outputPath} recommendation ${index + 1}`);
-    if (recommendation.priority !== undefined && !["low", "medium", "high"].includes(String(recommendation.priority))) {
+    const priority = recommendation.priority;
+    if (priority !== undefined && priority !== "low" && priority !== "medium" && priority !== "high") {
       throw new AgentFlowCollaborationError(`${outputPath} recommendation ${index + 1} priority must be low, medium, or high.`);
     }
   });

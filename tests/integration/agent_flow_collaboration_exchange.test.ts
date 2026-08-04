@@ -229,6 +229,15 @@ describe("Agent Flow consult and challenge steps", () => {
     expect(() => parseAgentFlowChallengeResult(null as never)).toThrow(AgentFlowCollaborationError);
   });
 
+  test("rejects non-string consult recommendation priorities", () => {
+    expect(() => parseAgentFlowConsultResult({
+      status: "advice",
+      blocking: false,
+      summary: "Use bounded retries.",
+      recommendations: [{ recommendation: "Add retry guidance.", priority: ["high"] }]
+    } as never)).toThrow(AgentFlowCollaborationError);
+  });
+
   test("rejects unauthorized blocking consultation during simulation", () => {
     const workflow = exchangeWorkflow();
     workflow.steps = [workflow.steps[0]!];
