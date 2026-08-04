@@ -231,6 +231,13 @@ Consultation output:
 }
 ```
 
+Consult questions are one static question ending in a single question mark and
+are limited to 4096 UTF-8 bytes. The `artifacts`, `.json` `output`, and boolean
+`blocking` fields are required. `schemas/consult.schema.json` defines the
+exported JSON contract; at runtime, `parseAgentFlowConsultResult` enforces the
+same fields and invariants before publishing a `consult_output`. An advisory
+consult cannot publish `blocking: true` or `status: "blocked"`.
+
 ## 9. Challenge and Rationale
 
 Reviewers may ask implementers why something was done.
@@ -246,7 +253,22 @@ Reviewers may ask implementers why something was done.
   output: challenges/exporter-service-rationale.json
 ```
 
-Challenge result should be bounded and recorded. It should not become a free-form debate.
+Challenge result:
+
+```json
+{
+  "status": "answered",
+  "rationale": "ExporterService owns the existing wire format; the new service isolates the incompatible format.",
+  "evidence": ["git.diff"]
+}
+```
+
+Challenge questions follow the same single-question and 4096-byte bound.
+`artifacts` and one `.json` `output` are required.
+`schemas/challenge.schema.json` defines the exported JSON contract; at runtime,
+`parseAgentFlowChallengeResult` enforces the same fields and invariants before
+persisting a `challenge_output`. Malformed or missing rationale fails closed
+instead of starting a free-form debate.
 
 ## 10. Decision Records
 

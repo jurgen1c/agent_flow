@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/jurgen1c/agent_flow/schemas/consult.schema.json",
+  "title": "Agent Flow Consult Result",
+  "type": "object",
+  "required": ["status", "blocking", "summary", "recommendations"],
+  "properties": {
+    "status": { "enum": ["advice", "blocked"] },
+    "blocking": { "type": "boolean" },
+    "summary": { "type": "string", "minLength": 1, "pattern": "\\S" },
+    "recommendations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["recommendation"],
+        "properties": {
+          "recommendation": { "type": "string", "minLength": 1, "pattern": "\\S" },
+          "priority": { "enum": ["low", "medium", "high"] }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "status": { "const": "advice" },
+        "blocking": { "const": false }
+      }
+    },
+    {
+      "properties": {
+        "status": { "const": "blocked" },
+        "blocking": { "const": true }
+      }
+    }
+  ],
+  "additionalProperties": true
+}

@@ -13,6 +13,13 @@ import {
 import { evaluateAgentFlowPolicy } from "./policy";
 import type { AgentFlowWorkflow, AgentFlowWorkflowStep, AgentFlowYamlMapping } from "./workflow";
 import { createAgentFlowReviewPrompt, parseAgentFlowReviewResult } from "./review";
+import {
+  createAgentFlowChallengePrompt,
+  createAgentFlowConsultPrompt,
+  parseAgentFlowChallengeResult,
+  parseAgentFlowConsultResult
+} from "./collaboration";
+import type { AgentFlowConsultResult } from "./collaboration";
 
 export const MAX_AGENT_FLOW_SESSION_PROMPT_BYTES = 1024 * 1024;
 export const MAX_AGENT_FLOW_SESSION_INPUT_BYTES = 10 * 1024 * 1024;
@@ -62,6 +69,7 @@ export interface AgentFlowSessionRequestExecutionResult {
   requestArtifact: AgentFlowArtifactRecord;
   outputArtifacts: AgentFlowArtifactRecord[];
   externalSessionId?: string;
+  consultResult?: AgentFlowConsultResult;
 }
 
 export interface ExecuteAgentFlowSessionRequestOptions {
@@ -71,7 +79,7 @@ export interface ExecuteAgentFlowSessionRequestOptions {
 }
 
 interface ExecuteAgentFlowSessionStepOptions extends ExecuteAgentFlowSessionRequestOptions {
-  review?: true;
+  kind?: "review" | "consult" | "challenge";
 }
 
 export class AgentFlowSessionRequestError extends Error {
@@ -179,7 +187,29 @@ export async function executeAgentFlowReview(
   registry: AgentFlowSessionProviderRegistry,
   options: ExecuteAgentFlowSessionRequestOptions = {}
 ): Promise<AgentFlowSessionRequestExecutionResult> {
-  return executeAgentFlowSessionStep(store, runId, workflow, step, registry, { ...options, review: true });
+  return executeAgentFlowSessionStep(store, runId, workflow, step, registry, { ...options, kind: "review" });
+}
+
+export async function executeAgentFlowConsult(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  workflow: AgentFlowWorkflow,
+  step: AgentFlowWorkflowStep,
+  registry: AgentFlowSessionProviderRegistry,
+  options: ExecuteAgentFlowSessionRequestOptions = {}
+): Promise<AgentFlowSessionRequestExecutionResult> {
+  return executeAgentFlowSessionStep(store, runId, workflow, step, registry, { ...options, kind: "consult" });
+}
+
+export async function executeAgentFlowChallenge(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  workflow: AgentFlowWorkflow,
+  step: AgentFlowWorkflowStep,
+  registry: AgentFlowSessionProviderRegistry,
+  options: ExecuteAgentFlowSessionRequestOptions = {}
+): Promise<AgentFlowSessionRequestExecutionResult> {
+  return executeAgentFlowSessionStep(store, runId, workflow, step, registry, { ...options, kind: "challenge" });
 }
 
 async function executeAgentFlowSessionStep(
@@ -199,11 +229,11 @@ async function executeAgentFlowSessionStep(
       "AGENT_FLOW_SESSION_RUN_STATUS"
     );
   }
-  const kind = options.review === true ? "review" : "session_request";
-  const requestKind = options.review === true ? "review_request" : "session_request";
-  const outputKind = options.review === true ? "review_output" : "session_output";
-  const requestIdPrefix = options.review === true ? "review-request" : "session-request";
-  const label = options.review === true ? "Review" : "Session request";
+  const kind = options.kind ?? "session_request";
+  const requestKind = kind === "session_request" ? "session_request" : `${kind}_request` as const;
+  const outputKind = kind === "session_request" ? "session_output" : `${kind}_output` as const;
+  const requestIdPrefix = kind === "session_request" ? "session-request" : `${kind}-request` as const;
+  const label = kind === "session_request" ? "Session request" : `${kind[0]!.toUpperCase()}${kind.slice(1)}`;
   const stepId = requiredName(step.id, `${label} step ID`);
   const declaredStep = findWorkflowStep(workflow.steps, stepId);
   if (requiredName(step.type, `${label} ${stepId} type`) !== kind
@@ -214,7 +244,7 @@ async function executeAgentFlowSessionStep(
       "AGENT_FLOW_SESSION_WORKFLOW_MISMATCH"
     );
   }
-  const sessionId = requiredName(options.review === true ? step.reviewer : step.session, `${label} ${stepId} session`);
+  const sessionId = requiredName(kind === "review" ? step.reviewer : kind === "session_request" ? step.session : step.to, `${label} ${stepId} session`);
   const session = mapping(workflow.sessions?.[sessionId]);
   if (session === undefined) {
     throw new AgentFlowSessionRequestError(
@@ -233,10 +263,10 @@ async function executeAgentFlowSessionStep(
   const resume = session.resume === true;
   const previous = store.getSession(runId, sessionId);
   const priorExternalSessionId = resume ? previous?.externalSessionId ?? undefined : undefined;
-  const rawInputs = options.review === true ? step.artifacts : step.inputs;
-  const rawOutputs = step.outputs;
+  const rawInputs = kind === "session_request" ? step.inputs : step.artifacts;
+  const rawOutputs = kind === "consult" || kind === "challenge" ? [step.output] : step.outputs;
   const outputPaths = normalizedArtifactPaths(rawOutputs, `${label} ${stepId} outputs`);
-  const prompt = options.review === true
+  const prompt = kind === "review"
     ? createAgentFlowReviewPrompt(
       stepId,
       sessionId,
@@ -244,13 +274,32 @@ async function executeAgentFlowSessionStep(
       normalizedArtifactPaths(rawInputs, `Review ${stepId} artifacts`),
       outputPaths
     )
-    : readAgentFlowSessionPrompt(store.repoRoot, requiredName(step.prompt, `Session request ${stepId} prompt`));
+    : kind === "consult"
+      ? createAgentFlowConsultPrompt(
+        stepId,
+        requiredName(step.from, `Consult ${stepId} from`),
+        sessionId,
+        requiredName(step.question, `Consult ${stepId} question`),
+        normalizedArtifactPaths(rawInputs, `Consult ${stepId} artifacts`),
+        outputPaths[0]!,
+        step.blocking === true
+      )
+      : kind === "challenge"
+        ? createAgentFlowChallengePrompt(
+          stepId,
+          requiredName(step.from, `Challenge ${stepId} from`),
+          sessionId,
+          requiredName(step.question, `Challenge ${stepId} question`),
+          normalizedArtifactPaths(rawInputs, `Challenge ${stepId} artifacts`),
+          outputPaths[0]!
+        )
+        : readAgentFlowSessionPrompt(store.repoRoot, requiredName(step.prompt, `Session request ${stepId} prompt`));
   if (Buffer.byteLength(prompt.content, "utf8") > MAX_AGENT_FLOW_SESSION_PROMPT_BYTES) {
     throw promptTooLarge(prompt.path);
   }
   const inputPaths = normalizedArtifactPaths(
-    options.review === true ? rawInputs : resolveSessionInputPaths(rawInputs, run.inputs, stepId),
-    `${label} ${stepId} ${options.review === true ? "artifacts" : "inputs"}`
+    kind === "session_request" ? resolveSessionInputPaths(rawInputs, run.inputs, stepId) : rawInputs,
+    `${label} ${stepId} ${kind === "session_request" ? "inputs" : "artifacts"}`
   );
   if (inputPaths.length > MAX_AGENT_FLOW_SESSION_INPUTS) {
     throw new AgentFlowSessionRequestError(
@@ -271,7 +320,7 @@ async function executeAgentFlowSessionStep(
     }
     inputs.push(input);
   }
-  const requestDirectory = options.review === true ? "review-requests" : "session-requests";
+  const requestDirectory = kind === "session_request" ? "session-requests" : `${kind}-requests`;
   const requestPath = `${requestDirectory}/${safePathSegment(stepId).slice(0, 200)}-${digest(stepId).slice(0, 12)}.json`;
   preflightOutputCollisions(store, runId, step, sessionId, outputPaths, requestPath, requestKind, outputKind, requestIdPrefix);
   const request: AgentFlowSessionProviderRequest = {
@@ -370,8 +419,13 @@ async function executeAgentFlowSessionStep(
     state: { resume, lastStepId: stepId, providerResponded: true }
   });
   const outputs = validateAgentFlowSessionProviderResponse(stepId, outputPaths, response);
-  if (options.review === true) {
+  let consultResult: AgentFlowConsultResult | undefined;
+  if (kind === "review") {
     for (const outputPath of outputPaths) parseAgentFlowReviewResult(outputs.get(outputPath)!, outputPath);
+  } else if (kind === "consult") {
+    consultResult = parseAgentFlowConsultResult(outputs.get(outputPaths[0]!)!, outputPaths[0]!, step.blocking === true);
+  } else if (kind === "challenge") {
+    parseAgentFlowChallengeResult(outputs.get(outputPaths[0]!)!, outputPaths[0]!);
   }
   const providerMetadata = validateAgentFlowSessionProviderMetadata(stepId, response.metadata);
   options.beforePublish?.();
@@ -460,6 +514,7 @@ async function executeAgentFlowSessionStep(
     provider,
     requestArtifact,
     outputArtifacts,
+    ...(consultResult === undefined ? {} : { consultResult }),
     ...(externalSessionId === undefined ? {} : { externalSessionId })
   };
   } catch (error) {
@@ -695,12 +750,13 @@ function preflightOutputCollisions(
   sessionId: string,
   outputPaths: string[],
   requestPath: string,
-  requestKind: "review_request" | "session_request",
-  outputKind: "review_output" | "session_output",
-  requestIdPrefix: "review-request" | "session-request"
+  requestKind: "challenge_request" | "consult_request" | "review_request" | "session_request",
+  outputKind: "challenge_output" | "consult_output" | "review_output" | "session_output",
+  requestIdPrefix: "challenge-request" | "consult-request" | "review-request" | "session-request"
 ): void {
-  const outputLabel = requestKind === "review_request" ? "Review output" : "Session output";
-  const requestLabel = requestKind === "review_request" ? "Review request" : "Session request";
+  const label = requestKind.replace("_request", "").replace(/^./, (value) => value.toUpperCase());
+  const outputLabel = `${label} output`;
+  const requestLabel = `${label} request`;
   if (outputPaths.includes(requestPath)) {
     throw new AgentFlowSessionRequestError(
       `${outputLabel} ${requestPath} conflicts with the runtime request metadata artifact.`,
@@ -732,7 +788,7 @@ function ownedSessionOutput(
   artifact: AgentFlowArtifactRecord | null,
   stepId: string,
   sessionId: string,
-  outputKind: "review_output" | "session_output"
+  outputKind: "challenge_output" | "consult_output" | "review_output" | "session_output"
 ): boolean {
   return artifact?.kind === outputKind
     && artifact.producerStepId === stepId

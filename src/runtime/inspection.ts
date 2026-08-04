@@ -453,7 +453,7 @@ function collectDirectArtifacts(step: AgentFlowWorkflowStep, direction: "read" |
   if (direction === "read") {
     const input = nonEmptyString(step.input);
     const inputs = stringValues(step.inputs);
-    const artifacts = ["approval", "decision_record", "review"].includes(String(step.type)) ? stringValues(step.artifacts) : [];
+    const artifacts = ["approval", "challenge", "consult", "decision_record", "review"].includes(String(step.type)) ? stringValues(step.artifacts) : [];
     return [...inputs, ...(input === undefined ? [] : [input]), ...artifacts];
   }
   const output = nonEmptyString(step.output);

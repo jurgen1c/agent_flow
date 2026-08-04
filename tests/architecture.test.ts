@@ -25,7 +25,9 @@ describe("standalone Agent Flow architecture", () => {
     expect(Object.keys(packageJson.exports ?? {}).sort()).toEqual([
       ".",
       "./cli",
+      "./schemas/challenge",
       "./schemas/config",
+      "./schemas/consult",
       "./schemas/failure-classification",
       "./schemas/review",
       "./schemas/workflow"
@@ -33,6 +35,20 @@ describe("standalone Agent Flow architecture", () => {
     for (const range of Object.values(packageJson.dependencies ?? {})) {
       expect(range).not.toMatch(/^(?:workspace:|file:)/);
     }
+  });
+
+  test("publishes consult status and blocking pairs consistently", () => {
+    const schema = JSON.parse(
+      fs.readFileSync(path.join(repositoryRoot, "schemas/consult.schema.json"), "utf8")
+    ) as { oneOf?: Array<{ properties?: Record<string, { const?: unknown }> }> };
+
+    expect(schema.oneOf?.map((entry) => ({
+      status: entry.properties?.status?.const,
+      blocking: entry.properties?.blocking?.const
+    }))).toEqual([
+      { status: "advice", blocking: false },
+      { status: "blocked", blocking: true }
+    ]);
   });
 
   test("contains no Agent Memory implementation, dependency, or adapter", () => {
