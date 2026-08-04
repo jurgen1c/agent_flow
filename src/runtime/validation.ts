@@ -1898,13 +1898,24 @@ function validateCollaborationExchangeContracts(
       );
     }
     const output = nonEmptyString(context.step.output);
-    if (output !== undefined && !output.endsWith(".json")) {
-      addStepIssue(
-        errors, context, `workflow.${context.type}.output.invalid`, "output",
-        `${label} output must use a normalized .json artifact path.`
-      );
+    if (output !== undefined) {
+      let normalized = "";
+      try {
+        normalized = normalizeAgentFlowArtifactPath(output);
+      } catch {
+        // Emit the exchange-specific contract error below.
+      }
+      if (context.step.output !== output || output.includes("{{") || output.includes("}}")
+          || normalized.length === 0 || normalized !== output || !output.endsWith(".json")) {
+        addStepIssue(
+          errors, context, `workflow.${context.type}.output.invalid`, "output",
+          `${label} output must use a normalized static .json artifact path.`
+        );
+      }
     }
-    const artifacts = stringList(context.step.artifacts);
+    const artifacts = Array.isArray(context.step.artifacts)
+      ? context.step.artifacts.filter((artifact): artifact is string => typeof artifact === "string")
+      : [];
     if (artifacts.length > MAX_AGENT_FLOW_SESSION_INPUTS) {
       addStepIssue(
         errors, context, `workflow.${context.type}.artifacts.limit`, "artifacts",
@@ -1919,7 +1930,9 @@ function validateCollaborationExchangeContracts(
       } catch {
         // Emit the exchange-specific contract error below.
       }
-      if (artifact.includes("{{") || artifact.includes("}}") || normalized.length === 0 || normalized !== artifact.trim()) {
+      const invalid = artifact !== artifact.trim() || artifact.includes("{{") || artifact.includes("}}")
+        || normalized.length === 0 || normalized !== artifact;
+      if (invalid) {
         addStepIssue(
           errors, context, `workflow.${context.type}.artifact.invalid`, `artifacts[${index}]`,
           `${label} artifact "${artifact}" must be a normalized static repo-relative artifact path.`
@@ -1930,7 +1943,7 @@ function validateCollaborationExchangeContracts(
           `${label} artifacts must not contain duplicate path "${normalized}".`
         );
       }
-      seen.add(normalized);
+      if (!invalid) seen.add(normalized);
     });
   }
 }

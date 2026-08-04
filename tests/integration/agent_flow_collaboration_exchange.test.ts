@@ -231,6 +231,23 @@ describe("Agent Flow consult and challenge steps", () => {
     ]));
   });
 
+  test("rejects non-static or non-normalized exchange artifact paths", () => {
+    const workflow = exchangeWorkflow();
+    workflow.steps[0]!.output = " {{ inputs.output }}.json ";
+    workflow.steps[0]!.artifacts = [" implementation.md "];
+
+    expect(validateAgentFlowWorkflow(workflow).errors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "workflow.consult.output.invalid", path: "steps[0].output" }),
+      expect.objectContaining({ code: "workflow.consult.artifact.invalid", path: "steps[0].artifacts[0]" })
+    ]));
+
+    workflow.steps[0]!.output = "./consultations/design.json";
+    expect(validateAgentFlowWorkflow(workflow).errors).toContainEqual(expect.objectContaining({
+      code: "workflow.consult.output.invalid",
+      path: "steps[0].output"
+    }));
+  });
+
   test("fails runtime preflight for malformed persisted exchange contracts", async () => {
     const cases = [
       {
