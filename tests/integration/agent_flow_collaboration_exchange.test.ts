@@ -221,6 +221,20 @@ describe("Agent Flow consult and challenge steps", () => {
     expect(malformed.availableArtifacts).not.toContain("challenges/exporter.json");
   });
 
+  test("fails closed when a simulated exchange has no declared output", () => {
+    const workflow = exchangeWorkflow();
+    workflow.steps = [workflow.steps[0]!];
+    delete workflow.steps[0]!.output;
+
+    const result = simulateAgentFlowWorkflow(workflow, {
+      artifacts: { "implementation.md": "Implementation" },
+      steps: { consult: {} }
+    });
+
+    expect(result.status).toBe("paused");
+    expect(result.visitedSteps).toContainEqual(expect.objectContaining({ id: "consult", outcome: "failed" }));
+  });
+
   test("rejects vague, unbounded, and unauthorized consult contracts", () => {
     const workflow = exchangeWorkflow();
     workflow.steps[0]!.question = "Thoughts?";

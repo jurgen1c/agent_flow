@@ -745,6 +745,15 @@ function simulateSessionRequestStep(
       .flatMap((output) => nonEmptyString(output) ?? [])
       .map(canonicalArtifactName)
   );
+  if (isExchange && declaredOutputs.size !== 1) {
+    return simulatedSessionFailure(
+      step,
+      fixture,
+      stepId,
+      state,
+      `${step.type === "consult" ? "Consult" : "Challenge"} simulation requires one declared output artifact.`
+    );
+  }
   for (const output of rawOutputs) {
     const name = nonEmptyString(output);
     if (name === undefined) continue;
