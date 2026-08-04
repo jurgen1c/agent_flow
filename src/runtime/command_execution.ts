@@ -34,6 +34,7 @@ import {
   MAX_AGENT_FLOW_SESSION_INPUTS,
   MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES,
   createAgentFlowSessionProviderRegistry,
+  executeAgentFlowReview,
   executeAgentFlowSessionRequest,
   invokeAgentFlowSessionProvider,
   readAgentFlowSessionInput,
@@ -451,13 +452,15 @@ async function runAgentFlowCommandPipeline(
         message: failure
       }, failureStatus(step), routingBudget.terminalEffects);
     }
-    if (stepType === "session_request") {
+    if (stepType === "session_request" || stepType === "review") {
+      const isReview = stepType === "review";
       const firstAttempt = allocateStepAttempt(routingBudget, stepId);
       if (firstAttempt === undefined) return stepAttemptLimitResult(store, runId, completedSteps, stepId, routingBudget);
-      const preflightError = validateSessionRequestStep(step);
+      const preflightError = isReview ? validateReviewStep(workflow, step) : validateSessionRequestStep(step);
       if (preflightError !== undefined) {
-        const sessionId = typeof step.session === "string" && step.session.trim().length > 0
-          ? step.session.trim()
+        const actor = isReview ? step.reviewer : step.session;
+        const sessionId = typeof actor === "string" && actor.trim().length > 0
+          ? actor.trim()
           : undefined;
         persistSessionRequestFailure(store, runId, stepId, sessionId, preflightError, false, "fail", true, firstAttempt);
         return finishFailure(store, runId, completedSteps, stepId, {
@@ -474,18 +477,20 @@ async function runAgentFlowCommandPipeline(
         const stopped = activeStopStatus(store, runId);
         if (stopped !== undefined) return stoppedPipelineResult(store, runId, completedSteps)!;
         store.updateRun(runId, { currentStepId: stepId, error: null });
-        const sessionId = (step.session as string).trim();
-        const input = {
+        const sessionId = ((isReview ? step.reviewer : step.session) as string).trim();
+        const input: Record<string, AgentFlowRunStateValue> = {
           attempt,
           session: sessionId,
-          prompt: step.prompt as string,
-          inputs: step.inputs as AgentFlowRunStateValue,
+          ...(isReview
+            ? { type: "review", subject: step.subject as string, artifacts: step.artifacts as AgentFlowRunStateValue }
+            : { prompt: step.prompt as string, inputs: step.inputs as AgentFlowRunStateValue }),
           outputs: step.outputs as AgentFlowRunStateValue
         };
         store.upsertStep({ runId, stepId, attempt, sessionId, status: "running", input });
         store.appendRunEvent(runId, { type: "step.started", stepId, payload: input });
         try {
-          const result = await executeAgentFlowSessionRequest(store, runId, workflow, step, sessionProviders, {
+          const execute = isReview ? executeAgentFlowReview : executeAgentFlowSessionRequest;
+          const result = await execute(store, runId, workflow, step, sessionProviders, {
             attempt,
             stopStatus: () => activeStopStatus(store, runId),
             beforePublish: () => {
@@ -4286,6 +4291,26 @@ function validateSessionRequestStep(step: AgentFlowWorkflowStep): string | undef
         || ["goto", "return_to"].some((field) => onFailure[field] !== undefined)) {
       return "Session request runtime supports only retry, recovery routes, and then: continue, ignore, fail, or pause.";
     }
+  }
+  return undefined;
+}
+
+function validateReviewStep(workflow: AgentFlowWorkflow, step: AgentFlowWorkflowStep): string | undefined {
+  if (typeof step.reviewer !== "string" || step.reviewer.trim().length === 0
+      || typeof step.subject !== "string" || step.subject.trim().length === 0
+      || !nonEmptyStringArray(step.artifacts) || !nonEmptyStringArray(step.outputs)) {
+    return "Review requires a non-empty reviewer, subject, artifacts list, and outputs list.";
+  }
+  if ((step.outputs as string[]).some((output) => !output.trim().endsWith(".json"))) {
+    return "Review outputs must use .json artifact paths.";
+  }
+  const reviewer = mapping(workflow.sessions?.[(step.reviewer as string).trim()]);
+  const authority = mapping(reviewer?.authority);
+  if (authority?.can_request_changes !== true || authority.can_approve !== true) {
+    return "Reviewers must explicitly declare can_request_changes and can_approve authority.";
+  }
+  if (step.on_failure !== undefined) {
+    return "Review steps do not support on_failure policies in this runtime phase.";
   }
   return undefined;
 }

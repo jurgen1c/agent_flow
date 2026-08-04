@@ -81,7 +81,7 @@ describe("Agent Flow workflow simulation", () => {
       },
       steps: {
         implement: { outputs: ["implementation-summary.md"] },
-        review: { outputs: { "reviews/code-review.json": { status: "approved" } } },
+        review: { outputs: { "reviews/code-review.json": { status: "approved", findings: [] } } },
         ask_user: { input: "continue" }
       }
     });

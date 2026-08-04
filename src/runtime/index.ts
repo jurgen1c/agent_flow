@@ -88,8 +88,20 @@ export {
   MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES,
   createAgentFlowFixtureSessionProvider,
   createAgentFlowSessionProviderRegistry,
+  executeAgentFlowReview,
   executeAgentFlowSessionRequest
 } from "./session_request";
+export {
+  AGENT_FLOW_REVIEW_STATUSES,
+  AgentFlowReviewError,
+  createAgentFlowReviewPrompt,
+  parseAgentFlowReviewResult
+} from "./review";
+export type {
+  AgentFlowReviewFinding,
+  AgentFlowReviewResult,
+  AgentFlowReviewStatus
+} from "./review";
 export {
   AgentFlowMcpCallError,
   AgentFlowMcpCallInterruptedError,

@@ -4,8 +4,9 @@ Agent Flow is a standalone, persistent workflow runtime and CLI for
 policy-aware agent pipelines.
 
 It validates and simulates workflow YAML, runs command, MCP, session-request,
-condition, and artifact-transform steps, persists lifecycle state in SQLite,
-and records artifacts, failures, notifications, and retention outcomes.
+formal review, condition, and artifact-transform steps, persists lifecycle
+state in SQLite, and records artifacts, failures, notifications, and retention
+outcomes.
 
 ## Install
 
@@ -69,12 +70,16 @@ with a persisted `recovery-context/injected.md` input.
 Programmatic CLI routing is exported from `@jurgen1c/agent-flow/cli`.
 Schemas are exported from `@jurgen1c/agent-flow/schemas/config`,
 `@jurgen1c/agent-flow/schemas/failure-classification`, and
-`@jurgen1c/agent-flow/schemas/workflow`.
+`@jurgen1c/agent-flow/schemas/review`, and `@jurgen1c/agent-flow/schemas/workflow`.
 
 Collaborative workflows opt in with `collaboration.enabled: true`. Their
 sessions declare roles and may declare ownership, authority, and file scopes;
 sessions remain advisory unless stronger authority is explicit. Both `explain`
 and `graph` surface the normalized role and authority model.
+Formal `review` steps invoke the declared reviewer session, require explicit
+`can_request_changes` and `can_approve` authority, and publish JSON artifacts
+with `approved`, `changes_requested`, or `unresolved` status plus a structured
+`findings` array. Conditions can route directly from those persisted results.
 
 ## Architecture
 

@@ -192,6 +192,14 @@ steps:
     then: review
 ```
 
+Formal review outputs use the `schemas/review.schema.json` contract. Every
+declared output is JSON with a `status` of `approved`, `changes_requested`, or
+`unresolved`, plus a `findings` array. Each finding is an object with a
+non-empty `summary`; implementations may add severity, artifact, location, or
+other structured fields. The runtime validates every result before atomically
+publishing it as a `review_output` artifact, so condition steps can route on
+the persisted status and malformed findings cannot influence routing.
+
 ## 8. Consultation Example
 
 ```yaml
