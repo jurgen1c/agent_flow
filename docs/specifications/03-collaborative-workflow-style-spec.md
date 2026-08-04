@@ -233,9 +233,10 @@ Consultation output:
 
 Consult questions are one static question ending in a single question mark and
 are limited to 4096 UTF-8 bytes. The `artifacts`, `.json` `output`, and boolean
-`blocking` fields are required. The runtime validates the result with
-`schemas/consult.schema.json` before publishing it as a `consult_output`. An
-advisory consult cannot publish `blocking: true` or `status: "blocked"`.
+`blocking` fields are required. `schemas/consult.schema.json` defines the
+exported JSON contract; at runtime, `parseAgentFlowConsultResult` enforces the
+same fields and invariants before publishing a `consult_output`. An advisory
+consult cannot publish `blocking: true` or `status: "blocked"`.
 
 ## 9. Challenge and Rationale
 
@@ -263,10 +264,11 @@ Challenge result:
 ```
 
 Challenge questions follow the same single-question and 4096-byte bound.
-`artifacts` and one `.json` `output` are required. The runtime validates the
-result with `schemas/challenge.schema.json` and persists it as a
-`challenge_output`; malformed or missing rationale fails closed instead of
-starting a free-form debate.
+`artifacts` and one `.json` `output` are required.
+`schemas/challenge.schema.json` defines the exported JSON contract; at runtime,
+`parseAgentFlowChallengeResult` enforces the same fields and invariants before
+persisting a `challenge_output`. Malformed or missing rationale fails closed
+instead of starting a free-form debate.
 
 ## 10. Decision Records
 
