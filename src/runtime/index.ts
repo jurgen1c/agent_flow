@@ -88,6 +88,8 @@ export {
   MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES,
   createAgentFlowFixtureSessionProvider,
   createAgentFlowSessionProviderRegistry,
+  executeAgentFlowChallenge,
+  executeAgentFlowConsult,
   executeAgentFlowReview,
   executeAgentFlowSessionRequest
 } from "./session_request";
@@ -102,6 +104,19 @@ export type {
   AgentFlowReviewResult,
   AgentFlowReviewStatus
 } from "./review";
+export {
+  MAX_AGENT_FLOW_COLLABORATION_QUESTION_BYTES,
+  AgentFlowCollaborationError,
+  createAgentFlowChallengePrompt,
+  createAgentFlowConsultPrompt,
+  parseAgentFlowChallengeResult,
+  parseAgentFlowConsultResult
+} from "./collaboration";
+export type {
+  AgentFlowChallengeResult,
+  AgentFlowConsultRecommendation,
+  AgentFlowConsultResult
+} from "./collaboration";
 export {
   AgentFlowMcpCallError,
   AgentFlowMcpCallInterruptedError,

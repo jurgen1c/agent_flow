@@ -34,6 +34,8 @@ import {
   MAX_AGENT_FLOW_SESSION_INPUTS,
   MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES,
   createAgentFlowSessionProviderRegistry,
+  executeAgentFlowChallenge,
+  executeAgentFlowConsult,
   executeAgentFlowReview,
   executeAgentFlowSessionRequest,
   invokeAgentFlowSessionProvider,
@@ -93,6 +95,7 @@ import {
 } from "./workspace";
 import { AgentFlowFailureClassificationError } from "./failure_classification";
 import { createAgentFlowLifecycleRun, transitionAgentFlowLifecycleRun } from "./lifecycle";
+import { MAX_AGENT_FLOW_COLLABORATION_QUESTION_BYTES } from "./collaboration";
 
 const MAX_CAPTURE_BYTES = 10 * 1024 * 1024;
 const RECOVERY_CONTEXT_INPUT_PATH = "recovery-context/injected.md";
@@ -452,13 +455,16 @@ async function runAgentFlowCommandPipeline(
         message: failure
       }, failureStatus(step), routingBudget.terminalEffects);
     }
-    if (stepType === "session_request" || stepType === "review") {
+    if (stepType !== undefined && ["challenge", "consult", "review", "session_request"].includes(stepType)) {
       const isReview = stepType === "review";
+      const isCollaborationExchange = stepType === "consult" || stepType === "challenge";
       const firstAttempt = allocateStepAttempt(routingBudget, stepId);
       if (firstAttempt === undefined) return stepAttemptLimitResult(store, runId, completedSteps, stepId, routingBudget);
-      const preflightError = isReview ? validateReviewStep(workflow, step) : validateSessionRequestStep(step);
+      const preflightError = isReview
+        ? validateReviewStep(workflow, step)
+        : isCollaborationExchange ? validateCollaborationExchangeStep(workflow, step) : validateSessionRequestStep(step);
       if (preflightError !== undefined) {
-        const actor = isReview ? step.reviewer : step.session;
+        const actor = isReview ? step.reviewer : isCollaborationExchange ? step.to : step.session;
         const sessionId = typeof actor === "string" && actor.trim().length > 0
           ? actor.trim()
           : undefined;
@@ -477,19 +483,30 @@ async function runAgentFlowCommandPipeline(
         const stopped = activeStopStatus(store, runId);
         if (stopped !== undefined) return stoppedPipelineResult(store, runId, completedSteps)!;
         store.updateRun(runId, { currentStepId: stepId, error: null });
-        const sessionId = ((isReview ? step.reviewer : step.session) as string).trim();
+        const sessionId = ((isReview ? step.reviewer : isCollaborationExchange ? step.to : step.session) as string).trim();
         const input: Record<string, AgentFlowRunStateValue> = {
           attempt,
           session: sessionId,
           ...(isReview
             ? { type: "review", subject: step.subject as string, artifacts: step.artifacts as AgentFlowRunStateValue }
+            : isCollaborationExchange
+              ? {
+                type: stepType,
+                from: step.from as string,
+                question: step.question as string,
+                artifacts: step.artifacts as AgentFlowRunStateValue,
+                blocking: step.blocking === true
+              }
             : { prompt: step.prompt as string, inputs: step.inputs as AgentFlowRunStateValue }),
-          outputs: step.outputs as AgentFlowRunStateValue
+          outputs: (isCollaborationExchange ? [step.output] : step.outputs) as AgentFlowRunStateValue
         };
         store.upsertStep({ runId, stepId, attempt, sessionId, status: "running", input });
         store.appendRunEvent(runId, { type: "step.started", stepId, payload: input });
         try {
-          const execute = isReview ? executeAgentFlowReview : executeAgentFlowSessionRequest;
+          const execute = isReview
+            ? executeAgentFlowReview
+            : stepType === "consult" ? executeAgentFlowConsult
+              : stepType === "challenge" ? executeAgentFlowChallenge : executeAgentFlowSessionRequest;
           const result = await execute(store, runId, workflow, step, sessionProviders, {
             attempt,
             stopStatus: () => activeStopStatus(store, runId),
@@ -509,6 +526,9 @@ async function runAgentFlowCommandPipeline(
           store.upsertStep({ runId, stepId, attempt, sessionId, status: "completed", output });
           store.appendRunEvent(runId, { type: "step.completed", stepId, payload: output });
           completedSteps.push(stepId);
+          if (result.consultResult?.status === "blocked") {
+            return finishBlockedConsult(store, runId, completedSteps, stepId, routingBudget.terminalEffects);
+          }
           failure = undefined;
           break;
         } catch (error) {
@@ -3548,6 +3568,31 @@ function finishCompleted(
   return { status: finalized.status, completedSteps, ...(finalized.message === undefined ? {} : { message: finalized.message }) };
 }
 
+function finishBlockedConsult(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  completedSteps: string[],
+  stepId: string,
+  terminalEffects: AgentFlowPipelineTerminalEffects
+): AgentFlowCommandPipelineResult {
+  const message = `Consultation ${stepId} blocked workflow continuation.`;
+  const finalized = finalizePipelineRun(store, runId, terminalEffects, {
+    intendedStatus: "paused",
+    completedSteps,
+    currentStepId: stepId,
+    output: { completedSteps, resultStatus: "blocked" },
+    message,
+    eventPayload: { completedSteps, resultStatus: "blocked", message },
+    eventStepId: stepId
+  });
+  return {
+    status: finalized.status,
+    completedSteps,
+    resultStatus: "blocked",
+    message: finalized.message ?? message
+  };
+}
+
 interface FinalizePipelineRunInput {
   intendedStatus: Extract<AgentFlowRunStatus, "completed" | "failed" | "paused" | "cancelled">;
   completedSteps: string[];
@@ -4312,6 +4357,49 @@ function validateReviewStep(workflow: AgentFlowWorkflow, step: AgentFlowWorkflow
   if (step.on_failure !== undefined) {
     return "Review steps do not support on_failure policies in this runtime phase.";
   }
+  return undefined;
+}
+
+function validateCollaborationExchangeStep(
+  workflow: AgentFlowWorkflow,
+  step: AgentFlowWorkflowStep
+): string | undefined {
+  const kind = normalizedTarget(step.type);
+  const label = kind === "challenge" ? "Challenge" : "Consult";
+  if (!nonEmptyStringArray(step.artifacts)
+      || typeof step.from !== "string" || step.from.trim().length === 0
+      || typeof step.to !== "string" || step.to.trim().length === 0
+      || typeof step.question !== "string" || step.question.trim().length === 0
+      || typeof step.output !== "string" || step.output.trim().length === 0) {
+    return `${label} requires non-empty from and to sessions, one bounded question, an artifacts list, and one output.`;
+  }
+  if (!step.output.trim().endsWith(".json")) return `${label} output must use a .json artifact path.`;
+  if (kind === "consult" && typeof step.blocking !== "boolean") {
+    return "Consult requires an explicit boolean blocking flag.";
+  }
+  const question = step.question.trim();
+  const questionMarks = [...question].filter((character) => character === "?").length;
+  const wordCount = question.split(/\s+/).filter(Boolean).length;
+  if (Buffer.byteLength(question, "utf8") > MAX_AGENT_FLOW_COLLABORATION_QUESTION_BYTES
+      || question.includes("{{") || question.includes("}}") || question.includes("\n")
+      || questionMarks !== 1 || !question.endsWith("?") || wordCount < 3) {
+    return `${label} question must be one static, specific question ending in a single question mark within the ${MAX_AGENT_FLOW_COLLABORATION_QUESTION_BYTES}-byte limit.`;
+  }
+  const source = mapping(workflow.sessions?.[step.from.trim()]);
+  if (source === undefined) return `${label} references undeclared source session ${step.from.trim()}.`;
+  const target = mapping(workflow.sessions?.[step.to.trim()]);
+  if (target === undefined) return `${label} references undeclared target session ${step.to.trim()}.`;
+  const authority = mapping(target.authority);
+  const hasEnabledAuthority = authority !== undefined && Object.values(authority).some((enabled) => enabled === true);
+  const hasEffectiveAdvisoryAuthority = target.authority === undefined || authority?.can_advise === true
+    || authority !== undefined && authority.can_advise !== false && !hasEnabledAuthority;
+  if (kind === "consult" && step.blocking === false && !hasEffectiveAdvisoryAuthority) {
+    return "Advisory consult targets must have effective can_advise authority.";
+  }
+  if (kind === "consult" && step.blocking === true && authority?.can_block !== true) {
+    return "Blocking consult targets must explicitly declare can_block authority.";
+  }
+  if (step.on_failure !== undefined) return `${label} steps do not support on_failure policies in this runtime phase.`;
   return undefined;
 }
 

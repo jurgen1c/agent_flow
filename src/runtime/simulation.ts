@@ -22,6 +22,7 @@ import {
 } from "./condition";
 import { AgentFlowFailureClassificationError } from "./failure_classification";
 import { parseAgentFlowReviewResult } from "./review";
+import { parseAgentFlowChallengeResult, parseAgentFlowConsultResult } from "./collaboration";
 import {
   agentFlowAmbiguousSuccessTargetMessage,
   collectAgentFlowAmbiguousSuccessTargets
@@ -414,7 +415,7 @@ function runStep(step: AgentFlowWorkflowStep, state: SimulationState, insideLoop
     if (type === "artifact_transform") {
       return failureControl(step, stepFixture, id, state);
     }
-    if (type === "session_request" || type === "review") {
+    if (["challenge", "consult", "review", "session_request"].includes(type)) {
       return simulateSessionRequestStep(step, stepFixture, id, state, true);
     }
     if (type === "mcp_call") {
@@ -427,7 +428,7 @@ function runStep(step: AgentFlowWorkflowStep, state: SimulationState, insideLoop
     const transformControl = simulateTransformStep(step, stepFixture, id, state);
     if (transformControl.kind !== "done") return transformControl;
     state.retryAttempts.delete(id);
-  } else if (type === "session_request" || type === "review") {
+  } else if (["challenge", "consult", "review", "session_request"].includes(type)) {
     const sessionControl = simulateSessionRequestStep(step, stepFixture, id, state, false);
     if (sessionControl.kind !== "done") return sessionControl;
     state.retryAttempts.delete(id);
@@ -532,7 +533,10 @@ function simulationModelBudgetControl(
   stepId: string,
   state: SimulationState
 ): SequenceControl | undefined {
-  return simulationSessionBudgetControl(nonEmptyString(step.session), stepId, state);
+  const actor = nonEmptyString(step.session)
+    ?? (step.type === "review" ? nonEmptyString(step.reviewer) : undefined)
+    ?? (step.type === "consult" || step.type === "challenge" ? nonEmptyString(step.to) : undefined);
+  return simulationSessionBudgetControl(actor, stepId, state);
 }
 
 function simulationSessionBudgetControl(
@@ -595,7 +599,7 @@ function sameCommandOutputArtifact(
 }
 
 function declaredOutputArtifacts(step: AgentFlowWorkflowStep): string[] {
-  const outputs = Array.isArray(step.outputs) ? step.outputs : [];
+  const outputs = [...(Array.isArray(step.outputs) ? step.outputs : []), step.output];
   return outputs.flatMap((value) => {
     const name = nonEmptyString(value);
     return name === undefined ? [] : [canonicalArtifactName(name)];
@@ -698,7 +702,8 @@ function simulateSessionRequestStep(
   providerOutcomeFailed: boolean
 ): SequenceControl {
   const isReview = step.type === "review";
-  const declaredInputs = isReview ? step.artifacts : step.inputs;
+  const isExchange = step.type === "consult" || step.type === "challenge";
+  const declaredInputs = isReview || isExchange ? step.artifacts : step.inputs;
   const resolvedInputs: string[] = [];
   for (const value of Array.isArray(declaredInputs) ? declaredInputs as AgentFlowYamlValue[] : []) {
     const name = nonEmptyString(value);
@@ -734,12 +739,13 @@ function simulateSessionRequestStep(
     );
   }
 
+  const rawOutputs = isExchange ? [step.output] : Array.isArray(step.outputs) ? step.outputs : [];
   const declaredOutputs = new Set(
-    (Array.isArray(step.outputs) ? step.outputs : [])
+    rawOutputs
       .flatMap((output) => nonEmptyString(output) ?? [])
       .map(canonicalArtifactName)
   );
-  for (const output of Array.isArray(step.outputs) ? step.outputs : []) {
+  for (const output of rawOutputs) {
     const name = nonEmptyString(output);
     if (name === undefined) continue;
     const artifact = canonicalArtifactName(name);
@@ -759,7 +765,13 @@ function simulateSessionRequestStep(
     return budgetControl;
   }
   if (providerOutcomeFailed) {
-    return simulatedSessionFailure(step, fixture, stepId, state, `Fixture marks the ${isReview ? "review" : "session request"} as failed.`);
+    return simulatedSessionFailure(
+      step,
+      fixture,
+      stepId,
+      state,
+      `Fixture marks the ${isReview ? "review" : isExchange ? String(step.type) : "session request"} as failed.`
+    );
   }
   const providedOutputs = Array.isArray(fixture.outputs)
     ? canonicalFixtureArtifactNames(fixture.outputs)
@@ -790,6 +802,32 @@ function simulateSessionRequestStep(
           error instanceof Error ? error.message : String(error)
         );
       }
+    }
+  } else if (step.type === "consult") {
+    const output = [...declaredOutputs][0]!;
+    const value = providedOutputs.values.get(output);
+    let consultResult;
+    try {
+      consultResult = parseAgentFlowConsultResult(
+        typeof value === "string" ? value : `${JSON.stringify(value)}\n`,
+        output,
+        step.blocking === true
+      );
+    } catch (error) {
+      return simulatedSessionFailure(step, fixture, stepId, state, error instanceof Error ? error.message : String(error));
+    }
+    if (consultResult.status === "blocked") {
+      recordOutputs(step, fixture, stepId, state);
+      state.terminalStates.push({ stepId, status: "paused" });
+      return { kind: "terminal", status: "paused" };
+    }
+  } else if (step.type === "challenge") {
+    const output = [...declaredOutputs][0]!;
+    const value = providedOutputs.values.get(output);
+    try {
+      parseAgentFlowChallengeResult(typeof value === "string" ? value : `${JSON.stringify(value)}\n`, output);
+    } catch (error) {
+      return simulatedSessionFailure(step, fixture, stepId, state, error instanceof Error ? error.message : String(error));
     }
   }
   recordOutputs(step, fixture, stepId, state);

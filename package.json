@@ -33,6 +33,8 @@
       "default": "./dist/cli/router.js"
     },
     "./schemas/config": "./schemas/config.schema.json",
+    "./schemas/challenge": "./schemas/challenge.schema.json",
+    "./schemas/consult": "./schemas/consult.schema.json",
     "./schemas/failure-classification": "./schemas/failure-classification.schema.json",
     "./schemas/review": "./schemas/review.schema.json",
     "./schemas/workflow": "./schemas/workflow.schema.json"

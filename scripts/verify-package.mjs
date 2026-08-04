@@ -31,8 +31,11 @@ try {
     "dist/cli/router.js",
     "dist/cli/router.d.ts",
     "dist/agent-flow.js",
+    "schemas/challenge.schema.json",
     "schemas/config.schema.json",
+    "schemas/consult.schema.json",
     "schemas/failure-classification.schema.json",
+    "schemas/review.schema.json",
     "schemas/workflow.schema.json"
   ]) {
     if (!files.includes(required)) fail(`Packed artifact is missing ${required}.`);

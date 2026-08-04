@@ -275,7 +275,12 @@ steps:
       "workflow.step.field.required",
       "workflow.step.field.required",
       "workflow.step.field.required",
-      "workflow.step.nested.item"
+      "workflow.step.field.required",
+      "workflow.step.field.required",
+      "workflow.step.field.required",
+      "workflow.step.field.required",
+      "workflow.step.nested.item",
+      "workflow.consult.blocking.required"
     ]);
   });
 
@@ -310,7 +315,10 @@ steps:
     type: consult
     from: author
     to: missing
-    question: Review this?
+    question: Does this result satisfy the contract?
+    artifacts: [result.md]
+    output: consultations/result.json
+    blocking: false
   - id: review
     type: review
     reviewer: author
@@ -2642,7 +2650,9 @@ steps:
     type: consult
     from: advisor
     to: advisor
-    question: Review the plan
+    question: Does this plan cover failure recovery?
+    artifacts: [plan.md]
+    output: consultations/plan.json
     blocking: false
 `);
 
@@ -2665,7 +2675,9 @@ steps:
     type: consult
     from: advisor
     to: advisor
-    question: Review the plan
+    question: Does this plan cover failure recovery?
+    artifacts: [plan.md]
+    output: consultations/plan.json
     blocking: false
 `);
 
@@ -2689,7 +2701,9 @@ steps:
     type: consult
     from: requester
     to: advisor
-    question: Review the plan
+    question: Does this plan cover failure recovery?
+    artifacts: [plan.md]
+    output: consultations/plan.json
     blocking: false
 `);
 
@@ -2719,7 +2733,9 @@ steps:
     type: consult
     from: writer
     to: advisor
-    question: Review the plan
+    question: Does this plan cover failure recovery?
+    artifacts: [plan.md]
+    output: consultations/plan.json
     blocking: true
   - id: write
     type: session_request
@@ -2786,13 +2802,17 @@ steps:
     type: consult
     from: advisor
     to: advisor
-    question: Review the plan
+    question: Does this plan cover failure recovery?
+    artifacts: [plan.md]
+    output: consultations/plan.json
     blocking: "true"
   - id: dynamic_consult
     type: consult
     from: advisor
     to: "{{ inputs.actor }}"
-    question: Review the plan
+    question: Does this plan cover failure recovery?
+    artifacts: [plan.md]
+    output: consultations/dynamic-plan.json
     blocking: true
   - id: approve
     type: approval
@@ -2818,6 +2838,12 @@ steps:
         message: "Approval reviewer must be a static declared session so can_approve authority can be validated.",
         path: "steps[2].reviewer",
         stepId: "approve"
+      },
+      {
+        code: "workflow.consult.to.dynamic",
+        message: "Consult to session must be static so the exchange and authority are inspectable.",
+        path: "steps[1].to",
+        stepId: "dynamic_consult"
       }
     ]);
   });
@@ -2874,7 +2900,7 @@ collaboration: { enabled: false }
 sessions:
   advisor: { provider: local, role: advisor, authority: { can_advise: false } }
 steps:
-  - { id: consult, type: consult, from: advisor, to: advisor, question: Review, blocking: false }
+  - { id: consult, type: consult, from: advisor, to: advisor, question: "Does this plan cover failure recovery?", artifacts: [plan.md], output: consultations/plan.json, blocking: false }
 `);
 
     expect(validateAgentFlowWorkflow(invalidRoot).errors).toEqual([{

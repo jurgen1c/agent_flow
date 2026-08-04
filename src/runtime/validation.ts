@@ -21,6 +21,7 @@ import {
 } from "./success_routing";
 import { validateAgentFlowNotifications } from "./notifications";
 import { AGENT_FLOW_FINAL_SUMMARY_PATH } from "./retention";
+import { MAX_AGENT_FLOW_COLLABORATION_QUESTION_BYTES } from "./collaboration";
 
 export const MAX_AGENT_FLOW_COMMAND_TIMEOUT_SECONDS = 2_147_483.647;
 
@@ -95,9 +96,9 @@ export const MAX_AGENT_FLOW_COMMAND_RETRIES = 100;
 const STEP_REQUIREMENTS: Readonly<Record<string, ReadonlyArray<readonly [string, "string" | "array" | "mapping"]>>> = {
   approval: [["reviewer", "string"], ["artifacts", "array"]],
   artifact_transform: [["input", "string"], ["output", "string"], ["transform", "string"]],
-  challenge: [["from", "string"], ["to", "string"], ["question", "string"]],
+  challenge: [["from", "string"], ["to", "string"], ["question", "string"], ["artifacts", "array"], ["output", "string"]],
   command: [["command", "string"]],
-  consult: [["from", "string"], ["to", "string"], ["question", "string"]],
+  consult: [["from", "string"], ["to", "string"], ["question", "string"], ["artifacts", "array"], ["output", "string"]],
   decision_record: [["owner", "string"], ["topic", "string"], ["artifacts", "array"]],
   handoff: [["from", "string"], ["to", "string"]],
   input_request: [["question", "string"], ["save_as", "string"]],
@@ -141,6 +142,7 @@ export function validateAgentFlowWorkflow(workflow: AgentFlowWorkflow): AgentFlo
   validateInputReferences(workflow, contexts, errors);
   validateArtifactPaths(executableContexts, errors);
   validateReviewArtifactPaths(executableContexts, errors);
+  validateCollaborationExchangeContracts(executableContexts, errors);
   validateArtifactOutputs(workflow, contexts, errors);
   validateApprovals(executableContexts, errors);
   validateParallelWriters(workflow, contexts, errors);
@@ -1850,6 +1852,89 @@ function validateReviewArtifactPaths(contexts: StepContext[], errors: AgentFlowW
   }
 }
 
+function validateCollaborationExchangeContracts(
+  contexts: StepContext[],
+  errors: AgentFlowWorkflowIssue[]
+): void {
+  for (const context of contexts) {
+    if (context.type !== "consult" && context.type !== "challenge") continue;
+    const label = context.type === "consult" ? "Consult" : "Challenge";
+    const question = nonEmptyString(context.step.question);
+    if (question !== undefined) {
+      const questionMarks = [...question].filter((character) => character === "?").length;
+      const wordCount = question.split(/\s+/).filter(Boolean).length;
+      if (Buffer.byteLength(question, "utf8") > MAX_AGENT_FLOW_COLLABORATION_QUESTION_BYTES) {
+        addStepIssue(
+          errors, context, `workflow.${context.type}.question.too_large`, "question",
+          `${label} question exceeds the ${MAX_AGENT_FLOW_COLLABORATION_QUESTION_BYTES}-byte limit.`
+        );
+      } else if (question.includes("{{") || question.includes("}}") || questionMarks !== 1 ||
+          !question.endsWith("?") || wordCount < 3 || question.includes("\n")) {
+        addStepIssue(
+          errors, context, `workflow.${context.type}.question.vague`, "question",
+          `${label} question must be one static, specific question ending in a single question mark.`
+        );
+      }
+    }
+    for (const field of ["from", "to"] as const) {
+      const actor = nonEmptyString(context.step[field]);
+      if (actor !== undefined && isDynamicReference(actor)) {
+        addStepIssue(
+          errors, context, `workflow.${context.type}.${field}.dynamic`, field,
+          `${label} ${field} session must be static so the exchange and authority are inspectable.`
+        );
+      }
+    }
+    if (context.type === "consult" && context.step.blocking === undefined) {
+      addStepIssue(
+        errors, context, "workflow.consult.blocking.required", "blocking",
+        "Consult must declare an explicit boolean blocking flag."
+      );
+    }
+    if (context.step.on_failure !== undefined) {
+      addStepIssue(
+        errors, context, `workflow.${context.type}.on_failure.unsupported`, "on_failure",
+        `${label} steps do not support on_failure policies in this runtime phase.`
+      );
+    }
+    const output = nonEmptyString(context.step.output);
+    if (output !== undefined && !output.endsWith(".json")) {
+      addStepIssue(
+        errors, context, `workflow.${context.type}.output.invalid`, "output",
+        `${label} output must use a normalized .json artifact path.`
+      );
+    }
+    const artifacts = stringList(context.step.artifacts);
+    if (artifacts.length > MAX_AGENT_FLOW_SESSION_INPUTS) {
+      addStepIssue(
+        errors, context, `workflow.${context.type}.artifacts.limit`, "artifacts",
+        `${label} may declare at most ${MAX_AGENT_FLOW_SESSION_INPUTS} input artifacts.`
+      );
+    }
+    const seen = new Set<string>();
+    artifacts.forEach((artifact, index) => {
+      let normalized = "";
+      try {
+        normalized = normalizeAgentFlowArtifactPath(artifact);
+      } catch {
+        // Emit the exchange-specific contract error below.
+      }
+      if (artifact.includes("{{") || artifact.includes("}}") || normalized.length === 0 || normalized !== artifact.trim()) {
+        addStepIssue(
+          errors, context, `workflow.${context.type}.artifact.invalid`, `artifacts[${index}]`,
+          `${label} artifact "${artifact}" must be a normalized static repo-relative artifact path.`
+        );
+      } else if (seen.has(normalized)) {
+        addStepIssue(
+          errors, context, `workflow.${context.type}.artifact.duplicate`, `artifacts[${index}]`,
+          `${label} artifacts must not contain duplicate path "${normalized}".`
+        );
+      }
+      seen.add(normalized);
+    });
+  }
+}
+
 function validateApprovals(contexts: StepContext[], errors: AgentFlowWorkflowIssue[]): void {
   for (const context of contexts) {
     if (context.type !== "manual_gate") {
@@ -2482,7 +2567,7 @@ function sessionReferenceFields(type: string | undefined): string[] {
 function stepInputs(step: AgentFlowWorkflowStep): string[] {
   const inputs = nestedStrings(step.inputs);
   const input = nonEmptyString(step.input);
-  const artifacts = ["approval", "decision_record", "review"].includes(String(step.type))
+  const artifacts = ["approval", "challenge", "consult", "decision_record", "review"].includes(String(step.type))
     ? stringList(step.artifacts)
     : [];
   return [...inputs, ...(input === undefined ? [] : [input]), ...artifacts];
@@ -2510,7 +2595,7 @@ function inputField(step: AgentFlowWorkflowStep): string {
   if (nonEmptyString(step.input) !== undefined) {
     return "input";
   }
-  return ["approval", "decision_record", "review"].includes(String(step.type)) && stringList(step.artifacts).length > 0
+  return ["approval", "challenge", "consult", "decision_record", "review"].includes(String(step.type)) && stringList(step.artifacts).length > 0
     ? "artifacts"
     : "inputs";
 }

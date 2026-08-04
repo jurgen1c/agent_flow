@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/jurgen1c/agent_flow/schemas/challenge.schema.json",
+  "title": "Agent Flow Challenge Result",
+  "type": "object",
+  "required": ["status", "rationale"],
+  "properties": {
+    "status": { "enum": ["answered", "unresolved"] },
+    "rationale": { "type": "string", "minLength": 1, "pattern": "\\S" },
+    "evidence": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "pattern": "\\S" }
+    }
+  },
+  "additionalProperties": true
+}
