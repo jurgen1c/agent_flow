@@ -1282,6 +1282,7 @@ function resumeWaitingStep(
       : outcome === "reject"
         ? "rejected"
         : "approved";
+    const decidedBy = response.decidedBy ?? (waiting.kind === "approval" ? "human" : undefined);
     let approvalArtifact: string | undefined;
     if (waiting.kind === "approval" && (approvalStatus === "approved" || approvalStatus === "rejected")) {
       let currentEvidence: AgentFlowWaitingEvidence[];
@@ -1365,7 +1366,7 @@ function resumeWaitingStep(
         runId,
         stepId: waiting.stepId,
         status: approvalStatus,
-        ...(response.decidedBy === undefined ? {} : { decidedBy: response.decidedBy }),
+        ...(decidedBy === undefined ? {} : { decidedBy }),
         decision: outcome
       });
     });
