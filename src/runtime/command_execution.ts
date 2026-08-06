@@ -627,7 +627,12 @@ async function runAgentFlowCommandPipeline(
               stepId,
               status: result.approvalResult.status,
               decidedBy: sessionId,
-              decision: result.approvalResult.decision
+              decision: result.approvalResult.decision,
+              context: {
+                artifacts: step.artifacts as AgentFlowRunStateValue,
+                evidence: result.inputEvidence as unknown as AgentFlowRunStateValue,
+                output: result.outputArtifacts[0]!.declaredPath
+              }
             });
             sessionSelectedTarget = result.approvalResult.status === "approved"
               ? normalizedTarget(step.on_approve)
@@ -1148,7 +1153,12 @@ function pauseForInteraction(
       context: {
         message: prompt,
         options: validOutcomes,
-        ...(evidence === undefined ? {} : { evidence: evidence as unknown as AgentFlowRunStateValue })
+        ...(evidence === undefined ? {} : {
+          evidence: evidence as unknown as AgentFlowRunStateValue,
+          output: typeof step.output === "string" && step.output.trim().length > 0
+            ? step.output.trim()
+            : defaultAgentFlowApprovalOutputPath(stepId)
+        })
       }
     });
   }
@@ -1234,6 +1244,28 @@ function resumeWaitingStep(
       `Agent Flow run ${runId} waiting state does not match workflow step ${waiting.stepId}.`,
       "AGENT_FLOW_RESUME_STATE"
     );
+  }
+  if (waiting.kind === "approval") {
+    const declaredEvidence = Array.isArray(step.artifacts)
+      ? step.artifacts.flatMap((value) => {
+        if (typeof value !== "string") return [];
+        try {
+          return normalizeAgentFlowArtifactPath(value) === value ? [value] : [];
+        } catch {
+          return [];
+        }
+      })
+      : [];
+    const expectedApprovalId = `approval:${safeId(waiting.stepId)}:attempt-${waiting.attempt}`;
+    if (!Array.isArray(step.artifacts)
+        || declaredEvidence.length !== step.artifacts.length
+        || !isDeepStrictEqual(waiting.evidence?.map(({ path }) => path), declaredEvidence)
+        || waiting.approvalId !== expectedApprovalId) {
+      throw new AgentFlowRunStateError(
+        `Agent Flow run ${runId} approval waiting state does not match workflow step ${waiting.stepId}.`,
+        "AGENT_FLOW_RESUME_STATE"
+      );
+    }
   }
 
   const routingBudget = deserializeRoutingBudget(waiting.routing, workflow, notifications);
@@ -1357,7 +1389,11 @@ function resumeWaitingStep(
           overwrite: step.overwrite === true || existing?.producerStepId === waiting.stepId,
           requiredRunStatus: "running",
           requiredArtifacts: waiting.evidence,
-          metadata: { reviewer: "human", decidedBy: response.decidedBy ?? "human" }
+          metadata: {
+            reviewer: "human",
+            decidedBy: response.decidedBy ?? "human",
+            evidence: waiting.evidence as unknown as AgentFlowRunStateValue
+          }
         });
         approvalArtifact = artifact.declaredPath;
       }
@@ -1514,11 +1550,14 @@ function parseWaitingState(value: AgentFlowRunStateValue | undefined): AgentFlow
   const validOutcomes = normalizedStringList(record.validOutcomes);
   const completedSteps = normalizedStringList(record.completedSteps);
   const routing = mapping(record.routing);
+  const reasonMatchesKind = kind === "approval" ? reason === "approval"
+    : kind === "manual_gate" ? reason === "manual_approval"
+      : kind === "input_request" ? reason === "missing_input" : false;
   if ((kind !== "approval" && kind !== "manual_gate" && kind !== "input_request")
       || stepId === undefined
       || !Number.isSafeInteger(attempt)
       || (attempt as number) < 1
-      || (reason !== "approval" && reason !== "manual_approval" && reason !== "missing_input")
+      || !reasonMatchesKind
       || prompt === undefined
       || routing === undefined) {
     throw new AgentFlowRunStateError(
@@ -1534,7 +1573,7 @@ function parseWaitingState(value: AgentFlowRunStateValue | undefined): AgentFlow
       const candidate = mapping(entry);
       const path = typeof candidate?.path === "string" ? candidate.path : undefined;
       const checksum = typeof candidate?.checksum === "string" ? candidate.checksum : undefined;
-      if (path === undefined || checksum === undefined || checksum.length === 0) return [];
+      if (path === undefined || checksum === undefined || !/^sha256:[a-f0-9]{64}$/.test(checksum)) return [];
       try {
         if (normalizeAgentFlowArtifactPath(path) !== path) return [];
       } catch {
@@ -1544,6 +1583,7 @@ function parseWaitingState(value: AgentFlowRunStateValue | undefined): AgentFlow
     })
     : [];
   if (((kind === "approval" || kind === "manual_gate") && (validOutcomes.length === 0 || approvalId === undefined))
+      || (kind === "approval" && !isDeepStrictEqual(validOutcomes, ["approve", "reject", "cancel"]))
       || (kind === "approval" && (evidence.length === 0 || evidence.length !== (record.evidence as unknown[] | undefined)?.length))
       || (kind === "input_request" && saveAs === undefined)) {
     throw new AgentFlowRunStateError(
@@ -1555,7 +1595,9 @@ function parseWaitingState(value: AgentFlowRunStateValue | undefined): AgentFlow
     kind,
     stepId,
     attempt: attempt as number,
-    reason,
+    reason: kind === "approval" ? "approval"
+      : kind === "manual_gate" ? "manual_approval"
+        : "missing_input",
     prompt,
     validOutcomes,
     ...(saveAs === undefined ? {} : { saveAs }),

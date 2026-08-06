@@ -74,6 +74,7 @@ export interface AgentFlowSessionRequestExecutionResult {
   provider: string;
   requestArtifact: AgentFlowArtifactRecord;
   outputArtifacts: AgentFlowArtifactRecord[];
+  inputEvidence: Array<{ path: string; checksum: string }>;
   externalSessionId?: string;
   consultResult?: AgentFlowConsultResult;
   approvalResult?: AgentFlowApprovalResult;
@@ -539,6 +540,9 @@ async function executeAgentFlowSessionStep(
         sessionId,
         provider,
         requestArtifact: requestPath,
+        ...(kind === "approval"
+          ? { evidence: inputs.map((input) => ({ path: input.path, checksum: input.checksum })) }
+          : {}),
         ...(options.attempt === undefined ? {} : { attempt: options.attempt })
       }
     };
@@ -568,6 +572,7 @@ async function executeAgentFlowSessionStep(
     provider,
     requestArtifact,
     outputArtifacts,
+    inputEvidence: inputs.map((input) => ({ path: input.path, checksum: input.checksum })),
     ...(consultResult === undefined ? {} : { consultResult }),
     ...(approvalResult === undefined ? {} : { approvalResult }),
     ...(externalSessionId === undefined ? {} : { externalSessionId })

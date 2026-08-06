@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -278,6 +279,157 @@ steps:
     expect(await resumeAgentFlowCommandPipeline(store, "changed-human-evidence", workflow, { outcome: "approve" }))
       .toMatchObject({ status: "completed" });
     store.close();
+  });
+
+  test("invalidates a terminal approval and its output when approved evidence is overwritten", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: invalidate-approved-evidence
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+sessions:
+  reviewer: { provider: fixture, role: release reviewer, authority: { can_approve: true } }
+steps:
+  - { id: approve, type: approval, reviewer: reviewer, artifacts: [evidence.md] }
+  - { id: revise, type: command, command: "printf revised > evidence.md", outputs: [evidence.md], overwrite: true }
+  - { id: done, type: result, status: completed }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "invalidate-approved-evidence", workflow });
+    const evidence = store.writeArtifact({
+      id: `command-output:${createHash("sha256").update("evidence.md").digest("hex")}`,
+      runId: "invalidate-approved-evidence",
+      path: "evidence.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Original evidence"
+    });
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => ({
+      outputs: {
+        "approvals/approve.json": JSON.stringify({ status: "approved", decision: "Approved original evidence." })
+      }
+    }));
+
+    expect(await executeAgentFlowCommandPipeline(
+      store,
+      "invalidate-approved-evidence",
+      workflow,
+      undefined,
+      providers
+    )).toMatchObject({ status: "completed", completedSteps: ["approve", "revise", "done"] });
+
+    expect(store.listApprovals("invalidate-approved-evidence")).toEqual([
+      expect.objectContaining({
+        status: "cancelled",
+        decision: "evidence_changed",
+        context: expect.objectContaining({
+          evidence: [{ path: "evidence.md", checksum: evidence.checksum }],
+          output: "approvals/approve.json",
+          invalidation: expect.objectContaining({ reason: "evidence_changed", path: "evidence.md" })
+        })
+      })
+    ]);
+    expect(store.getArtifact("invalidate-approved-evidence", "approvals/approve.json")).toMatchObject({
+      status: "stale",
+      metadata: expect.objectContaining({ approvalInvalidated: true })
+    });
+    expect(() => store.readArtifact("invalidate-approved-evidence", "approvals/approve.json"))
+      .toThrow("is stale because its evidence changed");
+    expect(store.listEvents("invalidate-approved-evidence").map((event) => event.type))
+      .toContain("approval.invalidated");
+    store.close();
+  });
+
+  test("rejects restored approval outcomes and evidence that differ from the workflow", async () => {
+    const outcomeRoot = temporaryRepo();
+    const outcomeWorkflow = humanApprovalWorkflow();
+    const outcomeStore = await openAgentFlowRunState({ cwd: outcomeRoot });
+    createAgentFlowLifecycleRun(outcomeStore, { id: "restored-approval-outcome", workflow: outcomeWorkflow });
+    outcomeStore.writeArtifact({
+      id: "release",
+      runId: "restored-approval-outcome",
+      path: "release.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Release"
+    });
+    expect(await executeAgentFlowCommandPipeline(
+      outcomeStore,
+      "restored-approval-outcome",
+      outcomeWorkflow
+    )).toMatchObject({ status: "paused" });
+    const outcomeRun = outcomeStore.getRun("restored-approval-outcome")!;
+    const outcomeWaiting = structuredClone(outcomeRun.context.waiting) as Record<string, AgentFlowRunStateValue>;
+    outcomeWaiting.validOutcomes = ["complete"];
+    outcomeStore.updateRun("restored-approval-outcome", {
+      context: { ...outcomeRun.context, waiting: outcomeWaiting }
+    });
+
+    await expect(resumeAgentFlowCommandPipeline(
+      outcomeStore,
+      "restored-approval-outcome",
+      outcomeWorkflow,
+      { outcome: "complete" }
+    )).rejects.toMatchObject({ code: "AGENT_FLOW_RESUME_STATE" });
+    expect(outcomeStore.getRun("restored-approval-outcome")?.status).toBe("paused");
+    expect(outcomeStore.listApprovals("restored-approval-outcome")).toEqual([
+      expect.objectContaining({ status: "requested" })
+    ]);
+    outcomeStore.close();
+
+    const evidenceRoot = temporaryRepo();
+    const evidenceWorkflow = humanApprovalWorkflow();
+    const evidenceStore = await openAgentFlowRunState({ cwd: evidenceRoot });
+    createAgentFlowLifecycleRun(evidenceStore, { id: "restored-approval-evidence", workflow: evidenceWorkflow });
+    const release = evidenceStore.writeArtifact({
+      id: "release",
+      runId: "restored-approval-evidence",
+      path: "release.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Release one"
+    });
+    const unrelated = evidenceStore.writeArtifact({
+      id: "unrelated",
+      runId: "restored-approval-evidence",
+      path: "unrelated.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Unrelated"
+    });
+    expect(await executeAgentFlowCommandPipeline(
+      evidenceStore,
+      "restored-approval-evidence",
+      evidenceWorkflow
+    )).toMatchObject({ status: "paused" });
+    evidenceStore.writeArtifact({
+      id: release.id,
+      runId: "restored-approval-evidence",
+      path: release.declaredPath,
+      kind: release.kind,
+      contentType: release.contentType,
+      content: "Release two",
+      overwrite: true
+    });
+    const evidenceRun = evidenceStore.getRun("restored-approval-evidence")!;
+    const evidenceWaiting = structuredClone(evidenceRun.context.waiting) as Record<string, AgentFlowRunStateValue>;
+    evidenceWaiting.evidence = [{ path: unrelated.declaredPath, checksum: unrelated.checksum! }];
+    evidenceStore.updateRun("restored-approval-evidence", {
+      context: { ...evidenceRun.context, waiting: evidenceWaiting }
+    });
+
+    await expect(resumeAgentFlowCommandPipeline(
+      evidenceStore,
+      "restored-approval-evidence",
+      evidenceWorkflow,
+      { outcome: "approve" }
+    )).rejects.toMatchObject({ code: "AGENT_FLOW_RESUME_STATE" });
+    expect(evidenceStore.getRun("restored-approval-evidence")?.status).toBe("paused");
+    expect(evidenceStore.listApprovals("restored-approval-evidence")).toEqual([
+      expect.objectContaining({ status: "requested" })
+    ]);
+    evidenceStore.close();
   });
 
   test("persists a preflight failure for a malformed approval reviewer", async () => {
