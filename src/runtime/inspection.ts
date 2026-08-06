@@ -368,6 +368,10 @@ function appendExplainedStep(lines: string[], step: AgentFlowWorkflowStep, depth
       if (!isRecord(value)) {
         return;
       }
+      if (nonEmptyString(value.type) !== undefined) {
+        appendExplainedStep(lines, value as AgentFlowWorkflowStep, depth + 1);
+        return;
+      }
       const branchName = nonEmptyString(value.id) ?? String(index + 1);
       const details = namedScalarDetails(value, ["session", "strategy"]);
       lines.push(`${indent}  - branch ${branchName}${details.length === 0 ? "" : ` — ${details.join("; ")}`}`);

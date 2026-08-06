@@ -217,6 +217,7 @@ steps:
 `);
 
     const graph = buildAgentFlowWorkflowGraph(workflow);
+    const explanation = explainAgentFlowWorkflow(workflow);
 
     expect(graph.nodes).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: "approve", type: "approval", path: "steps[0].branches[0]" }),
@@ -233,6 +234,18 @@ steps:
       { from: "approve", to: "revise", kind: "on_reject" },
       { from: "approve", to: "terminal:cancel", kind: "on_cancel" }
     ]));
+    expect(explanation).toContain([
+      "    - approve [approval] — reviewer=reviewer",
+      "      reads: release.md",
+      "      writes: approvals/approve.json"
+    ].join("\n"));
+    expect(explanation).toContain([
+      "    - record [decision_record] — owner=owner; topic=Record the direct branch decision",
+      "      reads: release.md",
+      "      writes: decision-records/record.json"
+    ].join("\n"));
+    expect(explanation).not.toContain("- branch approve");
+    expect(explanation).not.toContain("- branch record");
   });
 
   test("renders advisory authority for sessions without stronger grants", () => {
