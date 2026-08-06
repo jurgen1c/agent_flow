@@ -33,8 +33,10 @@ describe("Agent Flow approval and decision record steps", () => {
       content: "Ship the durable decision contract."
     });
     const requests: AgentFlowSessionProviderRequest[] = [];
+    let approvalPromptContent: string | undefined;
     const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => {
       requests.push(request);
+      approvalPromptContent = request.prompt.content;
       return {
         outputs: {
           "approvals/approve.json": JSON.stringify({ status: "approved", decision: "The evidence satisfies the contract." })
@@ -67,6 +69,9 @@ describe("Agent Flow approval and decision record steps", () => {
         decision: "The evidence satisfies the contract."
       })
     ]);
+    expect(approvalPromptContent).toContain('{"status":"approved","decision":"non-empty rationale summary"}');
+    expect(approvalPromptContent).toContain('{"status":"rejected","decision":"non-empty rationale summary"}');
+    expect(approvalPromptContent).not.toContain('"approved|rejected"');
     const decisionArtifact = store.getArtifact("session-approval", "decision-records/record_decision.json");
     expect(decisionArtifact).toMatchObject({ kind: "decision_record", status: "available" });
     expect(JSON.parse(store.readArtifact("session-approval", decisionArtifact!.declaredPath).content.toString())).toEqual({

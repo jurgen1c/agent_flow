@@ -35,7 +35,7 @@ export function createAgentFlowApprovalPrompt(
     ...(message === undefined ? [] : [`Approval criteria: ${message}`]),
     "Inspect every supplied artifact and return one strict JSON object at the declared output path.",
     `Output path: ${output}`,
-    'Required shape: {"status":"approved|rejected","decision":"non-empty rationale summary"}',
+    'Return exactly one of these shapes: {"status":"approved","decision":"non-empty rationale summary"} or {"status":"rejected","decision":"non-empty rationale summary"}',
     "Do not include Markdown fences or additional keys.",
     `Artifacts: ${artifacts.join(", ")}`,
     ""
