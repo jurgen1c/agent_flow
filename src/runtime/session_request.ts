@@ -343,6 +343,15 @@ async function executeAgentFlowSessionStep(
     kind === "session_request" ? resolveSessionInputPaths(rawInputs, run.inputs, stepId) : rawInputs,
     `${label} ${stepId} ${kind === "session_request" ? "inputs" : "artifacts"}`
   );
+  if (kind === "approval") {
+    const evidenceCollision = outputPaths.find((outputPath) => inputPaths.includes(outputPath));
+    if (evidenceCollision !== undefined) {
+      throw new AgentFlowSessionRequestError(
+        `Approval output must not overwrite evidence artifact ${evidenceCollision}.`,
+        "AGENT_FLOW_SESSION_OUTPUT_COLLISION"
+      );
+    }
+  }
   if (inputPaths.length > MAX_AGENT_FLOW_SESSION_INPUTS) {
     throw new AgentFlowSessionRequestError(
       `${label} ${stepId} declares ${inputPaths.length} inputs; at most ${MAX_AGENT_FLOW_SESSION_INPUTS} are allowed.`,
@@ -954,19 +963,11 @@ function findWorkflowStep(steps: AgentFlowWorkflowStep[], stepId: string): Agent
       const found = findWorkflowStep(nested, stepId);
       if (found !== undefined) return found;
     }
-    if (Array.isArray(step.branches)) {
-      for (const branch of step.branches) {
-        const branchMapping = mapping(branch);
-        if (branchMapping === undefined) continue;
-        for (const field of ["body", "steps"] as const) {
-          const nested = Array.isArray(branchMapping[field])
-            ? (branchMapping[field] as unknown[]).filter((entry): entry is AgentFlowWorkflowStep => mapping(entry) !== undefined)
-            : [];
-          const found = findWorkflowStep(nested, stepId);
-          if (found !== undefined) return found;
-        }
-      }
-    }
+    const branches = Array.isArray(step.branches)
+      ? (step.branches as unknown[]).filter((entry): entry is AgentFlowWorkflowStep => mapping(entry) !== undefined)
+      : [];
+    const found = findWorkflowStep(branches, stepId);
+    if (found !== undefined) return found;
   }
   return undefined;
 }

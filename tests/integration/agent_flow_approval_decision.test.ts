@@ -557,6 +557,78 @@ steps:
       .some((candidate) => decisionArtifactPath.test(candidate))).toBe(false);
   });
 
+  test("rejects approval and decision outputs that overwrite their own evidence", async () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: evidence-output-collisions
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  owner: { provider: fixture }
+steps:
+  - { id: approve, type: approval, reviewer: human, artifacts: [approvals/approve.json], overwrite: true }
+  - { id: record, type: decision_record, owner: owner, topic: Preserve evidence, artifacts: [source.md], output: source.md, overwrite: true }
+  - { id: record_default, type: decision_record, owner: owner, topic: Preserve default evidence, artifacts: [decision-records/record_default.json], overwrite: true }
+`);
+
+    expect(validateAgentFlowWorkflow(workflow).errors).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: "workflow.approval.output.evidence_collision",
+        path: "steps[0].output"
+      }),
+      expect.objectContaining({
+        code: "workflow.decision_record.output.evidence_collision",
+        path: "steps[1].output"
+      }),
+      expect.objectContaining({
+        code: "workflow.decision_record.output.evidence_collision",
+        path: "steps[2].output"
+      })
+    ]));
+    const simulated = simulateAgentFlowWorkflow(workflow, {
+      artifacts: { "approvals/approve.json": "Evidence", "source.md": "Source" },
+      steps: { approve: { input: "approve" } }
+    });
+    expect(simulated.status).toBe("unresolved");
+    expect(simulated.visitedSteps[0]).toMatchObject({ id: "approve", outcome: "failed" });
+
+    for (const [runId, step] of [
+      ["approval-evidence-collision", workflow.steps[0]!],
+      ["decision-evidence-collision", workflow.steps[1]!],
+      ["decision-default-evidence-collision", workflow.steps[2]!]
+    ] as const) {
+      const root = temporaryRepo();
+      const runtimeWorkflow = structuredClone(workflow);
+      runtimeWorkflow.steps = [structuredClone(step)];
+      const store = await openAgentFlowRunState({ cwd: root });
+      store.createRunWithEvent({
+        id: runId,
+        workflow: {
+          name: runtimeWorkflow.name,
+          version: runtimeWorkflow.version,
+          style: runtimeWorkflow.style,
+          maturity: runtimeWorkflow.maturity
+        },
+        context: { workflow: runtimeWorkflow as unknown as AgentFlowRunStateValue }
+      }, { type: "run.created", payload: { status: "pending" } });
+      const evidencePath = String(runtimeWorkflow.steps[0]!.artifacts![0]);
+      store.writeArtifact({
+        id: `evidence:${runId}`,
+        runId,
+        path: evidencePath,
+        kind: "fixture",
+        contentType: "text/plain",
+        content: "Original evidence"
+      });
+
+      const result = await executeAgentFlowCommandPipeline(store, runId, runtimeWorkflow);
+
+      expect(result).toMatchObject({ status: "failed", failedStep: runtimeWorkflow.steps[0]!.id });
+      expect(result.message).toContain("must not overwrite evidence artifact");
+      expect(store.readArtifact(runId, evidencePath).content.toString()).toBe("Original evidence");
+      store.close();
+    }
+  });
+
   test("fails runtime execution for noncanonical decision paths and duplicate participants", async () => {
     const scenarios = [
       {
@@ -773,6 +845,72 @@ steps:
     expect(result.record).toMatchObject({ decision_id: "decision:record", topic: "Persisted decision" });
     expect(result.artifact.declaredPath).toBe("decision-records/record.json");
     store.close();
+  });
+
+  test("executes specialized steps declared directly in parallel branches", async () => {
+    const decisionRoot = temporaryRepo();
+    const decisionWorkflow = parseAgentFlowWorkflowOrThrow(`name: direct-parallel-decision
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  owner: { provider: fixture }
+steps:
+  - { id: prepare, type: command, command: "printf Source > source.md", outputs: [source.md], then: record }
+  - id: parallel_work
+    type: parallel
+    branches:
+      - { id: record, type: decision_record, session: owner, owner: owner, topic: Direct branch decision, artifacts: [source.md] }
+`);
+    expect(validateAgentFlowWorkflow(decisionWorkflow)).toEqual({ valid: true, errors: [] });
+    const decisionStore = await openAgentFlowRunState({ cwd: decisionRoot });
+    createAgentFlowLifecycleRun(decisionStore, { id: "direct-parallel-decision", workflow: decisionWorkflow });
+
+    expect(await executeAgentFlowCommandPipeline(
+      decisionStore,
+      "direct-parallel-decision",
+      decisionWorkflow
+    )).toMatchObject({ status: "completed", completedSteps: ["prepare", "record"] });
+    expect(decisionStore.getArtifact(
+      "direct-parallel-decision",
+      "decision-records/record.json"
+    )).toMatchObject({ kind: "decision_record", status: "available" });
+    decisionStore.close();
+
+    const approvalRoot = temporaryRepo();
+    const approvalWorkflow = parseAgentFlowWorkflowOrThrow(`name: direct-parallel-approval
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  reviewer: { provider: fixture, authority: { can_approve: true } }
+steps:
+  - { id: prepare, type: command, command: "printf Evidence > evidence.md", outputs: [evidence.md], then: approve }
+  - id: parallel_work
+    type: parallel
+    branches:
+      - { id: approve, type: approval, session: reviewer, reviewer: reviewer, artifacts: [evidence.md] }
+`);
+    expect(validateAgentFlowWorkflow(approvalWorkflow)).toEqual({ valid: true, errors: [] });
+    const approvalStore = await openAgentFlowRunState({ cwd: approvalRoot });
+    createAgentFlowLifecycleRun(approvalStore, { id: "direct-parallel-approval", workflow: approvalWorkflow });
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => ({
+      outputs: {
+        "approvals/approve.json": JSON.stringify({ status: "approved", decision: "Evidence accepted." })
+      }
+    }));
+
+    expect(await executeAgentFlowCommandPipeline(
+      approvalStore,
+      "direct-parallel-approval",
+      approvalWorkflow,
+      undefined,
+      providers
+    )).toMatchObject({ status: "completed", completedSteps: ["prepare", "approve"] });
+    expect(approvalStore.listApprovals("direct-parallel-approval")).toEqual([
+      expect.objectContaining({ status: "approved", decidedBy: "reviewer" })
+    ]);
+    approvalStore.close();
   });
 
   test("replaces a human approval output when a bounded workflow revisits the step", async () => {

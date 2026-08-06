@@ -37,6 +37,12 @@ export function resolveAgentFlowDecisionRecordContract(
   const consulted = optionalUniqueTextList(step.consulted, `Decision record ${stepId} consulted sessions`);
   const approvedBy = optionalUniqueTextList(step.approved_by, `Decision record ${stepId} approvers`);
   const artifacts = requiredArtifactPathList(step.artifacts, `Decision record ${stepId} artifacts`);
+  const output = step.output === undefined
+    ? defaultAgentFlowDecisionRecordPath(stepId)
+    : requiredArtifactPath(step.output, `Decision record ${stepId} output`);
+  if (artifacts.includes(output)) {
+    throw new Error(`Decision record ${stepId} output must not overwrite evidence artifact ${output}.`);
+  }
   const sessions = new Set(Object.keys(workflow.sessions ?? {}));
   for (const [label, actors] of [["owner", [owner]], ["consulted", consulted], ["approved_by", approvedBy]] as const) {
     const undeclared = actors.find((actor) => !sessions.has(actor));
@@ -55,9 +61,7 @@ export function resolveAgentFlowDecisionRecordContract(
     consulted,
     approved_by: approvedBy,
     artifacts,
-    output: step.output === undefined
-      ? defaultAgentFlowDecisionRecordPath(stepId)
-      : requiredArtifactPath(step.output, `Decision record ${stepId} output`)
+    output
   };
 }
 
@@ -179,18 +183,11 @@ function findWorkflowStep(steps: AgentFlowWorkflowStep[], stepId: string): Agent
       const found = findWorkflowStep(nested, stepId);
       if (found !== undefined) return found;
     }
-    if (!Array.isArray(step.branches)) continue;
-    for (const branch of step.branches) {
-      const branchMapping = mapping(branch);
-      if (branchMapping === undefined) continue;
-      for (const field of ["body", "steps"] as const) {
-        const nested = Array.isArray(branchMapping[field])
-          ? (branchMapping[field] as unknown[]).filter((entry): entry is AgentFlowWorkflowStep => mapping(entry) !== undefined)
-          : [];
-        const found = findWorkflowStep(nested, stepId);
-        if (found !== undefined) return found;
-      }
-    }
+    const branches = Array.isArray(step.branches)
+      ? (step.branches as unknown[]).filter((entry): entry is AgentFlowWorkflowStep => mapping(entry) !== undefined)
+      : [];
+    const found = findWorkflowStep(branches, stepId);
+    if (found !== undefined) return found;
   }
   return undefined;
 }

@@ -403,6 +403,12 @@ function runStep(step: AgentFlowWorkflowStep, state: SimulationState, insideLoop
 
   state.visitedSteps.push({ id, type, outcome: type === "condition" && outcome === "succeeded" ? "selected" : outcome });
   checkInputs(step, id, state);
+  const evidenceCollision = evidenceBoundOutputCollision(step, id);
+  if (evidenceCollision !== undefined) {
+    state.visitedSteps.at(-1)!.outcome = "failed";
+    addUnresolved(state, id, `${type === "approval" ? "Approval" : "Decision record"} output must not overwrite evidence artifact ${evidenceCollision}.`);
+    return { kind: "terminal", status: "unresolved" };
+  }
 
   if (type === "parallel_branch" && nonEmptyString(step.session) !== undefined) {
     const budgetControl = simulationModelBudgetControl(step, id, state);
@@ -1272,6 +1278,17 @@ function hasMissingDeclaredArtifacts(step: AgentFlowWorkflowStep, state: Simulat
   return Array.isArray(step.artifacts) && step.artifacts
     .flatMap((value) => artifactName(value, state))
     .some((artifact) => !state.artifacts.has(artifact));
+}
+
+function evidenceBoundOutputCollision(step: AgentFlowWorkflowStep, stepId: string): string | undefined {
+  const type = nonEmptyString(step.type);
+  if (type !== "approval" && type !== "decision_record") return undefined;
+  const output = canonicalArtifactName(nonEmptyString(step.output)
+    ?? (type === "approval" ? defaultAgentFlowApprovalOutputPath(stepId) : defaultAgentFlowDecisionRecordPath(stepId)));
+  return Array.isArray(step.artifacts)
+    ? step.artifacts.flatMap((value) => typeof value === "string" ? [canonicalArtifactName(value)] : [])
+      .find((artifact) => artifact === output)
+    : undefined;
 }
 
 function recordOutputs(

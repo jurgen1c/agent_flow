@@ -1729,6 +1729,19 @@ function validateArtifactPaths(contexts: StepContext[], errors: AgentFlowWorkflo
             `${label} output must be a normalized static repo-relative path.`);
         }
       }
+      const effectiveOutput = context.step.output === undefined
+        ? context.id === undefined ? undefined
+          : context.type === "approval"
+            ? defaultAgentFlowApprovalOutputPath(context.id)
+            : defaultAgentFlowDecisionRecordPath(context.id)
+        : typeof context.step.output === "string" ? context.step.output : undefined;
+      const normalizedOutput = effectiveOutput === undefined
+        ? undefined
+        : normalizedStaticArtifactPath(effectiveOutput);
+      if (normalizedOutput !== undefined && seen.has(normalizedOutput)) {
+        addStepIssue(errors, context, `workflow.${context.type}.output.evidence_collision`, "output",
+          `${label} output must not overwrite evidence artifact "${normalizedOutput}".`);
+      }
       continue;
     }
     if (context.type === "mcp_call") {

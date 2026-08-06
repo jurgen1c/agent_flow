@@ -4586,6 +4586,12 @@ function validateApprovalStep(workflow: AgentFlowWorkflow, step: AgentFlowWorkfl
       && (typeof step.output !== "string" || !normalizedStaticCollaborationArtifactPath(step.output))) {
     return "Approval output must use a normalized static artifact path.";
   }
+  const approvalOutput = typeof step.output === "string"
+    ? step.output
+    : defaultAgentFlowApprovalOutputPath(typeof step.id === "string" ? step.id.trim() : "");
+  if ((step.artifacts as string[]).includes(approvalOutput)) {
+    return `Approval output must not overwrite evidence artifact ${approvalOutput}.`;
+  }
   if (step.outputs !== undefined) return "Approval steps do not support plural outputs.";
   if (step.message !== undefined && (typeof step.message !== "string" || step.message.trim().length === 0)) {
     return "Approval message must be non-empty text when declared.";
@@ -4617,6 +4623,12 @@ function validateDecisionRecordStep(step: AgentFlowWorkflowStep): string | undef
   if (step.rationale_summary !== undefined
       && (typeof step.rationale_summary !== "string" || step.rationale_summary.trim().length === 0)) {
     return "Decision record rationale_summary must be non-empty text when declared.";
+  }
+  const decisionOutput = typeof step.output === "string"
+    ? step.output
+    : defaultAgentFlowDecisionRecordPath(typeof step.id === "string" ? step.id.trim() : "");
+  if (Array.isArray(step.artifacts) && step.artifacts.includes(decisionOutput)) {
+    return `Decision record output must not overwrite evidence artifact ${decisionOutput}.`;
   }
   return undefined;
 }
