@@ -259,16 +259,17 @@ function collectStepList(
   nodes: AgentFlowWorkflowGraphNode[],
   edges: AgentFlowWorkflowGraphEdge[],
   locatedSteps: LocatedStep[],
-  parent?: { id: string; label: string }
+  parent?: { id: string; label: string; kind?: string },
+  indexOffset = 0
 ): void {
   const ids = steps.map((step) => nonEmptyString(step.id));
   const first = ids.find(isString);
   if (parent !== undefined && first !== undefined) {
-    edges.push({ from: parent.id, to: first, kind: "contains", label: parent.label });
+    edges.push({ from: parent.id, to: first, kind: parent.kind ?? "contains", label: parent.label });
   }
 
   steps.forEach((step, index) => {
-    const stepPath = `${path}[${index}]`;
+    const stepPath = `${path}[${index + indexOffset}]`;
     const id = nonEmptyString(step.id);
     const type = nonEmptyString(step.type) ?? "unknown";
     if (id === undefined) {
@@ -305,6 +306,18 @@ function collectStepList(
         const branchId = `${id}.branch.${branchName}`;
         const branchPath = `${stepPath}.branches[${branchIndex}]`;
         const branchLabel = namedScalarDetails(value, ["session", "strategy"]).join("; ");
+        if (nonEmptyString(value.type) !== undefined) {
+          collectStepList(
+            [value as AgentFlowWorkflowStep],
+            `${stepPath}.branches`,
+            nodes,
+            edges,
+            locatedSteps,
+            { id, label: branchName, kind: "branch" },
+            branchIndex
+          );
+          return;
+        }
         nodes.push({ id: branchId, type: "parallel_branch", path: branchPath, ...(branchLabel.length === 0 ? {} : { label: branchLabel }) });
         edges.push({ from: id, to: branchId, kind: "branch", label: branchName });
 
