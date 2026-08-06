@@ -1,9 +1,11 @@
+import { isDeepStrictEqual } from "node:util";
 import {
+  AgentFlowRunStateError,
   normalizeAgentFlowArtifactPath,
   type AgentFlowArtifactRecord,
   type AgentFlowRunStateStore
 } from "./run_state";
-import type { AgentFlowWorkflow, AgentFlowWorkflowStep } from "./workflow";
+import type { AgentFlowWorkflow, AgentFlowWorkflowStep, AgentFlowYamlMapping } from "./workflow";
 
 export interface AgentFlowDecisionRecord {
   decision_id: string;
@@ -65,8 +67,24 @@ export function executeAgentFlowDecisionRecord(
   step: AgentFlowWorkflowStep,
   workflow?: AgentFlowWorkflow
 ): { record: AgentFlowDecisionRecord; artifact: AgentFlowArtifactRecord } {
-  const persistedWorkflow = workflow ?? store.getRun(runId)?.context.workflow as unknown as AgentFlowWorkflow | undefined;
-  if (persistedWorkflow === undefined) throw new Error(`Decision record workflow for run ${runId} is unavailable.`);
+  const run = store.getRun(runId);
+  const persistedValue = run?.context.workflow;
+  if (run === null || mapping(persistedValue) === undefined) {
+    throw new AgentFlowRunStateError(
+      `Decision record workflow for run ${runId} is unavailable.`,
+      "AGENT_FLOW_DECISION_RECORD_WORKFLOW_MISMATCH"
+    );
+  }
+  const persistedWorkflow = persistedValue as unknown as AgentFlowWorkflow;
+  const stepId = requiredText(step.id, "Decision record step ID");
+  const declaredStep = findWorkflowStep(persistedWorkflow.steps, stepId);
+  if ((workflow !== undefined && !isDeepStrictEqual(workflow, persistedWorkflow))
+      || declaredStep === undefined || !isDeepStrictEqual(declaredStep, step)) {
+    throw new AgentFlowRunStateError(
+      `Decision record ${stepId} must match a step in the workflow persisted for run ${runId}.`,
+      "AGENT_FLOW_DECISION_RECORD_WORKFLOW_MISMATCH"
+    );
+  }
   const contract = resolveAgentFlowDecisionRecordContract(persistedWorkflow, step);
   const evidence = contract.artifacts.map((artifactPath) => store.readArtifact(runId, artifactPath).artifact);
   if (evidence.some((artifact) => artifact.checksum === null)) {
@@ -143,4 +161,36 @@ function requiredArtifactPath(value: unknown, label: string): string {
 
 function safePathSegment(value: string): string {
   return value.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "decision";
+}
+
+function mapping(value: unknown): AgentFlowYamlMapping | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as AgentFlowYamlMapping
+    : undefined;
+}
+
+function findWorkflowStep(steps: AgentFlowWorkflowStep[], stepId: string): AgentFlowWorkflowStep | undefined {
+  for (const step of steps) {
+    if (typeof step.id === "string" && step.id.trim() === stepId) return step;
+    for (const field of ["body", "steps"] as const) {
+      const nested = Array.isArray(step[field])
+        ? (step[field] as unknown[]).filter((entry): entry is AgentFlowWorkflowStep => mapping(entry) !== undefined)
+        : [];
+      const found = findWorkflowStep(nested, stepId);
+      if (found !== undefined) return found;
+    }
+    if (!Array.isArray(step.branches)) continue;
+    for (const branch of step.branches) {
+      const branchMapping = mapping(branch);
+      if (branchMapping === undefined) continue;
+      for (const field of ["body", "steps"] as const) {
+        const nested = Array.isArray(branchMapping[field])
+          ? (branchMapping[field] as unknown[]).filter((entry): entry is AgentFlowWorkflowStep => mapping(entry) !== undefined)
+          : [];
+        const found = findWorkflowStep(nested, stepId);
+        if (found !== undefined) return found;
+      }
+    }
+  }
+  return undefined;
 }

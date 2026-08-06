@@ -5,7 +5,9 @@ import path from "node:path";
 import {
   createAgentFlowLifecycleRun,
   createAgentFlowSessionProviderRegistry,
+  executeAgentFlowApproval,
   executeAgentFlowCommandPipeline,
+  executeAgentFlowDecisionRecord,
   lintAgentFlowWorkflow,
   openAgentFlowRunState,
   parseAgentFlowWorkflowOrThrow,
@@ -306,6 +308,54 @@ steps:
       expect.objectContaining({ classification: "session_request_policy", stepId: "approve" })
     ]);
     store.close();
+  });
+
+  test("enforces approval authority at the exported direct executor", async () => {
+    const unauthorized = sessionApprovalWorkflow();
+    (unauthorized.sessions!.reviewer as Record<string, unknown>).authority = { can_approve: false };
+    const interactive = humanApprovalWorkflow();
+    interactive.sessions = {
+      human: { provider: "fixture", authority: { can_approve: true } }
+    };
+    const scenarios = [
+      { runId: "direct-approval-unauthorized", workflow: unauthorized, message: "can_approve authority" },
+      { runId: "direct-approval-human", workflow: interactive, message: "interactive approval runtime" }
+    ];
+
+    for (const scenario of scenarios) {
+      const root = temporaryRepo();
+      const store = await openAgentFlowRunState({ cwd: root });
+      store.createRun({
+        id: scenario.runId,
+        status: "running",
+        workflow: {
+          name: scenario.workflow.name,
+          version: scenario.workflow.version,
+          style: scenario.workflow.style,
+          maturity: scenario.workflow.maturity
+        },
+        context: { workflow: scenario.workflow as unknown as AgentFlowRunStateValue }
+      });
+      let called = false;
+      const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+        called = true;
+        return { outputs: {} };
+      });
+
+      await expect(executeAgentFlowApproval(
+        store,
+        scenario.runId,
+        scenario.workflow,
+        scenario.workflow.steps[0]!,
+        providers
+      )).rejects.toMatchObject({
+        code: "AGENT_FLOW_SESSION_AUTHORITY",
+        message: expect.stringContaining(scenario.message)
+      });
+      expect(called).toBe(false);
+      expect(store.listApprovals(scenario.runId)).toEqual([]);
+      store.close();
+    }
   });
 
   test("bounds session approval failure policies before invoking a provider", async () => {
@@ -675,6 +725,53 @@ steps:
     expect(await executeAgentFlowCommandPipeline(store, "decision-overwrite", workflow)).toMatchObject({ status: "completed" });
     expect(JSON.parse(store.readArtifact("decision-overwrite", "decisions/current.json").content.toString()))
       .toMatchObject({ decision_id: "decision:record", owner: "owner" });
+    store.close();
+  });
+
+  test("binds the exported decision executor to its persisted workflow and step", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: direct-decision-contract
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  owner: { provider: fixture }
+steps:
+  - { id: record, type: decision_record, owner: owner, topic: Persisted decision, artifacts: [source.md] }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    store.createRun({
+      id: "direct-decision-contract",
+      status: "running",
+      workflow: { name: workflow.name, version: workflow.version, style: workflow.style, maturity: workflow.maturity },
+      context: { workflow: workflow as unknown as AgentFlowRunStateValue }
+    });
+    store.writeArtifact({
+      id: "source",
+      runId: "direct-decision-contract",
+      path: "source.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Source"
+    });
+    const changedWorkflow = structuredClone(workflow);
+    changedWorkflow.steps[0]!.topic = "Fabricated decision";
+    const alteredStep = structuredClone(workflow.steps[0]!);
+    alteredStep.overwrite = true;
+
+    expect(() => executeAgentFlowDecisionRecord(
+      store, "direct-decision-contract", changedWorkflow.steps[0]!, changedWorkflow
+    )).toThrow("must match a step in the workflow persisted");
+    expect(() => executeAgentFlowDecisionRecord(
+      store, "direct-decision-contract", alteredStep, workflow
+    )).toThrow("must match a step in the workflow persisted");
+    expect(store.getArtifact("direct-decision-contract", "decision-records/record.json")).toBeNull();
+
+    const result = executeAgentFlowDecisionRecord(
+      store, "direct-decision-contract", workflow.steps[0]!, workflow
+    );
+    expect(result.record).toMatchObject({ decision_id: "decision:record", topic: "Persisted decision" });
+    expect(result.artifact.declaredPath).toBe("decision-records/record.json");
     store.close();
   });
 

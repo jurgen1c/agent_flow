@@ -270,6 +270,20 @@ async function executeAgentFlowSessionStep(
       "AGENT_FLOW_SESSION_UNDECLARED"
     );
   }
+  if (kind === "approval") {
+    if (sessionId === "human") {
+      throw new AgentFlowSessionRequestError(
+        `Approval ${stepId} with reviewer human must use the interactive approval runtime.`,
+        "AGENT_FLOW_SESSION_AUTHORITY"
+      );
+    }
+    if (mapping(session.authority)?.can_approve !== true) {
+      throw new AgentFlowSessionRequestError(
+        `Approval reviewer ${sessionId} must explicitly declare can_approve authority.`,
+        "AGENT_FLOW_SESSION_AUTHORITY"
+      );
+    }
+  }
   const provider = requiredName(session.provider, `Session ${sessionId} provider`);
   const adapter = registry.get(provider);
   if (adapter === undefined) {
