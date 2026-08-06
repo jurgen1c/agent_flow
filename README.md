@@ -4,9 +4,9 @@ Agent Flow is a standalone, persistent workflow runtime and CLI for
 policy-aware agent pipelines.
 
 It validates and simulates workflow YAML, runs command, MCP, session-request,
-formal review, condition, and artifact-transform steps, persists lifecycle
-state in SQLite, and records artifacts, failures, notifications, and retention
-outcomes.
+formal review, approval, decision-record, condition, and artifact-transform
+steps, persists lifecycle state in SQLite, and records artifacts, failures,
+notifications, and retention outcomes.
 
 ## Install
 
@@ -68,8 +68,10 @@ injected into an active recovery session marks it dirty and reruns the provider
 with a persisted `recovery-context/injected.md` input.
 
 Programmatic CLI routing is exported from `@jurgen1c/agent-flow/cli`.
-Schemas are exported from `@jurgen1c/agent-flow/schemas/challenge`,
+Schemas are exported from `@jurgen1c/agent-flow/schemas/approval`,
+`@jurgen1c/agent-flow/schemas/challenge`,
 `@jurgen1c/agent-flow/schemas/config`, `@jurgen1c/agent-flow/schemas/consult`,
+`@jurgen1c/agent-flow/schemas/decision-record`,
 `@jurgen1c/agent-flow/schemas/failure-classification`,
 `@jurgen1c/agent-flow/schemas/review`, and
 `@jurgen1c/agent-flow/schemas/workflow`.
@@ -87,6 +89,11 @@ with one static question and explicit input artifacts. Consults publish advice
 and recommendations and may block only when both the step and target authority
 allow it. Challenges persist an answered or unresolved rationale. Both result
 types are strict JSON artifacts and malformed provider output fails closed.
+Approval steps either invoke a declared session with `can_approve: true` or
+pause for `reviewer: human`; both paths persist the outcome in run state.
+Decision-record steps publish durable JSON under `decision-records/` by
+default, validate every referenced artifact at execution time, and are exempt
+from default retention deletion.
 
 ## Architecture
 

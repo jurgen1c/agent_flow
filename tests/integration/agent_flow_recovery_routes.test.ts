@@ -535,6 +535,63 @@ retention:
     store.close();
   });
 
+  test("promotes implicit approval and decision record outputs from nested recovery", async () => {
+    const root = temporaryRepo();
+    const parent = parseAgentFlowWorkflowOrThrow(`name: implicit-output-parent
+version: 1
+style: recovery_pipeline
+maturity: experimental
+limits: { max_recovery_cycles: 1 }
+steps:
+  - id: check
+    type: command
+    command: exit 1
+    on_failure:
+      route_to: { workflow: implicit-output-child, file_scope: { include: [evidence.md] } }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+    const child = parseAgentFlowWorkflowOrThrow(`name: implicit-output-child
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  reviewer:
+    provider: fixture
+    authority: { can_approve: true }
+steps:
+  - { id: evidence, type: command, command: echo evidence > evidence.md, outputs: [evidence.md] }
+  - { id: approve, type: approval, reviewer: reviewer, artifacts: [evidence.md] }
+  - { id: record, type: decision_record, owner: reviewer, topic: Recovery approved, artifacts: [approvals/approve.json] }
+  - { id: done, type: result, status: remediated }
+`);
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => ({
+      outputs: {
+        "approvals/approve.json": JSON.stringify({ status: "approved", decision: "Recovery evidence is valid." })
+      }
+    }));
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "implicit-output-parent", workflow: parent });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      "implicit-output-parent",
+      parent,
+      undefined,
+      providers,
+      undefined,
+      undefined,
+      createAgentFlowWorkflowRegistry().register("implicit-output-child", child)
+    );
+
+    expect(result).toMatchObject({ status: "completed" });
+    expect(store.getArtifact("implicit-output-parent", "approvals/approve.json")?.metadata)
+      .toMatchObject({ recoveryRunId: expect.any(String) });
+    expect(store.getArtifact("implicit-output-parent", "decision-records/record.json")?.metadata)
+      .toMatchObject({ recoveryRunId: expect.any(String) });
+    store.close();
+  });
+
   test("does not notify completion when nested output promotion fails", async () => {
     const root = temporaryRepo();
     const parent = parseAgentFlowWorkflowOrThrow(`name: promotion-failure-parent

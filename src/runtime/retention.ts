@@ -102,6 +102,7 @@ export function applyAgentFlowRetention(
       artifact.status !== "missing"
       && artifact.kind !== "failure_payload"
       && artifact.kind !== "failure_attachment"
+      && artifact.kind !== "decision_record"
       && deletions.some((pattern) => matchesPolicyGlob(artifact.declaredPath, pattern))
       && !keep.some((pattern) => matchesPolicyGlob(artifact.declaredPath, pattern))
     )

@@ -401,6 +401,27 @@ steps:
     ]));
   });
 
+  test("renders implicit approval rejection and human cancellation outcomes", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: implicit-approval-outcomes
+version: 1
+style: collaborative
+maturity: experimental
+sessions:
+  reviewer: { provider: fixture, authority: { can_approve: true } }
+steps:
+  - { id: session_approval, type: approval, reviewer: reviewer, artifacts: [spec.md] }
+  - { id: human_approval, type: approval, reviewer: human, artifacts: [release.md] }
+  - { id: done, type: result, status: completed }
+`);
+
+    expect(buildAgentFlowWorkflowGraph(workflow).edges).toEqual(expect.arrayContaining([
+      { from: "session_approval", to: "terminal:cancel", kind: "on_reject" },
+      { from: "human_approval", to: "terminal:cancel", kind: "on_reject" },
+      { from: "human_approval", to: "terminal:cancel", kind: "on_cancel" }
+    ]));
+  });
+
   test("does not confuse shell-style target text with Agent Flow interpolation", () => {
     const workflow = parseAgentFlowWorkflowOrThrow(`
 name: target-syntax

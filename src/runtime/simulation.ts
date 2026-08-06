@@ -22,6 +22,8 @@ import {
 } from "./condition";
 import { AgentFlowFailureClassificationError } from "./failure_classification";
 import { parseAgentFlowReviewResult } from "./review";
+import { defaultAgentFlowApprovalOutputPath, parseAgentFlowApprovalResult } from "./approval";
+import { defaultAgentFlowDecisionRecordPath, resolveAgentFlowDecisionRecordContract } from "./decision_record";
 import { parseAgentFlowChallengeResult, parseAgentFlowConsultResult } from "./collaboration";
 import {
   agentFlowAmbiguousSuccessTargetMessage,
@@ -415,7 +417,8 @@ function runStep(step: AgentFlowWorkflowStep, state: SimulationState, insideLoop
     if (type === "artifact_transform") {
       return failureControl(step, stepFixture, id, state);
     }
-    if (["challenge", "consult", "review", "session_request"].includes(type)) {
+    if (["challenge", "consult", "review", "session_request"].includes(type)
+        || (type === "approval" && nonEmptyString(step.reviewer) !== "human")) {
       return simulateSessionRequestStep(step, stepFixture, id, state, true);
     }
     if (type === "mcp_call") {
@@ -428,7 +431,8 @@ function runStep(step: AgentFlowWorkflowStep, state: SimulationState, insideLoop
     const transformControl = simulateTransformStep(step, stepFixture, id, state);
     if (transformControl.kind !== "done") return transformControl;
     state.retryAttempts.delete(id);
-  } else if (["challenge", "consult", "review", "session_request"].includes(type)) {
+  } else if (["challenge", "consult", "review", "session_request"].includes(type)
+      || (type === "approval" && nonEmptyString(step.reviewer) !== "human")) {
     const sessionControl = simulateSessionRequestStep(step, stepFixture, id, state, false);
     if (sessionControl.kind !== "done") return sessionControl;
     state.retryAttempts.delete(id);
@@ -452,12 +456,55 @@ function runStep(step: AgentFlowWorkflowStep, state: SimulationState, insideLoop
     }
     state.retryAttempts.delete(id);
     recordOutputs(step, stepFixture, id, state);
-  } else if (type !== "condition") {
+  } else if (type !== "condition" && type !== "decision_record"
+      && !(type === "approval" && nonEmptyString(step.reviewer) === "human")) {
     state.retryAttempts.delete(id);
     recordOutputs(step, stepFixture, id, state);
   }
 
   if (type === "condition") return conditionControl(step, id, state);
+  if (type === "approval") {
+    if (nonEmptyString(step.reviewer) === "human") {
+      if (hasMissingDeclaredArtifacts(step, state)) {
+        state.visitedSteps.at(-1)!.outcome = "failed";
+        return { kind: "terminal", status: "unresolved" };
+      }
+      const outcome = typeof stepFixture.input === "string" ? stepFixture.input.trim() : undefined;
+      if (outcome === undefined) {
+        state.terminalStates.push({ stepId: id, status: "paused" });
+        return { kind: "terminal", status: "paused" };
+      }
+      if (outcome !== "approve" && outcome !== "reject" && outcome !== "cancel") {
+        addUnresolved(state, id, "Approval fixture input must be one of: approve, reject, cancel.");
+        return { kind: "terminal", status: "unresolved" };
+      }
+      const target = outcome === "approve" ? staticTarget(step.on_approve)
+        : outcome === "reject" ? staticTarget(step.on_reject) ?? "cancel"
+          : staticTarget(step.on_cancel) ?? "cancel";
+      if (outcome === "approve" || outcome === "reject") {
+        const output = canonicalArtifactName(nonEmptyString(step.output) ?? defaultAgentFlowApprovalOutputPath(id));
+        if (state.artifacts.has(output) && state.artifactProducers.get(output) !== id && step.overwrite !== true) {
+          const visitRecord = state.visitedSteps.at(-1);
+          if (visitRecord?.id === id && visitRecord.outcome === "succeeded") visitRecord.outcome = "failed";
+          addUnresolved(state, id, `Artifact ${output} already exists; declare overwrite: true to replace it during simulation.`);
+          return { kind: "terminal", status: "unresolved" };
+        }
+        state.artifacts.add(output);
+        state.artifactValues.set(output, {
+          status: outcome === "approve" ? "approved" : "rejected",
+          decision: outcome
+        });
+        markArtifactProduced(state, output, id);
+      }
+      return target === undefined ? { kind: "done" } : controlForTarget(target, id, state);
+    }
+    const output = canonicalArtifactName(nonEmptyString(step.output) ?? defaultAgentFlowApprovalOutputPath(id));
+    const value = state.artifactValues.get(output);
+    const approval = parseAgentFlowApprovalResult(typeof value === "string" ? value : `${JSON.stringify(value)}\n`, output);
+    const target = approval.status === "approved" ? staticTarget(step.on_approve)
+      : staticTarget(step.on_reject) ?? "cancel";
+    if (target !== undefined) return controlForTarget(target, id, state);
+  }
   if (type === "manual_gate") return gateControl(step, stepFixture, id, visit, state);
   if (type === "input_request") {
     if (stepFixture.input === undefined) {
@@ -471,6 +518,39 @@ function runStep(step: AgentFlowWorkflowStep, state: SimulationState, insideLoop
       state.artifactValues.set(artifact, stepFixture.input);
       markArtifactProduced(state, artifact, id);
     }
+  }
+  if (type === "decision_record") {
+    let contract: ReturnType<typeof resolveAgentFlowDecisionRecordContract>;
+    try {
+      contract = resolveAgentFlowDecisionRecordContract(state.workflow, step);
+    } catch {
+      state.visitedSteps.at(-1)!.outcome = "failed";
+      state.terminalStates.push({ stepId: id, status: "failed" });
+      return { kind: "terminal", status: "failed" };
+    }
+    if (hasMissingDeclaredArtifacts(step, state)) {
+      state.visitedSteps.at(-1)!.outcome = "failed";
+      return { kind: "terminal", status: "unresolved" };
+    }
+    const output = canonicalArtifactName(contract.output);
+    if (state.artifacts.has(output) && state.artifactProducers.get(output) !== id && step.overwrite !== true) {
+      const visitRecord = state.visitedSteps.at(-1);
+      if (visitRecord?.id === id && visitRecord.outcome === "succeeded") visitRecord.outcome = "failed";
+      addUnresolved(state, id, `Artifact ${output} already exists; declare overwrite: true to replace it during simulation.`);
+      return { kind: "terminal", status: "unresolved" };
+    }
+    state.artifacts.add(output);
+    state.artifactValues.set(output, {
+      decision_id: contract.decision_id,
+      owner: contract.owner,
+      topic: contract.topic,
+      rationale_summary: contract.rationale_summary,
+      consulted: contract.consulted,
+      approved_by: contract.approved_by,
+      artifacts: contract.artifacts,
+      created_at: "1970-01-01T00:00:00.000Z"
+    });
+    markArtifactProduced(state, output, id);
   }
   if (type === "loop") return loopControl(step, stepFixture, id, state);
   if (type === "parallel") return parallelControl(step, state, insideLoop);
@@ -534,7 +614,7 @@ function simulationModelBudgetControl(
   state: SimulationState
 ): SequenceControl | undefined {
   const actor = nonEmptyString(step.session)
-    ?? (step.type === "review" ? nonEmptyString(step.reviewer) : undefined)
+    ?? (step.type === "review" || step.type === "approval" ? nonEmptyString(step.reviewer) : undefined)
     ?? (step.type === "consult" || step.type === "challenge" ? nonEmptyString(step.to) : undefined);
   return simulationSessionBudgetControl(actor, stepId, state);
 }
@@ -600,10 +680,14 @@ function sameCommandOutputArtifact(
 
 function declaredOutputArtifacts(step: AgentFlowWorkflowStep): string[] {
   const outputs = [...(Array.isArray(step.outputs) ? step.outputs : []), step.output];
-  return outputs.flatMap((value) => {
+  const declared = outputs.flatMap((value) => {
     const name = nonEmptyString(value);
     return name === undefined ? [] : [canonicalArtifactName(name)];
   });
+  const id = nonEmptyString(step.id);
+  if (declared.length === 0 && id !== undefined && step.type === "approval") declared.push(defaultAgentFlowApprovalOutputPath(id));
+  if (declared.length === 0 && id !== undefined && step.type === "decision_record") declared.push(defaultAgentFlowDecisionRecordPath(id));
+  return declared;
 }
 
 function staticTarget(value: AgentFlowYamlValue | undefined): string | undefined {
@@ -702,7 +786,22 @@ function simulateSessionRequestStep(
   providerOutcomeFailed: boolean
 ): SequenceControl {
   const isReview = step.type === "review";
+  const isApproval = step.type === "approval";
   const isExchange = step.type === "consult" || step.type === "challenge";
+  if (isApproval) {
+    const reviewer = nonEmptyString(step.reviewer);
+    const session = reviewer === undefined ? undefined : state.workflow.sessions?.[reviewer];
+    const authority = isRecord(session) && isRecord(session.authority) ? session.authority : undefined;
+    if (authority?.can_approve !== true) {
+      return simulatedSessionFailure(
+        step,
+        fixture,
+        stepId,
+        state,
+        "Approval simulation reviewers must explicitly declare can_approve authority."
+      );
+    }
+  }
   if (step.type === "consult" && step.blocking === true) {
     const target = nonEmptyString(step.to);
     const session = target === undefined ? undefined : state.workflow.sessions?.[target];
@@ -717,7 +816,7 @@ function simulateSessionRequestStep(
       );
     }
   }
-  const declaredInputs = isReview || isExchange ? step.artifacts : step.inputs;
+  const declaredInputs = isApproval || isReview || isExchange ? step.artifacts : step.inputs;
   const resolvedInputs: string[] = [];
   for (const value of Array.isArray(declaredInputs) ? declaredInputs as AgentFlowYamlValue[] : []) {
     const name = nonEmptyString(value);
@@ -753,7 +852,9 @@ function simulateSessionRequestStep(
     );
   }
 
-  const rawOutputs = isExchange ? [step.output] : Array.isArray(step.outputs) ? step.outputs : [];
+  const rawOutputs = isExchange ? [step.output]
+    : isApproval ? [nonEmptyString(step.output) ?? defaultAgentFlowApprovalOutputPath(stepId)]
+      : Array.isArray(step.outputs) ? step.outputs : [];
   const declaredOutputs = new Set(
     rawOutputs
       .flatMap((output) => nonEmptyString(output) ?? [])
@@ -825,6 +926,14 @@ function simulateSessionRequestStep(
           error instanceof Error ? error.message : String(error)
         );
       }
+    }
+  } else if (isApproval) {
+    const output = [...declaredOutputs][0]!;
+    const value = providedOutputs.values.get(output);
+    try {
+      parseAgentFlowApprovalResult(typeof value === "string" ? value : `${JSON.stringify(value)}\n`, output);
+    } catch (error) {
+      return simulatedSessionFailure(step, fixture, stepId, state, error instanceof Error ? error.message : String(error));
     }
   } else if (step.type === "consult") {
     const output = [...declaredOutputs][0]!;
@@ -1159,21 +1268,19 @@ function checkInputs(step: AgentFlowWorkflowStep, stepId: string, state: Simulat
   }
 }
 
+function hasMissingDeclaredArtifacts(step: AgentFlowWorkflowStep, state: SimulationState): boolean {
+  return Array.isArray(step.artifacts) && step.artifacts
+    .flatMap((value) => artifactName(value, state))
+    .some((artifact) => !state.artifacts.has(artifact));
+}
+
 function recordOutputs(
   step: AgentFlowWorkflowStep,
   fixture: AgentFlowSimulationStepFixture,
   stepId: string,
   state: SimulationState
 ): void {
-  const declared = new Set<string>();
-  if (Array.isArray(step.outputs)) {
-    for (const value of step.outputs) {
-      const name = nonEmptyString(value);
-      if (name !== undefined) declared.add(canonicalArtifactName(name));
-    }
-  }
-  const singleOutput = nonEmptyString(step.output);
-  if (singleOutput !== undefined) declared.add(canonicalArtifactName(singleOutput));
+  const declared = new Set(declaredOutputArtifacts(step));
 
   let provided: Map<string, AgentFlowYamlValue | undefined>;
   if (Array.isArray(fixture.outputs)) {

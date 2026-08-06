@@ -121,7 +121,7 @@ Collaborative workflows use normal step types plus these collaboration patterns:
 | `approval` | Session or human approves/rejects |
 | `decision_record` | Persist a decision and owner |
 
-These can be represented as specialized step types or as `session_request` steps with required schemas.
+These are executable specialized step types with strict runtime contracts.
 
 ## 7. Implement and Review Example
 
@@ -270,7 +270,28 @@ Challenge questions follow the same single-question and 4096-byte bound.
 persisting a `challenge_output`. Malformed or missing rationale fails closed
 instead of starting a free-form debate.
 
-## 10. Decision Records
+## 10. Approvals
+
+Session approval invokes a declared session with explicit `can_approve`
+authority. The provider writes strict JSON to `output`, or to
+`approvals/<step-id>.json` when `output` is omitted:
+
+```yaml
+- id: approve_release
+  type: approval
+  reviewer: release_reviewer
+  artifacts: [release-notes.md]
+  on_approve: publish
+  on_reject: revise
+```
+
+The JSON result contains only `status` (`approved` or `rejected`) and a
+non-empty `decision`. Human approval uses `reviewer: human`; it pauses with
+`approve`, `reject`, and `cancel` outcomes and resumes through the same CLI
+interaction contract as a manual gate. Both paths persist their outcome in
+the run-state approval registry.
+
+## 11. Decision Records
 
 Every meaningful decision should be persisted.
 
@@ -291,8 +312,12 @@ Every meaningful decision should be persisted.
 ```
 
 Decision records are retained by default.
+The executable step accepts `owner`, `topic`, `artifacts`, and optional
+`rationale_summary`, `consulted`, `approved_by`, and `output`. It writes to
+`decision-records/<step-id>.json` by default and fails closed if any referenced
+artifact is unavailable.
 
-## 11. Parallel Collaboration
+## 12. Parallel Collaboration
 
 Parallel work is allowed when safe.
 
@@ -322,7 +347,7 @@ Rules:
 3. Read-only advisory sessions may run in parallel without file scopes.
 4. Parent workflow decides what to do if one branch fails.
 
-## 12. Approval Invalidation
+## 13. Approval Invalidation
 
 Approvals must be invalidated when relevant artifacts change.
 
@@ -343,7 +368,7 @@ approvals:
       - implementation-summary.md
 ```
 
-## 13. Disagreement Handling
+## 14. Disagreement Handling
 
 Disagreements must have a defined policy.
 
@@ -365,7 +390,7 @@ Supported strategies:
 | `owner_decides` | Artifact owner decides |
 | `fail` | End workflow |
 
-## 14. Collaboration Edge Cases
+## 15. Collaboration Edge Cases
 
 | Edge Case | Required Behavior |
 |---|---|
@@ -379,7 +404,7 @@ Supported strategies:
 | Arbiter disagrees with reviewer | Follow configured strategy |
 | Human injects new requirement | Mark affected decisions and approvals stale |
 
-## 15. Notifications
+## 16. Notifications
 
 Collaborative workflows should notify on:
 
@@ -401,7 +426,7 @@ notify:
     channels: [email_personal, terminal]
 ```
 
-## 16. Validation Rules
+## 17. Validation Rules
 
 Collaborative validation should enforce:
 
@@ -415,7 +440,7 @@ Collaborative validation should enforce:
 - Advisory sessions cannot block unless `can_block: true`.
 - Decision records are enabled for key approvals.
 
-## 17. Recommended Defaults
+## 18. Recommended Defaults
 
 For v1:
 

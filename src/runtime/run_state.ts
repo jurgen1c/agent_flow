@@ -271,6 +271,20 @@ export interface UpsertAgentFlowApprovalInput {
   decidedAt?: string;
 }
 
+export interface AgentFlowApprovalRecord {
+  id: string;
+  runId: string;
+  stepId: string | null;
+  status: AgentFlowApprovalStatus;
+  requestedBy: string | null;
+  decidedBy: string | null;
+  decision: string | null;
+  context: Record<string, AgentFlowRunStateValue>;
+  createdAt: string;
+  updatedAt: string;
+  decidedAt: string | null;
+}
+
 export interface UpsertAgentFlowBudgetInput {
   id: string;
   runId: string;
@@ -360,6 +374,20 @@ interface FailureRow {
   payload_json: string | null;
   created_at: string;
   resolved_at: string | null;
+}
+
+interface ApprovalRow {
+  run_id: string;
+  id: string;
+  step_id: string | null;
+  status: AgentFlowApprovalStatus;
+  requested_by: string | null;
+  decided_by: string | null;
+  decision: string | null;
+  context_json: string;
+  created_at: string;
+  updated_at: string;
+  decided_at: string | null;
 }
 
 const TERMINAL_RUN_STATUSES = new Set<AgentFlowRunStatus>(["completed", "failed", "cancelled"]);
@@ -1862,6 +1890,16 @@ export class AgentFlowRunStateStore {
     ]);
   }
 
+  listApprovals(runId: string): AgentFlowApprovalRecord[] {
+    this.assertOpen();
+    const normalizedRunId = requiredString(runId, "Run ID");
+    this.requireRun(normalizedRunId);
+    return this.database.all<ApprovalRow>(
+      "SELECT * FROM approvals WHERE run_id = ? ORDER BY created_at ASC, id ASC",
+      [normalizedRunId]
+    ).map(hydrateApproval);
+  }
+
   upsertBudget(input: UpsertAgentFlowBudgetInput): void {
     this.assertOpen();
     if (!Number.isFinite(input.limit) || input.limit < 0 || !Number.isFinite(input.used) || input.used < 0) {
@@ -2237,6 +2275,22 @@ function hydrateSession(row: SessionRow): AgentFlowSessionRecord {
     updatedAt: row.updated_at,
     startedAt: row.started_at,
     finishedAt: row.finished_at
+  };
+}
+
+function hydrateApproval(row: ApprovalRow): AgentFlowApprovalRecord {
+  return {
+    id: row.id,
+    runId: row.run_id,
+    stepId: row.step_id,
+    status: row.status,
+    requestedBy: row.requested_by,
+    decidedBy: row.decided_by,
+    decision: row.decision,
+    context: JSON.parse(row.context_json) as Record<string, AgentFlowRunStateValue>,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    decidedAt: row.decided_at
   };
 }
 

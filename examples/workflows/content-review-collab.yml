@@ -77,6 +77,8 @@ steps:
     type: decision_record
     owner: product
     topic: "Feature copy approved"
+    rationale_summary: "Product approved the copy against the feature brief."
+    approved_by: [product]
     artifacts:
       - content/feature-copy.md
       - reviews/product-copy-review.json

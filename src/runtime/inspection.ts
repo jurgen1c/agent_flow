@@ -7,6 +7,8 @@ import type {
 } from "./workflow";
 import { assertAgentFlowSuccessTargetsAreUnambiguous } from "./success_routing";
 import { normalizeRepoPattern } from "./policy_utils";
+import { defaultAgentFlowApprovalOutputPath } from "./approval";
+import { defaultAgentFlowDecisionRecordPath } from "./decision_record";
 
 export interface AgentFlowWorkflowGraphNode {
   id: string;
@@ -172,6 +174,16 @@ export function buildAgentFlowWorkflowGraph(workflow: AgentFlowWorkflow): AgentF
         const terminalId = `terminal:${option}`;
         nodes.push({ id: terminalId, type: "terminal", path: terminalId, label: option });
         edges.push({ from: source, to: terminalId, kind: "option", label: option });
+      }
+    }
+    if (step.type === "approval") {
+      if (!targets.some((target) => target.kind === "on_reject")) {
+        nodes.push({ id: "terminal:cancel", type: "terminal", path: "terminal:cancel", label: "cancel" });
+        edges.push({ from: source, to: "terminal:cancel", kind: "on_reject" });
+      }
+      if (nonEmptyString(step.reviewer) === "human" && !targets.some((target) => target.kind === "on_cancel")) {
+        nodes.push({ id: "terminal:cancel", type: "terminal", path: "terminal:cancel", label: "cancel" });
+        edges.push({ from: source, to: "terminal:cancel", kind: "on_cancel" });
       }
     }
   }
@@ -458,7 +470,13 @@ function collectDirectArtifacts(step: AgentFlowWorkflowStep, direction: "read" |
   }
   const output = nonEmptyString(step.output);
   const saveAs = step.type === "input_request" ? nonEmptyString(step.save_as) : undefined;
-  return [...stringValues(step.outputs), ...(output === undefined ? [] : [output]), ...(saveAs === undefined ? [] : [saveAs])];
+  const stepId = nonEmptyString(step.id);
+  const generated = output === undefined && stepId !== undefined
+    ? step.type === "approval" ? defaultAgentFlowApprovalOutputPath(stepId)
+      : step.type === "decision_record" ? defaultAgentFlowDecisionRecordPath(stepId) : undefined
+    : undefined;
+  const outputs = step.type === "approval" || step.type === "decision_record" ? [] : stringValues(step.outputs);
+  return [...outputs, ...(output === undefined ? generated === undefined ? [] : [generated] : [output]), ...(saveAs === undefined ? [] : [saveAs])];
 }
 
 function appendNamedValues(lines: string[], values: Record<string, AgentFlowYamlValue> | undefined): void {

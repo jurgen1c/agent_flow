@@ -89,10 +89,24 @@ export {
   createAgentFlowFixtureSessionProvider,
   createAgentFlowSessionProviderRegistry,
   executeAgentFlowChallenge,
+  executeAgentFlowApproval,
   executeAgentFlowConsult,
   executeAgentFlowReview,
   executeAgentFlowSessionRequest
 } from "./session_request";
+export {
+  AGENT_FLOW_APPROVAL_STATUSES,
+  AgentFlowApprovalError,
+  createAgentFlowApprovalPrompt,
+  defaultAgentFlowApprovalOutputPath,
+  parseAgentFlowApprovalResult
+} from "./approval";
+export type { AgentFlowApprovalResult, AgentFlowApprovalResultStatus } from "./approval";
+export {
+  defaultAgentFlowDecisionRecordPath,
+  executeAgentFlowDecisionRecord
+} from "./decision_record";
+export type { AgentFlowDecisionRecord } from "./decision_record";
 export {
   AGENT_FLOW_REVIEW_STATUSES,
   AgentFlowReviewError,
@@ -230,6 +244,7 @@ export type {
   AgentFlowPolicyStatus
 } from "./policy";
 export type {
+  AgentFlowApprovalRecord,
   AgentFlowApprovalStatus,
   AgentFlowArtifactContent,
   AgentFlowArtifactRecord,

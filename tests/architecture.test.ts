@@ -25,9 +25,11 @@ describe("standalone Agent Flow architecture", () => {
     expect(Object.keys(packageJson.exports ?? {}).sort()).toEqual([
       ".",
       "./cli",
+      "./schemas/approval",
       "./schemas/challenge",
       "./schemas/config",
       "./schemas/consult",
+      "./schemas/decision-record",
       "./schemas/failure-classification",
       "./schemas/review",
       "./schemas/workflow"
