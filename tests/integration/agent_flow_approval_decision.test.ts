@@ -415,6 +415,79 @@ steps:
     store.close();
   });
 
+  test("invalidates dependent approvals when their evidence backing is deleted", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: invalidate-deleted-approval-evidence
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+sessions:
+  reviewer: { provider: fixture, role: release reviewer, authority: { can_approve: true } }
+steps:
+  - { id: approve_source, type: approval, reviewer: reviewer, artifacts: [source.md] }
+  - { id: approve_release, type: approval, reviewer: reviewer, artifacts: [approvals/approve_source.json] }
+  - { id: done, type: result, status: completed }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "invalidate-deleted-approval-evidence", workflow });
+    store.writeArtifact({
+      id: "source",
+      runId: "invalidate-deleted-approval-evidence",
+      path: "source.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Temporary source"
+    });
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => ({
+      outputs: Object.fromEntries(request.outputs.map((output) => [
+        output,
+        JSON.stringify({ status: "approved", decision: `Approved ${output}.` })
+      ]))
+    }));
+
+    expect(await executeAgentFlowCommandPipeline(
+      store,
+      "invalidate-deleted-approval-evidence",
+      workflow,
+      undefined,
+      providers
+    )).toMatchObject({ status: "completed", completedSteps: ["approve_source", "approve_release", "done"] });
+    expect(store.listApprovals("invalidate-deleted-approval-evidence"))
+      .toEqual([expect.objectContaining({ status: "approved" }), expect.objectContaining({ status: "approved" })]);
+
+    store.deleteArtifactBacking("invalidate-deleted-approval-evidence", "source.md");
+
+    expect(store.getArtifact("invalidate-deleted-approval-evidence", "source.md")).toMatchObject({ status: "missing" });
+    expect(store.listApprovals("invalidate-deleted-approval-evidence")).toEqual([
+      expect.objectContaining({
+        stepId: "approve_source",
+        status: "cancelled",
+        context: expect.objectContaining({
+          invalidation: expect.objectContaining({ path: "source.md", actualChecksum: null })
+        })
+      }),
+      expect.objectContaining({
+        stepId: "approve_release",
+        status: "cancelled",
+        context: expect.objectContaining({
+          invalidation: expect.objectContaining({
+            path: "approvals/approve_source.json",
+            actualChecksum: null
+          })
+        })
+      })
+    ]);
+    for (const output of ["approvals/approve_source.json", "approvals/approve_release.json"]) {
+      expect(store.getArtifact("invalidate-deleted-approval-evidence", output)).toMatchObject({ status: "stale" });
+      expect(() => store.readArtifact("invalidate-deleted-approval-evidence", output))
+        .toThrow("is stale because its evidence changed");
+    }
+    const eventTypes = store.listEvents("invalidate-deleted-approval-evidence").map((event) => event.type);
+    expect(eventTypes.filter((type) => type === "approval.invalidated")).toHaveLength(2);
+    store.close();
+  });
+
   test("keeps implicit approval and decision-record paths unique after sanitizing step IDs", async () => {
     const root = temporaryRepo();
     const workflow = parseAgentFlowWorkflowOrThrow(`name: unique-specialized-default-paths

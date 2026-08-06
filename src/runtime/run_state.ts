@@ -1221,6 +1221,7 @@ export class AgentFlowRunStateStore {
         "UPDATE artifacts SET status = 'missing', checked_at = ?, updated_at = ? WHERE run_id = ? AND path = ?",
         [timestamp, timestamp, normalizedRunId, normalizedPath]
       );
+      this.invalidateApprovalsForEvidenceChange(normalizedRunId, normalizedPath, null, timestamp);
       const artifact = this.requireArtifact(normalizedRunId, row.id);
       if (manageTransaction) {
         this.database.exec("COMMIT");
@@ -2051,7 +2052,7 @@ export class AgentFlowRunStateStore {
   private invalidateApprovalsForEvidenceChange(
     runId: string,
     declaredPath: string,
-    checksum: string,
+    checksum: string | null,
     timestamp: string
   ): void {
     const approvals = this.database.all<ApprovalRow>(
