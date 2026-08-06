@@ -20,7 +20,10 @@ export class AgentFlowApprovalError extends Error {
 
 export function defaultAgentFlowApprovalOutputPath(stepId: string): string {
   const segment = stepId.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "approval";
-  return `approvals/${segment}.json`;
+  const uniqueness = segment === stepId
+    ? ""
+    : `-${createHash("sha256").update(stepId).digest("hex").slice(0, 12)}`;
+  return `approvals/${segment}${uniqueness}.json`;
 }
 
 export function createAgentFlowApprovalPrompt(

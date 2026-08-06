@@ -6,6 +6,8 @@ import path from "node:path";
 import {
   createAgentFlowLifecycleRun,
   createAgentFlowSessionProviderRegistry,
+  defaultAgentFlowApprovalOutputPath,
+  defaultAgentFlowDecisionRecordPath,
   executeAgentFlowApproval,
   executeAgentFlowCommandPipeline,
   executeAgentFlowDecisionRecord,
@@ -338,6 +340,143 @@ steps:
       .toThrow("is stale because its evidence changed");
     expect(store.listEvents("invalidate-approved-evidence").map((event) => event.type))
       .toContain("approval.invalidated");
+    store.close();
+  });
+
+  test("propagates evidence invalidation through dependent approval outputs", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: invalidate-dependent-approvals
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+sessions:
+  reviewer: { provider: fixture, role: release reviewer, authority: { can_approve: true } }
+steps:
+  - { id: approve_source, type: approval, reviewer: reviewer, artifacts: [source.md] }
+  - { id: approve_release, type: approval, reviewer: reviewer, artifacts: [approvals/approve_source.json] }
+  - { id: revise, type: command, command: "printf revised > source.md", outputs: [source.md], overwrite: true }
+  - { id: done, type: result, status: completed }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "invalidate-dependent-approvals", workflow });
+    store.writeArtifact({
+      id: `command-output:${createHash("sha256").update("source.md").digest("hex")}`,
+      runId: "invalidate-dependent-approvals",
+      path: "source.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Original source"
+    });
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => ({
+      outputs: Object.fromEntries(request.outputs.map((output) => [
+        output,
+        JSON.stringify({ status: "approved", decision: `Approved ${output}.` })
+      ]))
+    }));
+
+    expect(await executeAgentFlowCommandPipeline(
+      store,
+      "invalidate-dependent-approvals",
+      workflow,
+      undefined,
+      providers
+    )).toMatchObject({
+      status: "completed",
+      completedSteps: ["approve_source", "approve_release", "revise", "done"]
+    });
+
+    expect(store.listApprovals("invalidate-dependent-approvals")).toEqual([
+      expect.objectContaining({
+        stepId: "approve_source",
+        status: "cancelled",
+        context: expect.objectContaining({
+          invalidation: expect.objectContaining({ path: "source.md" })
+        })
+      }),
+      expect.objectContaining({
+        stepId: "approve_release",
+        status: "cancelled",
+        context: expect.objectContaining({
+          invalidation: expect.objectContaining({
+            path: "approvals/approve_source.json",
+            actualChecksum: null
+          })
+        })
+      })
+    ]);
+    for (const output of ["approvals/approve_source.json", "approvals/approve_release.json"]) {
+      expect(store.getArtifact("invalidate-dependent-approvals", output)).toMatchObject({ status: "stale" });
+      expect(() => store.readArtifact("invalidate-dependent-approvals", output))
+        .toThrow("is stale because its evidence changed");
+    }
+    expect(store.listEvents("invalidate-dependent-approvals")
+      .filter((event) => event.type === "approval.invalidated")).toHaveLength(2);
+    store.close();
+  });
+
+  test("keeps implicit approval and decision-record paths unique after sanitizing step IDs", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: unique-specialized-default-paths
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+sessions:
+  reviewer: { provider: fixture, role: release reviewer, authority: { can_approve: true } }
+steps:
+  - { id: release approval, type: approval, reviewer: reviewer, artifacts: [source.md] }
+  - { id: release-approval, type: approval, reviewer: reviewer, artifacts: [source.md] }
+  - { id: architecture decision, type: decision_record, owner: reviewer, topic: First, artifacts: [source.md] }
+  - { id: architecture-decision, type: decision_record, owner: reviewer, topic: Second, artifacts: [source.md] }
+  - { id: done, type: result, status: completed }
+`);
+    const lossyApprovalPath = defaultAgentFlowApprovalOutputPath("release approval");
+    const safeApprovalPath = defaultAgentFlowApprovalOutputPath("release-approval");
+    const lossyDecisionPath = defaultAgentFlowDecisionRecordPath("architecture decision");
+    const safeDecisionPath = defaultAgentFlowDecisionRecordPath("architecture-decision");
+    expect(lossyApprovalPath).toMatch(/^approvals\/release-approval-[a-f0-9]{12}\.json$/);
+    expect(lossyApprovalPath).not.toBe(safeApprovalPath);
+    expect(lossyDecisionPath).toMatch(/^decision-records\/architecture-decision-[a-f0-9]{12}\.json$/);
+    expect(lossyDecisionPath).not.toBe(safeDecisionPath);
+    expect(validateAgentFlowWorkflow(workflow)).toEqual({ valid: true, errors: [] });
+
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "unique-specialized-default-paths", workflow });
+    store.writeArtifact({
+      id: "source",
+      runId: "unique-specialized-default-paths",
+      path: "source.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Source"
+    });
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => ({
+      outputs: Object.fromEntries(request.outputs.map((output) => [
+        output,
+        JSON.stringify({ status: "approved", decision: `Approved ${output}.` })
+      ]))
+    }));
+
+    expect(await executeAgentFlowCommandPipeline(
+      store,
+      "unique-specialized-default-paths",
+      workflow,
+      undefined,
+      providers
+    )).toMatchObject({
+      status: "completed",
+      completedSteps: [
+        "release approval",
+        "release-approval",
+        "architecture decision",
+        "architecture-decision",
+        "done"
+      ]
+    });
+    for (const output of [lossyApprovalPath, safeApprovalPath, lossyDecisionPath, safeDecisionPath]) {
+      expect(store.getArtifact("unique-specialized-default-paths", output)).toMatchObject({ status: "available" });
+    }
     store.close();
   });
 

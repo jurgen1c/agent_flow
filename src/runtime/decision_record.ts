@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import {
   AgentFlowRunStateError,
@@ -24,7 +25,11 @@ export type AgentFlowDecisionRecordContract = Omit<AgentFlowDecisionRecord, "cre
 };
 
 export function defaultAgentFlowDecisionRecordPath(stepId: string): string {
-  return `decision-records/${safePathSegment(stepId)}.json`;
+  const segment = safePathSegment(stepId);
+  const uniqueness = segment === stepId
+    ? ""
+    : `-${createHash("sha256").update(stepId).digest("hex").slice(0, 12)}`;
+  return `decision-records/${segment}${uniqueness}.json`;
 }
 
 export function resolveAgentFlowDecisionRecordContract(

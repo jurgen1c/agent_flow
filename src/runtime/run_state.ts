@@ -2055,69 +2055,80 @@ export class AgentFlowRunStateStore {
     timestamp: string
   ): void {
     const approvals = this.database.all<ApprovalRow>(
-      "SELECT * FROM approvals WHERE run_id = ? AND status IN ('approved', 'rejected')",
+      "SELECT * FROM approvals WHERE run_id = ? AND status IN ('approved', 'rejected') ORDER BY id",
       [runId]
     );
-    for (const approval of approvals) {
-      const parsedContext = JSON.parse(approval.context_json) as unknown;
-      if (parsedContext === null || typeof parsedContext !== "object" || Array.isArray(parsedContext)) continue;
-      const context = parsedContext as Record<string, AgentFlowRunStateValue>;
-      const evidence = Array.isArray(context.evidence) ? context.evidence : [];
-      const invalidatedEvidence = evidence.find((entry) => {
-        if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return false;
-        const candidate = entry as Record<string, AgentFlowRunStateValue>;
-        return candidate.path === declaredPath && candidate.checksum !== checksum;
-      });
-      if (invalidatedEvidence === undefined) continue;
-      const expectedChecksum = (invalidatedEvidence as Record<string, AgentFlowRunStateValue>).checksum;
-      const invalidation: Record<string, AgentFlowRunStateValue> = {
-        reason: "evidence_changed",
-        path: declaredPath,
-        ...(typeof expectedChecksum === "string" ? { expectedChecksum } : {}),
-        actualChecksum: checksum,
-        invalidatedAt: timestamp
-      };
-      this.database.run(
-        `UPDATE approvals
-         SET status = 'cancelled', decision = 'evidence_changed', context_json = ?, updated_at = ?, decided_at = ?
-         WHERE run_id = ? AND id = ? AND status IN ('approved', 'rejected')`,
-        [stableJson({ ...context, invalidation }), timestamp, timestamp, runId, approval.id]
-      );
-      const outputValue = context.output;
-      if (typeof outputValue === "string") {
-        let outputPath: string | undefined;
-        try {
-          outputPath = normalizeAgentFlowArtifactPath(outputValue);
-        } catch {
-          outputPath = undefined;
-        }
-        if (outputPath !== undefined) {
-          const output = this.database.get<ArtifactRow>(
-            "SELECT * FROM artifacts WHERE run_id = ? AND path = ? AND kind = 'approval_output'",
-            [runId, outputPath]
-          );
-          if (output !== null) {
-            const metadata = JSON.parse(output.metadata_json) as Record<string, AgentFlowRunStateValue>;
-            this.database.run(
-              `UPDATE artifacts
-               SET status = 'stale', metadata_json = ?, checked_at = ?, updated_at = ?
-               WHERE run_id = ? AND id = ?`,
-              [
-                stableJson({ ...metadata, approvalInvalidated: true, approvalInvalidation: invalidation }),
-                timestamp,
-                timestamp,
-                runId,
-                output.id
-              ]
+    const invalidatedApprovalIds = new Set<string>();
+    const pendingEvidence: Array<{ path: string; actualChecksum: string | null }> = [
+      { path: declaredPath, actualChecksum: checksum }
+    ];
+    for (let index = 0; index < pendingEvidence.length; index += 1) {
+      const changedEvidence = pendingEvidence[index]!;
+      for (const approval of approvals) {
+        if (invalidatedApprovalIds.has(approval.id)) continue;
+        const parsedContext = JSON.parse(approval.context_json) as unknown;
+        if (parsedContext === null || typeof parsedContext !== "object" || Array.isArray(parsedContext)) continue;
+        const context = parsedContext as Record<string, AgentFlowRunStateValue>;
+        const evidence = Array.isArray(context.evidence) ? context.evidence : [];
+        const invalidatedEvidence = evidence.find((entry) => {
+          if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return false;
+          const candidate = entry as Record<string, AgentFlowRunStateValue>;
+          return candidate.path === changedEvidence.path
+            && (changedEvidence.actualChecksum === null || candidate.checksum !== changedEvidence.actualChecksum);
+        });
+        if (invalidatedEvidence === undefined) continue;
+        invalidatedApprovalIds.add(approval.id);
+        const expectedChecksum = (invalidatedEvidence as Record<string, AgentFlowRunStateValue>).checksum;
+        const invalidation: Record<string, AgentFlowRunStateValue> = {
+          reason: "evidence_changed",
+          path: changedEvidence.path,
+          ...(typeof expectedChecksum === "string" ? { expectedChecksum } : {}),
+          actualChecksum: changedEvidence.actualChecksum,
+          invalidatedAt: timestamp
+        };
+        this.database.run(
+          `UPDATE approvals
+           SET status = 'cancelled', decision = 'evidence_changed', context_json = ?, updated_at = ?, decided_at = ?
+           WHERE run_id = ? AND id = ? AND status IN ('approved', 'rejected')`,
+          [stableJson({ ...context, invalidation }), timestamp, timestamp, runId, approval.id]
+        );
+        const outputValue = context.output;
+        if (typeof outputValue === "string") {
+          let outputPath: string | undefined;
+          try {
+            outputPath = normalizeAgentFlowArtifactPath(outputValue);
+          } catch {
+            outputPath = undefined;
+          }
+          if (outputPath !== undefined) {
+            const output = this.database.get<ArtifactRow>(
+              "SELECT * FROM artifacts WHERE run_id = ? AND path = ? AND kind = 'approval_output'",
+              [runId, outputPath]
             );
+            if (output !== null) {
+              const metadata = JSON.parse(output.metadata_json) as Record<string, AgentFlowRunStateValue>;
+              this.database.run(
+                `UPDATE artifacts
+                 SET status = 'stale', metadata_json = ?, checked_at = ?, updated_at = ?
+                 WHERE run_id = ? AND id = ?`,
+                [
+                  stableJson({ ...metadata, approvalInvalidated: true, approvalInvalidation: invalidation }),
+                  timestamp,
+                  timestamp,
+                  runId,
+                  output.id
+                ]
+              );
+            }
+            pendingEvidence.push({ path: outputPath, actualChecksum: null });
           }
         }
+        this.appendNextEvent(runId, {
+          type: "approval.invalidated",
+          ...(approval.step_id === null ? {} : { stepId: approval.step_id }),
+          payload: { approvalId: approval.id, ...invalidation }
+        });
       }
-      this.appendNextEvent(runId, {
-        type: "approval.invalidated",
-        ...(approval.step_id === null ? {} : { stepId: approval.step_id }),
-        payload: { approvalId: approval.id, ...invalidation }
-      });
     }
   }
 

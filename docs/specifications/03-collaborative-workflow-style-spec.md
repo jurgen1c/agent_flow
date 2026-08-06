@@ -274,7 +274,9 @@ instead of starting a free-form debate.
 
 Session approval invokes a declared session with explicit `can_approve`
 authority. The provider writes strict JSON to `output`, or to
-`approvals/<step-id>.json` when `output` is omitted:
+`approvals/<step-id>.json` when `output` is omitted. When an ID contains
+characters that require filename sanitization, the generated filename includes
+a stable digest so distinct step IDs cannot collide:
 
 ```yaml
 - id: approve_release
@@ -314,7 +316,8 @@ Every meaningful decision should be persisted.
 Decision records are retained by default.
 The executable step accepts `owner`, `topic`, `artifacts`, and optional
 `rationale_summary`, `consulted`, `approved_by`, and `output`. It writes to
-`decision-records/<step-id>.json` by default and fails closed if any referenced
+`decision-records/<step-id>.json` by default, adding the same stable digest when
+the ID requires filename sanitization, and fails closed if any referenced
 artifact is unavailable.
 
 ## 12. Parallel Collaboration
