@@ -8,6 +8,8 @@ import {
 } from "./run_state";
 import type { AgentFlowWorkflow, AgentFlowWorkflowStep, AgentFlowYamlMapping } from "./workflow";
 
+const MAX_IMPLICIT_OUTPUT_SEGMENT_BYTES = 200;
+
 export interface AgentFlowDecisionRecord {
   decision_id: string;
   owner: string;
@@ -25,8 +27,9 @@ export type AgentFlowDecisionRecordContract = Omit<AgentFlowDecisionRecord, "cre
 };
 
 export function defaultAgentFlowDecisionRecordPath(stepId: string): string {
-  const segment = safePathSegment(stepId);
-  const uniqueness = segment === stepId
+  const sanitized = safePathSegment(stepId);
+  const segment = sanitized.slice(0, MAX_IMPLICIT_OUTPUT_SEGMENT_BYTES);
+  const uniqueness = sanitized === stepId && Buffer.byteLength(sanitized, "utf8") <= MAX_IMPLICIT_OUTPUT_SEGMENT_BYTES
     ? ""
     : `-${createHash("sha256").update(stepId).digest("hex").slice(0, 12)}`;
   return `decision-records/${segment}${uniqueness}.json`;

@@ -664,6 +664,61 @@ steps:
     store.close();
   });
 
+  test("bounds implicit approval and decision-record filenames for long valid step IDs", async () => {
+    const root = temporaryRepo();
+    const approvalStepId = `approval-${"a".repeat(300)}`;
+    const decisionStepId = `decision-${"d".repeat(300)}`;
+    const approvalPath = defaultAgentFlowApprovalOutputPath(approvalStepId);
+    const decisionPath = defaultAgentFlowDecisionRecordPath(decisionStepId);
+    expect(Buffer.byteLength(path.basename(approvalPath), "utf8")).toBeLessThanOrEqual(255);
+    expect(Buffer.byteLength(path.basename(decisionPath), "utf8")).toBeLessThanOrEqual(255);
+    expect(approvalPath).toMatch(/-[a-f0-9]{12}\.json$/);
+    expect(decisionPath).toMatch(/-[a-f0-9]{12}\.json$/);
+    expect(defaultAgentFlowApprovalOutputPath(`${approvalStepId}-other`)).not.toBe(approvalPath);
+    expect(defaultAgentFlowDecisionRecordPath(`${decisionStepId}-other`)).not.toBe(decisionPath);
+
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: bounded-specialized-default-paths
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+sessions:
+  reviewer: { provider: fixture, role: release reviewer, authority: { can_approve: true } }
+steps:
+  - { id: "${approvalStepId}", type: approval, reviewer: reviewer, artifacts: [source.md] }
+  - { id: "${decisionStepId}", type: decision_record, owner: reviewer, topic: Long decision, artifacts: [source.md] }
+  - { id: done, type: result, status: completed }
+`);
+    expect(validateAgentFlowWorkflow(workflow)).toEqual({ valid: true, errors: [] });
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "bounded-specialized-default-paths", workflow });
+    store.writeArtifact({
+      id: "source",
+      runId: "bounded-specialized-default-paths",
+      path: "source.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Source"
+    });
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => ({
+      outputs: {
+        [approvalPath]: JSON.stringify({ status: "approved", decision: "Approved." })
+      }
+    }));
+
+    expect(await executeAgentFlowCommandPipeline(
+      store,
+      "bounded-specialized-default-paths",
+      workflow,
+      undefined,
+      providers
+    )).toMatchObject({ status: "completed" });
+    for (const output of [approvalPath, decisionPath]) {
+      expect(store.getArtifact("bounded-specialized-default-paths", output)).toMatchObject({ status: "available" });
+    }
+    store.close();
+  });
+
   test("rejects restored approval outcomes and evidence that differ from the workflow", async () => {
     const outcomeRoot = temporaryRepo();
     const outcomeWorkflow = humanApprovalWorkflow();

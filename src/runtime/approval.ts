@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 export const AGENT_FLOW_APPROVAL_STATUSES = ["approved", "rejected"] as const;
 export type AgentFlowApprovalResultStatus = (typeof AGENT_FLOW_APPROVAL_STATUSES)[number];
+const MAX_IMPLICIT_OUTPUT_SEGMENT_BYTES = 200;
 
 export interface AgentFlowApprovalResult {
   status: AgentFlowApprovalResultStatus;
@@ -19,8 +20,9 @@ export class AgentFlowApprovalError extends Error {
 }
 
 export function defaultAgentFlowApprovalOutputPath(stepId: string): string {
-  const segment = stepId.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "approval";
-  const uniqueness = segment === stepId
+  const sanitized = stepId.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "approval";
+  const segment = sanitized.slice(0, MAX_IMPLICIT_OUTPUT_SEGMENT_BYTES);
+  const uniqueness = sanitized === stepId && Buffer.byteLength(sanitized, "utf8") <= MAX_IMPLICIT_OUTPUT_SEGMENT_BYTES
     ? ""
     : `-${createHash("sha256").update(stepId).digest("hex").slice(0, 12)}`;
   return `approvals/${segment}${uniqueness}.json`;
