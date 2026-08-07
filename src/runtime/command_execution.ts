@@ -322,14 +322,20 @@ async function runAgentFlowCommandPipeline(
     if (stepType === "decision_record") {
       const attempt = allocateStepAttempt(routingBudget, stepId);
       if (attempt === undefined) return stepAttemptLimitResult(store, runId, completedSteps, stepId, routingBudget);
-      store.updateRun(runId, { currentStepId: stepId, error: null });
-      store.upsertStep({ runId, stepId, attempt, status: "running", input: { type: "decision_record", artifacts: step.artifacts as AgentFlowRunStateValue } });
-      store.appendRunEvent(runId, { type: "step.started", stepId, payload: { attempt, type: "decision_record" } });
       try {
         const preflightError = validateDecisionRecordStep(step);
         if (preflightError !== undefined) {
           throw new AgentFlowRunStateError(preflightError, "AGENT_FLOW_DECISION_RECORD_INVALID");
         }
+        store.updateRun(runId, { currentStepId: stepId, error: null });
+        store.upsertStep({
+          runId,
+          stepId,
+          attempt,
+          status: "running",
+          input: { type: "decision_record", artifacts: step.artifacts as AgentFlowRunStateValue }
+        });
+        store.appendRunEvent(runId, { type: "step.started", stepId, payload: { attempt, type: "decision_record" } });
         store.withRunFinalizationTransaction(runId, () => {
           const result = executeAgentFlowDecisionRecord(store, runId, step, workflow);
           const output = { attempt, decisionId: result.record.decision_id, artifact: result.artifact.declaredPath };
@@ -4660,6 +4666,11 @@ function validateApprovalStep(workflow: AgentFlowWorkflow, step: AgentFlowWorkfl
 }
 
 function validateDecisionRecordStep(step: AgentFlowWorkflowStep): string | undefined {
+  if (typeof step.owner !== "string" || step.owner.trim().length === 0
+      || typeof step.topic !== "string" || step.topic.trim().length === 0
+      || !nonEmptyStringArray(step.artifacts)) {
+    return "Decision record requires a non-empty owner, topic, and artifacts list.";
+  }
   if (step.outputs !== undefined) return "Decision record steps do not support plural outputs.";
   if (step.on_failure !== undefined) {
     return "Decision record steps do not support on_failure policies in this runtime phase.";

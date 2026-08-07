@@ -176,6 +176,48 @@ steps:
     store.close();
   });
 
+  test("fails a restored decision record before persisting malformed step input", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: malformed-decision-input
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+sessions:
+  owner: { provider: fixture, role: owner }
+steps:
+  - { id: record, type: decision_record, owner: owner, topic: Missing artifacts, artifacts: [source.md] }
+`);
+    delete workflow.steps[0]!.artifacts;
+    const store = await openAgentFlowRunState({ cwd: root });
+    store.createRunWithEvent({
+      id: "malformed-decision-input",
+      workflow: {
+        name: workflow.name,
+        version: workflow.version,
+        style: workflow.style,
+        maturity: workflow.maturity
+      },
+      context: { workflow: workflow as unknown as AgentFlowRunStateValue }
+    }, { type: "run.created", payload: { status: "pending" } });
+
+    const result = await executeAgentFlowCommandPipeline(store, "malformed-decision-input", workflow);
+
+    expect(result).toMatchObject({
+      status: "failed",
+      failedStep: "record",
+      message: "Decision record requires a non-empty owner, topic, and artifacts list."
+    });
+    expect(store.getRun("malformed-decision-input")).toMatchObject({ status: "failed" });
+    expect(store.listFailures("malformed-decision-input")).toEqual([
+      expect.objectContaining({ classification: "decision_record_failure", stepId: "record" })
+    ]);
+    const eventTypes = store.listEvents("malformed-decision-input").map((event) => event.type);
+    expect(eventTypes).toContain("step.failed");
+    expect(eventTypes).not.toContain("step.started");
+    store.close();
+  });
+
   test("revalidates decision record actors when executing a restored malformed workflow", async () => {
     const base = parseAgentFlowWorkflowOrThrow(`name: malformed-decision-actors
 version: 1
