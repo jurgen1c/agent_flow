@@ -2148,6 +2148,7 @@ export class AgentFlowRunStateStore {
 
   private inspectArtifact(row: ArtifactRow): AgentFlowArtifactRecord {
     let status: AgentFlowArtifactStatus;
+    let actualChecksum: string | null = null;
     const metadata = JSON.parse(row.metadata_json) as Record<string, AgentFlowRunStateValue>;
     if (metadata.approvalInvalidated === true) {
       status = "stale";
@@ -2161,7 +2162,7 @@ export class AgentFlowRunStateStore {
           if (!stat.isFile() || row.checksum === null || (row.size_bytes !== null && stat.size !== row.size_bytes)) {
             status = "stale";
           } else {
-            const actualChecksum = artifactChecksum(target);
+            actualChecksum = artifactChecksum(target);
             status = actualChecksum !== row.checksum
               ? "stale"
               : row.previous_checksum !== null ? "overwritten" : "available";
@@ -2187,16 +2188,23 @@ export class AgentFlowRunStateStore {
     const original = row;
     const updatedAt = status === row.status ? row.updated_at : timestamp;
     const inspected = { ...row, status, checked_at: timestamp, updated_at: updatedAt };
+    let statusPersisted = false;
     try {
       this.database.run(
         `UPDATE artifacts SET status = ?, checked_at = ?, updated_at = ?
         WHERE run_id = ? AND id = ? AND checksum IS ? AND status = ? AND updated_at = ?`,
         [status, timestamp, updatedAt, row.run_id, row.id, row.checksum, row.status, row.updated_at]
       );
-      row = this.database.get<ArtifactRow>("SELECT * FROM artifacts WHERE run_id = ? AND id = ?", [row.run_id, row.id]) ?? original;
+      statusPersisted = true;
     } catch (error) {
       if (!isSqliteContentionError(error)) throw error;
       row = inspected;
+    }
+    if (status === "stale" || status === "missing") {
+      this.invalidateApprovalsForArtifactChange(row.run_id, row.path, actualChecksum, timestamp);
+    }
+    if (statusPersisted) {
+      row = this.database.get<ArtifactRow>("SELECT * FROM artifacts WHERE run_id = ? AND id = ?", [row.run_id, row.id]) ?? original;
     }
     return hydrateArtifact(this.repoRoot, row);
   }
@@ -2482,6 +2490,9 @@ function sortJsonValue(value: unknown, ancestors: Set<object>): AgentFlowRunStat
 }
 
 export function normalizeAgentFlowArtifactPath(value: string): string {
+  if (/[\u0000-\u001F\u007F-\u009F\u2028\u2029]/u.test(value)) {
+    throw new AgentFlowRunStateError("Artifact path cannot contain control characters.", "AGENT_FLOW_ARTIFACT_PATH");
+  }
   const candidate = requiredString(value, "Artifact path").replaceAll("\\", "/");
   if (path.posix.isAbsolute(candidate) || path.win32.isAbsolute(candidate)) {
     throw new AgentFlowRunStateError("Artifact path must be repo-relative.", "AGENT_FLOW_ARTIFACT_PATH");

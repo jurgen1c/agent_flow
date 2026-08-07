@@ -541,6 +541,68 @@ steps:
     store.close();
   });
 
+  test("invalidates approvals when inspection detects modified or deleted evidence backing", async () => {
+    for (const drift of ["modified", "deleted"] as const) {
+      const root = temporaryRepo();
+      const workflow = parseAgentFlowWorkflowOrThrow(`name: inspect-approval-evidence-drift
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+sessions:
+  reviewer: { provider: fixture, role: reviewer, authority: { can_approve: true } }
+steps:
+  - { id: approve, type: approval, reviewer: reviewer, artifacts: [source.md] }
+  - { id: done, type: result, status: completed }
+`);
+      const runId = `inspect-approval-evidence-${drift}`;
+      const store = await openAgentFlowRunState({ cwd: root });
+      createAgentFlowLifecycleRun(store, { id: runId, workflow });
+      const evidence = store.writeArtifact({
+        id: "source",
+        runId,
+        path: "source.md",
+        kind: "fixture",
+        contentType: "text/markdown",
+        content: "Source A"
+      });
+      const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => ({
+        outputs: {
+          "approvals/approve.json": JSON.stringify({ status: "approved", decision: "Approved." })
+        }
+      }));
+      expect(await executeAgentFlowCommandPipeline(store, runId, workflow, undefined, providers))
+        .toMatchObject({ status: "completed" });
+      expect(store.listApprovals(runId)).toEqual([expect.objectContaining({ status: "approved" })]);
+
+      const evidenceTarget = path.join(root, evidence.storagePath);
+      const actualChecksum = drift === "modified"
+        ? `sha256:${createHash("sha256").update("Source B").digest("hex")}`
+        : null;
+      if (drift === "modified") fs.writeFileSync(evidenceTarget, "Source B");
+      else fs.unlinkSync(evidenceTarget);
+
+      expect(store.getArtifact(runId, "source.md")).toMatchObject({
+        status: drift === "modified" ? "stale" : "missing"
+      });
+      expect(store.listApprovals(runId)).toEqual([
+        expect.objectContaining({
+          status: "cancelled",
+          decision: "evidence_changed",
+          context: expect.objectContaining({
+            invalidation: expect.objectContaining({ path: "source.md", actualChecksum })
+          })
+        })
+      ]);
+      expect(store.getArtifact(runId, "approvals/approve.json")).toMatchObject({ status: "stale" });
+      expect(() => store.readArtifact(runId, "approvals/approve.json"))
+        .toThrow("is stale because its evidence changed");
+      expect(store.listEvents(runId).filter((event) => event.type === "approval.invalidated"))
+        .toHaveLength(1);
+      store.close();
+    }
+  });
+
   test("invalidates an approval when its own outcome artifact is replaced or deleted", async () => {
     for (const mutation of ["replace", "delete"] as const) {
       const root = temporaryRepo();
@@ -903,6 +965,13 @@ steps:
           workflow.steps[0]!.output = "./approvals/approve.json";
         },
         message: "output must use a normalized static artifact path"
+      },
+      {
+        runId: "direct-approval-control-character",
+        mutate: (workflow: ReturnType<typeof sessionApprovalWorkflow>) => {
+          workflow.steps[0]!.artifacts = ["reports/foo\nbar.json"];
+        },
+        message: "artifacts must use normalized static artifact paths"
       }
     ];
 
@@ -1130,7 +1199,20 @@ steps:
     };
     const artifactPath = new RegExp(schema.$defs.artifactPath.pattern);
     expect(artifactPath.test("approvals/release.json")).toBe(true);
-    expect(["../secret", "./approval.json", "/absolute", "nested/../secret", "{{ inputs.path }}", "approvals/"]
+    const invalidArtifactPaths = [
+      "../secret",
+      "./approval.json",
+      "/absolute",
+      "nested/../secret",
+      "{{ inputs.path }}",
+      "approvals/",
+      "reports/foo\nbar.json",
+      "reports/foo\tbar.json",
+      "reports/foo\u0000bar.json",
+      "reports/foo\u0085bar.json",
+      "reports/foo\u2028bar.json"
+    ];
+    expect(invalidArtifactPaths
       .some((candidate) => artifactPath.test(candidate))).toBe(false);
     expect(schema.properties.steps.items).toEqual({ $ref: "#/$defs/step" });
     expect(schema.$defs.step.properties).toMatchObject({
@@ -1152,7 +1234,7 @@ steps:
     });
     const decisionArtifactPath = new RegExp(decisionSchema.$defs.artifactPath.pattern);
     expect(decisionArtifactPath.test("evidence/release.json")).toBe(true);
-    expect(["../secret", "./evidence.json", "/absolute", "nested/../secret", "{{ inputs.path }}"]
+    expect(invalidArtifactPaths
       .some((candidate) => decisionArtifactPath.test(candidate))).toBe(false);
   });
 
@@ -1251,6 +1333,11 @@ steps:
       {
         runId: "runtime-decision-padded-output",
         mutate: (step: Record<string, unknown>) => Object.assign(step, { output: " decision.json " }),
+        message: "normalized static repo-relative artifact paths"
+      },
+      {
+        runId: "runtime-decision-control-character",
+        mutate: (step: Record<string, unknown>) => Object.assign(step, { output: "reports/foo\nbar.json" }),
         message: "normalized static repo-relative artifact paths"
       },
       {
