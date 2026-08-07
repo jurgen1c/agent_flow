@@ -722,6 +722,75 @@ steps:
     }
   });
 
+  test("rejects noncanonical approval paths at the exported direct executor", async () => {
+    const scenarios = [
+      {
+        runId: "direct-approval-noncanonical-evidence",
+        mutate: (workflow: ReturnType<typeof sessionApprovalWorkflow>) => {
+          workflow.steps[0]!.artifacts = ["nested/../spec.md"];
+        },
+        message: "artifacts must use normalized static artifact paths"
+      },
+      {
+        runId: "direct-approval-noncanonical-output",
+        mutate: (workflow: ReturnType<typeof sessionApprovalWorkflow>) => {
+          workflow.steps[0]!.output = "./approvals/approve.json";
+        },
+        message: "output must use a normalized static artifact path"
+      }
+    ];
+
+    for (const scenario of scenarios) {
+      const root = temporaryRepo();
+      const workflow = sessionApprovalWorkflow();
+      scenario.mutate(workflow);
+      const store = await openAgentFlowRunState({ cwd: root });
+      store.createRun({
+        id: scenario.runId,
+        status: "running",
+        workflow: {
+          name: workflow.name,
+          version: workflow.version,
+          style: workflow.style,
+          maturity: workflow.maturity
+        },
+        context: { workflow: workflow as unknown as AgentFlowRunStateValue }
+      });
+      store.writeArtifact({
+        id: "spec",
+        runId: scenario.runId,
+        path: "spec.md",
+        kind: "fixture",
+        contentType: "text/markdown",
+        content: "Spec"
+      });
+      let called = false;
+      const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => {
+        called = true;
+        return {
+          outputs: Object.fromEntries(request.outputs.map((output) => [
+            output,
+            JSON.stringify({ status: "approved", decision: "Approved." })
+          ]))
+        };
+      });
+
+      await expect(executeAgentFlowApproval(
+        store,
+        scenario.runId,
+        workflow,
+        workflow.steps[0]!,
+        providers
+      )).rejects.toMatchObject({
+        code: "AGENT_FLOW_SESSION_REQUEST_INVALID",
+        message: expect.stringContaining(scenario.message)
+      });
+      expect(called).toBe(false);
+      expect(store.getArtifact(scenario.runId, "approvals/approve.json")).toBeNull();
+      store.close();
+    }
+  });
+
   test("bounds session approval failure policies before invoking a provider", async () => {
     const root = temporaryRepo();
     const parsed = sessionApprovalWorkflow();
@@ -1452,6 +1521,35 @@ steps:
     });
     expect(unauthorizedResult.status).not.toBe("completed");
     expect(unauthorizedResult.availableArtifacts).not.toContain("approvals/approve.json");
+
+    const noncanonicalApprovals = [
+      (workflow: ReturnType<typeof sessionApprovalWorkflow>) => {
+        workflow.steps[0]!.artifacts = ["nested/../spec.md"];
+      },
+      (workflow: ReturnType<typeof sessionApprovalWorkflow>) => {
+        workflow.steps[0]!.output = "./approvals/approve.json";
+      }
+    ];
+    for (const mutate of noncanonicalApprovals) {
+      const workflow = sessionApprovalWorkflow();
+      mutate(workflow);
+      const result = simulateAgentFlowWorkflow(workflow, {
+        artifacts: { "spec.md": "Spec" },
+        steps: { approve: approvalFixture("approve") }
+      });
+      expect(result.status).toBe("paused");
+      expect(result.visitedSteps[0]).toMatchObject({ id: "approve", outcome: "failed" });
+      expect(result.availableArtifacts).not.toContain("approvals/approve.json");
+    }
+    const noncanonicalHuman = humanApprovalWorkflow();
+    noncanonicalHuman.steps[0]!.output = "./approvals/approve_release.json";
+    const noncanonicalHumanResult = simulateAgentFlowWorkflow(noncanonicalHuman, {
+      artifacts: { "release.md": "Release" },
+      steps: { approve_release: { input: "approve" } }
+    });
+    expect(noncanonicalHumanResult.status).toBe("paused");
+    expect(noncanonicalHumanResult.visitedSteps[0]).toMatchObject({ id: "approve_release", outcome: "failed" });
+    expect(noncanonicalHumanResult.availableArtifacts).not.toContain("approvals/approve_release.json");
 
     const missingHuman = simulateAgentFlowWorkflow(humanApprovalWorkflow(), {
       steps: { approve_release: { input: "approve" } }

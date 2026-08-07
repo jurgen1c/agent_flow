@@ -11,7 +11,11 @@ import {
   createAgentFlowArtifactTransformRegistry,
   transformAgentFlowFixtureArtifact
 } from "./artifact_transform";
-import { normalizeAgentFlowArtifactPath, type AgentFlowRunStateValue } from "./run_state";
+import {
+  isNormalizedStaticAgentFlowArtifactPath,
+  normalizeAgentFlowArtifactPath,
+  type AgentFlowRunStateValue
+} from "./run_state";
 import { resolveAgentFlowMcpArguments } from "./mcp_call";
 import {
   AgentFlowConditionError,
@@ -402,6 +406,28 @@ function runStep(step: AgentFlowWorkflowStep, state: SimulationState, insideLoop
   const outcome = pickAt(stepFixture.outcome, visit) ?? "succeeded";
 
   state.visitedSteps.push({ id, type, outcome: type === "condition" && outcome === "succeeded" ? "selected" : outcome });
+  if (type === "approval") {
+    if (!Array.isArray(step.artifacts)
+        || step.artifacts.length === 0
+        || !step.artifacts.every(isNormalizedStaticAgentFlowArtifactPath)) {
+      return simulatedSessionFailure(
+        step,
+        stepFixture,
+        id,
+        state,
+        "Approval simulation artifacts must use normalized static artifact paths."
+      );
+    }
+    if (step.output !== undefined && !isNormalizedStaticAgentFlowArtifactPath(step.output)) {
+      return simulatedSessionFailure(
+        step,
+        stepFixture,
+        id,
+        state,
+        "Approval simulation output must use a normalized static artifact path."
+      );
+    }
+  }
   checkInputs(step, id, state);
   const evidenceCollision = evidenceBoundOutputCollision(step, id);
   if (evidenceCollision !== undefined) {

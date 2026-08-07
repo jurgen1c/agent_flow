@@ -5,6 +5,7 @@ import { spawn } from "node:child_process";
 import { isDeepStrictEqual } from "node:util";
 import {
   AgentFlowRunStateError,
+  isNormalizedStaticAgentFlowArtifactPath,
   normalizeAgentFlowArtifactPath,
   type AgentFlowRunStateValue,
   type AgentFlowRunStateStore,
@@ -4621,11 +4622,11 @@ function validateApprovalStep(workflow: AgentFlowWorkflow, step: AgentFlowWorkfl
       || !nonEmptyStringArray(step.artifacts)) {
     return "Approval requires a non-empty reviewer and artifacts list.";
   }
-  if (!(step.artifacts as string[]).every(normalizedStaticCollaborationArtifactPath)) {
+  if (!(step.artifacts as string[]).every(isNormalizedStaticAgentFlowArtifactPath)) {
     return "Approval artifacts must use normalized static artifact paths.";
   }
   if (step.output !== undefined
-      && (typeof step.output !== "string" || !normalizedStaticCollaborationArtifactPath(step.output))) {
+      && (typeof step.output !== "string" || !isNormalizedStaticAgentFlowArtifactPath(step.output))) {
     return "Approval output must use a normalized static artifact path.";
   }
   const approvalOutput = typeof step.output === "string"
@@ -4731,10 +4732,10 @@ function validateCollaborationExchangeStep(
       || typeof step.output !== "string" || step.output.trim().length === 0) {
     return `${label} requires non-empty from and to sessions, one bounded question, an artifacts list, and one output.`;
   }
-  if (!normalizedStaticCollaborationArtifactPath(step.output) || !step.output.endsWith(".json")) {
+  if (!isNormalizedStaticAgentFlowArtifactPath(step.output) || !step.output.endsWith(".json")) {
     return `${label} output must use a normalized static .json artifact path.`;
   }
-  if (!(step.artifacts as string[]).every(normalizedStaticCollaborationArtifactPath)) {
+  if (!(step.artifacts as string[]).every(isNormalizedStaticAgentFlowArtifactPath)) {
     return `${label} artifacts must use normalized static artifact paths.`;
   }
   if (kind === "consult" && typeof step.blocking !== "boolean") {
@@ -4764,15 +4765,6 @@ function validateCollaborationExchangeStep(
   }
   if (step.on_failure !== undefined) return `${label} steps do not support on_failure policies in this runtime phase.`;
   return undefined;
-}
-
-function normalizedStaticCollaborationArtifactPath(value: string): boolean {
-  if (value !== value.trim() || value.includes("{{") || value.includes("}}")) return false;
-  try {
-    return normalizeAgentFlowArtifactPath(value) === value;
-  } catch {
-    return false;
-  }
 }
 
 function validateMcpCallStep(step: AgentFlowWorkflowStep): string | undefined {

@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import {
   AgentFlowRunStateError,
+  isNormalizedStaticAgentFlowArtifactPath,
   normalizeAgentFlowArtifactPath,
   type AgentFlowArtifactRecord,
   type AgentFlowRunStateStore,
@@ -272,6 +273,20 @@ async function executeAgentFlowSessionStep(
     );
   }
   if (kind === "approval") {
+    if (!Array.isArray(step.artifacts)
+        || step.artifacts.length === 0
+        || !step.artifacts.every(isNormalizedStaticAgentFlowArtifactPath)) {
+      throw new AgentFlowSessionRequestError(
+        `Approval ${stepId} artifacts must use normalized static artifact paths.`,
+        "AGENT_FLOW_SESSION_REQUEST_INVALID"
+      );
+    }
+    if (step.output !== undefined && !isNormalizedStaticAgentFlowArtifactPath(step.output)) {
+      throw new AgentFlowSessionRequestError(
+        `Approval ${stepId} output must use a normalized static artifact path.`,
+        "AGENT_FLOW_SESSION_REQUEST_INVALID"
+      );
+    }
     if (sessionId === "human") {
       throw new AgentFlowSessionRequestError(
         `Approval ${stepId} with reviewer human must use the interactive approval runtime.`,

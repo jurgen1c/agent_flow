@@ -2483,6 +2483,19 @@ export function normalizeAgentFlowArtifactPath(value: string): string {
   return normalized;
 }
 
+export function isNormalizedStaticAgentFlowArtifactPath(value: unknown): value is string {
+  if (typeof value !== "string"
+      || value.length === 0
+      || value !== value.trim()
+      || value.includes("{{")
+      || value.includes("}}")) return false;
+  try {
+    return normalizeAgentFlowArtifactPath(value) === value;
+  } catch {
+    return false;
+  }
+}
+
 function artifactRunId(value: string): string {
   return requiredString(value, "Run ID");
 }
