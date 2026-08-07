@@ -977,7 +977,7 @@ export class AgentFlowRunStateStore {
         timestamp
       ]);
       if (replacingPublishedContent && priorArtifact?.checksum !== null && priorArtifact?.checksum !== undefined) {
-        this.invalidateApprovalsForEvidenceChange(runId, declaredPath, checksum, timestamp);
+        this.invalidateApprovalsForArtifactChange(runId, declaredPath, checksum, timestamp);
       }
       if (manageTransaction) this.database.exec("COMMIT");
       if (!manageTransaction && this.finalizationTransactionActive
@@ -1221,7 +1221,7 @@ export class AgentFlowRunStateStore {
         "UPDATE artifacts SET status = 'missing', checked_at = ?, updated_at = ? WHERE run_id = ? AND path = ?",
         [timestamp, timestamp, normalizedRunId, normalizedPath]
       );
-      this.invalidateApprovalsForEvidenceChange(normalizedRunId, normalizedPath, null, timestamp);
+      this.invalidateApprovalsForArtifactChange(normalizedRunId, normalizedPath, null, timestamp);
       const artifact = this.requireArtifact(normalizedRunId, row.id);
       if (manageTransaction) {
         this.database.exec("COMMIT");
@@ -2049,7 +2049,7 @@ export class AgentFlowRunStateStore {
     return hydrateArtifact(this.repoRoot, row);
   }
 
-  private invalidateApprovalsForEvidenceChange(
+  private invalidateApprovalsForArtifactChange(
     runId: string,
     declaredPath: string,
     checksum: string | null,
@@ -2060,11 +2060,11 @@ export class AgentFlowRunStateStore {
       [runId]
     );
     const invalidatedApprovalIds = new Set<string>();
-    const pendingEvidence: Array<{ path: string; actualChecksum: string | null }> = [
+    const pendingChanges: Array<{ path: string; actualChecksum: string | null }> = [
       { path: declaredPath, actualChecksum: checksum }
     ];
-    for (let index = 0; index < pendingEvidence.length; index += 1) {
-      const changedEvidence = pendingEvidence[index]!;
+    for (let index = 0; index < pendingChanges.length; index += 1) {
+      const changedEvidence = pendingChanges[index]!;
       for (const approval of approvals) {
         if (invalidatedApprovalIds.has(approval.id)) continue;
         const parsedContext = JSON.parse(approval.context_json) as unknown;
@@ -2077,12 +2077,24 @@ export class AgentFlowRunStateStore {
           return candidate.path === changedEvidence.path
             && (changedEvidence.actualChecksum === null || candidate.checksum !== changedEvidence.actualChecksum);
         });
-        if (invalidatedEvidence === undefined) continue;
+        let outputPath: string | undefined;
+        if (typeof context.output === "string") {
+          try {
+            outputPath = normalizeAgentFlowArtifactPath(context.output);
+          } catch {
+            outputPath = undefined;
+          }
+        }
+        const outcomeChanged = outputPath === changedEvidence.path;
+        if (invalidatedEvidence === undefined && !outcomeChanged) continue;
         invalidatedApprovalIds.add(approval.id);
-        const expectedChecksum = (invalidatedEvidence as Record<string, AgentFlowRunStateValue>).checksum;
+        const expectedChecksum = invalidatedEvidence === undefined
+          ? undefined
+          : (invalidatedEvidence as Record<string, AgentFlowRunStateValue>).checksum;
         const invalidation: Record<string, AgentFlowRunStateValue> = {
           reason: "evidence_changed",
           path: changedEvidence.path,
+          ...(outcomeChanged ? { source: "approval_output" } : {}),
           ...(typeof expectedChecksum === "string" ? { expectedChecksum } : {}),
           actualChecksum: changedEvidence.actualChecksum,
           invalidatedAt: timestamp
@@ -2093,21 +2105,22 @@ export class AgentFlowRunStateStore {
            WHERE run_id = ? AND id = ? AND status IN ('approved', 'rejected')`,
           [stableJson({ ...context, invalidation }), timestamp, timestamp, runId, approval.id]
         );
-        const outputValue = context.output;
-        if (typeof outputValue === "string") {
-          let outputPath: string | undefined;
-          try {
-            outputPath = normalizeAgentFlowArtifactPath(outputValue);
-          } catch {
-            outputPath = undefined;
-          }
-          if (outputPath !== undefined) {
-            const output = this.database.get<ArtifactRow>(
-              "SELECT * FROM artifacts WHERE run_id = ? AND path = ? AND kind = 'approval_output'",
-              [runId, outputPath]
-            );
-            if (output !== null) {
-              const metadata = JSON.parse(output.metadata_json) as Record<string, AgentFlowRunStateValue>;
+        if (outputPath !== undefined) {
+          const output = this.database.get<ArtifactRow>(
+            "SELECT * FROM artifacts WHERE run_id = ? AND path = ? AND kind = 'approval_output'",
+            [runId, outputPath]
+          );
+          if (output !== null) {
+            const metadata = JSON.parse(output.metadata_json) as Record<string, AgentFlowRunStateValue>;
+            const approvalAttempt = /:attempt-(\d+)$/.exec(approval.id)?.[1];
+            const replacementAttempt = typeof metadata.attempt === "number" && Number.isSafeInteger(metadata.attempt)
+              ? String(metadata.attempt)
+              : undefined;
+            const belongsToNewApprovalAttempt = outcomeChanged
+              && approvalAttempt !== undefined
+              && replacementAttempt !== undefined
+              && replacementAttempt !== approvalAttempt;
+            if (!belongsToNewApprovalAttempt) {
               this.database.run(
                 `UPDATE artifacts
                  SET status = 'stale', metadata_json = ?, checked_at = ?, updated_at = ?
@@ -2121,8 +2134,8 @@ export class AgentFlowRunStateStore {
                 ]
               );
             }
-            pendingEvidence.push({ path: outputPath, actualChecksum: null });
           }
+          pendingChanges.push({ path: outputPath, actualChecksum: null });
         }
         this.appendNextEvent(runId, {
           type: "approval.invalidated",

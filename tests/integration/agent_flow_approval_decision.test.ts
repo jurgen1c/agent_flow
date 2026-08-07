@@ -191,7 +191,10 @@ steps:
     const mutations = [
       (workflow: typeof base) => { workflow.steps[0]!.owner = "missing-owner"; },
       (workflow: typeof base) => { workflow.steps[0]!.consulted = ["missing-consulted"]; },
-      (workflow: typeof base) => { workflow.steps[0]!.approved_by = ["missing-approver"]; }
+      (workflow: typeof base) => { workflow.steps[0]!.approved_by = ["missing-approver"]; },
+      (workflow: typeof base) => {
+        (workflow.sessions as unknown as Record<string, unknown>).owner = null;
+      }
     ];
 
     for (const [index, mutate] of mutations.entries()) {
@@ -217,6 +220,14 @@ steps:
         contentType: "text/markdown",
         content: "Evidence"
       });
+
+      expect(() => executeAgentFlowDecisionRecord(
+        store,
+        `malformed-decision-${index}`,
+        workflow.steps[0]!,
+        workflow
+      )).toThrow("references undeclared session");
+      expect(store.getArtifact(`malformed-decision-${index}`, "decision-records/record.json")).toBeNull();
 
       const result = await executeAgentFlowCommandPipeline(store, `malformed-decision-${index}`, workflow);
 
@@ -486,6 +497,64 @@ steps:
     const eventTypes = store.listEvents("invalidate-deleted-approval-evidence").map((event) => event.type);
     expect(eventTypes.filter((type) => type === "approval.invalidated")).toHaveLength(2);
     store.close();
+  });
+
+  test("invalidates an approval when its own outcome artifact is replaced or deleted", async () => {
+    for (const mutation of ["replace", "delete"] as const) {
+      const root = temporaryRepo();
+      const workflow = sessionApprovalWorkflow();
+      const runId = `invalidate-${mutation}-approval-output`;
+      const store = await openAgentFlowRunState({ cwd: root });
+      createAgentFlowLifecycleRun(store, { id: runId, workflow });
+      store.writeArtifact({
+        id: "spec",
+        runId,
+        path: "spec.md",
+        kind: "fixture",
+        contentType: "text/markdown",
+        content: "Original evidence"
+      });
+      const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => ({
+        outputs: {
+          "approvals/approve.json": JSON.stringify({ status: "approved", decision: "Approved." })
+        }
+      }));
+
+      expect(await executeAgentFlowCommandPipeline(store, runId, workflow, undefined, providers))
+        .toMatchObject({ status: "completed" });
+      const outcome = store.getArtifact(runId, "approvals/approve.json");
+      expect(outcome).not.toBeNull();
+
+      if (mutation === "replace") {
+        store.writeArtifact({
+          id: outcome!.id,
+          runId,
+          path: outcome!.declaredPath,
+          kind: "fixture",
+          contentType: "application/json",
+          content: JSON.stringify({ unrelated: true }),
+          overwrite: true
+        });
+      } else {
+        store.deleteArtifactBacking(runId, outcome!.declaredPath);
+      }
+
+      expect(store.listApprovals(runId)).toEqual([
+        expect.objectContaining({
+          status: "cancelled",
+          decision: "evidence_changed",
+          context: expect.objectContaining({
+            invalidation: expect.objectContaining({
+              path: "approvals/approve.json",
+              source: "approval_output"
+            })
+          })
+        })
+      ]);
+      expect(store.listEvents(runId).filter((event) => event.type === "approval.invalidated"))
+        .toHaveLength(1);
+      store.close();
+    }
   });
 
   test("keeps implicit approval and decision-record paths unique after sanitizing step IDs", async () => {

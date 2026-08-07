@@ -1393,6 +1393,7 @@ function resumeWaitingStep(
           metadata: {
             reviewer: "human",
             decidedBy: response.decidedBy ?? "human",
+            attempt: waiting.attempt,
             evidence: waiting.evidence as unknown as AgentFlowRunStateValue
           }
         });

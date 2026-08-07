@@ -48,11 +48,13 @@ export function resolveAgentFlowDecisionRecordContract(
   if (artifacts.includes(output)) {
     throw new Error(`Decision record ${stepId} output must not overwrite evidence artifact ${output}.`);
   }
-  const sessions = new Set(Object.keys(workflow.sessions ?? {}));
+  const sessions = workflow.sessions ?? {};
   for (const [label, actors] of [["owner", [owner]], ["consulted", consulted], ["approved_by", approvedBy]] as const) {
-    const undeclared = actors.find((actor) => !sessions.has(actor));
-    if (undeclared !== undefined) {
-      throw new Error(`Decision record ${stepId} ${label} references undeclared session ${undeclared}.`);
+    const invalidActor = actors.find((actor) => mapping(sessions[actor]) === undefined);
+    if (invalidActor !== undefined) {
+      throw new Error(
+        `Decision record ${stepId} ${label} references undeclared session ${invalidActor} or a malformed session mapping.`
+      );
     }
   }
   return {
