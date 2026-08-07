@@ -271,6 +271,20 @@ export interface UpsertAgentFlowApprovalInput {
   decidedAt?: string;
 }
 
+export interface AgentFlowApprovalRecord {
+  id: string;
+  runId: string;
+  stepId: string | null;
+  status: AgentFlowApprovalStatus;
+  requestedBy: string | null;
+  decidedBy: string | null;
+  decision: string | null;
+  context: Record<string, AgentFlowRunStateValue>;
+  createdAt: string;
+  updatedAt: string;
+  decidedAt: string | null;
+}
+
 export interface UpsertAgentFlowBudgetInput {
   id: string;
   runId: string;
@@ -360,6 +374,20 @@ interface FailureRow {
   payload_json: string | null;
   created_at: string;
   resolved_at: string | null;
+}
+
+interface ApprovalRow {
+  run_id: string;
+  id: string;
+  step_id: string | null;
+  status: AgentFlowApprovalStatus;
+  requested_by: string | null;
+  decided_by: string | null;
+  decision: string | null;
+  context_json: string;
+  created_at: string;
+  updated_at: string;
+  decided_at: string | null;
 }
 
 const TERMINAL_RUN_STATUSES = new Set<AgentFlowRunStatus>(["completed", "failed", "cancelled"]);
@@ -948,6 +976,9 @@ export class AgentFlowRunStateStore {
         retryingPublishedContent ? existing?.written_at ?? timestamp : timestamp,
         timestamp
       ]);
+      if (replacingPublishedContent && priorArtifact?.checksum !== null && priorArtifact?.checksum !== undefined) {
+        this.invalidateApprovalsForArtifactChange(runId, declaredPath, checksum, timestamp);
+      }
       if (manageTransaction) this.database.exec("COMMIT");
       if (!manageTransaction && this.finalizationTransactionActive
           && fileMutationStarted && !alreadyWrittenInFinalization) {
@@ -1190,6 +1221,7 @@ export class AgentFlowRunStateStore {
         "UPDATE artifacts SET status = 'missing', checked_at = ?, updated_at = ? WHERE run_id = ? AND path = ?",
         [timestamp, timestamp, normalizedRunId, normalizedPath]
       );
+      this.invalidateApprovalsForArtifactChange(normalizedRunId, normalizedPath, null, timestamp);
       const artifact = this.requireArtifact(normalizedRunId, row.id);
       if (manageTransaction) {
         this.database.exec("COMMIT");
@@ -1270,6 +1302,13 @@ export class AgentFlowRunStateStore {
       throw new AgentFlowRunStateError(
         `Declared input artifact ${normalizedPath} was not found for run ${normalizedRunId}.`,
         "AGENT_FLOW_ARTIFACT_NOT_FOUND"
+      );
+    }
+    const metadata = JSON.parse(row.metadata_json) as Record<string, AgentFlowRunStateValue>;
+    if (metadata.approvalInvalidated === true) {
+      throw new AgentFlowRunStateError(
+        `Approval artifact ${normalizedPath} is stale because its evidence changed.`,
+        "AGENT_FLOW_ARTIFACT_STALE"
       );
     }
 
@@ -1862,6 +1901,16 @@ export class AgentFlowRunStateStore {
     ]);
   }
 
+  listApprovals(runId: string): AgentFlowApprovalRecord[] {
+    this.assertOpen();
+    const normalizedRunId = requiredString(runId, "Run ID");
+    this.requireRun(normalizedRunId);
+    return this.database.all<ApprovalRow>(
+      "SELECT * FROM approvals WHERE run_id = ? ORDER BY created_at ASC, id ASC",
+      [normalizedRunId]
+    ).map(hydrateApproval);
+  }
+
   upsertBudget(input: UpsertAgentFlowBudgetInput): void {
     this.assertOpen();
     if (!Number.isFinite(input.limit) || input.limit < 0 || !Number.isFinite(input.used) || input.used < 0) {
@@ -2000,52 +2049,162 @@ export class AgentFlowRunStateStore {
     return hydrateArtifact(this.repoRoot, row);
   }
 
+  private invalidateApprovalsForArtifactChange(
+    runId: string,
+    declaredPath: string,
+    checksum: string | null,
+    timestamp: string
+  ): void {
+    const approvals = this.database.all<ApprovalRow>(
+      "SELECT * FROM approvals WHERE run_id = ? AND status IN ('approved', 'rejected') ORDER BY id",
+      [runId]
+    );
+    const invalidatedApprovalIds = new Set<string>();
+    const pendingChanges: Array<{ path: string; actualChecksum: string | null }> = [
+      { path: declaredPath, actualChecksum: checksum }
+    ];
+    for (let index = 0; index < pendingChanges.length; index += 1) {
+      const changedEvidence = pendingChanges[index]!;
+      for (const approval of approvals) {
+        if (invalidatedApprovalIds.has(approval.id)) continue;
+        const parsedContext = JSON.parse(approval.context_json) as unknown;
+        if (parsedContext === null || typeof parsedContext !== "object" || Array.isArray(parsedContext)) continue;
+        const context = parsedContext as Record<string, AgentFlowRunStateValue>;
+        const evidence = Array.isArray(context.evidence) ? context.evidence : [];
+        const invalidatedEvidence = evidence.find((entry) => {
+          if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return false;
+          const candidate = entry as Record<string, AgentFlowRunStateValue>;
+          return candidate.path === changedEvidence.path
+            && (changedEvidence.actualChecksum === null || candidate.checksum !== changedEvidence.actualChecksum);
+        });
+        let outputPath: string | undefined;
+        if (typeof context.output === "string") {
+          try {
+            outputPath = normalizeAgentFlowArtifactPath(context.output);
+          } catch {
+            outputPath = undefined;
+          }
+        }
+        const outcomeChanged = outputPath === changedEvidence.path;
+        if (invalidatedEvidence === undefined && !outcomeChanged) continue;
+        invalidatedApprovalIds.add(approval.id);
+        const expectedChecksum = invalidatedEvidence === undefined
+          ? undefined
+          : (invalidatedEvidence as Record<string, AgentFlowRunStateValue>).checksum;
+        const invalidation: Record<string, AgentFlowRunStateValue> = {
+          reason: "evidence_changed",
+          path: changedEvidence.path,
+          ...(outcomeChanged ? { source: "approval_output" } : {}),
+          ...(typeof expectedChecksum === "string" ? { expectedChecksum } : {}),
+          actualChecksum: changedEvidence.actualChecksum,
+          invalidatedAt: timestamp
+        };
+        this.database.run(
+          `UPDATE approvals
+           SET status = 'cancelled', decision = 'evidence_changed', context_json = ?, updated_at = ?, decided_at = ?
+           WHERE run_id = ? AND id = ? AND status IN ('approved', 'rejected')`,
+          [stableJson({ ...context, invalidation }), timestamp, timestamp, runId, approval.id]
+        );
+        if (outputPath !== undefined) {
+          const output = this.database.get<ArtifactRow>(
+            "SELECT * FROM artifacts WHERE run_id = ? AND path = ? AND kind = 'approval_output'",
+            [runId, outputPath]
+          );
+          if (output !== null) {
+            const metadata = JSON.parse(output.metadata_json) as Record<string, AgentFlowRunStateValue>;
+            const approvalAttempt = /:attempt-(\d+)$/.exec(approval.id)?.[1];
+            const replacementAttempt = typeof metadata.attempt === "number" && Number.isSafeInteger(metadata.attempt)
+              ? String(metadata.attempt)
+              : undefined;
+            const belongsToNewApprovalAttempt = outcomeChanged
+              && approvalAttempt !== undefined
+              && replacementAttempt !== undefined
+              && replacementAttempt !== approvalAttempt;
+            if (!belongsToNewApprovalAttempt) {
+              this.database.run(
+                `UPDATE artifacts
+                 SET status = 'stale', metadata_json = ?, checked_at = ?, updated_at = ?
+                 WHERE run_id = ? AND id = ?`,
+                [
+                  stableJson({ ...metadata, approvalInvalidated: true, approvalInvalidation: invalidation }),
+                  timestamp,
+                  timestamp,
+                  runId,
+                  output.id
+                ]
+              );
+            }
+          }
+          pendingChanges.push({ path: outputPath, actualChecksum: null });
+        }
+        this.appendNextEvent(runId, {
+          type: "approval.invalidated",
+          ...(approval.step_id === null ? {} : { stepId: approval.step_id }),
+          payload: { approvalId: approval.id, ...invalidation }
+        });
+      }
+    }
+  }
+
   private inspectArtifact(row: ArtifactRow): AgentFlowArtifactRecord {
     let status: AgentFlowArtifactStatus;
-    try {
-      const target = artifactStoragePath(this.repoRoot, row.run_id, row.path, false, true);
-      if (isSymbolicLink(target)) {
-        status = "stale";
-      } else {
-        const stat = fs.statSync(target);
-        if (!stat.isFile() || row.checksum === null || (row.size_bytes !== null && stat.size !== row.size_bytes)) {
+    let actualChecksum: string | null = null;
+    const metadata = JSON.parse(row.metadata_json) as Record<string, AgentFlowRunStateValue>;
+    if (metadata.approvalInvalidated === true) {
+      status = "stale";
+    } else {
+      try {
+        const target = artifactStoragePath(this.repoRoot, row.run_id, row.path, false, true);
+        if (isSymbolicLink(target)) {
           status = "stale";
         } else {
-          const actualChecksum = artifactChecksum(target);
-          status = actualChecksum !== row.checksum
-            ? "stale"
-            : row.previous_checksum !== null ? "overwritten" : "available";
+          const stat = fs.statSync(target);
+          if (!stat.isFile() || row.checksum === null || (row.size_bytes !== null && stat.size !== row.size_bytes)) {
+            status = "stale";
+          } else {
+            actualChecksum = artifactChecksum(target);
+            status = actualChecksum !== row.checksum
+              ? "stale"
+              : row.previous_checksum !== null ? "overwritten" : "available";
+          }
         }
-      }
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code ?? "";
-      if ((error instanceof AgentFlowRunStateError && error.code === "AGENT_FLOW_ARTIFACT_PATH") || code === "ELOOP") {
-        status = "stale";
-      } else if (["ENOENT", "ENOTDIR"].includes(code)) {
-        const { deletionBackupPath } = artifactStagingPaths(this.repoRoot, row.run_id, row.path);
-        status = isSymbolicLink(deletionBackupPath)
-          ? "stale"
-          : fs.existsSync(deletionBackupPath) && fs.statSync(deletionBackupPath).isFile()
-            ? row.status
-            : "missing";
-      } else {
-        throw error;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code ?? "";
+        if ((error instanceof AgentFlowRunStateError && error.code === "AGENT_FLOW_ARTIFACT_PATH") || code === "ELOOP") {
+          status = "stale";
+        } else if (["ENOENT", "ENOTDIR"].includes(code)) {
+          const { deletionBackupPath } = artifactStagingPaths(this.repoRoot, row.run_id, row.path);
+          status = isSymbolicLink(deletionBackupPath)
+            ? "stale"
+            : fs.existsSync(deletionBackupPath) && fs.statSync(deletionBackupPath).isFile()
+              ? row.status
+              : "missing";
+        } else {
+          throw error;
+        }
       }
     }
     const timestamp = currentTimestamp(this.now);
     const original = row;
     const updatedAt = status === row.status ? row.updated_at : timestamp;
     const inspected = { ...row, status, checked_at: timestamp, updated_at: updatedAt };
+    let statusPersisted = false;
     try {
       this.database.run(
         `UPDATE artifacts SET status = ?, checked_at = ?, updated_at = ?
         WHERE run_id = ? AND id = ? AND checksum IS ? AND status = ? AND updated_at = ?`,
         [status, timestamp, updatedAt, row.run_id, row.id, row.checksum, row.status, row.updated_at]
       );
-      row = this.database.get<ArtifactRow>("SELECT * FROM artifacts WHERE run_id = ? AND id = ?", [row.run_id, row.id]) ?? original;
+      statusPersisted = true;
     } catch (error) {
       if (!isSqliteContentionError(error)) throw error;
       row = inspected;
+    }
+    if (status === "stale" || status === "missing") {
+      this.invalidateApprovalsForArtifactChange(row.run_id, row.path, actualChecksum, timestamp);
+    }
+    if (statusPersisted) {
+      row = this.database.get<ArtifactRow>("SELECT * FROM artifacts WHERE run_id = ? AND id = ?", [row.run_id, row.id]) ?? original;
     }
     return hydrateArtifact(this.repoRoot, row);
   }
@@ -2240,6 +2399,22 @@ function hydrateSession(row: SessionRow): AgentFlowSessionRecord {
   };
 }
 
+function hydrateApproval(row: ApprovalRow): AgentFlowApprovalRecord {
+  return {
+    id: row.id,
+    runId: row.run_id,
+    stepId: row.step_id,
+    status: row.status,
+    requestedBy: row.requested_by,
+    decidedBy: row.decided_by,
+    decision: row.decision,
+    context: JSON.parse(row.context_json) as Record<string, AgentFlowRunStateValue>,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    decidedAt: row.decided_at
+  };
+}
+
 function hydrateFailure(row: FailureRow): AgentFlowFailureRecord {
   const payload = row.payload_json === null
     ? null
@@ -2315,6 +2490,9 @@ function sortJsonValue(value: unknown, ancestors: Set<object>): AgentFlowRunStat
 }
 
 export function normalizeAgentFlowArtifactPath(value: string): string {
+  if (/[\u0000-\u001F\u007F-\u009F\u2028\u2029]/u.test(value)) {
+    throw new AgentFlowRunStateError("Artifact path cannot contain control characters.", "AGENT_FLOW_ARTIFACT_PATH");
+  }
   const candidate = requiredString(value, "Artifact path").replaceAll("\\", "/");
   if (path.posix.isAbsolute(candidate) || path.win32.isAbsolute(candidate)) {
     throw new AgentFlowRunStateError("Artifact path must be repo-relative.", "AGENT_FLOW_ARTIFACT_PATH");
@@ -2327,6 +2505,19 @@ export function normalizeAgentFlowArtifactPath(value: string): string {
     throw new AgentFlowRunStateError("Artifact path must be repo-relative and cannot escape the repository root.", "AGENT_FLOW_ARTIFACT_PATH");
   }
   return normalized;
+}
+
+export function isNormalizedStaticAgentFlowArtifactPath(value: unknown): value is string {
+  if (typeof value !== "string"
+      || value.length === 0
+      || value !== value.trim()
+      || value.includes("{{")
+      || value.includes("}}")) return false;
+  try {
+    return normalizeAgentFlowArtifactPath(value) === value;
+  } catch {
+    return false;
+  }
 }
 
 function artifactRunId(value: string): string {

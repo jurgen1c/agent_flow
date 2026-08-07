@@ -22,6 +22,8 @@ import {
 import { validateAgentFlowNotifications } from "./notifications";
 import { AGENT_FLOW_FINAL_SUMMARY_PATH } from "./retention";
 import { MAX_AGENT_FLOW_COLLABORATION_QUESTION_BYTES } from "./collaboration";
+import { defaultAgentFlowApprovalOutputPath } from "./approval";
+import { defaultAgentFlowDecisionRecordPath } from "./decision_record";
 
 export const MAX_AGENT_FLOW_COMMAND_TIMEOUT_SECONDS = 2_147_483.647;
 
@@ -571,11 +573,11 @@ function validateCollaborationAuthority(
 ): void {
   const collaborationEnabled = workflow.style === "collaborative" &&
     isRecord(workflow.collaboration) && workflow.collaboration.enabled === true;
-  if (!collaborationEnabled && !contexts.some((context) => context.type === "review")) return;
+  if (!collaborationEnabled && !contexts.some((context) => context.type === "review" || context.type === "approval")) return;
 
   for (const context of contexts) {
     const requirements: Array<{ session?: string; capability: string; field: string; action: string }> = [];
-    if (!collaborationEnabled && context.type !== "review") continue;
+    if (!collaborationEnabled && context.type !== "review" && context.type !== "approval") continue;
     if (context.type === "consult" && context.step.blocking !== undefined &&
         typeof context.step.blocking !== "boolean") {
       addStepIssue(
@@ -619,12 +621,15 @@ function validateCollaborationAuthority(
       );
     }
     if (context.type === "approval") {
-      requirements.push({
-        session: nonEmptyString(context.step.reviewer),
-        capability: "can_approve",
-        field: "reviewer",
-        action: "to perform approvals"
-      });
+      const reviewer = nonEmptyString(context.step.reviewer);
+      if (reviewer !== "human") {
+        requirements.push({
+          session: reviewer,
+          capability: "can_approve",
+          field: "reviewer",
+          action: "to perform approvals"
+        });
+      }
     }
 
     for (const requirement of requirements) {
@@ -744,13 +749,16 @@ function validateRequiredStepFields(context: StepContext, errors: AgentFlowWorkf
     );
   }
 
-  if ((context.type === "command" || context.type === "artifact_transform" || context.type === "session_request" || context.type === "mcp_call") && isRecord(context.step.on_failure)) {
+  const sessionApproval = context.type === "approval" && nonEmptyString(context.step.reviewer) !== "human";
+  if ((context.type === "command" || context.type === "artifact_transform" || context.type === "session_request" || context.type === "mcp_call" || sessionApproval) && isRecord(context.step.on_failure)) {
     const failureLabel = context.type === "command"
       ? "Command"
-      : context.type === "artifact_transform" ? "Artifact transform" : context.type === "mcp_call" ? "MCP call" : "Session request";
+      : context.type === "artifact_transform" ? "Artifact transform" : context.type === "mcp_call" ? "MCP call"
+        : context.type === "approval" ? "Approval" : "Session request";
     const failureCode = context.type === "command"
       ? "workflow.command"
-      : context.type === "artifact_transform" ? "workflow.artifact_transform" : context.type === "mcp_call" ? "workflow.mcp_call" : "workflow.session_request";
+      : context.type === "artifact_transform" ? "workflow.artifact_transform" : context.type === "mcp_call" ? "workflow.mcp_call"
+        : context.type === "approval" ? "workflow.approval" : "workflow.session_request";
     const retry = context.step.on_failure.retry;
     const failureThen = typeof context.step.on_failure.then === "string"
       ? context.step.on_failure.then.trim()
@@ -773,7 +781,7 @@ function validateRequiredStepFields(context: StepContext, errors: AgentFlowWorkf
         `${failureLabel} failures may continue or be ignored only when on_failure.allowed is true.`
       );
     }
-    if (context.type === "artifact_transform" || context.type === "session_request" || context.type === "mcp_call") {
+    if (context.type === "artifact_transform" || context.type === "session_request" || context.type === "mcp_call" || sessionApproval) {
       const unsupportedTarget = unsupportedTransformFailureTarget(context.step.on_failure);
       if (unsupportedTarget !== undefined) {
         addStepIssue(
@@ -1280,7 +1288,8 @@ function validateSessionReferences(
     for (const field of fields) {
       const value = nonEmptyString(context.step[field]);
 
-      if (value !== undefined && !isDynamicReference(value) && !sessions.has(value)) {
+      if (value !== undefined && !isDynamicReference(value) && !sessions.has(value)
+          && !(context.type === "approval" && field === "reviewer" && value === "human")) {
         addStepIssue(
           errors,
           context,
@@ -1288,6 +1297,56 @@ function validateSessionReferences(
           field,
           `Session "${value}" is referenced but not declared in workflow sessions.`
         );
+      }
+    }
+
+    if (context.type === "decision_record") {
+      const owner = nonEmptyString(context.step.owner);
+      if (owner !== undefined && isDynamicReference(owner)) {
+        addStepIssue(
+          errors,
+          context,
+          "workflow.decision_record.owner.dynamic",
+          "owner",
+          "Decision record owner must be a static declared session."
+        );
+      }
+      for (const field of ["consulted", "approved_by"] as const) {
+        const value = context.step[field];
+        if (value === undefined) continue;
+        if (!Array.isArray(value) || value.length === 0 || value.some((entry) => nonEmptyString(entry) === undefined)) {
+          addStepIssue(
+            errors,
+            context,
+            `workflow.decision_record.${field}.invalid`,
+            field,
+            `Decision record ${field} must be a non-empty list of declared sessions when present.`
+          );
+          continue;
+        }
+        const seen = new Set<string>();
+        value.forEach((entry, index) => {
+          const session = nonEmptyString(entry)!;
+          if (seen.has(session)) {
+            addStepIssue(
+              errors,
+              context,
+              `workflow.decision_record.${field}.duplicate`,
+              `${field}[${index}]`,
+              `Decision record ${field} must not contain duplicate session "${session}".`
+            );
+          }
+          seen.add(session);
+          if (!sessions.has(session)) {
+            addStepIssue(
+              errors,
+              context,
+              "workflow.session.undeclared",
+              `${field}[${index}]`,
+              `Session "${session}" is referenced but not declared in workflow sessions.`
+            );
+          }
+        });
       }
     }
 
@@ -1617,6 +1676,74 @@ function validateArtifactPaths(contexts: StepContext[], errors: AgentFlowWorkflo
       }
       continue;
     }
+    if (context.type === "approval" || context.type === "decision_record") {
+      const label = context.type === "approval" ? "Approval" : "Decision record";
+      const optionalTextField = context.type === "approval" ? "message" : "rationale_summary";
+      if (context.step[optionalTextField] !== undefined && nonEmptyString(context.step[optionalTextField]) === undefined) {
+        addStepIssue(errors, context, `workflow.${context.type}.${optionalTextField}.invalid`, optionalTextField,
+          `${label} ${optionalTextField} must be non-empty text when declared.`);
+      }
+      if (context.type === "decision_record" && context.step.on_failure !== undefined) {
+        addStepIssue(errors, context, "workflow.decision_record.on_failure.unsupported", "on_failure",
+          "Decision record steps do not support on_failure policies in this runtime phase.");
+      }
+      if (context.type === "approval" && nonEmptyString(context.step.reviewer) === "human"
+          && context.step.on_failure !== undefined) {
+        addStepIssue(errors, context, "workflow.approval.on_failure.unsupported", "on_failure",
+          "Human approval steps do not support on_failure policies in this runtime phase.");
+      }
+      const values = Array.isArray(context.step.artifacts) ? context.step.artifacts : [];
+      if (context.type === "approval" && nonEmptyString(context.step.reviewer) !== "human"
+          && values.length > MAX_AGENT_FLOW_SESSION_INPUTS) {
+        addStepIssue(errors, context, "workflow.approval.artifacts.limit", "artifacts",
+          `Session approvals may declare at most ${MAX_AGENT_FLOW_SESSION_INPUTS} artifact inputs.`);
+      }
+      if (context.step.outputs !== undefined) {
+        addStepIssue(errors, context, `workflow.${context.type}.outputs.unsupported`, "outputs",
+          `${label} steps use one singular output artifact and do not support outputs.`);
+      }
+      const seen = new Set<string>();
+      values.forEach((value, index) => {
+        const field = `artifacts[${index}]`;
+        if (typeof value !== "string" || value.trim().length === 0) {
+          addStepIssue(errors, context, `workflow.${context.type}.artifact.invalid`, field,
+            `${label} artifacts must contain normalized static repo-relative paths.`);
+          return;
+        }
+        const normalized = normalizedStaticArtifactPath(value);
+        if (normalized === undefined) {
+          addStepIssue(errors, context, `workflow.${context.type}.artifact.invalid`, field,
+            `${label} artifact "${value}" must be a normalized static repo-relative path.`);
+          return;
+        }
+        if (seen.has(normalized)) {
+          addStepIssue(errors, context, `workflow.${context.type}.artifact.duplicate`, field,
+            `${label} artifacts must not contain duplicate path "${normalized}".`);
+        }
+        seen.add(normalized);
+      });
+      if (context.step.output !== undefined) {
+        const output = typeof context.step.output === "string" ? context.step.output : "";
+        if (normalizedStaticArtifactPath(output) === undefined) {
+          addStepIssue(errors, context, `workflow.${context.type}.output.invalid`, "output",
+            `${label} output must be a normalized static repo-relative path.`);
+        }
+      }
+      const effectiveOutput = context.step.output === undefined
+        ? context.id === undefined ? undefined
+          : context.type === "approval"
+            ? defaultAgentFlowApprovalOutputPath(context.id)
+            : defaultAgentFlowDecisionRecordPath(context.id)
+        : typeof context.step.output === "string" ? context.step.output : undefined;
+      const normalizedOutput = effectiveOutput === undefined
+        ? undefined
+        : normalizedStaticArtifactPath(effectiveOutput);
+      if (normalizedOutput !== undefined && seen.has(normalizedOutput)) {
+        addStepIssue(errors, context, `workflow.${context.type}.output.evidence_collision`, "output",
+          `${label} output must not overwrite evidence artifact "${normalizedOutput}".`);
+      }
+      continue;
+    }
     if (context.type === "mcp_call") {
       for (const field of ["server", "tool"] as const) {
         const value = nonEmptyString(context.step[field]);
@@ -1783,6 +1910,16 @@ function validateArtifactPaths(contexts: StepContext[], errors: AgentFlowWorkflo
         `Artifact path "${value}" must be repo-relative and stay within the repository.`
       );
     }
+  }
+}
+
+function normalizedStaticArtifactPath(value: string): string | undefined {
+  if (value.length === 0 || isDynamicReference(value)) return undefined;
+  try {
+    const normalized = normalizeAgentFlowArtifactPath(value);
+    return normalized === value ? normalized : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -2272,7 +2409,8 @@ function lintCommands(contexts: StepContext[], warnings: AgentFlowWorkflowIssue[
       );
     }
 
-    const modelFacing = ["challenge", "consult", "handoff", "review", "session_request"].includes(context.type ?? "");
+    const modelFacing = ["challenge", "consult", "handoff", "review", "session_request"].includes(context.type ?? "")
+      || context.type === "approval" && nonEmptyString(context.step.reviewer) !== "human";
 
     if (context.type !== "command" && !modelFacing) {
       continue;
@@ -2587,10 +2725,16 @@ function stepInputs(step: AgentFlowWorkflowStep): string[] {
 }
 
 function stepOutputs(step: AgentFlowWorkflowStep): string[] {
-  const outputs = stringList(step.outputs);
+  const specialized = nonEmptyString(step.type) === "approval" || nonEmptyString(step.type) === "decision_record";
+  const outputs = specialized ? [] : stringList(step.outputs);
   const output = nonEmptyString(step.output);
   const saveAs = nonEmptyString(step.type) === "input_request" ? nonEmptyString(step.save_as) : undefined;
-  return [...outputs, ...(output === undefined ? [] : [output]), ...(saveAs === undefined ? [] : [saveAs])];
+  const stepId = nonEmptyString(step.id);
+  const generated = output === undefined && stepId !== undefined
+    ? nonEmptyString(step.type) === "approval" ? defaultAgentFlowApprovalOutputPath(stepId)
+      : nonEmptyString(step.type) === "decision_record" ? defaultAgentFlowDecisionRecordPath(stepId) : undefined
+    : undefined;
+  return [...outputs, ...(output === undefined ? generated === undefined ? [] : [generated] : [output]), ...(saveAs === undefined ? [] : [saveAs])];
 }
 
 function nestedStepOutputs(step: AgentFlowWorkflowStep): string[] {

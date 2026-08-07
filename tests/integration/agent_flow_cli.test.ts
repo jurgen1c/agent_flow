@@ -283,6 +283,36 @@ steps:
     expect(fs.readFileSync(path.join(repo, "finished.txt"), "utf8")).toBe("done\n");
   });
 
+  test("attributes CLI human approval decisions to the human actor by default", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-human-approval-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.writeFileSync(path.join(repo, "workflow.yml"), `
+name: cli-human-approval
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: prepare, type: command, command: "printf 'Release candidate\\n' > release.md", outputs: [release.md] }
+  - { id: approve, type: approval, reviewer: human, artifacts: [release.md] }
+`);
+
+    expect(await captureCli(["run", "workflow.yml", "--id", "cli-human-approval"], repo)).toMatchObject({
+      exitCode: 3
+    });
+    expect(await captureCli([
+      "resume",
+      "cli-human-approval",
+      "--outcome",
+      "approve"
+    ], repo)).toMatchObject({ exitCode: 0 });
+
+    const store = await openAgentFlowRunState({ cwd: repo });
+    expect(store.listApprovals("cli-human-approval")).toEqual([
+      expect.objectContaining({ status: "approved", decidedBy: "human", decision: "approve" })
+    ]);
+    store.close();
+  });
+
   test("restores the CLI fixture provider after a manual gate", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-fixture-resume-"));
     fs.mkdirSync(path.join(repo, ".git"));

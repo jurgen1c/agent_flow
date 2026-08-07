@@ -73,6 +73,8 @@ steps:
     type: decision_record
     owner: reviewer
     topic: "Implementation approved"
+    rationale_summary: "The formal review approved the implementation evidence."
+    approved_by: [reviewer]
     artifacts:
       - reviews/code-review.json
       - implementation-summary.md

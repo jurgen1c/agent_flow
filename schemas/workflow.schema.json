@@ -15,7 +15,10 @@
     },
     "collaboration": { "$ref": "#/$defs/collaboration" },
     "artifacts": { "type": "object" },
-    "steps": { "type": "array", "items": { "type": "object" } },
+    "steps": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/step" }
+    },
     "short_circuit_if": {
       "type": "array",
       "minItems": 1,
@@ -140,6 +143,92 @@
     }
   ],
   "$defs": {
+    "step": {
+      "type": "object",
+      "properties": {
+        "body": { "type": "array", "items": { "$ref": "#/$defs/step" } },
+        "steps": { "type": "array", "items": { "$ref": "#/$defs/step" } },
+        "branches": { "type": "array", "items": { "$ref": "#/$defs/step" } }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "approval" } }, "required": ["type"] },
+          "then": { "$ref": "#/$defs/approvalStep" }
+        },
+        {
+          "if": { "properties": { "type": { "const": "decision_record" } }, "required": ["type"] },
+          "then": { "$ref": "#/$defs/decisionRecordStep" }
+        }
+      ],
+      "additionalProperties": true
+    },
+    "artifactPath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!.*[\\u0000-\\u001F\\u007F-\\u009F\\u2028\\u2029])(?!/)(?![A-Za-z]:[\\\\/])(?!\\./)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*(?:^|/)\\.(?:/|$))(?!.*[\\\\/]$)(?!.*\\\\)(?!.*//)(?!.*\\{\\{)(?!.*\\}\\})\\S(?:.*\\S)?$"
+    },
+    "artifactPathList": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/artifactPath" }
+    },
+    "sessionNameList": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1, "pattern": "\\S" }
+    },
+    "approvalFailurePolicy": {
+      "type": "object",
+      "properties": {
+        "retry": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "allowed": { "type": "boolean" },
+        "then": { "enum": ["continue", "ignore", "fail", "pause"] }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "then": { "enum": ["continue", "ignore"] } }, "required": ["then"] },
+          "then": { "properties": { "allowed": { "const": true } }, "required": ["allowed"] }
+        }
+      ],
+      "additionalProperties": true
+    },
+    "approvalStep": {
+      "required": ["id", "type", "reviewer", "artifacts"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "type": { "const": "approval" },
+        "reviewer": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "message": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "artifacts": { "$ref": "#/$defs/artifactPathList" },
+        "output": { "$ref": "#/$defs/artifactPath" },
+        "outputs": false,
+        "on_failure": { "$ref": "#/$defs/approvalFailurePolicy" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "reviewer": { "const": "human" } }, "required": ["reviewer"] },
+          "then": { "properties": { "on_failure": false } }
+        }
+      ]
+    },
+    "decisionRecordStep": {
+      "required": ["id", "type", "owner", "topic", "artifacts"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "type": { "const": "decision_record" },
+        "owner": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "topic": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "rationale_summary": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "consulted": { "$ref": "#/$defs/sessionNameList" },
+        "approved_by": { "$ref": "#/$defs/sessionNameList" },
+        "artifacts": { "$ref": "#/$defs/artifactPathList" },
+        "output": { "$ref": "#/$defs/artifactPath" },
+        "outputs": false,
+        "on_failure": false
+      }
+    },
     "collaboration": {
       "type": "object",
       "properties": {

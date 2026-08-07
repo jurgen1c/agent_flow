@@ -185,6 +185,69 @@ steps:
     );
   });
 
+  test("models executable direct parallel branches as typed routed steps", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: direct-specialized-branches
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  reviewer: { provider: fixture, authority: { can_approve: true } }
+  owner: { provider: fixture }
+steps:
+  - id: split
+    type: parallel
+    branches:
+      - id: approve
+        type: approval
+        session: reviewer
+        reviewer: reviewer
+        artifacts: [release.md]
+        on_approve: done
+        on_reject: revise
+        on_cancel: cancel
+      - id: record
+        type: decision_record
+        session: owner
+        owner: owner
+        topic: Record the direct branch decision
+        artifacts: [release.md]
+  - { id: revise, type: result, status: failed }
+  - { id: done, type: result, status: completed }
+`);
+
+    const graph = buildAgentFlowWorkflowGraph(workflow);
+    const explanation = explainAgentFlowWorkflow(workflow);
+
+    expect(graph.nodes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "approve", type: "approval", path: "steps[0].branches[0]" }),
+      expect.objectContaining({ id: "record", type: "decision_record", path: "steps[0].branches[1]" })
+    ]));
+    expect(graph.nodes.map((node) => node.id)).not.toEqual(expect.arrayContaining([
+      "split.branch.approve",
+      "split.branch.record"
+    ]));
+    expect(graph.edges).toEqual(expect.arrayContaining([
+      { from: "split", to: "approve", kind: "branch", label: "approve" },
+      { from: "split", to: "record", kind: "branch", label: "record" },
+      { from: "approve", to: "done", kind: "on_approve" },
+      { from: "approve", to: "revise", kind: "on_reject" },
+      { from: "approve", to: "terminal:cancel", kind: "on_cancel" }
+    ]));
+    expect(explanation).toContain([
+      "    - approve [approval] — reviewer=reviewer",
+      "      reads: release.md",
+      "      writes: approvals/approve.json"
+    ].join("\n"));
+    expect(explanation).toContain([
+      "    - record [decision_record] — owner=owner; topic=Record the direct branch decision",
+      "      reads: release.md",
+      "      writes: decision-records/record.json"
+    ].join("\n"));
+    expect(explanation).not.toContain("- branch approve");
+    expect(explanation).not.toContain("- branch record");
+  });
+
   test("renders advisory authority for sessions without stronger grants", () => {
     const workflow = parseAgentFlowWorkflowOrThrow(`name: advisory
 version: 1
@@ -398,6 +461,27 @@ steps:
       { from: "gate", to: "terminal:cancel", kind: "option", label: "reject" },
       { from: "gate", to: "terminal:completed", kind: "option", label: "completed" },
       { from: "gate", to: "terminal:cancel", kind: "option", label: "cancel" }
+    ]));
+  });
+
+  test("renders implicit approval rejection and human cancellation outcomes", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: implicit-approval-outcomes
+version: 1
+style: collaborative
+maturity: experimental
+sessions:
+  reviewer: { provider: fixture, authority: { can_approve: true } }
+steps:
+  - { id: session_approval, type: approval, reviewer: reviewer, artifacts: [spec.md] }
+  - { id: human_approval, type: approval, reviewer: human, artifacts: [release.md] }
+  - { id: done, type: result, status: completed }
+`);
+
+    expect(buildAgentFlowWorkflowGraph(workflow).edges).toEqual(expect.arrayContaining([
+      { from: "session_approval", to: "terminal:cancel", kind: "on_reject" },
+      { from: "human_approval", to: "terminal:cancel", kind: "on_reject" },
+      { from: "human_approval", to: "terminal:cancel", kind: "on_cancel" }
     ]));
   });
 

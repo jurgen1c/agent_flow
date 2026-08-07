@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import {
   AgentFlowRunStateError,
+  isNormalizedStaticAgentFlowArtifactPath,
   normalizeAgentFlowArtifactPath,
   type AgentFlowArtifactRecord,
   type AgentFlowRunStateStore,
@@ -20,6 +21,12 @@ import {
   parseAgentFlowConsultResult
 } from "./collaboration";
 import type { AgentFlowConsultResult } from "./collaboration";
+import {
+  createAgentFlowApprovalPrompt,
+  defaultAgentFlowApprovalOutputPath,
+  parseAgentFlowApprovalResult,
+  type AgentFlowApprovalResult
+} from "./approval";
 
 export const MAX_AGENT_FLOW_SESSION_PROMPT_BYTES = 1024 * 1024;
 export const MAX_AGENT_FLOW_SESSION_INPUT_BYTES = 10 * 1024 * 1024;
@@ -68,8 +75,10 @@ export interface AgentFlowSessionRequestExecutionResult {
   provider: string;
   requestArtifact: AgentFlowArtifactRecord;
   outputArtifacts: AgentFlowArtifactRecord[];
+  inputEvidence: Array<{ path: string; checksum: string }>;
   externalSessionId?: string;
   consultResult?: AgentFlowConsultResult;
+  approvalResult?: AgentFlowApprovalResult;
 }
 
 export interface ExecuteAgentFlowSessionRequestOptions {
@@ -79,7 +88,7 @@ export interface ExecuteAgentFlowSessionRequestOptions {
 }
 
 interface ExecuteAgentFlowSessionStepOptions extends ExecuteAgentFlowSessionRequestOptions {
-  kind?: "review" | "consult" | "challenge";
+  kind?: "review" | "consult" | "challenge" | "approval";
 }
 
 export class AgentFlowSessionRequestError extends Error {
@@ -212,6 +221,17 @@ export async function executeAgentFlowChallenge(
   return executeAgentFlowSessionStep(store, runId, workflow, step, registry, { ...options, kind: "challenge" });
 }
 
+export async function executeAgentFlowApproval(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  workflow: AgentFlowWorkflow,
+  step: AgentFlowWorkflowStep,
+  registry: AgentFlowSessionProviderRegistry,
+  options: ExecuteAgentFlowSessionRequestOptions = {}
+): Promise<AgentFlowSessionRequestExecutionResult> {
+  return executeAgentFlowSessionStep(store, runId, workflow, step, registry, { ...options, kind: "approval" });
+}
+
 async function executeAgentFlowSessionStep(
   store: AgentFlowRunStateStore,
   runId: string,
@@ -244,13 +264,41 @@ async function executeAgentFlowSessionStep(
       "AGENT_FLOW_SESSION_WORKFLOW_MISMATCH"
     );
   }
-  const sessionId = requiredName(kind === "review" ? step.reviewer : kind === "session_request" ? step.session : step.to, `${label} ${stepId} session`);
+  const sessionId = requiredName(kind === "review" || kind === "approval" ? step.reviewer : kind === "session_request" ? step.session : step.to, `${label} ${stepId} session`);
   const session = mapping(workflow.sessions?.[sessionId]);
   if (session === undefined) {
     throw new AgentFlowSessionRequestError(
       `${label} ${stepId} references undeclared session ${sessionId}.`,
       "AGENT_FLOW_SESSION_UNDECLARED"
     );
+  }
+  if (kind === "approval") {
+    if (!Array.isArray(step.artifacts)
+        || step.artifacts.length === 0
+        || !step.artifacts.every(isNormalizedStaticAgentFlowArtifactPath)) {
+      throw new AgentFlowSessionRequestError(
+        `Approval ${stepId} artifacts must use normalized static artifact paths.`,
+        "AGENT_FLOW_SESSION_REQUEST_INVALID"
+      );
+    }
+    if (step.output !== undefined && !isNormalizedStaticAgentFlowArtifactPath(step.output)) {
+      throw new AgentFlowSessionRequestError(
+        `Approval ${stepId} output must use a normalized static artifact path.`,
+        "AGENT_FLOW_SESSION_REQUEST_INVALID"
+      );
+    }
+    if (sessionId === "human") {
+      throw new AgentFlowSessionRequestError(
+        `Approval ${stepId} with reviewer human must use the interactive approval runtime.`,
+        "AGENT_FLOW_SESSION_AUTHORITY"
+      );
+    }
+    if (mapping(session.authority)?.can_approve !== true) {
+      throw new AgentFlowSessionRequestError(
+        `Approval reviewer ${sessionId} must explicitly declare can_approve authority.`,
+        "AGENT_FLOW_SESSION_AUTHORITY"
+      );
+    }
   }
   const provider = requiredName(session.provider, `Session ${sessionId} provider`);
   const adapter = registry.get(provider);
@@ -264,9 +312,19 @@ async function executeAgentFlowSessionStep(
   const previous = store.getSession(runId, sessionId);
   const priorExternalSessionId = resume ? previous?.externalSessionId ?? undefined : undefined;
   const rawInputs = kind === "session_request" ? step.inputs : step.artifacts;
-  const rawOutputs = kind === "consult" || kind === "challenge" ? [step.output] : step.outputs;
+  const rawOutputs = kind === "consult" || kind === "challenge"
+    ? [step.output]
+    : kind === "approval" ? [typeof step.output === "string" ? step.output : defaultAgentFlowApprovalOutputPath(stepId)] : step.outputs;
   const outputPaths = normalizedArtifactPaths(rawOutputs, `${label} ${stepId} outputs`);
-  const prompt = kind === "review"
+  const prompt = kind === "approval"
+    ? createAgentFlowApprovalPrompt(
+      stepId,
+      sessionId,
+      normalizedArtifactPaths(rawInputs, `Approval ${stepId} artifacts`),
+      outputPaths[0]!,
+      typeof step.message === "string" ? step.message.trim() : undefined
+    )
+    : kind === "review"
     ? createAgentFlowReviewPrompt(
       stepId,
       sessionId,
@@ -301,6 +359,15 @@ async function executeAgentFlowSessionStep(
     kind === "session_request" ? resolveSessionInputPaths(rawInputs, run.inputs, stepId) : rawInputs,
     `${label} ${stepId} ${kind === "session_request" ? "inputs" : "artifacts"}`
   );
+  if (kind === "approval") {
+    const evidenceCollision = outputPaths.find((outputPath) => inputPaths.includes(outputPath));
+    if (evidenceCollision !== undefined) {
+      throw new AgentFlowSessionRequestError(
+        `Approval output must not overwrite evidence artifact ${evidenceCollision}.`,
+        "AGENT_FLOW_SESSION_OUTPUT_COLLISION"
+      );
+    }
+  }
   if (inputPaths.length > MAX_AGENT_FLOW_SESSION_INPUTS) {
     throw new AgentFlowSessionRequestError(
       `${label} ${stepId} declares ${inputPaths.length} inputs; at most ${MAX_AGENT_FLOW_SESSION_INPUTS} are allowed.`,
@@ -420,12 +487,15 @@ async function executeAgentFlowSessionStep(
   });
   const outputs = validateAgentFlowSessionProviderResponse(stepId, outputPaths, response);
   let consultResult: AgentFlowConsultResult | undefined;
+  let approvalResult: AgentFlowApprovalResult | undefined;
   if (kind === "review") {
     for (const outputPath of outputPaths) parseAgentFlowReviewResult(outputs.get(outputPath)!, outputPath);
   } else if (kind === "consult") {
     consultResult = parseAgentFlowConsultResult(outputs.get(outputPaths[0]!)!, outputPaths[0]!, step.blocking === true);
   } else if (kind === "challenge") {
     parseAgentFlowChallengeResult(outputs.get(outputPaths[0]!)!, outputPaths[0]!);
+  } else if (kind === "approval") {
+    approvalResult = parseAgentFlowApprovalResult(outputs.get(outputPaths[0]!)!, outputPaths[0]!);
   }
   const providerMetadata = validateAgentFlowSessionProviderMetadata(stepId, response.metadata);
   options.beforePublish?.();
@@ -485,6 +555,9 @@ async function executeAgentFlowSessionStep(
         sessionId,
         provider,
         requestArtifact: requestPath,
+        ...(kind === "approval"
+          ? { evidence: inputs.map((input) => ({ path: input.path, checksum: input.checksum })) }
+          : {}),
         ...(options.attempt === undefined ? {} : { attempt: options.attempt })
       }
     };
@@ -514,7 +587,9 @@ async function executeAgentFlowSessionStep(
     provider,
     requestArtifact,
     outputArtifacts,
+    inputEvidence: inputs.map((input) => ({ path: input.path, checksum: input.checksum })),
     ...(consultResult === undefined ? {} : { consultResult }),
+    ...(approvalResult === undefined ? {} : { approvalResult }),
     ...(externalSessionId === undefined ? {} : { externalSessionId })
   };
   } catch (error) {
@@ -750,9 +825,9 @@ function preflightOutputCollisions(
   sessionId: string,
   outputPaths: string[],
   requestPath: string,
-  requestKind: "challenge_request" | "consult_request" | "review_request" | "session_request",
-  outputKind: "challenge_output" | "consult_output" | "review_output" | "session_output",
-  requestIdPrefix: "challenge-request" | "consult-request" | "review-request" | "session-request"
+  requestKind: "approval_request" | "challenge_request" | "consult_request" | "review_request" | "session_request",
+  outputKind: "approval_output" | "challenge_output" | "consult_output" | "review_output" | "session_output",
+  requestIdPrefix: "approval-request" | "challenge-request" | "consult-request" | "review-request" | "session-request"
 ): void {
   const label = requestKind.replace("_request", "").replace(/^./, (value) => value.toUpperCase());
   const outputLabel = `${label} output`;
@@ -788,7 +863,7 @@ function ownedSessionOutput(
   artifact: AgentFlowArtifactRecord | null,
   stepId: string,
   sessionId: string,
-  outputKind: "challenge_output" | "consult_output" | "review_output" | "session_output"
+  outputKind: "approval_output" | "challenge_output" | "consult_output" | "review_output" | "session_output"
 ): boolean {
   return artifact?.kind === outputKind
     && artifact.producerStepId === stepId
@@ -908,19 +983,11 @@ function findWorkflowStep(steps: AgentFlowWorkflowStep[], stepId: string): Agent
       const found = findWorkflowStep(nested, stepId);
       if (found !== undefined) return found;
     }
-    if (Array.isArray(step.branches)) {
-      for (const branch of step.branches) {
-        const branchMapping = mapping(branch);
-        if (branchMapping === undefined) continue;
-        for (const field of ["body", "steps"] as const) {
-          const nested = Array.isArray(branchMapping[field])
-            ? (branchMapping[field] as unknown[]).filter((entry): entry is AgentFlowWorkflowStep => mapping(entry) !== undefined)
-            : [];
-          const found = findWorkflowStep(nested, stepId);
-          if (found !== undefined) return found;
-        }
-      }
-    }
+    const branches = Array.isArray(step.branches)
+      ? (step.branches as unknown[]).filter((entry): entry is AgentFlowWorkflowStep => mapping(entry) !== undefined)
+      : [];
+    const found = findWorkflowStep(branches, stepId);
+    if (found !== undefined) return found;
   }
   return undefined;
 }

@@ -31,9 +31,11 @@ try {
     "dist/cli/router.js",
     "dist/cli/router.d.ts",
     "dist/agent-flow.js",
+    "schemas/approval.schema.json",
     "schemas/challenge.schema.json",
     "schemas/config.schema.json",
     "schemas/consult.schema.json",
+    "schemas/decision-record.schema.json",
     "schemas/failure-classification.schema.json",
     "schemas/review.schema.json",
     "schemas/workflow.schema.json"

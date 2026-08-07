@@ -181,7 +181,7 @@ function renderHelp(topic?: string): string {
     "Reserved placeholders:",
     `  ${plannedAgentFlowRuntimeCommands.filter((command) => !["validate", "lint", "explain", "graph", "simulate", ...ACTIVE_LIFECYCLE_COMMANDS].includes(command as ActiveLifecycleCommand)).join(", ")}`,
     "",
-    "Command and artifact-transform pipeline execution, including session-request and review steps, plus persistent lifecycle state are active."
+    "Command and artifact-transform pipeline execution, including session-request, review, approval, and decision-record steps, plus persistent lifecycle state are active."
   ].join("\n");
 }
 
@@ -212,8 +212,10 @@ async function runLifecycleCommand(
         };
       }
       const unsupportedProviders = sessionRequestSteps
-        .filter((step) => typeof step.session === "string")
-        .map((step) => workflowResult!.workflow.sessions?.[String(step.session).trim()])
+        .map((step) => step.type === "review" || step.type === "approval" ? step.reviewer
+          : step.type === "consult" || step.type === "challenge" ? step.to : step.session)
+        .filter((session): session is string => typeof session === "string")
+        .map((session) => workflowResult!.workflow.sessions?.[session.trim()])
         .flatMap((session) => session !== null && typeof session === "object" && !Array.isArray(session)
           ? [String((session as Record<string, unknown>).provider ?? "").trim()]
           : [])
@@ -712,7 +714,10 @@ function collectSessionRequestSteps(
 ): import("../runtime/index").AgentFlowWorkflowStep[] {
   const requests: import("../runtime/index").AgentFlowWorkflowStep[] = [];
   const visit = (step: import("../runtime/index").AgentFlowWorkflowStep): void => {
-    if (typeof step.type === "string" && step.type.trim() === "session_request") requests.push(step);
+    if (typeof step.type === "string" && (
+      ["challenge", "consult", "review", "session_request"].includes(step.type.trim())
+      || (step.type.trim() === "approval" && String(step.reviewer ?? "").trim() !== "human")
+    )) requests.push(step);
     for (const field of ["body", "steps", "branches"] as const) {
       const nested = step[field];
       if (!Array.isArray(nested)) continue;

@@ -7,6 +7,8 @@ import type {
 } from "./workflow";
 import { assertAgentFlowSuccessTargetsAreUnambiguous } from "./success_routing";
 import { normalizeRepoPattern } from "./policy_utils";
+import { defaultAgentFlowApprovalOutputPath } from "./approval";
+import { defaultAgentFlowDecisionRecordPath } from "./decision_record";
 
 export interface AgentFlowWorkflowGraphNode {
   id: string;
@@ -174,6 +176,16 @@ export function buildAgentFlowWorkflowGraph(workflow: AgentFlowWorkflow): AgentF
         edges.push({ from: source, to: terminalId, kind: "option", label: option });
       }
     }
+    if (step.type === "approval") {
+      if (!targets.some((target) => target.kind === "on_reject")) {
+        nodes.push({ id: "terminal:cancel", type: "terminal", path: "terminal:cancel", label: "cancel" });
+        edges.push({ from: source, to: "terminal:cancel", kind: "on_reject" });
+      }
+      if (nonEmptyString(step.reviewer) === "human" && !targets.some((target) => target.kind === "on_cancel")) {
+        nodes.push({ id: "terminal:cancel", type: "terminal", path: "terminal:cancel", label: "cancel" });
+        edges.push({ from: source, to: "terminal:cancel", kind: "on_cancel" });
+      }
+    }
   }
 
   return {
@@ -247,16 +259,17 @@ function collectStepList(
   nodes: AgentFlowWorkflowGraphNode[],
   edges: AgentFlowWorkflowGraphEdge[],
   locatedSteps: LocatedStep[],
-  parent?: { id: string; label: string }
+  parent?: { id: string; label: string; kind?: string },
+  indexOffset = 0
 ): void {
   const ids = steps.map((step) => nonEmptyString(step.id));
   const first = ids.find(isString);
   if (parent !== undefined && first !== undefined) {
-    edges.push({ from: parent.id, to: first, kind: "contains", label: parent.label });
+    edges.push({ from: parent.id, to: first, kind: parent.kind ?? "contains", label: parent.label });
   }
 
   steps.forEach((step, index) => {
-    const stepPath = `${path}[${index}]`;
+    const stepPath = `${path}[${index + indexOffset}]`;
     const id = nonEmptyString(step.id);
     const type = nonEmptyString(step.type) ?? "unknown";
     if (id === undefined) {
@@ -293,6 +306,18 @@ function collectStepList(
         const branchId = `${id}.branch.${branchName}`;
         const branchPath = `${stepPath}.branches[${branchIndex}]`;
         const branchLabel = namedScalarDetails(value, ["session", "strategy"]).join("; ");
+        if (nonEmptyString(value.type) !== undefined) {
+          collectStepList(
+            [value as AgentFlowWorkflowStep],
+            `${stepPath}.branches`,
+            nodes,
+            edges,
+            locatedSteps,
+            { id, label: branchName, kind: "branch" },
+            branchIndex
+          );
+          return;
+        }
         nodes.push({ id: branchId, type: "parallel_branch", path: branchPath, ...(branchLabel.length === 0 ? {} : { label: branchLabel }) });
         edges.push({ from: id, to: branchId, kind: "branch", label: branchName });
 
@@ -341,6 +366,10 @@ function appendExplainedStep(lines: string[], step: AgentFlowWorkflowStep, depth
   if (type === "parallel" && Array.isArray(step.branches)) {
     step.branches.forEach((value, index) => {
       if (!isRecord(value)) {
+        return;
+      }
+      if (nonEmptyString(value.type) !== undefined) {
+        appendExplainedStep(lines, value as AgentFlowWorkflowStep, depth + 1);
         return;
       }
       const branchName = nonEmptyString(value.id) ?? String(index + 1);
@@ -458,7 +487,13 @@ function collectDirectArtifacts(step: AgentFlowWorkflowStep, direction: "read" |
   }
   const output = nonEmptyString(step.output);
   const saveAs = step.type === "input_request" ? nonEmptyString(step.save_as) : undefined;
-  return [...stringValues(step.outputs), ...(output === undefined ? [] : [output]), ...(saveAs === undefined ? [] : [saveAs])];
+  const stepId = nonEmptyString(step.id);
+  const generated = output === undefined && stepId !== undefined
+    ? step.type === "approval" ? defaultAgentFlowApprovalOutputPath(stepId)
+      : step.type === "decision_record" ? defaultAgentFlowDecisionRecordPath(stepId) : undefined
+    : undefined;
+  const outputs = step.type === "approval" || step.type === "decision_record" ? [] : stringValues(step.outputs);
+  return [...outputs, ...(output === undefined ? generated === undefined ? [] : [generated] : [output]), ...(saveAs === undefined ? [] : [saveAs])];
 }
 
 function appendNamedValues(lines: string[], values: Record<string, AgentFlowYamlValue> | undefined): void {

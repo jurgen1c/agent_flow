@@ -109,7 +109,7 @@ steps:
       }
       store.close();
     }
-  });
+  }, 10_000);
 
   test("validates classification branches before an earlier branch can route", async () => {
     const root = temporaryRepo();

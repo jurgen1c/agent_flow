@@ -408,7 +408,7 @@ function closeCancelledInteraction(
   const approvalId = typeof waiting?.approvalId === "string" && waiting.approvalId.trim().length > 0
     ? waiting.approvalId.trim()
     : undefined;
-  if (waiting?.kind === "manual_gate" && approvalId !== undefined) {
+  if ((waiting?.kind === "manual_gate" || waiting?.kind === "approval") && approvalId !== undefined) {
     store.upsertApproval({
       id: approvalId,
       runId,
