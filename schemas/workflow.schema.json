@@ -87,7 +87,10 @@
       },
       "additionalProperties": true
     },
-    "notify": { "type": "array" },
+    "notify": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/notificationRule" }
+    },
     "retention": {
       "type": "object",
       "properties": {
@@ -134,20 +137,6 @@
       },
       "then": {
         "properties": { "short_circuit_if": false }
-      }
-    },
-    {
-      "if": {
-        "properties": { "style": { "const": "pipeline" } },
-        "required": ["style"]
-      },
-      "then": {
-        "properties": {
-          "notify": {
-            "type": "array",
-            "items": { "$ref": "#/$defs/notificationRule" }
-          }
-        }
       }
     }
   ],

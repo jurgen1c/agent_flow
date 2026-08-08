@@ -90,7 +90,5 @@ limits:
   max_frontier_calls: 6
 
 notify:
-  - on: loop.timeout
-    channels: [email_personal, terminal]
   - on: workflow.paused
-    channels: [system, terminal]
+    channels: [email_personal, system, terminal]

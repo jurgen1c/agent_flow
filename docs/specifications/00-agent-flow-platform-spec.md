@@ -300,9 +300,10 @@ notify:
 ```
 
 Notification delivery failure must not fail the workflow unless `required: true`.
-The initial runtime adapters are `terminal` and `system`. Each channel attempt
-is persisted as `notification.delivered` or `notification.failed`; registered
-custom adapters may implement additional channel names.
+The built-in runtime adapters are `terminal` and `system`. Embedders can inject
+`email`, `slack`, `webhook`, and `command` adapters or register additional
+channel names. Each channel attempt is persisted as `notification.delivered` or
+`notification.failed`.
 
 ## 12. Retention and Cleanup
 

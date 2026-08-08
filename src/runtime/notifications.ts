@@ -1,11 +1,13 @@
 import { spawnSync } from "node:child_process";
-import type { AgentFlowRunStateStore, AgentFlowRunStatus } from "./run_state";
+import type { AgentFlowRunStateStore, AgentFlowRunStateValue, AgentFlowRunStatus } from "./run_state";
 import type { AgentFlowWorkflow, AgentFlowYamlMapping, AgentFlowYamlValue } from "./workflow";
 
 export type AgentFlowNotificationEvent =
   | "workflow.completed"
   | "workflow.failed"
-  | "workflow.paused";
+  | "workflow.paused"
+  | "approval.waiting"
+  | "collaboration.disagreement";
 
 export interface AgentFlowNotification {
   runId: string;
@@ -15,9 +17,29 @@ export interface AgentFlowNotification {
   title: string;
   message: string;
   required: boolean;
+  stepId?: string;
+  payload?: AgentFlowRunStateValue;
 }
 
 export type AgentFlowNotificationAdapter = (notification: AgentFlowNotification) => undefined;
+export type AgentFlowEmailNotificationAdapter = AgentFlowNotificationAdapter;
+export type AgentFlowSlackNotificationAdapter = AgentFlowNotificationAdapter;
+export type AgentFlowWebhookNotificationAdapter = AgentFlowNotificationAdapter;
+export type AgentFlowCommandNotificationAdapter = AgentFlowNotificationAdapter;
+
+export interface AgentFlowNotificationAdapters {
+  terminal?: AgentFlowNotificationAdapter;
+  system?: AgentFlowNotificationAdapter;
+  email?: AgentFlowEmailNotificationAdapter;
+  slack?: AgentFlowSlackNotificationAdapter;
+  webhook?: AgentFlowWebhookNotificationAdapter;
+  command?: AgentFlowCommandNotificationAdapter;
+}
+
+export interface AgentFlowNotificationContext {
+  stepId?: string;
+  payload?: AgentFlowRunStateValue;
+}
 
 export interface AgentFlowNotificationDeliveryResult {
   requiredFailure?: {
@@ -49,23 +71,24 @@ export class AgentFlowNotificationRegistry {
 }
 
 export function createAgentFlowNotificationRegistry(
-  adapters: {
-    terminal?: AgentFlowNotificationAdapter;
-    system?: AgentFlowNotificationAdapter;
-  } = {}
+  adapters: AgentFlowNotificationAdapters = {}
 ): AgentFlowNotificationRegistry {
-  return new AgentFlowNotificationRegistry()
+  const registry = new AgentFlowNotificationRegistry()
     .register("terminal", adapters.terminal ?? terminalNotificationAdapter)
     .register("system", adapters.system ?? systemNotificationAdapter);
+  for (const channel of ["email", "slack", "webhook", "command"] as const) {
+    const adapter = adapters[channel];
+    if (adapter !== undefined) registry.register(channel, adapter);
+  }
+  return registry;
 }
 
 export function validateAgentFlowNotifications(workflow: AgentFlowWorkflow): AgentFlowNotificationIssue[] {
-  if (workflow.style !== "pipeline") return [];
   if (workflow.notify !== undefined && !Array.isArray(workflow.notify)) {
     return [issue(
       "workflow.notification.rules.invalid",
       "notify",
-      "Pipeline notifications must be a list."
+      "Workflow notifications must be a list."
     )];
   }
   const errors: AgentFlowNotificationIssue[] = [];
@@ -86,7 +109,7 @@ export function validateAgentFlowNotifications(workflow: AgentFlowWorkflow): Age
       errors.push(issue(
         "workflow.notification.event.unsupported",
         `${path}.on`,
-        "Notification on must be workflow.completed, workflow.failed, or workflow.paused."
+        "Notification on must be workflow.completed, workflow.failed, workflow.paused, approval.waiting, or collaboration.disagreement."
       ));
     }
 
@@ -125,6 +148,17 @@ export function deliverAgentFlowNotifications(
 ): AgentFlowNotificationDeliveryResult {
   const event = notificationEvent(status);
   if (event === undefined) return {};
+  return deliverAgentFlowNotificationEvent(store, runId, workflow, event, registry);
+}
+
+export function deliverAgentFlowNotificationEvent(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  workflow: AgentFlowWorkflow,
+  event: AgentFlowNotificationEvent,
+  registry: AgentFlowNotificationRegistry,
+  context: AgentFlowNotificationContext = {}
+): AgentFlowNotificationDeliveryResult {
   let requiredFailure: AgentFlowNotificationDeliveryResult["requiredFailure"];
 
   for (const value of workflow.notify ?? []) {
@@ -132,7 +166,7 @@ export function deliverAgentFlowNotifications(
     if (nonEmptyString(rule?.on) !== event) continue;
     const required = rule?.required === true;
     for (const channel of stringList(rule?.channels)) {
-      const notification = buildNotification(runId, workflow.name, event, channel, required);
+      const notification = buildNotification(runId, workflow.name, event, channel, required, context);
       let failureMessage: string | undefined;
       try {
         const adapter = registry.get(channel);
@@ -151,12 +185,25 @@ export function deliverAgentFlowNotifications(
       if (failureMessage === undefined) {
         store.appendRunEvent(runId, {
           type: "notification.delivered",
-          payload: { channel, event, required }
+          ...(context.stepId === undefined ? {} : { stepId: context.stepId }),
+          payload: {
+            channel,
+            event,
+            required,
+            ...(context.stepId === undefined ? {} : { stepId: context.stepId })
+          }
         });
       } else {
         store.appendRunEvent(runId, {
           type: "notification.failed",
-          payload: { channel, event, message: failureMessage, required }
+          ...(context.stepId === undefined ? {} : { stepId: context.stepId }),
+          payload: {
+            channel,
+            event,
+            message: failureMessage,
+            required,
+            ...(context.stepId === undefined ? {} : { stepId: context.stepId })
+          }
         });
         if (required && requiredFailure === undefined) {
           requiredFailure = { channel, event, message: failureMessage };
@@ -171,7 +218,9 @@ export function deliverAgentFlowNotifications(
 const NOTIFICATION_EVENTS = new Set<AgentFlowNotificationEvent>([
   "workflow.completed",
   "workflow.failed",
-  "workflow.paused"
+  "workflow.paused",
+  "approval.waiting",
+  "collaboration.disagreement"
 ]);
 
 function notificationEvent(status: AgentFlowRunStatus): AgentFlowNotificationEvent | undefined {
@@ -186,17 +235,25 @@ function buildNotification(
   workflowName: string,
   event: AgentFlowNotificationEvent,
   channel: string,
-  required: boolean
+  required: boolean,
+  context: AgentFlowNotificationContext
 ): AgentFlowNotification {
-  const status = event.slice("workflow.".length);
+  const subject = context.stepId === undefined ? "" : ` step ${context.stepId}`;
+  const message = event.startsWith("workflow.")
+    ? `Agent Flow workflow ${workflowName} run ${runId} ${event.slice("workflow.".length)}.`
+    : event === "approval.waiting"
+      ? `Agent Flow workflow ${workflowName} run ${runId}${subject} is waiting for approval.`
+      : `Agent Flow workflow ${workflowName} run ${runId}${subject} entered disagreement handling.`;
   return {
     runId,
     workflowName,
     event,
     channel,
     title: `Agent Flow: ${workflowName}`,
-    message: `Agent Flow workflow ${workflowName} run ${runId} ${status}.`,
-    required
+    message,
+    required,
+    ...(context.stepId === undefined ? {} : { stepId: context.stepId }),
+    ...(context.payload === undefined ? {} : { payload: context.payload })
   };
 }
 
