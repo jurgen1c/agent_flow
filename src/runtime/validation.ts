@@ -1690,7 +1690,7 @@ function validateDisagreementArtifactOutputs(
   if (policy.strategy === "ask_user" || policy.strategy === "fail") return;
   const reservations = [...collectAgentFlowReviewCycleStepIds(workflow.steps)].map((reviewId) => {
     const firstOutput = defaultAgentFlowDisagreementOutputPath(reviewId, 1);
-    return { reviewId, prefix: firstOutput.slice(0, -"round-1.json".length) };
+    return { reviewId, prefix: firstOutput.slice(0, firstOutput.lastIndexOf("/") + 1) };
   });
 
   for (const context of contexts) {

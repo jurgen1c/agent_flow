@@ -1753,7 +1753,7 @@ function resumeWaitingStep(
           `User selected ${outcome} for review disagreement ${waiting.stepId}.`,
           response.decidedBy?.trim() || "human",
           policy.strategy,
-          routingBudget.disagreementRounds.get(waiting.stepId) ?? 0,
+          Math.max(1, routingBudget.disagreementRounds.get(waiting.stepId) ?? 0),
           waiting.evidence
         );
       }

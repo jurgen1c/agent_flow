@@ -54,6 +54,8 @@ describe("Agent Flow collaborative disagreement handling", () => {
     expect(completed).toMatchObject({ status: "completed" });
     expect(JSON.parse(store.readArtifact("ask-user", "reviews/review.json").content.toString()))
       .toMatchObject({ status: "approved", summary: expect.stringContaining("User selected approve") });
+    expect(store.getArtifact("ask-user", "reviews/review.json")?.metadata)
+      .toMatchObject({ disagreementStrategy: "ask_user", disagreementRound: 1 });
     expect(store.listEvents("ask-user")).toContainEqual(expect.objectContaining({
       type: "collaboration.disagreement.resolved",
       payload: expect.objectContaining({ path: "user", outcome: "approve", decidedBy: "operator" })
