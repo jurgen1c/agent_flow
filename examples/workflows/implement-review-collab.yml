@@ -53,7 +53,7 @@ steps:
     type: condition
     branches:
       - if: reviews.code_review.status == "approved"
-        then: record_approval
+        then: approve_implementation
       - if: reviews.code_review.status == "changes_requested"
         then: address_review
     else: ask_user
@@ -68,6 +68,17 @@ steps:
     outputs:
       - implementation-summary.md
     then: review
+
+  - id: approve_implementation
+    type: approval
+    reviewer: reviewer
+    message: "Approve the reviewed implementation evidence before recording the decision."
+    artifacts:
+      - reviews/code-review.json
+      - implementation-summary.md
+      - git.diff
+    on_approve: record_approval
+    on_reject: address_review
 
   - id: record_approval
     type: decision_record
@@ -85,7 +96,7 @@ steps:
     save_as: user-input/review-disagreement.md
 
 approvals:
-  reviewer_approval:
+  approve_implementation:
     invalidated_by:
       - git.diff
       - implementation-summary.md

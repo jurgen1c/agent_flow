@@ -28,6 +28,7 @@ export interface AgentFlowWorkflow {
   maturity: AgentFlowMaturity;
   inputs?: Record<string, AgentFlowYamlValue>;
   sessions?: Record<string, AgentFlowYamlValue>;
+  approvals?: Record<string, AgentFlowYamlValue>;
   artifacts?: Record<string, AgentFlowYamlValue>;
   steps: AgentFlowWorkflowStep[];
   policies?: Record<string, AgentFlowYamlValue>;
@@ -155,6 +156,7 @@ function validateWorkflowRoot(value: AgentFlowYamlValue): AgentFlowWorkflowParse
   validateEnum(value, "maturity", WORKFLOW_MATURITIES, errors);
   validateOptionalRecord(value, "inputs", errors);
   validateOptionalRecord(value, "sessions", errors);
+  validateOptionalRecord(value, "approvals", errors);
   validateOptionalRecord(value, "artifacts", errors);
   validateOptionalRecord(value, "policies", errors);
   validateOptionalArray(value, "notify", errors);

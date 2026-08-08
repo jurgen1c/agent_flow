@@ -360,6 +360,9 @@ function checkUnsafeOperation(
 
 function approvalDecision(operation: string, status?: AgentFlowApprovalStatus): AgentFlowPolicyDecision {
   if (status === "approved") return allow();
+  if (status === "stale") {
+    return pause("policy.approval.stale", `Approval for ${operation} is stale and must be rerun.`);
+  }
   if (status === "rejected" || status === "cancelled") {
     return fail("policy.approval.rejected", `Approval for ${operation} was ${status}.`);
   }

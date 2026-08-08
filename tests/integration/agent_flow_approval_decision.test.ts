@@ -6,11 +6,13 @@ import path from "node:path";
 import {
   createAgentFlowLifecycleRun,
   createAgentFlowSessionProviderRegistry,
+  createAgentFlowWorkflowRegistry,
   defaultAgentFlowApprovalOutputPath,
   defaultAgentFlowDecisionRecordPath,
   executeAgentFlowApproval,
   executeAgentFlowCommandPipeline,
   executeAgentFlowDecisionRecord,
+  executeAgentFlowSessionRequest,
   lintAgentFlowWorkflow,
   openAgentFlowRunState,
   parseAgentFlowWorkflowOrThrow,
@@ -328,11 +330,149 @@ steps:
     expect(store.getRun("changed-human-evidence")?.status).toBe("paused");
     expect(store.getArtifact("changed-human-evidence", "approvals/approve_release.json")).toBeNull();
     expect(store.listApprovals("changed-human-evidence")).toEqual([
-      expect.objectContaining({ status: "cancelled", decision: "evidence_changed" }),
+      expect.objectContaining({
+        status: "stale",
+        context: expect.objectContaining({
+          invalidation: expect.objectContaining({ reason: "evidence_changed", path: "release.md" })
+        })
+      }),
       expect.objectContaining({ status: "requested" })
     ]);
     expect(await resumeAgentFlowCommandPipeline(store, "changed-human-evidence", workflow, { outcome: "approve" }))
       .toMatchObject({ status: "completed" });
+    store.close();
+  });
+
+  test("reruns a pending human approval when a configured dependency changes", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: pending-configured-invalidation
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: approve, type: approval, reviewer: human, artifacts: [spec.md] }
+  - { id: done, type: result, status: completed }
+approvals:
+  approve: { invalidated_by: [watched.md] }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "pending-configured-invalidation", workflow });
+    for (const [id, artifactPath, content] of [
+      ["spec", "spec.md", "Specification"],
+      ["watched", "watched.md", "Initial dependency"]
+    ] as const) {
+      store.writeArtifact({
+        id,
+        runId: "pending-configured-invalidation",
+        path: artifactPath,
+        kind: "fixture",
+        contentType: "text/markdown",
+        content
+      });
+    }
+
+    expect(await executeAgentFlowCommandPipeline(store, "pending-configured-invalidation", workflow))
+      .toMatchObject({ status: "paused" });
+    store.writeArtifact({
+      id: "watched",
+      runId: "pending-configured-invalidation",
+      path: "watched.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Changed dependency",
+      overwrite: true
+    });
+    expect(store.listApprovals("pending-configured-invalidation"))
+      .toEqual([expect.objectContaining({ status: "stale" })]);
+
+    expect(await resumeAgentFlowCommandPipeline(
+      store,
+      "pending-configured-invalidation",
+      workflow,
+      { outcome: "approve" }
+    )).toMatchObject({ status: "paused" });
+    expect(store.listApprovals("pending-configured-invalidation")).toEqual([
+      expect.objectContaining({ status: "stale" }),
+      expect.objectContaining({ status: "requested" })
+    ]);
+    expect(await resumeAgentFlowCommandPipeline(
+      store,
+      "pending-configured-invalidation",
+      workflow,
+      { outcome: "approve" }
+    )).toMatchObject({ status: "completed" });
+    store.close();
+  });
+
+  test("rechecks human approval staleness after acquiring the resume transaction", async () => {
+    const root = temporaryRepo();
+    fs.writeFileSync(path.join(root, "consume.md"), "Consume the approval.\n");
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: concurrent-human-invalidation
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  consumer: { provider: fixture }
+steps:
+  - { id: approve, type: approval, reviewer: human, artifacts: [spec.md] }
+  - { id: consume, type: session_request, session: consumer, prompt: consume.md, inputs: [approvals/approve.json], outputs: [result.md] }
+  - { id: done, type: result, status: completed }
+approvals:
+  approve: { invalidated_by: [watched.md] }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    const competitor = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "concurrent-human-invalidation", workflow });
+    for (const [id, artifactPath] of [["spec", "spec.md"], ["watched", "watched.md"]] as const) {
+      store.writeArtifact({
+        id,
+        runId: "concurrent-human-invalidation",
+        path: artifactPath,
+        kind: "fixture",
+        contentType: "text/markdown",
+        content: "Initial content"
+      });
+    }
+    expect(await executeAgentFlowCommandPipeline(store, "concurrent-human-invalidation", workflow))
+      .toMatchObject({ status: "paused" });
+
+    const originalFinalization = store.withRunFinalizationTransaction.bind(store);
+    let invalidated = false;
+    store.withRunFinalizationTransaction = ((runId, callback) => {
+      if (!invalidated) {
+        invalidated = true;
+        competitor.writeArtifact({
+          id: "watched",
+          runId,
+          path: "watched.md",
+          kind: "fixture",
+          contentType: "text/markdown",
+          content: "Changed concurrently",
+          overwrite: true
+        });
+      }
+      return originalFinalization(runId, callback);
+    }) as typeof store.withRunFinalizationTransaction;
+    let consumerInvoked = false;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+      consumerInvoked = true;
+      return { outputs: { "result.md": "Consumed" } };
+    });
+
+    await expect(resumeAgentFlowCommandPipeline(
+      store,
+      "concurrent-human-invalidation",
+      workflow,
+      { outcome: "approve" },
+      undefined,
+      providers
+    )).rejects.toMatchObject({ code: "AGENT_FLOW_APPROVAL_STALE" });
+    expect(consumerInvoked).toBe(false);
+    expect(store.getRun("concurrent-human-invalidation")).toMatchObject({ status: "paused" });
+    expect(store.getArtifact("concurrent-human-invalidation", "approvals/approve.json")).toBeNull();
+    expect(store.listApprovals("concurrent-human-invalidation"))
+      .toEqual([expect.objectContaining({ status: "stale" })]);
+    competitor.close();
     store.close();
   });
 
@@ -372,12 +512,16 @@ steps:
       workflow,
       undefined,
       providers
-    )).toMatchObject({ status: "completed", completedSteps: ["approve", "revise", "done"] });
+    )).toMatchObject({
+      status: "failed",
+      completedSteps: ["approve", "revise", "done"],
+      message: "Stale approval approve must be rerun before workflow completion."
+    });
 
     expect(store.listApprovals("invalidate-approved-evidence")).toEqual([
       expect.objectContaining({
-        status: "cancelled",
-        decision: "evidence_changed",
+        status: "stale",
+        decision: "Approved original evidence.",
         context: expect.objectContaining({
           evidence: [{ path: "evidence.md", checksum: evidence.checksum }],
           output: "approvals/approve.json",
@@ -393,6 +537,891 @@ steps:
       .toThrow("is stale because its evidence changed");
     expect(store.listEvents("invalidate-approved-evidence").map((event) => event.type))
       .toContain("approval.invalidated");
+    store.close();
+  });
+
+  test("invalidates approvals when recovering an interrupted first publication", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: recover-first-publication-invalidation
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: approve, type: approval, reviewer: human, artifacts: [spec.md] }
+approvals:
+  approve: { invalidated_by: [watched.md] }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "recover-first-publication-invalidation", workflow });
+    store.upsertArtifact({
+      id: "watched",
+      runId: "recover-first-publication-invalidation",
+      path: "watched.md",
+      kind: "fixture",
+      contentType: "text/markdown"
+    });
+    const watched = store.getArtifact("recover-first-publication-invalidation", "watched.md")!;
+    store.upsertApproval({
+      id: "approval:approve:attempt-1",
+      runId: "recover-first-publication-invalidation",
+      stepId: "approve",
+      status: "approved",
+      decision: "Approved before the watched artifact appeared.",
+      context: { output: "approvals/approve.json" }
+    });
+    const target = path.join(root, watched.storagePath);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, "interrupted publication");
+
+    store.writeArtifact({
+      id: "watched",
+      runId: "recover-first-publication-invalidation",
+      path: "watched.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "interrupted publication"
+    });
+
+    expect(store.listApprovals("recover-first-publication-invalidation"))
+      .toEqual([expect.objectContaining({ status: "stale" })]);
+    store.close();
+  });
+
+  test("invalidates approvals on first publication of a pre-registered watched artifact", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: preregistered-first-publication
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: approve, type: approval, reviewer: human, artifacts: [spec.md] }
+approvals:
+  approve: { invalidated_by: [watched.md] }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "preregistered-first-publication", workflow });
+    const content = "Published after approval";
+    store.upsertArtifact({
+      id: "watched",
+      runId: "preregistered-first-publication",
+      path: "watched.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      checksum: `sha256:${createHash("sha256").update(content).digest("hex")}`,
+      sizeBytes: Buffer.byteLength(content)
+    });
+    store.upsertApproval({
+      id: "approval:approve:attempt-1",
+      runId: "preregistered-first-publication",
+      stepId: "approve",
+      status: "approved",
+      decision: "Approved before publication.",
+      context: { output: "approvals/approve.json" }
+    });
+
+    store.writeArtifact({
+      id: "watched",
+      runId: "preregistered-first-publication",
+      path: "watched.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content
+    });
+
+    expect(store.listApprovals("preregistered-first-publication"))
+      .toEqual([expect.objectContaining({ status: "stale" })]);
+    store.close();
+  });
+
+  test("invalidates configured approval dependencies and blocks merge-capable continuation", async () => {
+    const root = temporaryRepo();
+    fs.writeFileSync(path.join(root, "merge-prompt.md"), "Merge the approved result.\n");
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: configured-approval-invalidation
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+sessions:
+  reviewer: { provider: fixture, role: reviewer, authority: { can_approve: true } }
+  merger: { provider: fixture, role: merger, authority: { can_merge: true } }
+steps:
+  - { id: approve, type: approval, reviewer: reviewer, artifacts: [spec.md] }
+  - { id: revise, type: command, command: "printf revised > implementation-summary.md", outputs: [implementation-summary.md], overwrite: true }
+  - { id: merge, type: session_request, session: " merger ", prompt: merge-prompt.md, inputs: [approvals/approve.json], outputs: [merge-result.md] }
+  - { id: done, type: result, status: completed }
+approvals:
+  approve:
+    invalidated_by: [implementation-summary.md]
+`);
+    expect(validateAgentFlowWorkflow(workflow)).toEqual({ valid: true, errors: [] });
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "configured-approval-invalidation", workflow });
+    store.writeArtifact({
+      id: "spec",
+      runId: "configured-approval-invalidation",
+      path: "spec.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Approved specification"
+    });
+    store.writeArtifact({
+      id: `command-output:${createHash("sha256").update("implementation-summary.md").digest("hex")}`,
+      runId: "configured-approval-invalidation",
+      path: "implementation-summary.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Original summary"
+    });
+    let mergeInvoked = false;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => {
+      if (request.stepId === "merge") {
+        mergeInvoked = true;
+        return { outputs: { "merge-result.md": "merged" } };
+      }
+      return {
+        outputs: {
+          "approvals/approve.json": JSON.stringify({ status: "approved", decision: "Approved before revision." })
+        }
+      };
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      "configured-approval-invalidation",
+      workflow,
+      undefined,
+      providers
+    );
+
+    expect(result).toMatchObject({
+      status: "failed",
+      failedStep: "merge",
+      completedSteps: ["approve", "revise"],
+      message: "Stale approval approve must be rerun before merge-capable step merge."
+    });
+    expect(mergeInvoked).toBe(false);
+    expect(store.listApprovals("configured-approval-invalidation")).toEqual([
+      expect.objectContaining({
+        stepId: "approve",
+        status: "stale",
+        decision: "Approved before revision.",
+        context: expect.objectContaining({
+          invalidation: expect.objectContaining({
+            path: "implementation-summary.md",
+            source: "configured_artifact"
+          })
+        })
+      })
+    ]);
+    expect(store.getArtifact("configured-approval-invalidation", "approvals/approve.json"))
+      .toMatchObject({ status: "stale" });
+    store.close();
+  });
+
+  test("withholds an approval output invalidated while its provider is running", async () => {
+    const root = temporaryRepo();
+    fs.writeFileSync(path.join(root, "consume.md"), "Consume the approved result.\n");
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: in-flight-approval-invalidation
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+sessions:
+  reviewer: { provider: fixture, role: reviewer, authority: { can_approve: true } }
+  consumer: { provider: fixture, role: consumer }
+steps:
+  - id: approve
+    type: approval
+    reviewer: reviewer
+    artifacts: [spec.md]
+    on_failure: { then: continue, allowed: true }
+  - { id: consume, type: session_request, session: consumer, prompt: consume.md, inputs: [approvals/approve.json], outputs: [result.md] }
+  - { id: done, type: result, status: completed }
+approvals:
+  approve: { invalidated_by: [watched.md] }
+`);
+    expect(validateAgentFlowWorkflow(workflow)).toEqual({ valid: true, errors: [] });
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "in-flight-approval-invalidation", workflow });
+    for (const [id, artifactPath, content] of [
+      ["spec", "spec.md", "Specification"],
+      ["watched", "watched.md", "Initial dependency"]
+    ] as const) {
+      store.writeArtifact({
+        id,
+        runId: "in-flight-approval-invalidation",
+        path: artifactPath,
+        kind: "fixture",
+        contentType: "text/markdown",
+        content
+      });
+    }
+    let consumerInvoked = false;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => {
+      if (request.stepId === "approve") {
+        store.writeArtifact({
+          id: "watched",
+          runId: "in-flight-approval-invalidation",
+          path: "watched.md",
+          kind: "fixture",
+          contentType: "text/markdown",
+          content: "Changed dependency",
+          overwrite: true
+        });
+        return {
+          outputs: {
+            "approvals/approve.json": JSON.stringify({ status: "approved", decision: "Approved stale evidence." })
+          }
+        };
+      }
+      consumerInvoked = true;
+      return { outputs: { "result.md": "Consumed" } };
+    });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store,
+      "in-flight-approval-invalidation",
+      workflow,
+      undefined,
+      providers
+    )).toMatchObject({ status: "paused", failedStep: "consume" });
+    expect(consumerInvoked).toBe(false);
+    expect(store.getArtifact("in-flight-approval-invalidation", "approvals/approve.json")).toBeNull();
+    expect(store.listApprovals("in-flight-approval-invalidation"))
+      .toEqual([expect.objectContaining({ status: "stale" })]);
+    store.close();
+  });
+
+  test("keeps an approval stale when its declared evidence changes during provider execution", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: in-flight-approval-evidence-invalidation
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+sessions:
+  reviewer: { provider: fixture, role: reviewer, authority: { can_approve: true } }
+steps:
+  - id: approve
+    type: approval
+    reviewer: reviewer
+    artifacts: [spec.md]
+    on_failure: { then: continue, allowed: true }
+  - { id: done, type: result, status: completed }
+`);
+    expect(validateAgentFlowWorkflow(workflow)).toEqual({ valid: true, errors: [] });
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "in-flight-approval-evidence-invalidation", workflow });
+    store.writeArtifact({
+      id: "spec",
+      runId: "in-flight-approval-evidence-invalidation",
+      path: "spec.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Original specification"
+    });
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+      store.writeArtifact({
+        id: "spec",
+        runId: "in-flight-approval-evidence-invalidation",
+        path: "spec.md",
+        kind: "fixture",
+        contentType: "text/markdown",
+        content: "Changed specification",
+        overwrite: true
+      });
+      return {
+        outputs: {
+          "approvals/approve.json": JSON.stringify({
+            status: "approved",
+            decision: "Approved stale evidence."
+          })
+        }
+      };
+    });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store,
+      "in-flight-approval-evidence-invalidation",
+      workflow,
+      undefined,
+      providers
+    )).toMatchObject({
+      status: "failed",
+      message: "Stale approval approve must be rerun before workflow completion."
+    });
+    expect(store.getArtifact("in-flight-approval-evidence-invalidation", "approvals/approve.json")).toBeNull();
+    expect(store.listApprovals("in-flight-approval-evidence-invalidation")).toEqual([
+      expect.objectContaining({
+        stepId: "approve",
+        status: "stale",
+        context: expect.objectContaining({
+          invalidation: expect.objectContaining({
+            reason: "evidence_changed",
+            path: "spec.md"
+          })
+        })
+      })
+    ]);
+    store.close();
+  });
+
+  test("allows a whitespace-normalized approval step to rerun after invalidation", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: normalized-approval-rerun
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+limits:
+  max_recovery_cycles: 2
+  max_step_attempts: { approve: 2 }
+sessions:
+  reviewer: { provider: fixture, role: reviewer, authority: { can_approve: true, can_merge: true } }
+steps:
+  - { id: approve, type: " approval ", reviewer: reviewer, artifacts: [spec.md], on_reject: done }
+  - { id: revise, type: command, command: "printf revised > summary.md", outputs: [summary.md], goto: approve }
+  - { id: done, type: result, status: completed }
+approvals:
+  approve: { invalidated_by: [summary.md] }
+`);
+    expect(validateAgentFlowWorkflow(workflow)).toEqual({ valid: true, errors: [] });
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "normalized-approval-rerun", workflow });
+    store.writeArtifact({
+      id: "spec",
+      runId: "normalized-approval-rerun",
+      path: "spec.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Specification"
+    });
+    let approvalInvocations = 0;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+      approvalInvocations += 1;
+      const approved = approvalInvocations === 1;
+      return {
+        outputs: {
+          "approvals/approve.json": JSON.stringify({
+            status: approved ? "approved" : "rejected",
+            decision: approved ? "Revise once." : "Stop revising."
+          })
+        }
+      };
+    });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store,
+      "normalized-approval-rerun",
+      workflow,
+      undefined,
+      providers
+    )).toMatchObject({ status: "completed", completedSteps: ["approve", "revise", "approve", "done"] });
+    expect(approvalInvocations).toBe(2);
+    expect(store.listApprovals("normalized-approval-rerun")).toEqual([
+      expect.objectContaining({ status: "stale" }),
+      expect.objectContaining({ status: "rejected" })
+    ]);
+    store.close();
+  });
+
+  test("keeps an earlier stale approval outstanding when its rerun is cancelled", async () => {
+    const root = temporaryRepo();
+    fs.writeFileSync(path.join(root, "merge.md"), "Merge the approved result.\n");
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: cancelled-approval-rerun
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+sessions:
+  reviewer: { provider: fixture, role: reviewer, authority: { can_approve: true } }
+  merger: { provider: fixture, role: merger, authority: { can_merge: true } }
+steps:
+  - id: approve
+    type: approval
+    reviewer: reviewer
+    artifacts: [spec.md]
+    on_failure: { then: continue, allowed: true }
+  - { id: merge, type: session_request, session: merger, prompt: merge.md, inputs: [spec.md], outputs: [merged.md] }
+  - { id: done, type: result, status: completed }
+`);
+    expect(validateAgentFlowWorkflow(workflow)).toEqual({ valid: true, errors: [] });
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "cancelled-approval-rerun", workflow });
+    store.writeArtifact({
+      id: "spec",
+      runId: "cancelled-approval-rerun",
+      path: "spec.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Specification"
+    });
+    store.upsertStep({
+      runId: "cancelled-approval-rerun",
+      stepId: "approve",
+      attempt: 1,
+      status: "completed"
+    });
+    store.upsertApproval({
+      id: "approval:approve:attempt-1",
+      runId: "cancelled-approval-rerun",
+      stepId: "approve",
+      status: "stale",
+      decision: "Evidence changed after approval.",
+      context: { output: "approvals/approve.json" }
+    });
+    let mergeInvoked = false;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => {
+      if (request.stepId === "merge") {
+        mergeInvoked = true;
+        return { outputs: { "merged.md": "Merged" } };
+      }
+      throw new Error("Reviewer unavailable");
+    });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store,
+      "cancelled-approval-rerun",
+      workflow,
+      undefined,
+      providers
+    )).toMatchObject({
+      status: "failed",
+      failedStep: "merge",
+      message: "Stale approval approve must be rerun before merge-capable step merge."
+    });
+    expect(mergeInvoked).toBe(false);
+    expect(store.listApprovals("cancelled-approval-rerun")).toEqual([
+      expect.objectContaining({ status: "stale" }),
+      expect.objectContaining({ status: "cancelled" })
+    ]);
+    store.close();
+  });
+
+  test("rejects malformed approval invalidation declarations", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: invalid-approval-invalidation
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+steps:
+  - { id: approve, type: approval, reviewer: human, artifacts: [spec.md] }
+approvals:
+  missing: { invalidated_by: [summary.md] }
+  approve:
+    invalidated_by: [summary.md, summary.md, ./noncanonical.md, approvals/approve.json, final-summary.md]
+    unsupported: true
+`);
+
+    expect(validateAgentFlowWorkflow(workflow).errors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "workflow.approvals.step.undeclared", path: "approvals.missing" }),
+      expect.objectContaining({ code: "workflow.approvals.field.unsupported", path: "approvals.approve.unsupported" }),
+      expect.objectContaining({
+        code: "workflow.approvals.invalidated_by.duplicate",
+        path: "approvals.approve.invalidated_by[1]"
+      }),
+      expect.objectContaining({
+        code: "workflow.approvals.invalidated_by.invalid",
+        path: "approvals.approve.invalidated_by[2]"
+      }),
+      expect.objectContaining({
+        code: "workflow.approvals.invalidated_by.output_collision",
+        path: "approvals.approve.invalidated_by"
+      }),
+      expect.objectContaining({
+        code: "workflow.approvals.invalidated_by.reserved",
+        path: "approvals.approve.invalidated_by[4]"
+      })
+    ]));
+  });
+
+  test("rejects malformed persisted approval invalidation declarations at runtime", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: malformed-persisted-invalidation
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: approve, type: approval, reviewer: human, artifacts: [spec.md] }
+approvals:
+  approve: { invalidated_by: watched.md }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    store.createRun({
+      id: "malformed-persisted-invalidation",
+      workflow: {
+        name: workflow.name,
+        version: workflow.version,
+        style: workflow.style,
+        maturity: workflow.maturity
+      },
+      context: { workflow }
+    });
+
+    await expect(executeAgentFlowCommandPipeline(
+      store,
+      "malformed-persisted-invalidation",
+      workflow
+    )).rejects.toMatchObject({ code: "AGENT_FLOW_WORKFLOW_INVALID" });
+    expect(store.getRun("malformed-persisted-invalidation")).toMatchObject({ status: "pending" });
+    store.close();
+  });
+
+  test("rejects approval configuration that targets condition branch metadata", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: condition-branch-metadata
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: route
+    type: condition
+    if: inputs.ready
+    then: done
+    branches:
+      - { id: ghost, type: approval, if: inputs.ready, then: done }
+  - { id: done, type: result, status: completed }
+approvals:
+  ghost: { invalidated_by: [watched.md] }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    store.createRun({
+      id: "condition-branch-metadata",
+      workflow: {
+        name: workflow.name,
+        version: workflow.version,
+        style: workflow.style,
+        maturity: workflow.maturity
+      },
+      context: { workflow }
+    });
+
+    expect(() => store.validateApprovalInvalidationConfiguration("condition-branch-metadata"))
+      .toThrow("does not name a declared approval step");
+    store.close();
+  });
+
+  test("blocks direct merge-capable session execution while an approval is stale", async () => {
+    const root = temporaryRepo();
+    fs.writeFileSync(path.join(root, "merge.md"), "Merge the approved result.\n");
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: direct-stale-approval-guard
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+sessions:
+  merger: { provider: fixture, role: merger, authority: { can_merge: true } }
+steps:
+  - { id: approve, type: approval, reviewer: human, artifacts: [spec.md] }
+  - { id: merge, type: session_request, session: merger, prompt: merge.md, inputs: [spec.md], outputs: [merged.md] }
+approvals:
+  approve: { invalidated_by: [watched.md] }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "direct-stale-approval-guard", workflow });
+    for (const [id, artifactPath, content] of [
+      ["spec", "spec.md", "Specification"],
+      ["watched", "watched.md", "Initial dependency"]
+    ] as const) {
+      store.writeArtifact({
+        id,
+        runId: "direct-stale-approval-guard",
+        path: artifactPath,
+        kind: "fixture",
+        contentType: "text/markdown",
+        content
+      });
+    }
+    store.upsertApproval({
+      id: "approval:approve:attempt-1",
+      runId: "direct-stale-approval-guard",
+      stepId: "approve",
+      status: "approved",
+      decision: "Approved.",
+      context: { output: "approvals/approve.json" }
+    });
+    store.writeArtifact({
+      id: "watched",
+      runId: "direct-stale-approval-guard",
+      path: "watched.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Changed dependency",
+      overwrite: true
+    });
+    store.transitionRunWithEvent("direct-stale-approval-guard", {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: {} }
+    });
+    let providerCalls = 0;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+      providerCalls += 1;
+      return { outputs: { "merged.md": "Merged" } };
+    });
+
+    await expect(executeAgentFlowSessionRequest(
+      store,
+      "direct-stale-approval-guard",
+      workflow,
+      workflow.steps[1]!,
+      providers
+    )).rejects.toMatchObject({ code: "AGENT_FLOW_APPROVAL_STALE" });
+    expect(providerCalls).toBe(0);
+    expect(store.getSession("direct-stale-approval-guard", "merger")).toBeNull();
+    store.close();
+  });
+
+  test("aborts a merge-capable session when approval becomes stale during provider execution", async () => {
+    const root = temporaryRepo();
+    fs.writeFileSync(path.join(root, "merge.md"), "Merge the approved result.\n");
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: in-flight-merge-invalidation
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+sessions:
+  merger: { provider: fixture, role: merger, authority: { can_merge: true } }
+steps:
+  - { id: approve, type: approval, reviewer: human, artifacts: [spec.md] }
+  - { id: merge, type: session_request, session: merger, prompt: merge.md, inputs: [spec.md], outputs: [merged.md] }
+approvals:
+  approve: { invalidated_by: [watched.md] }
+`);
+    const runId = "in-flight-merge-invalidation";
+    const store = await openAgentFlowRunState({ cwd: root });
+    const competingStore = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: runId, workflow });
+    for (const [id, artifactPath] of [["spec", "spec.md"], ["watched", "watched.md"]] as const) {
+      store.writeArtifact({
+        id,
+        runId,
+        path: artifactPath,
+        kind: "fixture",
+        contentType: "text/markdown",
+        content: "Initial content"
+      });
+    }
+    store.upsertApproval({
+      id: "approval:approve:attempt-1",
+      runId,
+      stepId: "approve",
+      status: "approved",
+      decision: "Approved.",
+      context: { output: "approvals/approve.json" }
+    });
+    store.transitionRunWithEvent(runId, {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: {} }
+    });
+    let providerAborted = false;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) =>
+      new Promise((resolve, reject) => {
+        const mutationTimer = setTimeout(() => {
+          competingStore.writeArtifact({
+            id: "watched",
+            runId,
+            path: "watched.md",
+            kind: "fixture",
+            contentType: "text/markdown",
+            content: "Changed during merge",
+            overwrite: true
+          });
+        }, 10);
+        const completionTimer = setTimeout(() => resolve({ outputs: { "merged.md": "Merged" } }), 250);
+        request.signal.addEventListener("abort", () => {
+          providerAborted = true;
+          clearTimeout(mutationTimer);
+          clearTimeout(completionTimer);
+          reject(request.signal.reason);
+        }, { once: true });
+      })
+    );
+
+    await expect(executeAgentFlowSessionRequest(
+      store,
+      runId,
+      workflow,
+      workflow.steps[1]!,
+      providers
+    )).rejects.toMatchObject({ code: "AGENT_FLOW_APPROVAL_STALE" });
+    expect(providerAborted).toBe(true);
+    expect(store.getArtifact(runId, "merged.md")).toBeNull();
+    expect(store.listApprovals(runId)).toEqual([expect.objectContaining({ status: "stale" })]);
+    competingStore.close();
+    store.close();
+  });
+
+  test("ignores incidental merge-capable actor fields on non-session steps", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: incidental-merge-actor
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  merger: { provider: fixture, authority: { can_merge: true } }
+steps:
+  - { id: prepare, type: command, command: "true", owner: merger }
+  - { id: approve, type: approval, reviewer: human, artifacts: [spec.md] }
+`);
+    expect(validateAgentFlowWorkflow(workflow)).toEqual({ valid: true, errors: [] });
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "incidental-merge-actor", workflow });
+    store.writeArtifact({
+      id: "spec",
+      runId: "incidental-merge-actor",
+      path: "spec.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Specification"
+    });
+    store.upsertApproval({
+      id: "approval:approve:attempt-1",
+      runId: "incidental-merge-actor",
+      stepId: "approve",
+      status: "stale",
+      context: { output: "approvals/approve.json" }
+    });
+
+    expect(await executeAgentFlowCommandPipeline(store, "incidental-merge-actor", workflow))
+      .toMatchObject({ status: "paused", completedSteps: ["prepare"] });
+    store.close();
+  });
+
+  test("blocks merge-capable recovery sessions after configured approval invalidation", async () => {
+    const root = temporaryRepo();
+    fs.writeFileSync(path.join(root, "merge-prompt.md"), "Repair and merge the approved result.\n");
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: recovery-approval-invalidation
+version: 1
+style: recovery_pipeline
+maturity: experimental
+sessions:
+  reviewer: { provider: fixture, authority: { can_approve: true } }
+  merger: { provider: fixture, authority: { can_merge: true } }
+steps:
+  - { id: approve, type: approval, reviewer: reviewer, artifacts: [spec.md] }
+  - { id: revise, type: command, command: "printf revised > implementation-summary.md", outputs: [implementation-summary.md], overwrite: true }
+  - id: verify
+    type: command
+    command: "false"
+    on_failure:
+      route_to: { session: merger, prompt: merge-prompt.md }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+approvals:
+  approve: { invalidated_by: [implementation-summary.md] }
+limits: { max_recovery_cycles: 1 }
+`);
+    expect(validateAgentFlowWorkflow(workflow)).toEqual({ valid: true, errors: [] });
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "recovery-approval-invalidation", workflow });
+    store.writeArtifact({
+      id: "spec",
+      runId: "recovery-approval-invalidation",
+      path: "spec.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Approved specification"
+    });
+    let mergerInvoked = false;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => {
+      if (request.stepId === "verify:recovery") {
+        mergerInvoked = true;
+        return { outputs: {}, metadata: { recovery_status: "remediated" } };
+      }
+      return {
+        outputs: {
+          "approvals/approve.json": JSON.stringify({ status: "approved", decision: "Approved before revision." })
+        }
+      };
+    });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "recovery-approval-invalidation", workflow, undefined, providers
+    )).toMatchObject({
+      status: "failed",
+      failedStep: "verify",
+      completedSteps: ["approve", "revise"],
+      message: "Stale approval approve must be rerun before merge-capable recovery session merger."
+    });
+    expect(mergerInvoked).toBe(false);
+    store.close();
+  });
+
+  test("blocks merge-capable sessions inside nested recovery workflows when a parent approval is stale", async () => {
+    const root = temporaryRepo();
+    fs.writeFileSync(path.join(root, "merge-prompt.md"), "Merge the repaired result.\n");
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: nested-recovery-approval-invalidation
+version: 1
+style: recovery_pipeline
+maturity: experimental
+sessions:
+  reviewer: { provider: fixture, authority: { can_approve: true } }
+steps:
+  - { id: approve, type: approval, reviewer: reviewer, artifacts: [spec.md] }
+  - { id: revise, type: command, command: "printf revised > implementation-summary.md", outputs: [implementation-summary.md] }
+  - id: verify
+    type: command
+    command: "false"
+    on_failure:
+      route_to: { workflow: repair, file_scope: { include: [request.md, repaired.md] } }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+approvals:
+  approve: { invalidated_by: [implementation-summary.md] }
+limits: { max_recovery_cycles: 1 }
+`);
+    const recovery = parseAgentFlowWorkflowOrThrow(`name: repair
+version: 1
+style: recovery_pipeline
+maturity: experimental
+sessions:
+  merger: { provider: fixture, authority: { can_merge: true } }
+steps:
+  - { id: prepare, type: command, command: "printf request > request.md", outputs: [request.md] }
+  - { id: merge, type: session_request, session: merger, prompt: merge-prompt.md, inputs: [request.md], outputs: [repaired.md] }
+  - { id: done, type: result, status: remediated }
+`);
+    expect(validateAgentFlowWorkflow(workflow)).toEqual({ valid: true, errors: [] });
+    expect(validateAgentFlowWorkflow(recovery)).toEqual({ valid: true, errors: [] });
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "nested-recovery-approval-invalidation", workflow });
+    store.writeArtifact({
+      id: "spec",
+      runId: "nested-recovery-approval-invalidation",
+      path: "spec.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Approved specification"
+    });
+    let mergerInvoked = false;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => {
+      if (request.stepId === "merge") {
+        mergerInvoked = true;
+        return { outputs: { "repaired.md": "repaired" } };
+      }
+      return {
+        outputs: {
+          "approvals/approve.json": JSON.stringify({ status: "approved", decision: "Approved before revision." })
+        }
+      };
+    });
+    const workflows = createAgentFlowWorkflowRegistry().register("repair", recovery);
+
+    expect(await executeAgentFlowCommandPipeline(
+      store,
+      "nested-recovery-approval-invalidation",
+      workflow,
+      undefined,
+      providers,
+      undefined,
+      undefined,
+      workflows
+    )).toMatchObject({ status: "paused", completedSteps: ["approve", "revise"] });
+    expect(mergerInvoked).toBe(false);
+    expect(store.getRun("nested-recovery-approval-invalidation:recovery:verify-a12dd3a7:attempt-1"))
+      .toMatchObject({ status: "failed" });
     store.close();
   });
 
@@ -435,21 +1464,21 @@ steps:
       undefined,
       providers
     )).toMatchObject({
-      status: "completed",
+      status: "failed",
       completedSteps: ["approve_source", "approve_release", "revise", "done"]
     });
 
     expect(store.listApprovals("invalidate-dependent-approvals")).toEqual([
       expect.objectContaining({
         stepId: "approve_source",
-        status: "cancelled",
+        status: "stale",
         context: expect.objectContaining({
           invalidation: expect.objectContaining({ path: "source.md" })
         })
       }),
       expect.objectContaining({
         stepId: "approve_release",
-        status: "cancelled",
+        status: "stale",
         context: expect.objectContaining({
           invalidation: expect.objectContaining({
             path: "approvals/approve_source.json",
@@ -515,14 +1544,14 @@ steps:
     expect(store.listApprovals("invalidate-deleted-approval-evidence")).toEqual([
       expect.objectContaining({
         stepId: "approve_source",
-        status: "cancelled",
+        status: "stale",
         context: expect.objectContaining({
           invalidation: expect.objectContaining({ path: "source.md", actualChecksum: null })
         })
       }),
       expect.objectContaining({
         stepId: "approve_release",
-        status: "cancelled",
+        status: "stale",
         context: expect.objectContaining({
           invalidation: expect.objectContaining({
             path: "approvals/approve_source.json",
@@ -587,8 +1616,8 @@ steps:
       });
       expect(store.listApprovals(runId)).toEqual([
         expect.objectContaining({
-          status: "cancelled",
-          decision: "evidence_changed",
+          status: "stale",
+          decision: "Approved.",
           context: expect.objectContaining({
             invalidation: expect.objectContaining({ path: "source.md", actualChecksum })
           })
@@ -601,6 +1630,135 @@ steps:
         .toHaveLength(1);
       store.close();
     }
+  });
+
+  test("reconciles configured approval invalidation drift before successful completion", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: reconcile-approval-before-completion
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  reviewer: { provider: fixture, authority: { can_approve: true } }
+steps:
+  - { id: approve, type: approval, reviewer: reviewer, artifacts: [source.md] }
+  - { id: wait, type: command, command: "sleep 0.2" }
+  - { id: done, type: result, status: completed }
+approvals:
+  approve:
+    invalidated_by: [release-notes.md]
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "reconcile-approval-before-completion", workflow });
+    store.writeArtifact({
+      id: "source",
+      runId: "reconcile-approval-before-completion",
+      path: "source.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Source A"
+    });
+    const releaseNotes = store.writeArtifact({
+      id: "release-notes",
+      runId: "reconcile-approval-before-completion",
+      path: "release-notes.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Release A"
+    });
+    const releaseNotesTarget = path.join(root, releaseNotes.storagePath);
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+      setTimeout(() => fs.writeFileSync(releaseNotesTarget, "Release B"), 25);
+      return {
+        outputs: {
+          "approvals/approve.json": JSON.stringify({ status: "approved", decision: "Approved Source A." })
+        }
+      };
+    });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "reconcile-approval-before-completion", workflow, undefined, providers
+    )).toMatchObject({
+      status: "failed",
+      message: "Stale approval approve must be rerun before workflow completion."
+    });
+    expect(store.listApprovals("reconcile-approval-before-completion"))
+      .toEqual([expect.objectContaining({
+        status: "stale",
+        context: expect.objectContaining({
+          invalidation: expect.objectContaining({ path: "release-notes.md" })
+        })
+      })]);
+    store.close();
+  });
+
+  test("checks stale approvals after acquiring the finalization write lock", async () => {
+    const root = temporaryRepo();
+    const runId = "locked-approval-completion";
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: locked-approval-completion
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  reviewer: { provider: fixture, authority: { can_approve: true } }
+steps:
+  - { id: approve, type: approval, reviewer: reviewer, artifacts: [source.md] }
+  - { id: done, type: result, status: completed }
+approvals:
+  approve:
+    invalidated_by: [release-notes.md]
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    const competingStore = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: runId, workflow });
+    store.writeArtifact({
+      id: "source",
+      runId,
+      path: "source.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Source A"
+    });
+    store.writeArtifact({
+      id: "release-notes",
+      runId,
+      path: "release-notes.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Release A"
+    });
+    const originalFinalization = store.withRunFinalizationTransaction.bind(store);
+    let racedFinalization = false;
+    store.withRunFinalizationTransaction = ((transactionRunId, callback) => {
+      const approved = store.listApprovals(runId).some((approval) => approval.status === "approved");
+      if (!racedFinalization && approved) {
+        racedFinalization = true;
+        competingStore.writeArtifact({
+          id: "release-notes",
+          runId,
+          path: "release-notes.md",
+          kind: "fixture",
+          contentType: "text/markdown",
+          content: "Release B",
+          overwrite: true
+        });
+      }
+      return originalFinalization(transactionRunId, callback);
+    }) as typeof store.withRunFinalizationTransaction;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => ({
+      outputs: {
+        "approvals/approve.json": JSON.stringify({ status: "approved", decision: "Approved Release A." })
+      }
+    }));
+
+    expect(await executeAgentFlowCommandPipeline(store, runId, workflow, undefined, providers)).toMatchObject({
+      status: "failed",
+      message: "Stale approval approve must be rerun before workflow completion."
+    });
+    expect(racedFinalization).toBe(true);
+    expect(store.listApprovals(runId)).toEqual([expect.objectContaining({ status: "stale" })]);
+    competingStore.close();
+    store.close();
   });
 
   test("invalidates an approval when its own outcome artifact is replaced or deleted", async () => {
@@ -645,8 +1803,8 @@ steps:
 
       expect(store.listApprovals(runId)).toEqual([
         expect.objectContaining({
-          status: "cancelled",
-          decision: "evidence_changed",
+          status: "stale",
+          decision: "Approved.",
           context: expect.objectContaining({
             invalidation: expect.objectContaining({
               path: "approvals/approve.json",
@@ -867,7 +2025,7 @@ steps:
     )).rejects.toMatchObject({ code: "AGENT_FLOW_RESUME_STATE" });
     expect(evidenceStore.getRun("restored-approval-evidence")?.status).toBe("paused");
     expect(evidenceStore.listApprovals("restored-approval-evidence")).toEqual([
-      expect.objectContaining({ status: "requested" })
+      expect.objectContaining({ status: "stale" })
     ]);
     evidenceStore.close();
   });
@@ -1191,7 +2349,7 @@ steps:
       expect.objectContaining({ code: "workflow.decision_record.approved_by.duplicate", path: "steps[1].approved_by[1]" })
     ]));
     const schema = JSON.parse(fs.readFileSync(path.join(import.meta.dir, "../../schemas/workflow.schema.json"), "utf8")) as {
-      properties: { steps: { items: unknown } };
+      properties: { steps: { items: unknown }; approvals: { additionalProperties: unknown } };
       $defs: {
         artifactPath: { pattern: string };
         step: { properties: Record<string, { items: unknown }> };
@@ -1215,6 +2373,7 @@ steps:
     expect(invalidArtifactPaths
       .some((candidate) => artifactPath.test(candidate))).toBe(false);
     expect(schema.properties.steps.items).toEqual({ $ref: "#/$defs/step" });
+    expect(schema.properties.approvals.additionalProperties).toEqual({ $ref: "#/$defs/approvalInvalidation" });
     expect(schema.$defs.step.properties).toMatchObject({
       body: { items: { $ref: "#/$defs/step" } },
       steps: { items: { $ref: "#/$defs/step" } },
@@ -1666,6 +2825,60 @@ retention:
     expect(await executeAgentFlowCommandPipeline(store, "retained-decision", workflow)).toMatchObject({ status: "completed" });
     expect(store.getArtifact("retained-decision", "source.md")?.status).toBe("missing");
     expect(store.readArtifact("retained-decision", "decision-records/record.json").artifact.status).toBe("available");
+    store.close();
+  });
+
+  test("retains approved evidence and outcome backing during successful cleanup", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: retained-approval
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  reviewer: { provider: fixture, authority: { can_approve: true } }
+steps:
+  - { id: temporary, type: command, command: "printf temporary > temporary.md", outputs: [temporary.md] }
+  - { id: approve, type: approval, reviewer: reviewer, artifacts: ["evidence/[draft].md"] }
+  - { id: done, type: result, status: completed }
+approvals:
+  approve:
+    invalidated_by: [release-notes.md]
+retention:
+  on_success:
+    delete: ["**"]
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "retained-approval", workflow });
+    store.writeArtifact({
+      id: "spec",
+      runId: "retained-approval",
+      path: "evidence/[draft].md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Approved specification"
+    });
+    store.writeArtifact({
+      id: "release-notes",
+      runId: "retained-approval",
+      path: "release-notes.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Watched release notes"
+    });
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => ({
+      outputs: {
+        "approvals/approve.json": JSON.stringify({ status: "approved", decision: "Retain this evidence." })
+      }
+    }));
+
+    expect(await executeAgentFlowCommandPipeline(store, "retained-approval", workflow, undefined, providers))
+      .toMatchObject({ status: "completed" });
+    expect(store.listApprovals("retained-approval"))
+      .toEqual([expect.objectContaining({ status: "approved" })]);
+    expect(store.readArtifact("retained-approval", "evidence/[draft].md").artifact.status).toBe("available");
+    expect(store.readArtifact("retained-approval", "approvals/approve.json").artifact.status).toBe("available");
+    expect(store.readArtifact("retained-approval", "release-notes.md").artifact.status).toBe("available");
+    expect(store.getArtifact("retained-approval", "temporary.md")?.status).toBe("missing");
     store.close();
   });
 

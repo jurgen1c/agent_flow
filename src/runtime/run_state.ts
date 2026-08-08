@@ -16,8 +16,9 @@ import {
   AgentFlowRunStateSchemaVersionError,
   initializeAgentFlowRunStateSchema
 } from "./run_state_schema";
+import { defaultAgentFlowApprovalOutputPath } from "./approval";
 
-export const AGENT_FLOW_RUN_STATE_SCHEMA_VERSION = 3;
+export const AGENT_FLOW_RUN_STATE_SCHEMA_VERSION = 4;
 export const DEFAULT_AGENT_FLOW_DATABASE_PATH = ".agent-flow/agent-flow.sqlite";
 export const AGENT_FLOW_FINAL_SUMMARY_PATH = "final-summary.md";
 export const MAX_AGENT_FLOW_RECOVERY_CONTEXT_BYTES = 64 * 1024;
@@ -27,7 +28,7 @@ export type AgentFlowRunStatus = "pending" | "running" | "waiting" | "paused" | 
 export type AgentFlowRunStopStatus = Extract<AgentFlowRunStatus, "paused" | "failed" | "cancelled">;
 export type AgentFlowStepStatus = AgentFlowRunStatus | "skipped";
 export type AgentFlowSessionStatus = AgentFlowRunStatus;
-export type AgentFlowApprovalStatus = "requested" | "approved" | "rejected" | "cancelled";
+export type AgentFlowApprovalStatus = "requested" | "approved" | "rejected" | "cancelled" | "stale";
 export type AgentFlowArtifactStatus = "available" | "missing" | "stale" | "overwritten";
 export type AgentFlowFailureOutcome = "retry" | "pause" | "fail" | "continue";
 export type AgentFlowRunStateValue = null | boolean | number | string | AgentFlowRunStateValue[] | { [key: string]: AgentFlowRunStateValue };
@@ -117,6 +118,8 @@ export interface WriteAgentFlowArtifactInput extends Omit<UpsertAgentFlowArtifac
   overwrite?: boolean;
   requiredRunStatus?: AgentFlowRunStatus;
   requiredArtifacts?: Array<{ path: string; checksum: string }>;
+  requiredApproval?: { id: string; status: "requested" };
+  requiredNoStaleApprovals?: boolean;
   requiredCurrentArtifact?: {
     artifact: null | {
       id: string;
@@ -393,8 +396,8 @@ interface ApprovalRow {
 const TERMINAL_RUN_STATUSES = new Set<AgentFlowRunStatus>(["completed", "failed", "cancelled"]);
 const RUN_STATUSES = ["pending", "running", "waiting", "paused", "completed", "failed", "cancelled"] as const;
 const STEP_STATUSES = [...RUN_STATUSES, "skipped"] as const;
-const APPROVAL_STATUSES = ["requested", "approved", "rejected", "cancelled"] as const;
-const TERMINAL_APPROVAL_STATUSES = new Set<AgentFlowApprovalStatus>(["approved", "rejected", "cancelled"]);
+const APPROVAL_STATUSES = ["requested", "approved", "rejected", "cancelled", "stale"] as const;
+const TERMINAL_APPROVAL_STATUSES = new Set<AgentFlowApprovalStatus>(["approved", "rejected", "cancelled", "stale"]);
 const WORKFLOW_STYLES = ["pipeline", "recovery_pipeline", "collaborative"] as const;
 const WORKFLOW_MATURITIES = ["draft", "experimental", "stable", "trusted"] as const;
 const FAILURE_OUTCOMES = new Set<AgentFlowFailureOutcome>(["retry", "pause", "fail", "continue"]);
@@ -825,6 +828,28 @@ export class AgentFlowRunStateStore {
           );
         }
       }
+      if (input.requiredApproval !== undefined) {
+        const requiredApproval = input.requiredApproval;
+        const current = this.database.get<Pick<ApprovalRow, "status">>(
+          "SELECT status FROM approvals WHERE run_id = ? AND id = ?",
+          [runId, requiredString(requiredApproval.id, "Required approval ID")]
+        );
+        if (current?.status !== requiredApproval.status) {
+          throw new AgentFlowRunStateError(
+            `Approval ${requiredApproval.id} changed before ${declaredPath} could be published.`,
+            "AGENT_FLOW_APPROVAL_STALE"
+          );
+        }
+      }
+      if (input.requiredNoStaleApprovals === true) {
+        const staleApprovalIds = persistedStaleApprovalStepIdsAcrossLineage(this.database, runId);
+        if (staleApprovalIds.length > 0) {
+          throw new AgentFlowRunStateError(
+            `Stale approval${staleApprovalIds.length === 1 ? "" : "s"} ${staleApprovalIds.join(", ")} must be rerun before merge output publication.`,
+            "AGENT_FLOW_APPROVAL_STALE"
+          );
+        }
+      }
       for (const requiredArtifact of requiredArtifacts) {
         const current = this.database.get<Pick<ArtifactRow, "checksum">>(
           "SELECT checksum FROM artifacts WHERE run_id = ? AND path = ?",
@@ -976,7 +1001,8 @@ export class AgentFlowRunStateStore {
         retryingPublishedContent ? existing?.written_at ?? timestamp : timestamp,
         timestamp
       ]);
-      if (replacingPublishedContent && priorArtifact?.checksum !== null && priorArtifact?.checksum !== undefined) {
+      const backingAppeared = !targetExistedBeforeWrite || priorArtifact?.written_at === null;
+      if (backingAppeared || priorArtifact?.checksum !== checksum) {
         this.invalidateApprovalsForArtifactChange(runId, declaredPath, checksum, timestamp);
       }
       if (manageTransaction) this.database.exec("COMMIT");
@@ -1873,14 +1899,14 @@ export class AgentFlowRunStateStore {
       run_id, id, step_id, status, requested_by, decided_by, decision, context_json, created_at, updated_at, decided_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(run_id, id) DO UPDATE SET
-      step_id = CASE WHEN approvals.status IN ('approved', 'rejected', 'cancelled') OR ? = 1 THEN approvals.step_id ELSE excluded.step_id END,
-      status = CASE WHEN approvals.status IN ('approved', 'rejected', 'cancelled') THEN approvals.status ELSE excluded.status END,
-      requested_by = CASE WHEN approvals.status IN ('approved', 'rejected', 'cancelled') OR ? = 1 THEN approvals.requested_by ELSE excluded.requested_by END,
-      decided_by = CASE WHEN approvals.status IN ('approved', 'rejected', 'cancelled') OR ? = 1 THEN approvals.decided_by ELSE excluded.decided_by END,
-      decision = CASE WHEN approvals.status IN ('approved', 'rejected', 'cancelled') OR ? = 1 THEN approvals.decision ELSE excluded.decision END,
-      context_json = CASE WHEN approvals.status IN ('approved', 'rejected', 'cancelled') OR ? = 1 THEN approvals.context_json ELSE excluded.context_json END,
-      updated_at = CASE WHEN approvals.status IN ('approved', 'rejected', 'cancelled') THEN approvals.updated_at ELSE excluded.updated_at END,
-      decided_at = CASE WHEN approvals.status IN ('approved', 'rejected', 'cancelled') OR ? = 1 THEN approvals.decided_at ELSE excluded.decided_at END`, [
+      step_id = CASE WHEN approvals.status IN ('approved', 'rejected', 'cancelled', 'stale') OR ? = 1 THEN approvals.step_id ELSE excluded.step_id END,
+      status = CASE WHEN approvals.status IN ('approved', 'rejected', 'cancelled', 'stale') THEN approvals.status ELSE excluded.status END,
+      requested_by = CASE WHEN approvals.status IN ('approved', 'rejected', 'cancelled', 'stale') OR ? = 1 THEN approvals.requested_by ELSE excluded.requested_by END,
+      decided_by = CASE WHEN approvals.status IN ('approved', 'rejected', 'cancelled', 'stale') OR ? = 1 THEN approvals.decided_by ELSE excluded.decided_by END,
+      decision = CASE WHEN approvals.status IN ('approved', 'rejected', 'cancelled', 'stale') OR ? = 1 THEN approvals.decision ELSE excluded.decision END,
+      context_json = CASE WHEN approvals.status IN ('approved', 'rejected', 'cancelled', 'stale') OR ? = 1 THEN approvals.context_json ELSE excluded.context_json END,
+      updated_at = CASE WHEN approvals.status IN ('approved', 'rejected', 'cancelled', 'stale') THEN approvals.updated_at ELSE excluded.updated_at END,
+      decided_at = CASE WHEN approvals.status IN ('approved', 'rejected', 'cancelled', 'stale') OR ? = 1 THEN approvals.decided_at ELSE excluded.decided_at END`, [
       requiredString(input.runId, "Run ID"),
       requiredString(input.id, "Approval ID"),
       optionalString(input.stepId, "Step ID"),
@@ -1909,6 +1935,21 @@ export class AgentFlowRunStateStore {
       "SELECT * FROM approvals WHERE run_id = ? ORDER BY created_at ASC, id ASC",
       [normalizedRunId]
     ).map(hydrateApproval);
+  }
+
+  validateApprovalInvalidationConfiguration(runId: string): void {
+    this.assertOpen();
+    const normalizedRunId = requiredString(runId, "Run ID");
+    this.requireRun(normalizedRunId);
+    persistedApprovalInvalidationConfiguration(this.database, normalizedRunId);
+  }
+
+  approvalInvalidationPaths(runId: string, stepId: string): string[] {
+    this.assertOpen();
+    const normalizedRunId = requiredString(runId, "Run ID");
+    this.requireRun(normalizedRunId);
+    return persistedApprovalInvalidationConfiguration(this.database, normalizedRunId)
+      .get(requiredString(stepId, "Approval step ID")) ?? [];
   }
 
   upsertBudget(input: UpsertAgentFlowBudgetInput): void {
@@ -2056,7 +2097,7 @@ export class AgentFlowRunStateStore {
     timestamp: string
   ): void {
     const approvals = this.database.all<ApprovalRow>(
-      "SELECT * FROM approvals WHERE run_id = ? AND status IN ('approved', 'rejected') ORDER BY id",
+      "SELECT * FROM approvals WHERE run_id = ? AND status IN ('requested', 'approved') ORDER BY id",
       [runId]
     );
     const invalidatedApprovalIds = new Set<string>();
@@ -2071,12 +2112,17 @@ export class AgentFlowRunStateStore {
         if (parsedContext === null || typeof parsedContext !== "object" || Array.isArray(parsedContext)) continue;
         const context = parsedContext as Record<string, AgentFlowRunStateValue>;
         const evidence = Array.isArray(context.evidence) ? context.evidence : [];
+        const requestedEvidenceChanged = approval.status === "requested"
+          && Array.isArray(context.artifacts)
+          && context.artifacts.includes(changedEvidence.path);
         const invalidatedEvidence = evidence.find((entry) => {
           if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return false;
           const candidate = entry as Record<string, AgentFlowRunStateValue>;
           return candidate.path === changedEvidence.path
             && (changedEvidence.actualChecksum === null || candidate.checksum !== changedEvidence.actualChecksum);
         });
+        const configuredInvalidation = approval.step_id !== null
+          && approvalInvalidatedBy(this.database, runId, approval.step_id).includes(changedEvidence.path);
         let outputPath: string | undefined;
         if (typeof context.output === "string") {
           try {
@@ -2085,8 +2131,27 @@ export class AgentFlowRunStateStore {
             outputPath = undefined;
           }
         }
-        const outcomeChanged = outputPath === changedEvidence.path;
-        if (invalidatedEvidence === undefined && !outcomeChanged) continue;
+        let outcomeChanged = outputPath === changedEvidence.path;
+        if (outcomeChanged && approval.status === "requested" && outputPath !== undefined) {
+          const output = this.database.get<ArtifactRow>(
+            "SELECT * FROM artifacts WHERE run_id = ? AND path = ? AND kind = 'approval_output'",
+            [runId, outputPath]
+          );
+          const metadata = output === null
+            ? undefined
+            : JSON.parse(output.metadata_json) as Record<string, AgentFlowRunStateValue>;
+          const approvalAttempt = /:attempt-(\d+)$/.exec(approval.id)?.[1];
+          const outputAttempt = typeof metadata?.attempt === "number" && Number.isSafeInteger(metadata.attempt)
+            ? String(metadata.attempt)
+            : undefined;
+          if (approvalAttempt !== undefined && outputAttempt === approvalAttempt) outcomeChanged = false;
+        }
+        if (
+          invalidatedEvidence === undefined
+          && !requestedEvidenceChanged
+          && !outcomeChanged
+          && !configuredInvalidation
+        ) continue;
         invalidatedApprovalIds.add(approval.id);
         const expectedChecksum = invalidatedEvidence === undefined
           ? undefined
@@ -2095,14 +2160,15 @@ export class AgentFlowRunStateStore {
           reason: "evidence_changed",
           path: changedEvidence.path,
           ...(outcomeChanged ? { source: "approval_output" } : {}),
+          ...(configuredInvalidation ? { source: "configured_artifact" } : {}),
           ...(typeof expectedChecksum === "string" ? { expectedChecksum } : {}),
           actualChecksum: changedEvidence.actualChecksum,
           invalidatedAt: timestamp
         };
         this.database.run(
           `UPDATE approvals
-           SET status = 'cancelled', decision = 'evidence_changed', context_json = ?, updated_at = ?, decided_at = ?
-           WHERE run_id = ? AND id = ? AND status IN ('approved', 'rejected')`,
+           SET status = 'stale', context_json = ?, updated_at = ?, decided_at = COALESCE(decided_at, ?)
+           WHERE run_id = ? AND id = ? AND status IN ('requested', 'approved')`,
           [stableJson({ ...context, invalidation }), timestamp, timestamp, runId, approval.id]
         );
         if (outputPath !== undefined) {
@@ -2413,6 +2479,156 @@ function hydrateApproval(row: ApprovalRow): AgentFlowApprovalRecord {
     updatedAt: row.updated_at,
     decidedAt: row.decided_at
   };
+}
+
+function persistedStaleApprovalStepIdsAcrossLineage(
+  database: Pick<SqliteDatabase, "all" | "get">,
+  runId: string
+): string[] {
+  const stale = new Set<string>();
+  const visited = new Set<string>();
+  let currentRunId: string | null = runId;
+  while (currentRunId !== null && !visited.has(currentRunId)) {
+    visited.add(currentRunId);
+    const latestByStep = new Map<string, ApprovalRow>();
+    for (const approval of database.all<ApprovalRow>(
+      "SELECT * FROM approvals WHERE run_id = ? ORDER BY id",
+      [currentRunId]
+    )) {
+      if (approval.step_id === null || approval.status === "requested" || approval.status === "cancelled") continue;
+      const previous = latestByStep.get(approval.step_id);
+      if (previous === undefined || approvalAttempt(approval.id) > approvalAttempt(previous.id)
+          || approvalAttempt(approval.id) === approvalAttempt(previous.id)
+            && (approval.updated_at > previous.updated_at
+              || approval.updated_at === previous.updated_at && approval.id > previous.id)) {
+        latestByStep.set(approval.step_id, approval);
+      }
+    }
+    for (const [stepId, approval] of latestByStep) {
+      if (approval.status === "stale") stale.add(stepId);
+    }
+    currentRunId = database.get<Pick<RunRow, "parent_run_id">>(
+      "SELECT parent_run_id FROM runs WHERE id = ?",
+      [currentRunId]
+    )?.parent_run_id ?? null;
+  }
+  return [...stale].sort();
+}
+
+function approvalAttempt(id: string): number {
+  return Number(/:attempt-(\d+)(?::|$)/.exec(id)?.[1] ?? 0);
+}
+
+function approvalInvalidatedBy(
+  database: Pick<SqliteDatabase, "get">,
+  runId: string,
+  stepId: string
+): string[] {
+  return persistedApprovalInvalidationConfiguration(database, runId).get(stepId) ?? [];
+}
+
+function persistedApprovalInvalidationConfiguration(
+  database: Pick<SqliteDatabase, "get">,
+  runId: string
+): Map<string, string[]> {
+  const row = database.get<Pick<RunRow, "context_json">>(
+    "SELECT context_json FROM runs WHERE id = ?",
+    [runId]
+  );
+  if (row === null) return new Map();
+  try {
+    const context = JSON.parse(row.context_json) as Record<string, unknown>;
+    const workflow = recordValue(context.workflow);
+    if (workflow === undefined || workflow.approvals === undefined) return new Map();
+    const approvals = recordValue(workflow.approvals);
+    if (approvals === undefined) throw invalidPersistedApprovalConfiguration("approvals must be a mapping");
+    const approvalSteps = collectPersistedApprovalSteps(workflow.steps);
+    const result = new Map<string, string[]>();
+    for (const [approvalId, rawConfiguration] of Object.entries(approvals)) {
+      const approvalStep = approvalSteps.get(approvalId);
+      if (approvalStep === undefined) {
+        throw invalidPersistedApprovalConfiguration(`approval key ${JSON.stringify(approvalId)} does not name a declared approval step`);
+      }
+      const configuration = recordValue(rawConfiguration);
+      if (configuration === undefined) {
+        throw invalidPersistedApprovalConfiguration(`approval ${JSON.stringify(approvalId)} must be a mapping`);
+      }
+      const unsupported = Object.keys(configuration).find((field) => field !== "invalidated_by");
+      if (unsupported !== undefined) {
+        throw invalidPersistedApprovalConfiguration(`approval ${JSON.stringify(approvalId)} has unsupported field ${JSON.stringify(unsupported)}`);
+      }
+      const invalidatedBy = configuration.invalidated_by;
+      if (!Array.isArray(invalidatedBy) || invalidatedBy.length === 0) {
+        throw invalidPersistedApprovalConfiguration(`approval ${JSON.stringify(approvalId)} invalidated_by must be a non-empty list`);
+      }
+      const paths: string[] = [];
+      const seen = new Set<string>();
+      for (const entry of invalidatedBy) {
+        if (!isNormalizedStaticAgentFlowArtifactPath(entry)) {
+          throw invalidPersistedApprovalConfiguration(
+            `approval ${JSON.stringify(approvalId)} invalidated_by contains invalid path ${JSON.stringify(entry)}`
+          );
+        }
+        if (seen.has(entry)) {
+          throw invalidPersistedApprovalConfiguration(
+            `approval ${JSON.stringify(approvalId)} invalidated_by contains duplicate path ${JSON.stringify(entry)}`
+          );
+        }
+        if (entry === AGENT_FLOW_FINAL_SUMMARY_PATH) {
+          throw invalidPersistedApprovalConfiguration(
+            `approval ${JSON.stringify(approvalId)} cannot watch reserved artifact ${JSON.stringify(entry)}`
+          );
+        }
+        seen.add(entry);
+        paths.push(entry);
+      }
+      const output = typeof approvalStep.output === "string" && approvalStep.output.trim().length > 0
+        ? approvalStep.output.trim()
+        : defaultAgentFlowApprovalOutputPath(approvalId);
+      if (seen.has(output)) {
+        throw invalidPersistedApprovalConfiguration(
+          `approval ${JSON.stringify(approvalId)} cannot be invalidated by its own output ${JSON.stringify(output)}`
+        );
+      }
+      result.set(approvalId, paths);
+    }
+    return result;
+  } catch (error) {
+    if (error instanceof AgentFlowRunStateError) throw error;
+    throw invalidPersistedApprovalConfiguration(error instanceof Error ? error.message : String(error));
+  }
+}
+
+function collectPersistedApprovalSteps(
+  value: unknown,
+  result = new Map<string, Record<string, unknown>>()
+): Map<string, Record<string, unknown>> {
+  if (!Array.isArray(value)) return result;
+  for (const entry of value) {
+    const step = recordValue(entry);
+    if (step === undefined) continue;
+    const id = typeof step.id === "string" ? step.id.trim() : undefined;
+    const type = typeof step.type === "string" ? step.type.trim() : undefined;
+    if (id !== undefined && id.length > 0 && type === "approval") result.set(id, step);
+    for (const field of ["body", "steps"] as const) {
+      collectPersistedApprovalSteps(step[field], result);
+    }
+    if (type === "parallel") collectPersistedApprovalSteps(step.branches, result);
+  }
+  return result;
+}
+
+function invalidPersistedApprovalConfiguration(message: string): AgentFlowRunStateError {
+  return new AgentFlowRunStateError(
+    `Persisted approval invalidation configuration is invalid: ${message}.`,
+    "AGENT_FLOW_WORKFLOW_INVALID"
+  );
+}
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
 }
 
 function hydrateFailure(row: FailureRow): AgentFlowFailureRecord {

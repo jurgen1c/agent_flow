@@ -32,10 +32,15 @@ export function initializeAgentFlowRunStateSchema(database: SchemaDatabase, sche
     migrateVersionOneToTwo(database);
     existingVersion = "2";
   }
-  if (existingVersion === "2" && schemaVersion === 3) {
+  if (existingVersion === "2" && schemaVersion >= 3) {
     if (schemaNeedsRepair(database)) createSchema(database, 2);
     migrateVersionTwoToThree(database);
     existingVersion = "3";
+  }
+  if (existingVersion === "3" && schemaVersion === 4) {
+    if (schemaNeedsRepair(database)) createSchema(database, 3);
+    migrateVersionThreeToFour(database);
+    existingVersion = "4";
   }
   verifySchemaVersion(database, schemaVersion);
   if (existingVersion !== null && schemaNeedsRepair(database)) createSchema(database, schemaVersion);
@@ -189,7 +194,7 @@ CREATE TABLE IF NOT EXISTS approvals (
   run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
   id TEXT NOT NULL,
   step_id TEXT,
-  status TEXT NOT NULL CHECK (status IN ('requested', 'approved', 'rejected', 'cancelled')),
+  status TEXT NOT NULL CHECK (status IN ('requested', 'approved', 'rejected', 'cancelled', 'stale')),
   requested_by TEXT,
   decided_by TEXT,
   decision TEXT,
@@ -227,7 +232,7 @@ function migrateVersionOneToTwo(database: SchemaDatabase): void {
   database.exec("BEGIN IMMEDIATE");
   try {
     const lockedVersion = existingSchemaVersion(database);
-    if (lockedVersion === "2" || lockedVersion === "3") {
+    if (lockedVersion === "2" || lockedVersion === "3" || lockedVersion === "4") {
       database.exec("COMMIT");
       return;
     }
@@ -251,7 +256,7 @@ function migrateVersionTwoToThree(database: SchemaDatabase): void {
   database.exec("BEGIN IMMEDIATE");
   try {
     const lockedVersion = existingSchemaVersion(database);
-    if (lockedVersion === "3") {
+    if (lockedVersion === "3" || lockedVersion === "4") {
       database.exec("COMMIT");
       return;
     }
@@ -263,6 +268,54 @@ function migrateVersionTwoToThree(database: SchemaDatabase): void {
       database.exec("ALTER TABLE artifacts ADD COLUMN generation INTEGER NOT NULL DEFAULT 1 CHECK (generation > 0)");
     }
     database.run("UPDATE run_state_metadata SET value = '3' WHERE key = 'schema_version'");
+    database.exec("COMMIT");
+  } catch (error) {
+    rollback(database);
+    throw error;
+  }
+}
+
+function migrateVersionThreeToFour(database: SchemaDatabase): void {
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    const lockedVersion = existingSchemaVersion(database);
+    if (lockedVersion === "4") {
+      database.exec("COMMIT");
+      return;
+    }
+    if (lockedVersion !== "3") throw schemaVersionError(lockedVersion ?? "missing", 4);
+    database.exec(`
+ALTER TABLE approvals RENAME TO approvals_version_three;
+CREATE TABLE approvals (
+  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  id TEXT NOT NULL,
+  step_id TEXT,
+  status TEXT NOT NULL CHECK (status IN ('requested', 'approved', 'rejected', 'cancelled', 'stale')),
+  requested_by TEXT,
+  decided_by TEXT,
+  decision TEXT,
+  context_json TEXT NOT NULL CHECK (json_valid(context_json)),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  decided_at TEXT,
+  PRIMARY KEY (run_id, id)
+);
+INSERT INTO approvals (
+  run_id, id, step_id, status, requested_by, decided_by, decision,
+  context_json, created_at, updated_at, decided_at
+)
+SELECT
+  run_id, id, step_id,
+  CASE
+    WHEN status = 'cancelled' AND decision = 'evidence_changed' THEN 'stale'
+    ELSE status
+  END,
+  requested_by, decided_by, decision,
+  context_json, created_at, updated_at, decided_at
+FROM approvals_version_three;
+DROP TABLE approvals_version_three;
+    `);
+    database.run("UPDATE run_state_metadata SET value = '4' WHERE key = 'schema_version'");
     database.exec("COMMIT");
   } catch (error) {
     rollback(database);

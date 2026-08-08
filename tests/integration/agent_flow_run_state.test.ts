@@ -1199,7 +1199,7 @@ describe("Agent Flow run-state SQLite store", () => {
       writtenAt: null
     });
     const migrated = new Database(store.databasePath, { readonly: true });
-    expect(migrated.query("SELECT value FROM run_state_metadata WHERE key = 'schema_version'").get()).toEqual({ value: "3" });
+    expect(migrated.query("SELECT value FROM run_state_metadata WHERE key = 'schema_version'").get()).toEqual({ value: "4" });
     migrated.close();
     store.close();
 
@@ -1220,6 +1220,45 @@ describe("Agent Flow run-state SQLite store", () => {
     writer.close();
   });
 
+  test("migrates version-three evidence invalidations to stale approvals", async () => {
+    const repoRoot = temporaryRepo();
+    let store = await openAgentFlowRunState({ cwd: repoRoot, now: () => FIXED_TIME });
+    store.createRun({
+      id: "run-version-three",
+      workflow: { name: "migrate-approval", version: 1, style: "pipeline", maturity: "experimental" }
+    });
+    store.upsertApproval({
+      id: "legacy-invalidation",
+      runId: "run-version-three",
+      stepId: "approve",
+      status: "cancelled",
+      decision: "evidence_changed",
+      context: {
+        invalidation: { reason: "evidence_changed", path: "spec.md", actualChecksum: null }
+      }
+    });
+    store.upsertApproval({
+      id: "ordinary-cancellation",
+      runId: "run-version-three",
+      stepId: "other",
+      status: "cancelled",
+      decision: "operator_cancelled"
+    });
+    const databasePath = store.databasePath;
+    store.close();
+
+    const legacy = new Database(databasePath);
+    legacy.query("UPDATE run_state_metadata SET value = '3' WHERE key = 'schema_version'").run();
+    legacy.close();
+
+    store = await openAgentFlowRunState({ cwd: repoRoot, now: () => FIXED_TIME });
+    expect(store.listApprovals("run-version-three")).toEqual([
+      expect.objectContaining({ id: "legacy-invalidation", status: "stale", decision: "evidence_changed" }),
+      expect.objectContaining({ id: "ordinary-cancellation", status: "cancelled", decision: "operator_cancelled" })
+    ]);
+    store.close();
+  });
+
   test("repairs a damaged version-two schema before migrating it", async () => {
     const repoRoot = temporaryRepo();
     let store = await openAgentFlowRunState({ cwd: repoRoot });
@@ -1235,7 +1274,7 @@ describe("Agent Flow run-state SQLite store", () => {
     expect(store.getRun("missing")).toBeNull();
     const repaired = new Database(databasePath, { readonly: true });
     expect(repaired.query("SELECT value FROM run_state_metadata WHERE key = 'schema_version'").get())
-      .toEqual({ value: "3" });
+      .toEqual({ value: "4" });
     expect(repaired.query("SELECT name FROM pragma_table_info('artifacts') WHERE name = 'generation'").get())
       .toEqual({ name: "generation" });
     repaired.close();

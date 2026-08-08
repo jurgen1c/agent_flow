@@ -365,11 +365,28 @@ Invalidation config:
 
 ```yaml
 approvals:
-  reviewer_approval:
+  approve_release:
     invalidated_by:
       - git.diff
       - implementation-summary.md
 ```
+
+Each key must name an `approval` step. `invalidated_by` is a non-empty,
+duplicate-free list of normalized static repository-relative artifact paths,
+and it cannot include that approval step's own output or the runtime-managed
+`final-summary.md` artifact. The runtime records an
+approved outcome as `stale` when a watched artifact is replaced, deleted, or
+found to have checksum drift. It retains the original decision and records the
+invalidation evidence in approval context.
+
+Successful retention cleanup preserves the evidence and outcome artifacts for
+approved decisions so cleanup cannot retroactively stale a completed run.
+
+A stale approval makes its output artifact unreadable, pauses policy checks
+that require the approval, blocks sessions with `can_merge: true`, and prevents
+successful workflow completion. The workflow must route through the affected
+approval step again before reaching those continuation points; the newest
+attempt for that step determines whether continuation is allowed.
 
 ## 14. Disagreement Handling
 

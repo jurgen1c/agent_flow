@@ -235,6 +235,11 @@ steps:
     expect(evaluateAgentFlowPolicy(workflow, {
       kind: "approval",
       operation: "publish",
+      approvalStatus: "stale"
+    })).toMatchObject({ status: "pause", code: "policy.approval.stale" });
+    expect(evaluateAgentFlowPolicy(workflow, {
+      kind: "approval",
+      operation: "publish",
       approvalStatus: "rejected"
     })).toMatchObject({ status: "fail", code: "policy.approval.rejected" });
   });

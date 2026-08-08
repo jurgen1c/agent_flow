@@ -91,6 +91,9 @@ allow it. Challenges persist an answered or unresolved rationale. Both result
 types are strict JSON artifacts and malformed provider output fails closed.
 Approval steps either invoke a declared session with `can_approve: true` or
 pause for `reviewer: human`; both paths persist the outcome in run state.
+Top-level `approvals.<step-id>.invalidated_by` declarations watch normalized
+artifact paths. Changes mark the approved attempt and its output stale, and a
+fresh attempt is required before workflow completion or a `can_merge` session.
 Decision-record steps publish durable JSON under `decision-records/` by
 default, validate every referenced artifact at execution time, and are exempt
 from default retention deletion.

@@ -104,6 +104,8 @@ interface SimulationState {
   artifactValues: Map<string, AgentFlowYamlValue>;
   producedArtifacts: Map<string, number>;
   artifactProducers: Map<string, string>;
+  approvalStatuses: Map<string, "approved" | "stale">;
+  approvalInvalidations: Map<string, number>;
   transforms: AgentFlowArtifactTransformRegistry;
   visitedSteps: AgentFlowSimulationVisitedStep[];
   missingArtifacts: AgentFlowSimulationMissingArtifact[];
@@ -218,6 +220,8 @@ export function simulateAgentFlowWorkflow(
     artifactValues: fixtureArtifacts.values,
     producedArtifacts: new Map(),
     artifactProducers: new Map(),
+    approvalStatuses: new Map(),
+    approvalInvalidations: new Map(),
     transforms,
     visitedSteps: [],
     missingArtifacts: [],
@@ -277,6 +281,12 @@ export function simulateAgentFlowWorkflow(
   }
   if (control.kind === "terminal") {
     state.status = control.status;
+  }
+  if ((state.status ?? "completed") === "completed" && staleSimulationApprovalIds(state).length > 0) {
+    state.status = "failed";
+    const terminal = [...state.terminalStates].reverse().find((entry) => entry.status === "completed");
+    if (terminal === undefined) state.terminalStates.push({ stepId: "(workflow)", status: "failed" });
+    else terminal.status = "failed";
   }
 
   const hasUnhandledMissingArtifacts = state.missingArtifacts.some((artifact) =>
@@ -389,6 +399,13 @@ function runSequence(
 function runStep(step: AgentFlowWorkflowStep, state: SimulationState, insideLoop: boolean): SequenceControl {
   const id = nonEmptyString(step.id) ?? "(unnamed)";
   const type = nonEmptyString(step.type) ?? "unknown";
+  if (type !== "approval" && type !== "review" && simulationStepCanMerge(step, state)) {
+    const staleApprovalIds = staleSimulationApprovalIds(state);
+    if (staleApprovalIds.length > 0) {
+      state.terminalStates.push({ stepId: id, status: "failed" });
+      return { kind: "terminal", status: "failed" };
+    }
+  }
   const immediateRetry = state.immediateRetries.delete(id);
   if (!immediateRetry) {
     const guardControl = simulationRecoveryGuard(step, id, state);
@@ -521,12 +538,13 @@ function runStep(step: AgentFlowWorkflowStep, state: SimulationState, insideLoop
           addUnresolved(state, id, `Artifact ${output} already exists; declare overwrite: true to replace it during simulation.`);
           return { kind: "terminal", status: "unresolved" };
         }
-        state.artifacts.add(output);
-        state.artifactValues.set(output, {
+        state.approvalStatuses.delete(id);
+        markArtifactProduced(state, output, id, {
           status: outcome === "approve" ? "approved" : "rejected",
           decision: outcome
-        });
-        markArtifactProduced(state, output, id);
+        }, true);
+        if (outcome === "approve") state.approvalStatuses.set(id, "approved");
+        else state.approvalStatuses.delete(id);
       }
       return target === undefined ? { kind: "done" } : controlForTarget(target, id, state);
     }
@@ -546,9 +564,7 @@ function runStep(step: AgentFlowWorkflowStep, state: SimulationState, insideLoop
     const saved = nonEmptyString(step.save_as);
     if (saved !== undefined) {
       const artifact = canonicalArtifactName(saved);
-      state.artifacts.add(artifact);
-      state.artifactValues.set(artifact, stepFixture.input);
-      markArtifactProduced(state, artifact, id);
+      markArtifactProduced(state, artifact, id, stepFixture.input, true);
     }
   }
   if (type === "decision_record") {
@@ -571,8 +587,7 @@ function runStep(step: AgentFlowWorkflowStep, state: SimulationState, insideLoop
       addUnresolved(state, id, `Artifact ${output} already exists; declare overwrite: true to replace it during simulation.`);
       return { kind: "terminal", status: "unresolved" };
     }
-    state.artifacts.add(output);
-    state.artifactValues.set(output, {
+    markArtifactProduced(state, output, id, {
       decision_id: contract.decision_id,
       owner: contract.owner,
       topic: contract.topic,
@@ -581,8 +596,7 @@ function runStep(step: AgentFlowWorkflowStep, state: SimulationState, insideLoop
       approved_by: contract.approved_by,
       artifacts: contract.artifacts,
       created_at: "1970-01-01T00:00:00.000Z"
-    });
-    markArtifactProduced(state, output, id);
+    }, true);
   }
   if (type === "loop") return loopControl(step, stepFixture, id, state);
   if (type === "parallel") return parallelControl(step, state, insideLoop);
@@ -820,6 +834,7 @@ function simulateSessionRequestStep(
   const isReview = step.type === "review";
   const isApproval = step.type === "approval";
   const isExchange = step.type === "consult" || step.type === "challenge";
+  let approvalApproved = false;
   if (isApproval) {
     const reviewer = nonEmptyString(step.reviewer);
     const session = reviewer === undefined ? undefined : state.workflow.sessions?.[reviewer];
@@ -963,7 +978,9 @@ function simulateSessionRequestStep(
     const output = [...declaredOutputs][0]!;
     const value = providedOutputs.values.get(output);
     try {
-      parseAgentFlowApprovalResult(typeof value === "string" ? value : `${JSON.stringify(value)}\n`, output);
+      approvalApproved = parseAgentFlowApprovalResult(
+        typeof value === "string" ? value : `${JSON.stringify(value)}\n`, output
+      ).status === "approved";
     } catch (error) {
       return simulatedSessionFailure(step, fixture, stepId, state, error instanceof Error ? error.message : String(error));
     }
@@ -994,7 +1011,12 @@ function simulateSessionRequestStep(
       return simulatedSessionFailure(step, fixture, stepId, state, error instanceof Error ? error.message : String(error));
     }
   }
+  if (isApproval) state.approvalStatuses.delete(stepId);
   recordOutputs(step, fixture, stepId, state);
+  if (isApproval) {
+    if (approvalApproved) state.approvalStatuses.set(stepId, "approved");
+    else state.approvalStatuses.delete(stepId);
+  }
   return { kind: "done" };
 }
 
@@ -1151,6 +1173,10 @@ function parallelControl(step: AgentFlowWorkflowStep, state: SimulationState, in
   const mergedProducedArtifacts = new Map(initialProducedArtifacts);
   const initialArtifactProducers = new Map(state.artifactProducers);
   const mergedArtifactProducers = new Map(initialArtifactProducers);
+  const initialApprovalStatuses = new Map(state.approvalStatuses);
+  const initialApprovalInvalidations = new Map(state.approvalInvalidations);
+  const mergedApprovalInvalidations = new Map(initialApprovalInvalidations);
+  const mergedApprovalChanges = new Map<string, "approved" | "stale" | undefined>();
   const parallelArtifactValues = new Map<string, AgentFlowYamlValue | undefined>();
   const conflictedArtifacts = new Set<string>();
   const parallelId = nonEmptyString(step.id) ?? "(unnamed)";
@@ -1164,6 +1190,8 @@ function parallelControl(step: AgentFlowWorkflowStep, state: SimulationState, in
       state.artifactValues = new Map(initialArtifactValues);
       state.producedArtifacts = new Map(initialProducedArtifacts);
       state.artifactProducers = new Map(initialArtifactProducers);
+      state.approvalStatuses = new Map(initialApprovalStatuses);
+      state.approvalInvalidations = new Map(initialApprovalInvalidations);
       const branchId = nonEmptyString(entry.id) ?? "(unnamed)";
       if (!takeTransition(state, branchId)) {
         finalControl = { kind: "terminal", status: "unresolved" };
@@ -1219,6 +1247,34 @@ function parallelControl(step: AgentFlowWorkflowStep, state: SimulationState, in
         if (hasValue) mergedArtifactValues.set(artifact, value!);
         else mergedArtifactValues.delete(artifact);
       }
+      const approvalIds = new Set([
+        ...initialApprovalStatuses.keys(),
+        ...state.approvalStatuses.keys(),
+        ...state.approvalInvalidations.keys()
+      ]);
+      for (const approvalId of approvalIds) {
+        const output = simulationApprovalOutputPath(state, approvalId);
+        const outputProduced = (state.producedArtifacts.get(output) ?? 0)
+          > (initialProducedArtifacts.get(output) ?? 0);
+        const initialInvalidations = initialApprovalInvalidations.get(approvalId) ?? 0;
+        const branchInvalidations = state.approvalInvalidations.get(approvalId) ?? 0;
+        const invalidated = branchInvalidations > initialInvalidations;
+        if (invalidated) {
+          mergedApprovalInvalidations.set(
+            approvalId,
+            (mergedApprovalInvalidations.get(approvalId) ?? initialInvalidations)
+              + branchInvalidations - initialInvalidations
+          );
+        }
+        const approvalStatus = state.approvalStatuses.get(approvalId);
+        if (!outputProduced && !invalidated && approvalStatus === initialApprovalStatuses.get(approvalId)) continue;
+        const branchStatus = invalidated && !(outputProduced && approvalStatus === "approved")
+          ? "stale"
+          : approvalStatus;
+        if (branchStatus === "stale" || mergedApprovalChanges.get(approvalId) !== "stale") {
+          mergedApprovalChanges.set(approvalId, branchStatus);
+        }
+      }
       if (control.kind !== "done" && finalControl.kind === "done") {
         finalControl = control;
       }
@@ -1229,6 +1285,18 @@ function parallelControl(step: AgentFlowWorkflowStep, state: SimulationState, in
   state.artifactValues = mergedArtifactValues;
   state.producedArtifacts = mergedProducedArtifacts;
   state.artifactProducers = mergedArtifactProducers;
+  state.approvalStatuses = new Map(initialApprovalStatuses);
+  state.approvalInvalidations = mergedApprovalInvalidations;
+  for (const [approvalId, status] of mergedApprovalChanges) {
+    if (status === undefined) state.approvalStatuses.delete(approvalId);
+    else state.approvalStatuses.set(approvalId, status);
+  }
+  for (const [approvalId, status] of state.approvalStatuses) {
+    if (status !== "stale") continue;
+    const output = simulationApprovalOutputPath(state, approvalId);
+    state.artifacts.delete(output);
+    state.artifactValues.delete(output);
+  }
   return finalControl;
 }
 
@@ -1260,6 +1328,10 @@ function failureControl(
     const route = isRecord(onFailure.route_to) ? onFailure.route_to : undefined;
     const routeSession = nonEmptyString(route?.session);
     if (routeSession !== undefined) {
+      if (simulationSessionCanMerge(state, routeSession) && staleSimulationApprovalIds(state).length > 0) {
+        state.terminalStates.push({ stepId: id, status: "failed" });
+        return { kind: "terminal", status: "failed" };
+      }
       const budgetControl = simulationSessionBudgetControl(routeSession, id, state);
       if (budgetControl !== undefined) return budgetControl;
     }
@@ -1338,11 +1410,8 @@ function recordOutputs(
   }
   for (const artifact of declared) {
     if (provided.has(artifact)) {
-      state.artifacts.add(artifact);
-      markArtifactProduced(state, artifact, stepId);
       const value = provided.get(artifact);
-      if (value !== undefined) state.artifactValues.set(artifact, value);
-      else state.artifactValues.delete(artifact);
+      markArtifactProduced(state, artifact, stepId, value, value !== undefined);
     }
     else addMissingArtifact(state, { stepId, artifact, kind: "output" });
   }
@@ -1391,9 +1460,7 @@ function simulateTransformStep(
         && step.overwrite !== true) {
       return simulatedTransformFailure(step, stepFixture, stepId, state, `Artifact ${outputPath} already exists; declare overwrite: true to replace it during simulation.`);
     }
-    state.artifacts.add(outputPath);
-    state.artifactValues.set(outputPath, output);
-    markArtifactProduced(state, outputPath, stepId);
+    markArtifactProduced(state, outputPath, stepId, output, true);
     return { kind: "done" };
   } catch (error) {
     const message = error instanceof AgentFlowArtifactTransformError
@@ -1631,9 +1698,88 @@ function addMissingArtifact(state: SimulationState, entry: AgentFlowSimulationMi
   }
 }
 
-function markArtifactProduced(state: SimulationState, artifact: string, stepId: string): void {
+function markArtifactProduced(
+  state: SimulationState,
+  artifact: string,
+  stepId: string,
+  value: AgentFlowYamlValue | undefined,
+  hasValue: boolean
+): void {
+  const existed = state.artifacts.has(artifact);
+  const previouslyHadValue = state.artifactValues.has(artifact);
+  const previousValue = state.artifactValues.get(artifact);
+  const changed = !existed || existed && !hasValue || previouslyHadValue !== hasValue
+    || hasValue && !isDeepStrictEqual(previousValue, value);
+  state.artifacts.add(artifact);
+  if (hasValue) state.artifactValues.set(artifact, value!);
+  else state.artifactValues.delete(artifact);
   state.producedArtifacts.set(artifact, (state.producedArtifacts.get(artifact) ?? 0) + 1);
   state.artifactProducers.set(artifact, stepId);
+  if (changed) invalidateSimulationApprovals(state, artifact);
+}
+
+function invalidateSimulationApprovals(state: SimulationState, changedArtifact: string): void {
+  const pending = [changedArtifact];
+  const visited = new Set<string>();
+  while (pending.length > 0) {
+    const artifact = pending.shift()!;
+    if (visited.has(artifact)) continue;
+    visited.add(artifact);
+    for (const [approvalId, status] of state.approvalStatuses) {
+      if (!simulationApprovalWatchedPaths(state, approvalId).includes(artifact)) continue;
+      state.approvalInvalidations.set(approvalId, (state.approvalInvalidations.get(approvalId) ?? 0) + 1);
+      const output = simulationApprovalOutputPath(state, approvalId);
+      if (status === "approved") {
+        state.approvalStatuses.set(approvalId, "stale");
+        state.artifacts.delete(output);
+        state.artifactValues.delete(output);
+      }
+      pending.push(output);
+    }
+  }
+}
+
+function simulationApprovalOutputPath(state: SimulationState, approvalId: string): string {
+  const location = state.stepLocations.get(approvalId);
+  return location === undefined
+    ? defaultAgentFlowApprovalOutputPath(approvalId)
+    : canonicalArtifactName(nonEmptyString(location.steps[location.index]?.output)
+      ?? defaultAgentFlowApprovalOutputPath(approvalId));
+}
+
+function simulationApprovalWatchedPaths(state: SimulationState, approvalId: string): string[] {
+  const location = state.stepLocations.get(approvalId);
+  const step = location?.steps[location.index];
+  const evidence = Array.isArray(step?.artifacts)
+    ? step.artifacts.flatMap((value) => nonEmptyString(value) ?? []).map(canonicalArtifactName)
+    : [];
+  const declaration = isRecord(state.workflow.approvals?.[approvalId])
+    ? state.workflow.approvals[approvalId]
+    : undefined;
+  const configured = isRecord(declaration) && Array.isArray(declaration.invalidated_by)
+    ? declaration.invalidated_by.flatMap((value) => nonEmptyString(value) ?? []).map(canonicalArtifactName)
+    : [];
+  return [...new Set([...evidence, ...configured, simulationApprovalOutputPath(state, approvalId)])];
+}
+
+function staleSimulationApprovalIds(state: SimulationState): string[] {
+  return [...state.approvalStatuses]
+    .filter(([, status]) => status === "stale")
+    .map(([approvalId]) => approvalId)
+    .sort();
+}
+
+function simulationStepCanMerge(step: AgentFlowWorkflowStep, state: SimulationState): boolean {
+  const type = nonEmptyString(step.type);
+  const actor = type === "session_request"
+    ? nonEmptyString(step.session)
+    : type === "consult" || type === "challenge" ? nonEmptyString(step.to) : undefined;
+  return actor !== undefined && simulationSessionCanMerge(state, actor);
+}
+
+function simulationSessionCanMerge(state: SimulationState, sessionId: string): boolean {
+  const session = state.workflow.sessions?.[sessionId];
+  return isRecord(session) && isRecord(session.authority) && session.authority.can_merge === true;
 }
 
 function missingArtifactKey(entry: AgentFlowSimulationMissingArtifact): string {
