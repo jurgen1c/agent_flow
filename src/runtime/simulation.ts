@@ -538,6 +538,7 @@ function runStep(step: AgentFlowWorkflowStep, state: SimulationState, insideLoop
           addUnresolved(state, id, `Artifact ${output} already exists; declare overwrite: true to replace it during simulation.`);
           return { kind: "terminal", status: "unresolved" };
         }
+        state.approvalStatuses.delete(id);
         markArtifactProduced(state, output, id, {
           status: outcome === "approve" ? "approved" : "rejected",
           decision: outcome
@@ -1010,6 +1011,7 @@ function simulateSessionRequestStep(
       return simulatedSessionFailure(step, fixture, stepId, state, error instanceof Error ? error.message : String(error));
     }
   }
+  if (isApproval) state.approvalStatuses.delete(stepId);
   recordOutputs(step, fixture, stepId, state);
   if (isApproval) {
     if (approvalApproved) state.approvalStatuses.set(stepId, "approved");

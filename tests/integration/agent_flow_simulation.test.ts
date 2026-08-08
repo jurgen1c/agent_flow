@@ -354,6 +354,50 @@ limits: { max_recovery_cycles: 3 }
     expect(result.terminalStates).toContainEqual({ stepId: "done", status: "completed" });
   });
 
+  test("keeps a changed approval outcome available when an approved step reruns", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: simulated-approved-rerun
+version: 1
+style: recovery_pipeline
+maturity: experimental
+sessions:
+  reviewer: { provider: fixture, authority: { can_approve: true } }
+steps:
+  - { id: approve, type: approval, reviewer: reviewer, artifacts: [spec.md] }
+  - id: route
+    type: command
+    command: route
+    then: done
+    on_failure: { then: approve, allowed: true }
+  - { id: done, type: result, status: completed }
+limits: { max_recovery_cycles: 2 }
+`);
+    expect(validateAgentFlowWorkflow(workflow)).toEqual({ valid: true, errors: [] });
+
+    let approvalOutputReads = 0;
+    const approvalOutputs = {
+      get "approvals/approve.json"() {
+        approvalOutputReads += 1;
+        return approvalOutputReads <= 2
+          ? { status: "approved", decision: "First approval." }
+          : { status: "approved", decision: "Fresh approval." };
+      }
+    };
+    const result = simulateAgentFlowWorkflow(workflow, {
+      artifacts: { "spec.md": "specification" },
+      steps: {
+        approve: { outputs: approvalOutputs },
+        route: { outcome: ["failed", "succeeded"] }
+      }
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.availableArtifacts).toContain("approvals/approve.json");
+    expect(result.artifactValues["approvals/approve.json"]).toEqual({
+      status: "approved",
+      decision: "Fresh approval."
+    });
+  });
+
   test("keeps an approval stale when a sibling branch changes watched evidence during its rerun", () => {
     const workflow = parseAgentFlowWorkflowOrThrow(`name: simulated-parallel-approval-rerun-race
 version: 1
