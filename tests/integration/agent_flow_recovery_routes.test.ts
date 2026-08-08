@@ -243,6 +243,7 @@ steps:
       on_unresolved: { then: pause }
   - id: fanout
     type: parallel
+    strategy: fail_fast
     branches:
       - id: direct
         type: command

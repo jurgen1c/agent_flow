@@ -119,6 +119,10 @@
                 { "required": ["role"] }
               ]
             }
+          },
+          "steps": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/collaborativeStep" }
           }
         }
       }
@@ -153,7 +157,14 @@
       "properties": {
         "body": { "type": "array", "items": { "$ref": "#/$defs/step" } },
         "steps": { "type": "array", "items": { "$ref": "#/$defs/step" } },
-        "branches": { "type": "array", "items": { "$ref": "#/$defs/step" } }
+        "branches": { "type": "array", "items": { "$ref": "#/$defs/step" } },
+        "allow_overlap": { "type": "boolean" },
+        "conflict_policy": {
+          "oneOf": [
+            { "type": "string", "minLength": 1, "pattern": "\\S" },
+            { "type": "object", "minProperties": 1 }
+          ]
+        }
       },
       "allOf": [
         {
@@ -167,6 +178,27 @@
       ],
       "additionalProperties": true
     },
+    "collaborativeStep": {
+      "allOf": [
+        { "$ref": "#/$defs/step" },
+        {
+          "type": "object",
+          "properties": {
+            "body": { "type": "array", "items": { "$ref": "#/$defs/collaborativeStep" } },
+            "steps": { "type": "array", "items": { "$ref": "#/$defs/collaborativeStep" } },
+            "branches": { "type": "array", "items": { "$ref": "#/$defs/collaborativeStep" } }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "parallel" } }, "required": ["type"] },
+          "then": {
+            "required": ["strategy"],
+            "properties": { "strategy": { "$ref": "#/$defs/parallelStrategy" } }
+          }
+        }
+      ]
+    },
+    "parallelStrategy": { "const": "fail_fast" },
     "artifactPath": {
       "type": "string",
       "minLength": 1,

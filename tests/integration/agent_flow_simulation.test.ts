@@ -287,6 +287,7 @@ steps:
   - { id: approve, type: approval, reviewer: reviewer, artifacts: [spec.md] }
   - id: split
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: revise, type: command, command: revise, outputs: [summary.md] }
   - { id: consume, type: session_request, session: worker, prompt: consume.md, inputs: [approvals/approve.json], outputs: [result.md] }
@@ -322,6 +323,7 @@ steps:
   - { id: revise, type: command, command: revise, outputs: [summary.md] }
   - id: split
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: approve, session: reviewer, type: approval, reviewer: reviewer, artifacts: [spec.md] }
       - id: route
@@ -411,6 +413,7 @@ steps:
   - { id: revise, type: command, command: revise, outputs: [summary.md] }
   - id: split
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: approve, session: reviewer, type: approval, reviewer: reviewer, artifacts: [spec.md] }
       - id: route
@@ -612,6 +615,7 @@ sessions:
 steps:
   - id: split
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: backend, session: backend, outputs: [backend.json] }
       - { id: docs, session: docs, inputs: [brief.md], outputs: [docs.md] }
@@ -939,6 +943,7 @@ maturity: draft
 steps:
   - id: split
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: produce, type: command, command: echo data, outputs: [shared.json] }
       - { id: consume, type: command, command: cat shared.json, inputs: [shared.json], outputs: [used.json] }
@@ -963,6 +968,7 @@ maturity: draft
 steps:
   - id: split
     type: parallel
+    strategy: fail_fast
     allow_overlap: true
     conflict_policy: { strategy: manual }
     branches:
@@ -995,6 +1001,7 @@ maturity: draft
 steps:
   - id: split
     type: parallel
+    strategy: fail_fast
     branches:
       - id: replace
         type: command
@@ -1030,6 +1037,7 @@ steps:
     outputs: [shared.txt]
   - id: split
     type: parallel
+    strategy: fail_fast
     branches:
       - id: replace
         type: artifact_transform
@@ -1155,6 +1163,7 @@ maturity: draft
 steps:
   - id: split
     type: parallel
+    strategy: fail_fast
     allow_overlap: true
     conflict_policy: { strategy: manual }
     branches:
@@ -1185,6 +1194,7 @@ maturity: draft
 steps:
   - id: split
     type: parallel
+    strategy: fail_fast
     body:
       - { id: from_body, type: command, command: echo body, outputs: [body.json] }
     steps:
@@ -1279,6 +1289,7 @@ steps:
     body:
       - id: split
         type: parallel
+        strategy: fail_fast
         branches:
           - id: branch
             session: worker
@@ -1337,6 +1348,7 @@ sessions:
 steps:
   - id: split
     type: parallel
+    strategy: fail_fast
     branches:
       - id: branch
         session: worker
@@ -1366,6 +1378,7 @@ sessions:
 steps:
   - id: split
     type: parallel
+    strategy: fail_fast
     branches:
       - id: branch
         session: worker
@@ -1506,6 +1519,7 @@ steps:
   - { id: start, type: command, command: echo start, then: complete }
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: complete, session: worker }
 `);
@@ -1527,6 +1541,7 @@ sessions:
 steps:
   - id: split
     type: parallel
+    strategy: fail_fast
     branches:
       - id: branch
         session: worker
@@ -1613,6 +1628,7 @@ sessions:
 steps:
   - id: split
     type: parallel
+    strategy: fail_fast
     branches:
       - id: branch
         session: worker
@@ -1644,10 +1660,12 @@ sessions:
 steps:
   - id: first
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: shared, session: worker }
   - id: second
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: shared, session: worker }
 `);
@@ -1717,6 +1735,7 @@ sessions:
 steps:
   - id: split
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: failing, session: worker }
       - { id: unchecked, session: worker, inputs: [missing.json], outputs: [result.json] }

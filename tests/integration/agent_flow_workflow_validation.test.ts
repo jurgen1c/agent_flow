@@ -252,7 +252,7 @@ sessions:
 steps:
   - { id: empty_approval, type: approval }
   - { id: empty_condition, type: condition }
-  - { id: empty_parallel, type: parallel }
+  - { id: empty_parallel, type: parallel, strategy: fail_fast }
   - { id: empty_consult, type: consult }
   - { id: empty_challenge, type: challenge }
   - { id: empty_handoff, type: handoff }
@@ -373,21 +373,187 @@ steps:
     });
   });
 
-  test("requires scopes for parallel writers and accepts disjoint glob suffixes", () => {
+  test("requires explicit fail-fast parent behavior for collaborative parallel steps", () => {
+    const missing = parseAgentFlowWorkflowOrThrow(`name: missing-parallel-strategy
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: true }
+sessions:
+  reader: { provider: local, role: advisor }
+steps:
+  - id: outer
+    type: parallel
+    branches:
+      - id: nested
+        type: parallel
+        strategy: fail_fast
+        branches:
+          - { id: reader, session: reader }
+`);
+    const unsupported = parseAgentFlowWorkflowOrThrow(`name: unsupported-parallel-strategy
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: true }
+sessions:
+  reader: { provider: local, role: advisor }
+steps:
+  - id: parallel_read
+    type: parallel
+    strategy: collect_all
+    branches:
+      - { id: reader, session: reader }
+`);
+    const pipeline = parseAgentFlowWorkflowOrThrow(`name: pipeline-parallel-strategy
+version: 1
+style: pipeline
+maturity: draft
+sessions:
+  first: { provider: local }
+  second: { provider: local }
+steps:
+  - id: parallel_work
+    type: parallel
+    branches:
+      - { id: first, session: first }
+      - { id: second, session: second }
+`);
+
+    expect(validateAgentFlowWorkflow(missing).errors).toContainEqual({
+      code: "workflow.parallel.strategy.required",
+      message: "Collaborative parallel steps must explicitly declare strategy: fail_fast.",
+      path: "steps[0].strategy",
+      stepId: "outer"
+    });
+    expect(validateAgentFlowWorkflow(unsupported).errors).toEqual([
+      {
+        code: "workflow.parallel.strategy.unsupported",
+        message: "Collaborative parallel strategy must be exactly fail_fast.",
+        path: "steps[0].strategy",
+        stepId: "parallel_read"
+      }
+    ]);
+    expect(validateAgentFlowWorkflow(pipeline)).toEqual({ valid: true, errors: [] });
+  });
+
+  test("enforces parallel contracts for nested direct branch containers", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: nested-parallel-contracts
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: true }
+sessions:
+  reader: { provider: local, role: advisor }
+  backend:
+    provider: local
+    role: implementer
+    authority: { can_modify_files: true }
+    file_scope: { include: [src/**] }
+  frontend:
+    provider: local
+    role: implementer
+    authority: { can_modify_files: true }
+    file_scope: { include: [src/runtime/**] }
+steps:
+  - id: outer
+    type: parallel
+    strategy: fail_fast
+    branches:
+      - id: nested
+        type: parallel
+        session: reader
+        branches:
+          - { id: backend, session: backend }
+          - { id: frontend, session: frontend }
+`);
+
+    expect(validateAgentFlowWorkflow(workflow).errors).toEqual(expect.arrayContaining([
+      {
+        code: "workflow.parallel.strategy.required",
+        message: "Collaborative parallel steps must explicitly declare strategy: fail_fast.",
+        path: "steps[0].branches[0].strategy",
+        stepId: "nested"
+      },
+      {
+        code: "workflow.parallel.file_scope.overlap",
+        message: 'Parallel branches "backend" and "frontend" have overlapping file scopes (src/** and src/runtime/**).',
+        path: "steps[0].branches[0].branches",
+        stepId: "nested"
+      }
+    ]));
+  });
+
+  test("validates overlap configuration shape and accepts an explicit conflict policy", () => {
+    const malformed = parseAgentFlowWorkflowOrThrow(`name: malformed-overlap-policy
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: true }
+sessions:
+  reader: { provider: local, role: advisor }
+steps:
+  - id: parallel_read
+    type: parallel
+    strategy: fail_fast
+    allow_overlap: "yes"
+    conflict_policy: []
+    branches:
+      - { id: reader, session: reader }
+`);
+    const authorized = parseAgentFlowWorkflowOrThrow(`name: authorized-overlap
+version: 1
+style: collaborative
+maturity: draft
+collaboration: { enabled: true }
+sessions:
+  first: { provider: local, role: writer, authority: { can_modify_files: true } }
+  second: { provider: local, role: writer, authority: { can_modify_files: true } }
+steps:
+  - id: parallel_write
+    type: parallel
+    strategy: fail_fast
+    allow_overlap: true
+    conflict_policy: manual_reconciliation
+    branches:
+      - { id: first, session: first, file_scope: { include: [app/**] } }
+      - { id: second, session: second, file_scope: { include: [app/**] } }
+`);
+
+    expect(validateAgentFlowWorkflow(malformed).errors).toEqual([
+      {
+        code: "workflow.parallel.allow_overlap.invalid",
+        message: "Parallel allow_overlap must be a boolean when declared.",
+        path: "steps[0].allow_overlap",
+        stepId: "parallel_read"
+      },
+      {
+        code: "workflow.parallel.conflict_policy.invalid",
+        message: "Parallel conflict_policy must be a non-empty strategy name or mapping when declared.",
+        path: "steps[0].conflict_policy",
+        stepId: "parallel_read"
+      }
+    ]);
+    expect(validateAgentFlowWorkflow(authorized)).toEqual({ valid: true, errors: [] });
+  });
+
+  test("requires scopes for parallel writers and accepts disjoint backend, frontend, and docs scopes", () => {
     const missingScopes = parseAgentFlowWorkflowOrThrow(`name: missing-scopes
 version: 1
 style: collaborative
 maturity: draft
 collaboration: { enabled: true }
 sessions:
-  ruby: { provider: local, role: ruby, authority: { can_modify_files: true } }
-  js: { provider: local, role: js, authority: { can_modify_files: true } }
+  backend: { provider: local, role: backend, authority: { can_modify_files: true } }
+  frontend: { provider: local, role: frontend, authority: { can_modify_files: true } }
+  docs: { provider: local, role: docs, authority: { can_modify_files: true } }
 steps:
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     branches:
-      - { id: ruby, session: ruby }
-      - { id: js, session: js }
+      - { id: backend, session: backend }
+      - { id: frontend, session: frontend }
 `);
     const disjointScopes = parseAgentFlowWorkflowOrThrow(`name: disjoint-scopes
 version: 1
@@ -395,14 +561,17 @@ style: collaborative
 maturity: draft
 collaboration: { enabled: true }
 sessions:
-  ruby: { provider: local, role: ruby, authority: { can_modify_files: true } }
-  js: { provider: local, role: js, authority: { can_modify_files: true } }
+  backend: { provider: local, role: backend, authority: { can_modify_files: true } }
+  frontend: { provider: local, role: frontend, authority: { can_modify_files: true } }
+  docs: { provider: local, role: docs, authority: { can_modify_files: true } }
 steps:
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     branches:
-      - { id: ruby, session: ruby, file_scope: { include: [app/**/*.rb] } }
-      - { id: js, session: js, file_scope: { include: [app/**/*.js] } }
+      - { id: backend, session: backend, file_scope: { include: [src/server/**] } }
+      - { id: frontend, session: frontend, file_scope: { include: [src/client/**] } }
+      - { id: docs, session: docs, file_scope: { include: [docs/**] } }
 `);
 
     expect(validateAgentFlowWorkflow(missingScopes).errors.map((issue) => issue.code)).toEqual([
@@ -430,6 +599,7 @@ sessions:
 steps:
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: left, session: left }
       - { id: right, session: right }
@@ -451,6 +621,7 @@ sessions:
 steps:
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     branches:
       - id: left
         type: command
@@ -496,6 +667,7 @@ sessions:
 steps:
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: ruby, session: ruby }
       - { id: js, session: js }
@@ -516,6 +688,7 @@ sessions:
 steps:
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: first, session: first, file_scope: { include: [src/**] } }
       - { id: second, session: second, file_scope: { include: [src/**] } }
@@ -532,6 +705,7 @@ sessions:
 steps:
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: writer, session: writer, file_scope: { include: [docs/**] } }
 `);
@@ -555,6 +729,7 @@ policies:
 steps:
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: writer, session: writer }
 `);
@@ -577,6 +752,7 @@ sessions:
 steps:
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: writer, session: writer }
 `);
@@ -604,6 +780,7 @@ sessions:
 steps:
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: writer, session: writer }
 `);
@@ -634,6 +811,7 @@ sessions:
 steps:
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: writer, session: writer }
 `);
@@ -652,6 +830,7 @@ sessions:
 steps:
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: writer, session: writer, file_scope: { include: [app/**, 42] } }
 `);
@@ -675,6 +854,7 @@ sessions:
 steps:
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     branches:
       - id: writer
         session: writer
@@ -720,6 +900,7 @@ sessions:
 steps:
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: write, session: writer, file_scope: [docs/**] }
 `);
@@ -744,6 +925,7 @@ sessions:
 steps:
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: writer, session: "{{ inputs.worker }}" }
 `);
@@ -767,6 +949,7 @@ sessions:
 steps:
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: first, session: first, file_scope: { include: [app/models/**] } }
       - { id: second, session: second, file_scope: { include: [app/services/**] } }
@@ -791,11 +974,13 @@ sessions:
 steps:
   - id: body_work
     type: parallel
+    strategy: fail_fast
     body:
       - { id: body_first, type: session_request, session: first, prompt: Write, file_scope: { include: [app/**] } }
       - { id: body_second, type: session_request, session: second, prompt: Write, file_scope: { include: [docs/**] } }
   - id: steps_work
     type: parallel
+    strategy: fail_fast
     steps:
       - { id: steps_first, type: session_request, session: first, prompt: Write, file_scope: { include: [app/**] } }
       - { id: steps_second, type: session_request, session: second, prompt: Write, file_scope: { include: [docs/**] } }
@@ -820,10 +1005,12 @@ sessions:
 steps:
   - id: body_work
     type: parallel
+    strategy: fail_fast
     body:
       - { id: body_writer, type: session_request, session: writer, prompt: Write, inputs: [body-input.md], outputs: [body-output.md] }
   - id: steps_work
     type: parallel
+    strategy: fail_fast
     steps:
       - { id: steps_writer, type: session_request, session: writer, prompt: Write, inputs: [steps-input.md], outputs: [steps-output.md] }
 `);
@@ -846,11 +1033,13 @@ sessions:
 steps:
   - id: body_work
     type: parallel
+    strategy: fail_fast
     body:
       - { id: body_first, type: session_request, session: first, prompt: Write, file_scope: { include: [shared/**] } }
       - { id: body_second, type: session_request, session: second, prompt: Write, file_scope: { include: [shared/**] } }
   - id: steps_work
     type: parallel
+    strategy: fail_fast
     steps:
       - { id: steps_first, type: session_request, session: first, prompt: Write, file_scope: { include: [shared/**] } }
       - { id: steps_second, type: session_request, session: second, prompt: Write, file_scope: { include: [shared/**] } }
@@ -875,6 +1064,7 @@ sessions:
 steps:
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     body:
       - id: loop_work
         type: loop
@@ -902,6 +1092,7 @@ sessions:
 steps:
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     branches:
       - id: branch
         session: worker
@@ -929,6 +1120,7 @@ sessions:
 steps:
   - id: outer
     type: parallel
+    strategy: fail_fast
     branches:
       - id: left
         session: first
@@ -936,6 +1128,7 @@ steps:
         steps:
           - id: nested
             type: parallel
+            strategy: fail_fast
             branches:
               - { id: nested_writer, session: first, file_scope: { include: [shared/**] } }
       - { id: right, session: second, file_scope: { include: [shared/**] } }
@@ -958,6 +1151,7 @@ sessions:
 steps:
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     allow_overlap: true
     conflict_policy: {}
     branches:
@@ -978,6 +1172,7 @@ maturity: draft
 steps:
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     allow_overlap: true
     conflict_policy: {}
     body:
@@ -1001,6 +1196,7 @@ sessions:
 steps:
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: duplicate, session: worker }
       - { id: duplicate, session: worker }
@@ -1025,6 +1221,7 @@ sessions:
 steps:
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: malformed, session: worker, inputs: 42, outputs: [result.md, 42] }
 `);
@@ -1665,6 +1862,7 @@ sessions:
 steps:
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: scalar, session: scalar }
       - { id: string_flag, session: string_flag }
@@ -1901,6 +2099,7 @@ maturity: draft
 steps:
   - id: container
     type: parallel
+    strategy: fail_fast
     body:
       - { id: nested, type: command, command: echo retry, goto: container }
 `);
@@ -2134,6 +2333,7 @@ sessions:
 steps:
   - id: parallel_read
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: first, session: first, file_scope: { include: [app/**] } }
       - { id: second, session: second, file_scope: { include: [app/**] } }
@@ -2154,6 +2354,7 @@ sessions:
 steps:
   - id: parallel_write
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: first, session: first, file_scope: { include: ["app/**/*.{rb,js}"] } }
       - { id: second, session: second, file_scope: { include: ["app/**/*.rb"] } }
@@ -2176,6 +2377,7 @@ sessions:
 steps:
   - id: parallel_write
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: first, session: first, file_scope: { include: ["app/{models,services}/**"] } }
       - { id: second, session: second, file_scope: { include: ["app/models/**"] } }
@@ -2198,6 +2400,7 @@ sessions:
 steps:
   - id: parallel_write
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: first, session: first, file_scope: { include: ["{app,lib/deep}/*.rb"] } }
       - { id: second, session: second, file_scope: { include: ["app/*.rb"] } }
@@ -2220,6 +2423,7 @@ sessions:
 steps:
   - id: parallel_write
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: first, session: first, file_scope: { include: ["**/*.rb"] } }
       - { id: second, session: second, file_scope: { include: ["app/**/*.rb"] } }
@@ -2242,6 +2446,7 @@ sessions:
 steps:
   - id: parallel_write
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: first, session: first, file_scope: { include: ["./app/**"] } }
       - { id: second, session: second, file_scope: { include: ["app/**"] } }
@@ -2264,6 +2469,7 @@ sessions:
 steps:
   - id: parallel_write
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: first, session: first, file_scope: { include: ["app/**"] } }
       - { id: second, session: second, file_scope: { include: ["app2/**"] } }
@@ -2284,6 +2490,7 @@ sessions:
 steps:
   - id: parallel_write
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: first, session: first, file_scope: { include: ["app/foo"] } }
       - { id: second, session: second, file_scope: { include: ["app/foobar/**"] } }
@@ -2304,6 +2511,7 @@ sessions:
 steps:
   - id: parallel_write
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: first, session: first, file_scope: { include: ["app/*.rb"] } }
       - { id: second, session: second, file_scope: { include: ["app/foo/*.rb"] } }
@@ -2324,6 +2532,7 @@ sessions:
 steps:
   - id: parallel_write
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: first, session: first, file_scope: { include: ["app/test*.rb"] } }
       - { id: second, session: second, file_scope: { include: ["app/test_helper.rb"] } }
@@ -2439,6 +2648,7 @@ sessions:
 steps:
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: branch, session: worker, outputs: [same.md] }
   - { id: later, type: command, command: echo later, outputs: [same.md] }
@@ -2463,6 +2673,7 @@ steps:
   - { id: first, type: command, command: echo first, outputs: [same.md] }
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: branch, session: worker, outputs: [same.md], overwrite: true }
 `);
@@ -2501,6 +2712,7 @@ sessions:
 steps:
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     body:
       - id: first_loop
         type: loop
@@ -2528,11 +2740,13 @@ collaboration: { enabled: true }
 steps:
   - id: body_work
     type: parallel
+    strategy: fail_fast
     body:
       - { id: body_first, type: command, command: echo first, outputs: [shared.md] }
       - { id: body_second, type: command, command: echo second, outputs: [shared.md] }
   - id: steps_work
     type: parallel
+    strategy: fail_fast
     steps:
       - { id: steps_first, type: command, command: echo first, outputs: [shared.json] }
       - { id: steps_second, type: command, command: echo second, outputs: [shared.json] }
@@ -2558,6 +2772,7 @@ sessions:
 steps:
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: first, session: first, outputs: [./result.md] }
       - { id: second, session: second, outputs: [tmp/../result.md] }
@@ -2580,12 +2795,14 @@ sessions:
 steps:
   - id: outer
     type: parallel
+    strategy: fail_fast
     branches:
       - id: left
         session: first
         steps:
           - id: nested
             type: parallel
+            strategy: fail_fast
             branches:
               - { id: nested_output, session: first, outputs: [same.md] }
       - { id: right, session: second, outputs: [same.md] }
@@ -2968,6 +3185,17 @@ steps: []
     expect(Object.keys(schema.$defs.session.properties ?? {}).sort()).toEqual([
       "authority", "file_scope", "owns", "provider", "resume", "role"
     ]);
+    expect(schema.$defs.step.properties).toMatchObject({
+      allow_overlap: { type: "boolean" },
+      conflict_policy: {
+        oneOf: expect.arrayContaining([
+          { type: "string", minLength: 1, pattern: "\\S" },
+          { type: "object", minProperties: 1 }
+        ])
+      }
+    });
+    expect(schema.$defs.collaborativeStep).toBeDefined();
+    expect(schema.$defs.parallelStrategy).toEqual({ const: "fail_fast" });
     expect(schema.$defs.session.properties).toMatchObject({
       provider: { type: "string", minLength: 1, pattern: "\\S" },
       role: { type: "string", minLength: 1, pattern: "\\S" },
@@ -3290,6 +3518,7 @@ sessions:
 steps:
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: producer, session: producer, outputs: [shared.json] }
       - { id: consumer, session: consumer, inputs: [shared.json] }
@@ -3312,6 +3541,7 @@ maturity: draft
 steps:
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     ${field}:
       - { id: producer, type: command, command: echo data, outputs: [shared.json] }
       - { id: consumer, type: command, command: cat shared.json, inputs: [shared.json] }
@@ -3337,6 +3567,7 @@ steps:
   - { id: prepare, type: command, command: echo input, outputs: [input.md] }
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: transform, session: worker, inputs: [input.md], outputs: [output.md] }
   - { id: consume, type: command, command: cat output.md, inputs: [output.md] }
@@ -3359,6 +3590,7 @@ sessions:
 steps:
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     branches:
       - id: producer_branch
         session: producer

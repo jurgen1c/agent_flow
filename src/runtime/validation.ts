@@ -148,7 +148,8 @@ export function validateAgentFlowWorkflow(workflow: AgentFlowWorkflow): AgentFlo
   validateArtifactOutputs(workflow, contexts, errors);
   validateApprovals(executableContexts, errors);
   validateApprovalInvalidation(workflow, executableContexts, errors);
-  validateParallelWriters(workflow, contexts, errors);
+  validateParallelContracts(workflow, executableContexts, errors);
+  validateParallelWriters(workflow, executableContexts, errors);
   validateCollaborativeReviewBounds(workflow, contexts, errors);
 
   return { valid: errors.length === 0, errors };
@@ -2292,6 +2293,62 @@ function validateParallelWriters(
             `Parallel branches "${left.id}" and "${right.id}" have overlapping file scopes (${overlap[0]} and ${overlap[1]}).`
           );
         }
+      }
+    }
+  }
+}
+
+function validateParallelContracts(
+  workflow: AgentFlowWorkflow,
+  contexts: StepContext[],
+  errors: AgentFlowWorkflowIssue[]
+): void {
+  for (const context of contexts) {
+    if (context.type !== "parallel") continue;
+
+    if (workflow.style === "collaborative") {
+      const strategy = nonEmptyString(context.step.strategy);
+      if (strategy === undefined) {
+        addStepIssue(
+          errors,
+          context,
+          "workflow.parallel.strategy.required",
+          "strategy",
+          "Collaborative parallel steps must explicitly declare strategy: fail_fast."
+        );
+      } else if (strategy !== "fail_fast" || context.step.strategy !== strategy) {
+        addStepIssue(
+          errors,
+          context,
+          "workflow.parallel.strategy.unsupported",
+          "strategy",
+          "Collaborative parallel strategy must be exactly fail_fast."
+        );
+      }
+    }
+
+    if (context.step.allow_overlap !== undefined && typeof context.step.allow_overlap !== "boolean") {
+      addStepIssue(
+        errors,
+        context,
+        "workflow.parallel.allow_overlap.invalid",
+        "allow_overlap",
+        "Parallel allow_overlap must be a boolean when declared."
+      );
+    }
+
+    if (context.step.conflict_policy !== undefined) {
+      const policy = context.step.conflict_policy;
+      const valid = nonEmptyString(policy) !== undefined ||
+        (isRecord(policy) && Object.keys(policy).length > 0);
+      if (!valid) {
+        addStepIssue(
+          errors,
+          context,
+          "workflow.parallel.conflict_policy.invalid",
+          "conflict_policy",
+          "Parallel conflict_policy must be a non-empty strategy name or mapping when declared."
+        );
       }
     }
   }

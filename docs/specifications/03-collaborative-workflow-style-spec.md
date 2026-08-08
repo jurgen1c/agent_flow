@@ -345,10 +345,15 @@ Parallel work is allowed when safe.
 
 Rules:
 
-1. Parallel writers must declare non-overlapping file scopes.
-2. If scopes overlap, workflow validation fails unless `allow_overlap: true` and conflict policy is set.
-3. Read-only advisory sessions may run in parallel without file scopes.
-4. Parent workflow decides what to do if one branch fails.
+1. Collaborative parallel steps must declare `strategy: fail_fast`; this is the only supported parent branch-failure strategy.
+2. Parallel writers must declare non-overlapping file scopes.
+3. If scopes overlap, workflow validation fails unless `allow_overlap: true` and a non-empty conflict policy is set.
+4. Read-only advisory sessions may run in parallel without file scopes.
+
+This contract validates safe declarations. It does not add a concurrent runtime
+scheduler or automatically apply a declared conflict policy. Fixture simulation
+continues to collect branch diagnostics and reports conflicting artifact values
+as unresolved.
 
 ## 13. Approval Invalidation
 
