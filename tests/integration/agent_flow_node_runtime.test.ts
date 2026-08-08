@@ -5,7 +5,7 @@ import path from "node:path";
 
 const repositoryRoot = path.resolve(".");
 const builtCli = path.join(repositoryRoot, "dist", "agent-flow.js");
-const nodeExecutable = process.env.AGENT_TEST_NODE ?? "node";
+const nodeExecutable = process.env.AGENT_TEST_NODE ?? resolveNodeExecutable();
 
 describe("built Node CLI", () => {
   test("runs persistent workflows without exposing Node SQLite warnings", () => {
@@ -68,4 +68,14 @@ function run(
     stdout: new TextDecoder().decode(result.stdout),
     stderr: new TextDecoder().decode(result.stderr)
   };
+}
+
+function resolveNodeExecutable(): string {
+  const result = Bun.spawnSync(["node", "-p", "process.execPath"], {
+    cwd: repositoryRoot,
+    env: process.env
+  });
+  if (result.exitCode !== 0) return "node";
+  const executable = new TextDecoder().decode(result.stdout).trim();
+  return executable.length > 0 ? executable : "node";
 }

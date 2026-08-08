@@ -19,8 +19,43 @@ import {
   validateAgentFlowWorkflow,
   type AgentFlowSessionProviderRequest
 } from "../../src/runtime";
+import { invokeAgentFlowSessionProvider } from "../../src/runtime/session_request";
 
 describe("Agent Flow session request steps", () => {
+  test("rejects and aborts when an in-flight interrupt check throws", async () => {
+    let interruptChecks = 0;
+    let aborted = false;
+    const request: AgentFlowSessionProviderRequest = {
+      runId: "polling-error",
+      stepId: "ask",
+      sessionId: "worker",
+      provider: "fixture",
+      resume: false,
+      prompt: { path: "prompt.md", content: "Prompt", checksum: "sha256:prompt" },
+      inputs: [],
+      outputs: ["response.md"],
+      signal: new AbortController().signal
+    };
+    const execution = invokeAgentFlowSessionProvider(
+      (providerRequest) => new Promise((_resolve, reject) => {
+        providerRequest.signal.addEventListener("abort", () => {
+          aborted = true;
+          reject(providerRequest.signal.reason);
+        }, { once: true });
+      }),
+      request,
+      undefined,
+      () => {
+        interruptChecks += 1;
+        if (interruptChecks > 1) throw new Error("Approval polling failed.");
+        return undefined;
+      }
+    );
+
+    await expect(execution).rejects.toThrow("Approval polling failed.");
+    expect(aborted).toBe(true);
+  });
+
   test("validates static provider, resume, prompt, bounded inputs, and outputs", () => {
     const workflow = parseAgentFlowWorkflowOrThrow(`name: invalid-session-contract
 version: 1

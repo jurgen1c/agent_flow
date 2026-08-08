@@ -13,6 +13,11 @@
       "type": "object",
       "additionalProperties": { "$ref": "#/$defs/session" }
     },
+    "approvals": {
+      "type": "object",
+      "propertyNames": { "pattern": "^\\S(?:.*\\S)?$" },
+      "additionalProperties": { "$ref": "#/$defs/approvalInvalidation" }
+    },
     "collaboration": { "$ref": "#/$defs/collaboration" },
     "artifacts": { "type": "object" },
     "steps": {
@@ -212,6 +217,14 @@
           "then": { "properties": { "on_failure": false } }
         }
       ]
+    },
+    "approvalInvalidation": {
+      "type": "object",
+      "required": ["invalidated_by"],
+      "properties": {
+        "invalidated_by": { "$ref": "#/$defs/artifactPathList" }
+      },
+      "additionalProperties": false
     },
     "decisionRecordStep": {
       "required": ["id", "type", "owner", "topic", "artifacts"],

@@ -6,7 +6,8 @@ import {
   parseAgentFlowWorkflowOrThrow,
   renderAgentFlowSimulationSummary,
   parseAgentFlowSimulationFixture,
-  simulateAgentFlowWorkflow
+  simulateAgentFlowWorkflow,
+  validateAgentFlowWorkflow
 } from "../../src/runtime";
 
 const repoRoot = path.resolve(".");
@@ -82,6 +83,11 @@ describe("Agent Flow workflow simulation", () => {
       steps: {
         implement: { outputs: ["implementation-summary.md"] },
         review: { outputs: { "reviews/code-review.json": { status: "approved", findings: [] } } },
+        approve_implementation: {
+          outputs: {
+            "approvals/approve_implementation.json": { status: "approved", decision: "Reviewed evidence is current." }
+          }
+        },
         ask_user: { input: "continue" }
       }
     });
@@ -91,10 +97,308 @@ describe("Agent Flow workflow simulation", () => {
       "implement",
       "review",
       "route_review",
+      "approve_implementation",
       "record_approval",
       "ask_user"
     ]);
     expect(result.missingArtifacts).toEqual([]);
+  });
+
+  test("fails simulation before merge-capable continuation when a watched artifact changes", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: simulated-approval-invalidation
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+sessions:
+  reviewer: { provider: fixture, role: reviewer, authority: { can_approve: true } }
+  merger: { provider: fixture, role: merger, authority: { can_merge: true } }
+steps:
+  - { id: approve, type: approval, reviewer: reviewer, artifacts: [spec.md] }
+  - { id: revise, type: command, command: revise, outputs: [summary.md], overwrite: true }
+  - { id: merge, type: session_request, session: merger, prompt: merge.md, inputs: [approvals/approve.json], outputs: [merged.md] }
+  - { id: done, type: result, status: completed }
+approvals:
+  approve: { invalidated_by: [summary.md] }
+`);
+
+    const result = simulateAgentFlowWorkflow(workflow, {
+      artifacts: { "spec.md": "specification", "summary.md": "original" },
+      steps: {
+        approve: {
+          outputs: {
+            "approvals/approve.json": { status: "approved", decision: "Approved original summary." }
+          }
+        },
+        revise: { outputs: { "summary.md": "revised" } },
+        merge: { outputs: { "merged.md": "merged" } }
+      }
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.visitedSteps.map((step) => step.id)).toEqual(["approve", "revise"]);
+    expect(result.availableArtifacts).not.toContain("merged.md");
+    expect(result.terminalStates).toContainEqual({ stepId: "merge", status: "failed" });
+  });
+
+  test("makes stale approval outputs unavailable to ordinary simulation consumers", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: simulated-stale-approval-output
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+sessions:
+  reviewer: { provider: fixture, role: reviewer, authority: { can_approve: true } }
+  worker: { provider: fixture, role: worker }
+steps:
+  - { id: approve, type: approval, reviewer: reviewer, artifacts: [spec.md] }
+  - { id: revise, type: command, command: revise, outputs: [summary.md] }
+  - { id: consume, type: session_request, session: worker, prompt: consume.md, inputs: [approvals/approve.json], outputs: [result.md] }
+  - { id: done, type: result, status: completed }
+approvals:
+  approve: { invalidated_by: [summary.md] }
+`);
+
+    const result = simulateAgentFlowWorkflow(workflow, {
+      artifacts: { "spec.md": "specification" },
+      steps: {
+        approve: {
+          outputs: {
+            "approvals/approve.json": { status: "approved", decision: "Approved." }
+          }
+        },
+        revise: { outputs: { "summary.md": "revised" } },
+        consume: { outputs: { "result.md": "consumed" } }
+      }
+    });
+
+    expect(result.status).toBe("paused");
+    expect(result.availableArtifacts).not.toContain("approvals/approve.json");
+    expect(result.availableArtifacts).not.toContain("result.md");
+    expect(result.visitedSteps.at(-1)).toEqual({ id: "consume", type: "session_request", outcome: "failed" });
+  });
+
+  test("invalidates a simulated approval when its outcome is overwritten", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: simulated-approval-outcome-overwrite
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+sessions:
+  reviewer: { provider: fixture, authority: { can_approve: true } }
+steps:
+  - { id: approve, type: approval, reviewer: reviewer, artifacts: [spec.md] }
+  - { id: replace, type: command, command: replace, outputs: [approvals/approve.json], overwrite: true }
+  - { id: done, type: result, status: completed }
+`);
+
+    const result = simulateAgentFlowWorkflow(workflow, {
+      artifacts: { "spec.md": "specification" },
+      steps: {
+        approve: {
+          outputs: { "approvals/approve.json": { status: "approved", decision: "Approved." } }
+        },
+        replace: {
+          outputs: { "approvals/approve.json": { status: "replaced", decision: "No longer approved." } }
+        }
+      }
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.availableArtifacts).not.toContain("approvals/approve.json");
+    expect(result.terminalStates).toContainEqual({ stepId: "done", status: "failed" });
+  });
+
+  test("treats repeated value-less watched output production as an unknown change", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: simulated-value-less-invalidation
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+sessions:
+  reviewer: { provider: fixture, role: reviewer, authority: { can_approve: true } }
+steps:
+  - { id: seed, type: command, command: seed, outputs: [watched.md] }
+  - { id: approve, type: approval, reviewer: reviewer, artifacts: [watched.md] }
+  - { id: revise, type: command, command: revise, outputs: [watched.md], overwrite: true }
+  - { id: done, type: result, status: completed }
+approvals:
+  approve: { invalidated_by: [watched.md] }
+`);
+
+    const result = simulateAgentFlowWorkflow(workflow, {
+      steps: {
+        seed: { outputs: ["watched.md"] },
+        approve: {
+          outputs: { "approvals/approve.json": { status: "approved", decision: "Approved." } }
+        },
+        revise: { outputs: ["watched.md"] }
+      }
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.availableArtifacts).not.toContain("approvals/approve.json");
+    expect(result.terminalStates).toContainEqual({ stepId: "done", status: "failed" });
+  });
+
+  test("does not treat incidental actor fields on commands as merge sessions", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: simulated-incidental-merge-actor
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  reviewer: { provider: fixture, authority: { can_approve: true } }
+  merger: { provider: fixture, authority: { can_merge: true } }
+steps:
+  - { id: approve, type: approval, reviewer: reviewer, artifacts: [spec.md] }
+  - { id: revise, type: command, command: revise, outputs: [watched.md] }
+  - { id: prepare, type: command, command: prepare, owner: merger, outputs: [prepared.md] }
+  - { id: done, type: result, status: completed }
+approvals:
+  approve: { invalidated_by: [watched.md] }
+`);
+
+    const result = simulateAgentFlowWorkflow(workflow, {
+      artifacts: { "spec.md": "Specification" },
+      steps: {
+        approve: {
+          outputs: { "approvals/approve.json": { status: "approved", decision: "Approved." } }
+        },
+        revise: { outputs: { "watched.md": "Changed" } },
+        prepare: { outputs: { "prepared.md": "Prepared" } }
+      }
+    });
+
+    expect(result.visitedSteps).toContainEqual({ id: "prepare", type: "command", outcome: "succeeded" });
+    expect(result.availableArtifacts).toContain("prepared.md");
+    expect(result.status).toBe("failed");
+  });
+
+  test("preserves stale approval output unavailability across parallel joins", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: simulated-parallel-approval-invalidation
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+sessions:
+  reviewer: { provider: fixture, role: reviewer, authority: { can_approve: true } }
+  worker: { provider: fixture, role: worker }
+steps:
+  - { id: approve, type: approval, reviewer: reviewer, artifacts: [spec.md] }
+  - id: split
+    type: parallel
+    branches:
+      - { id: revise, type: command, command: revise, outputs: [summary.md] }
+  - { id: consume, type: session_request, session: worker, prompt: consume.md, inputs: [approvals/approve.json], outputs: [result.md] }
+approvals:
+  approve: { invalidated_by: [summary.md] }
+`);
+
+    const result = simulateAgentFlowWorkflow(workflow, {
+      artifacts: { "spec.md": "specification" },
+      steps: {
+        approve: {
+          outputs: { "approvals/approve.json": { status: "approved", decision: "Approved." } }
+        },
+        revise: { outputs: { "summary.md": "revised" } },
+        consume: { outputs: { "result.md": "consumed" } }
+      }
+    });
+
+    expect(result.status).toBe("paused");
+    expect(result.availableArtifacts).not.toContain("approvals/approve.json");
+    expect(result.availableArtifacts).not.toContain("result.md");
+  });
+
+  test("lets a parallel approval rerun clear inherited staleness", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: simulated-parallel-approval-rerun
+version: 1
+style: recovery_pipeline
+maturity: experimental
+sessions:
+  reviewer: { provider: fixture, authority: { can_approve: true } }
+steps:
+  - { id: start, type: command, command: start, then: approve }
+  - { id: revise, type: command, command: revise, outputs: [summary.md] }
+  - id: split
+    type: parallel
+    branches:
+      - { id: approve, session: reviewer, type: approval, reviewer: reviewer, artifacts: [spec.md] }
+      - id: route
+        session: reviewer
+        type: command
+        command: route
+        then: done
+        on_failure: { then: revise, allowed: true }
+  - { id: done, type: result, status: completed }
+approvals:
+  approve: { invalidated_by: [summary.md] }
+limits: { max_recovery_cycles: 3 }
+`);
+    expect(validateAgentFlowWorkflow(workflow)).toEqual({ valid: true, errors: [] });
+
+    const result = simulateAgentFlowWorkflow(workflow, {
+      artifacts: { "spec.md": "specification" },
+      steps: {
+        start: {},
+        revise: { outputs: { "summary.md": "revised" } },
+        approve: {
+          outputs: { "approvals/approve.json": { status: "approved", decision: "Approved." } }
+        },
+        route: { outcome: ["failed", "succeeded"] }
+      }
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.availableArtifacts).toContain("approvals/approve.json");
+    expect(result.terminalStates).toContainEqual({ stepId: "done", status: "completed" });
+  });
+
+  test("keeps an approval stale when a sibling branch changes watched evidence during its rerun", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: simulated-parallel-approval-rerun-race
+version: 1
+style: recovery_pipeline
+maturity: experimental
+sessions:
+  reviewer: { provider: fixture, authority: { can_approve: true } }
+  worker: { provider: fixture }
+steps:
+  - { id: start, type: command, command: start, then: approve }
+  - { id: revise, type: command, command: revise, outputs: [summary.md] }
+  - id: split
+    type: parallel
+    branches:
+      - { id: approve, session: reviewer, type: approval, reviewer: reviewer, artifacts: [spec.md] }
+      - id: route
+        session: worker
+        type: command
+        command: route
+        then: done
+        on_failure: { then: revise, allowed: true }
+      - { id: revise_again, session: worker, type: command, command: revise, outputs: [summary.md], overwrite: true }
+  - { id: done, type: result, status: completed }
+approvals:
+  approve: { invalidated_by: [summary.md] }
+limits: { max_recovery_cycles: 5 }
+`);
+    expect(validateAgentFlowWorkflow(workflow)).toEqual({ valid: true, errors: [] });
+
+    const result = simulateAgentFlowWorkflow(workflow, {
+      artifacts: { "spec.md": "specification" },
+      steps: {
+        start: {},
+        revise: { outputs: { "summary.md": "first revision" } },
+        approve: {
+          outputs: { "approvals/approve.json": { status: "approved", decision: "Approved." } }
+        },
+        route: { outcome: ["failed", "succeeded"] },
+        revise_again: { outputs: { "summary.md": "concurrent revision" } }
+      }
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.availableArtifacts).not.toContain("approvals/approve.json");
+    expect(result.terminalStates).toContainEqual({ stepId: "done", status: "failed" });
   });
 
   test("reports unresolved conditions and missing artifacts deterministically", () => {

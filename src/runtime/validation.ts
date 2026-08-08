@@ -147,6 +147,7 @@ export function validateAgentFlowWorkflow(workflow: AgentFlowWorkflow): AgentFlo
   validateCollaborationExchangeContracts(executableContexts, errors);
   validateArtifactOutputs(workflow, contexts, errors);
   validateApprovals(executableContexts, errors);
+  validateApprovalInvalidation(workflow, executableContexts, errors);
   validateParallelWriters(workflow, contexts, errors);
   validateCollaborativeReviewBounds(workflow, contexts, errors);
 
@@ -2102,6 +2103,104 @@ function validateApprovals(contexts: StepContext[], errors: AgentFlowWorkflowIss
         "options",
         "Manual gate needs a pause, paused, cancel, cancelled, or reject outcome so the workflow cannot wait forever."
       );
+    }
+  }
+}
+
+function validateApprovalInvalidation(
+  workflow: AgentFlowWorkflow,
+  contexts: StepContext[],
+  errors: AgentFlowWorkflowIssue[]
+): void {
+  if (workflow.approvals === undefined) return;
+  if (!isRecord(workflow.approvals)) {
+    errors.push({
+      code: "workflow.approvals.invalid",
+      path: "approvals",
+      message: "Approval invalidation must be a mapping keyed by approval step ID."
+    });
+    return;
+  }
+
+  const approvalSteps = new Map(contexts
+    .filter((context) => context.type === "approval" && context.id !== undefined)
+    .map((context) => [context.id!, context]));
+  for (const [approvalId, value] of Object.entries(workflow.approvals)) {
+    const basePath = `approvals.${approvalId}`;
+    const context = approvalSteps.get(approvalId);
+    if (context === undefined) {
+      errors.push({
+        code: "workflow.approvals.step.undeclared",
+        path: basePath,
+        message: `Approval invalidation key ${JSON.stringify(approvalId)} must name a declared approval step.`
+      });
+    }
+    if (!isRecord(value)) {
+      errors.push({
+        code: "workflow.approvals.invalid",
+        path: basePath,
+        message: `Approval invalidation for ${JSON.stringify(approvalId)} must be a mapping.`
+      });
+      continue;
+    }
+    for (const field of Object.keys(value)) {
+      if (field !== "invalidated_by") {
+        errors.push({
+          code: "workflow.approvals.field.unsupported",
+          path: `${basePath}.${field}`,
+          message: `Approval invalidation field ${JSON.stringify(field)} is not supported.`
+        });
+      }
+    }
+    const invalidatedBy = value.invalidated_by;
+    if (!Array.isArray(invalidatedBy) || invalidatedBy.length === 0) {
+      errors.push({
+        code: "workflow.approvals.invalidated_by.invalid",
+        path: `${basePath}.invalidated_by`,
+        message: "Approval invalidated_by must be a non-empty list of normalized static repo-relative artifact paths."
+      });
+      continue;
+    }
+    const seen = new Set<string>();
+    invalidatedBy.forEach((entry, index) => {
+      const path = `${basePath}.invalidated_by[${index}]`;
+      const normalized = typeof entry === "string" ? normalizedStaticArtifactPath(entry) : undefined;
+      if (normalized === undefined) {
+        errors.push({
+          code: "workflow.approvals.invalidated_by.invalid",
+          path,
+          message: `Approval invalidation artifact ${JSON.stringify(entry)} must be a normalized static repo-relative path.`
+        });
+        return;
+      }
+      if (seen.has(normalized)) {
+        errors.push({
+          code: "workflow.approvals.invalidated_by.duplicate",
+          path,
+          message: `Approval invalidated_by must not contain duplicate path ${JSON.stringify(normalized)}.`
+        });
+      }
+      if (normalized === AGENT_FLOW_FINAL_SUMMARY_PATH) {
+        errors.push({
+          code: "workflow.approvals.invalidated_by.reserved",
+          path,
+          message: `Approval invalidated_by cannot watch runtime-managed artifact ${JSON.stringify(normalized)}.`
+        });
+      }
+      seen.add(normalized);
+    });
+    if (context !== undefined) {
+      const output = typeof context.step.output === "string"
+        ? normalizedStaticArtifactPath(context.step.output)
+        : defaultAgentFlowApprovalOutputPath(approvalId);
+      if (output !== undefined && seen.has(output)) {
+        errors.push({
+          code: "workflow.approvals.invalidated_by.output_collision",
+          path: `${basePath}.invalidated_by`,
+          stepId: approvalId,
+          message: `Approval ${JSON.stringify(approvalId)} cannot be invalidated by its own output ${JSON.stringify(output)}.`
+        });
+      }
     }
   }
 }

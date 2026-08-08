@@ -99,6 +99,11 @@ import { AgentFlowFailureClassificationError } from "./failure_classification";
 import { createAgentFlowLifecycleRun, transitionAgentFlowLifecycleRun } from "./lifecycle";
 import { MAX_AGENT_FLOW_COLLABORATION_QUESTION_BYTES } from "./collaboration";
 import { defaultAgentFlowApprovalOutputPath } from "./approval";
+import {
+  latestStaleApprovalStepIds,
+  staleApprovalMessage,
+  staleApprovalStepIdsAcrossLineage
+} from "./approval_state";
 import { defaultAgentFlowDecisionRecordPath, executeAgentFlowDecisionRecord } from "./decision_record";
 
 const MAX_CAPTURE_BYTES = 10 * 1024 * 1024;
@@ -220,6 +225,7 @@ async function runAgentFlowCommandPipeline(
       "AGENT_FLOW_RUN_COLLISION"
     );
   }
+  store.validateApprovalInvalidationConfiguration(runId);
   const notificationIssue = validateAgentFlowNotifications(workflow)[0];
   if (notificationIssue !== undefined) {
     throw new AgentFlowRunStateError(
@@ -295,6 +301,14 @@ async function runAgentFlowCommandPipeline(
     const stoppedBeforeStep = stoppedPipelineResult(store, runId, completedSteps);
     if (stoppedBeforeStep !== undefined) return stoppedBeforeStep;
     const stepId = requiredStepId(step);
+    const staleApprovalIds = mergeContinuationStaleApprovals(store, runId, workflow, step);
+    if (staleApprovalIds.length > 0) {
+      return finishFailure(store, runId, completedSteps, stepId, {
+        exitCode: null,
+        timedOut: false,
+        message: staleApprovalMessage(staleApprovalIds, `merge-capable step ${stepId}`)
+      }, "failed", routingBudget.terminalEffects);
+    }
     const recoveryGuard = recoveryGuardFailure(store, runId, workflow, completedSteps, stepId, step, routingBudget);
     if (recoveryGuard !== undefined) return recoveryGuard;
     routingBudget.visits.set(stepId, (routingBudget.visits.get(stepId) ?? 0) + 1);
@@ -591,9 +605,10 @@ async function runAgentFlowCommandPipeline(
         };
         store.upsertStep({ runId, stepId, attempt, sessionId, status: "running", input });
         store.appendRunEvent(runId, { type: "step.started", stepId, payload: input });
+        const approvalId = isApproval ? `approval:${safeId(stepId)}:attempt-${attempt}` : undefined;
         if (isApproval) {
           store.upsertApproval({
-            id: `approval:${safeId(stepId)}:attempt-${attempt}`,
+            id: approvalId!,
             runId,
             stepId,
             status: "requested",
@@ -610,6 +625,7 @@ async function runAgentFlowCommandPipeline(
               : stepType === "challenge" ? executeAgentFlowChallenge : executeAgentFlowSessionRequest;
           const result = await execute(store, runId, workflow, step, sessionProviders, {
             attempt,
+            ...(approvalId === undefined ? {} : { requiredApprovalId: approvalId }),
             stopStatus: () => activeStopStatus(store, runId),
             beforePublish: () => {
               const status = activeStopStatus(store, runId);
@@ -629,7 +645,7 @@ async function runAgentFlowCommandPipeline(
           completedSteps.push(stepId);
           if (isApproval && result.approvalResult !== undefined) {
             store.upsertApproval({
-              id: `approval:${safeId(stepId)}:attempt-${attempt}`,
+              id: approvalId!,
               runId,
               stepId,
               status: result.approvalResult.status,
@@ -653,7 +669,7 @@ async function runAgentFlowCommandPipeline(
         } catch (error) {
           if (isApproval) {
             store.upsertApproval({
-              id: `approval:${safeId(stepId)}:attempt-${attempt}`,
+              id: approvalId!,
               runId,
               stepId,
               status: "cancelled",
@@ -1324,17 +1340,22 @@ function resumeWaitingStep(
     const decidedBy = response.decidedBy ?? (waiting.kind === "approval" ? "human" : undefined);
     let approvalArtifact: string | undefined;
     if (waiting.kind === "approval" && (approvalStatus === "approved" || approvalStatus === "rejected")) {
-      let currentEvidence: AgentFlowWaitingEvidence[];
-      let evidenceChange: string | undefined;
-      try {
-        currentEvidence = waiting.evidence!.map(({ path }) => {
-          const artifact = store.readArtifact(runId, path).artifact;
-          if (artifact.checksum === null) throw new Error(`Artifact ${path} does not have a persisted checksum.`);
-          return { path: artifact.declaredPath, checksum: artifact.checksum };
-        });
-      } catch (error) {
-        currentEvidence = [];
-        evidenceChange = `evidence is no longer available: ${error instanceof Error ? error.message : String(error)}`;
+      const persistedApproval = store.listApprovals(runId)
+        .find((approval) => approval.id === waiting.approvalId);
+      let currentEvidence: AgentFlowWaitingEvidence[] = [];
+      let evidenceChange = persistedApproval?.status === "stale"
+        ? "a configured approval dependency changed while the run was paused"
+        : undefined;
+      if (evidenceChange === undefined) {
+        try {
+          currentEvidence = waiting.evidence!.map(({ path }) => {
+            const artifact = store.readArtifact(runId, path).artifact;
+            if (artifact.checksum === null) throw new Error(`Artifact ${path} does not have a persisted checksum.`);
+            return { path: artifact.declaredPath, checksum: artifact.checksum };
+          });
+        } catch (error) {
+          evidenceChange = `evidence is no longer available: ${error instanceof Error ? error.message : String(error)}`;
+        }
       }
       if (evidenceChange !== undefined || !isDeepStrictEqual(currentEvidence, waiting.evidence)) {
         const message = evidenceChange ?? "evidence changed while the run was paused";
@@ -1395,6 +1416,7 @@ function resumeWaitingStep(
           content: `${JSON.stringify({ status: approvalStatus, decision: outcome })}\n`,
           overwrite: step.overwrite === true || existing?.producerStepId === waiting.stepId,
           requiredRunStatus: "running",
+          requiredApproval: { id: waiting.approvalId!, status: "requested" },
           requiredArtifacts: waiting.evidence,
           metadata: {
             reviewer: "human",
@@ -1961,6 +1983,18 @@ async function routeAfterFailedStep(
   }
   const routeKind = normalizedTarget(route.session) === undefined ? "workflow" : "session";
   const target = normalizedTarget(route[routeKind])!;
+  if (routeKind === "session" && sessionCanMerge(workflow, target)) {
+    const staleApprovalIds = staleApprovalStepIdsAcrossLineage(store, runId);
+    if (staleApprovalIds.length > 0) {
+      return {
+        result: finishFailure(store, runId, completedSteps, stepId, {
+          exitCode: null,
+          timedOut: false,
+          message: staleApprovalMessage(staleApprovalIds, `merge-capable recovery session ${target}`)
+        }, "failed", budget.terminalEffects)
+      };
+    }
+  }
   const routeBudgetFailure = recoveryInvocationBudgetFailure(
     store,
     runId,
@@ -3905,6 +3939,7 @@ function finalizePipelineRun(
 } {
   if (terminalEffects.workflow.style !== "pipeline") {
     return store.withRunFinalizationTransaction(runId, () => {
+      input = staleApprovalFailureInput(store, runId, input);
       input.beforeTerminalEffects?.();
       input.onFinalStatus?.(input.intendedStatus, input.message);
       store.updateRun(runId, {
@@ -3932,8 +3967,49 @@ function finalizePipelineRun(
     store,
     runId,
     () => finalizationResultForCurrentRun(store, runId, input),
-    () => finalizePipelineRunLocked(store, runId, terminalEffects, input)
+    () => finalizePipelineRunLocked(
+      store,
+      runId,
+      terminalEffects,
+      staleApprovalFailureInput(store, runId, input)
+    )
   );
+}
+
+function staleApprovalFailureInput(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  input: FinalizePipelineRunInput
+): FinalizePipelineRunInput {
+  if (input.intendedStatus !== "completed") return input;
+  const staleApprovalIds = latestStaleApprovalStepIds(store, runId);
+  if (staleApprovalIds.length === 0) return input;
+  const message = staleApprovalMessage(staleApprovalIds, "workflow completion");
+  return {
+    ...input,
+    intendedStatus: "failed",
+    message,
+    error: { code: "approval.stale", approvalStepIds: staleApprovalIds, message },
+    eventPayload: { completedSteps: input.completedSteps, approvalStepIds: staleApprovalIds, message }
+  };
+}
+
+function mergeContinuationStaleApprovals(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  workflow: AgentFlowWorkflow,
+  step: AgentFlowWorkflowStep
+): string[] {
+  const stepType = normalizedTarget(step.type);
+  const actor = stepType === "session_request"
+    ? step.session
+    : stepType === "consult" || stepType === "challenge" ? step.to : undefined;
+  const mergeCapable = typeof actor === "string" && sessionCanMerge(workflow, actor);
+  return mergeCapable ? staleApprovalStepIdsAcrossLineage(store, runId) : [];
+}
+
+function sessionCanMerge(workflow: AgentFlowWorkflow, sessionId: string): boolean {
+  return mapping(mapping(mapping(workflow.sessions)?.[sessionId.trim()])?.authority)?.can_merge === true;
 }
 
 function finalizePipelineRunLocked(

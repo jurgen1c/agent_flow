@@ -96,7 +96,11 @@ export function applyAgentFlowRetention(
 
   const deletions = stringList(rule.delete);
   if (deletions.length === 0) return;
-  const keep = [...stringList(rule.keep), AGENT_FLOW_FINAL_SUMMARY_PATH];
+  const keepPatterns = stringList(rule.keep);
+  const protectedPaths = new Set([
+    AGENT_FLOW_FINAL_SUMMARY_PATH,
+    ...approvedArtifactPaths(store, runId, workflow)
+  ]);
   const candidates = store.listArtifactMetadata(runId)
     .filter((artifact) =>
       artifact.status !== "missing"
@@ -104,7 +108,8 @@ export function applyAgentFlowRetention(
       && artifact.kind !== "failure_attachment"
       && artifact.kind !== "decision_record"
       && deletions.some((pattern) => matchesPolicyGlob(artifact.declaredPath, pattern))
-      && !keep.some((pattern) => matchesPolicyGlob(artifact.declaredPath, pattern))
+      && !protectedPaths.has(artifact.declaredPath)
+      && !keepPatterns.some((pattern) => matchesPolicyGlob(artifact.declaredPath, pattern))
     )
     .sort((left, right) => left.declaredPath.localeCompare(right.declaredPath));
   const deleted: string[] = [];
@@ -154,6 +159,28 @@ export function applyAgentFlowRetention(
       payload: { rule: ruleName, artifacts: deleted }
     });
   }
+}
+
+function approvedArtifactPaths(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  workflow: AgentFlowWorkflow
+): string[] {
+  const paths = new Set<string>();
+  for (const approval of store.listApprovals(runId)) {
+    if (approval.status !== "approved") continue;
+    const evidence = Array.isArray(approval.context.evidence) ? approval.context.evidence : [];
+    for (const entry of evidence) {
+      const path = mapping(entry)?.path;
+      if (typeof path === "string") paths.add(path);
+    }
+    if (typeof approval.context.output === "string") paths.add(approval.context.output);
+    if (approval.stepId !== null) {
+      const invalidatedBy = stringList(mapping(workflow.approvals?.[approval.stepId])?.invalidated_by);
+      for (const path of invalidatedBy) paths.add(path);
+    }
+  }
+  return [...paths];
 }
 
 export function agentFlowPipelineEffectsFinalized(

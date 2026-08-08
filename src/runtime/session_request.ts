@@ -27,6 +27,11 @@ import {
   parseAgentFlowApprovalResult,
   type AgentFlowApprovalResult
 } from "./approval";
+import {
+  persistedStaleApprovalStepIdsAcrossLineage,
+  staleApprovalMessage,
+  staleApprovalStepIdsAcrossLineage
+} from "./approval_state";
 
 export const MAX_AGENT_FLOW_SESSION_PROMPT_BYTES = 1024 * 1024;
 export const MAX_AGENT_FLOW_SESSION_INPUT_BYTES = 10 * 1024 * 1024;
@@ -84,6 +89,7 @@ export interface AgentFlowSessionRequestExecutionResult {
 export interface ExecuteAgentFlowSessionRequestOptions {
   attempt?: number;
   beforePublish?: () => void;
+  requiredApprovalId?: string;
   stopStatus?: () => AgentFlowRunStopStatus | undefined;
 }
 
@@ -264,6 +270,7 @@ async function executeAgentFlowSessionStep(
       "AGENT_FLOW_SESSION_WORKFLOW_MISMATCH"
     );
   }
+  store.validateApprovalInvalidationConfiguration(runId);
   const sessionId = requiredName(kind === "review" || kind === "approval" ? step.reviewer : kind === "session_request" ? step.session : step.to, `${label} ${stepId} session`);
   const session = mapping(workflow.sessions?.[sessionId]);
   if (session === undefined) {
@@ -300,6 +307,21 @@ async function executeAgentFlowSessionStep(
       );
     }
   }
+  const mergeCapable = kind !== "approval" && kind !== "review"
+    && mapping(session.authority)?.can_merge === true;
+  const staleMergeApprovalError = (verifyArtifacts = true): AgentFlowSessionPolicyError | undefined => {
+    if (!mergeCapable) return undefined;
+    const staleApprovalIds = verifyArtifacts
+      ? staleApprovalStepIdsAcrossLineage(store, runId)
+      : persistedStaleApprovalStepIdsAcrossLineage(store, runId);
+    return staleApprovalIds.length === 0 ? undefined : new AgentFlowSessionPolicyError(
+      staleApprovalMessage(staleApprovalIds, `merge-capable session ${sessionId}`),
+      "AGENT_FLOW_APPROVAL_STALE",
+      "fail"
+    );
+  };
+  const initialStaleApproval = staleMergeApprovalError();
+  if (initialStaleApproval !== undefined) throw initialStaleApproval;
   const provider = requiredName(session.provider, `Session ${sessionId} provider`);
   const adapter = registry.get(provider);
   if (adapter === undefined) {
@@ -433,7 +455,12 @@ async function executeAgentFlowSessionStep(
   let response: AgentFlowSessionProviderResponse;
   let effectiveExternalSessionId = priorExternalSessionId;
   try {
-    response = await invokeAgentFlowSessionProvider(adapter, request, options.stopStatus);
+    response = await invokeAgentFlowSessionProvider(
+      adapter,
+      request,
+      options.stopStatus,
+      () => staleMergeApprovalError(false)
+    );
   } catch (error) {
     const stopped = error instanceof AgentFlowSessionRequestInterruptedError
       ? error.status
@@ -498,6 +525,8 @@ async function executeAgentFlowSessionStep(
     approvalResult = parseAgentFlowApprovalResult(outputs.get(outputPaths[0]!)!, outputPaths[0]!);
   }
   const providerMetadata = validateAgentFlowSessionProviderMetadata(stepId, response.metadata);
+  const staleApprovalBeforePublication = staleMergeApprovalError();
+  if (staleApprovalBeforePublication !== undefined) throw staleApprovalBeforePublication;
   options.beforePublish?.();
 
   const requestMetadata = {
@@ -548,6 +577,10 @@ async function executeAgentFlowSessionStep(
       content: output.content,
       overwrite: step.overwrite === true || ownedSessionOutput(existing, stepId, sessionId, outputKind),
       requiredRunStatus: "running" as const,
+      ...(mergeCapable ? { requiredNoStaleApprovals: true } : {}),
+      ...(kind === "approval" && options.requiredApprovalId !== undefined
+        ? { requiredApproval: { id: options.requiredApprovalId, status: "requested" as const } }
+        : {}),
       requiredArtifacts: inputs
         .filter((input) => !overwrittenInputs.has(input.path))
         .map((input) => ({ path: input.path, checksum: input.checksum })),
@@ -564,6 +597,8 @@ async function executeAgentFlowSessionStep(
     if (inputPathSet.has(outputPath)) overwrittenInputs.add(outputPath);
     return publication;
   });
+  const staleApprovalBeforeOutputs = staleMergeApprovalError();
+  if (staleApprovalBeforeOutputs !== undefined) throw staleApprovalBeforeOutputs;
   const published = new Map(store.writeArtifactsAtomically(publications)
     .map((artifact) => [artifact.declaredPath, artifact]));
   const outputArtifacts = outputPaths.map((outputPath) => published.get(outputPath)!);
@@ -617,21 +652,30 @@ async function executeAgentFlowSessionStep(
 export async function invokeAgentFlowSessionProvider(
   adapter: AgentFlowSessionProviderAdapter,
   request: AgentFlowSessionProviderRequest,
-  stopStatus: ExecuteAgentFlowSessionRequestOptions["stopStatus"]
+  stopStatus: ExecuteAgentFlowSessionRequestOptions["stopStatus"],
+  interruptError?: () => AgentFlowSessionRequestError | undefined
 ): Promise<AgentFlowSessionProviderResponse> {
   const initialStatus = stopStatus?.();
   if (initialStatus !== undefined) throw new AgentFlowSessionRequestInterruptedError(initialStatus);
-  if (stopStatus === undefined) return adapter(request);
+  const initialError = interruptError?.();
+  if (initialError !== undefined) throw initialError;
+  if (stopStatus === undefined && interruptError === undefined) return adapter(request);
 
   const controller = new AbortController();
   request.signal = controller.signal;
   let timer: ReturnType<typeof setInterval> | undefined;
   const interrupted = new Promise<never>((_resolve, reject) => {
     timer = setInterval(() => {
-      const status = stopStatus();
-      if (status === undefined) return;
-      controller.abort(new AgentFlowSessionRequestInterruptedError(status));
-      reject(new AgentFlowSessionRequestInterruptedError(status));
+      try {
+        const status = stopStatus?.();
+        const error = status === undefined ? interruptError?.() : new AgentFlowSessionRequestInterruptedError(status);
+        if (error === undefined) return;
+        controller.abort(error);
+        reject(error);
+      } catch (error) {
+        controller.abort(error);
+        reject(error);
+      }
     }, 25);
   });
   try {
