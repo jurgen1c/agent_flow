@@ -22,6 +22,26 @@ These examples show how Agent Flow workflows can start simple and grow into reco
 4. Trigger a fake CI failure and show `ci-triage.yml`.
 5. Show `implement-review-collab.yml` to demonstrate collaboration.
 
+## Collaborative Examples
+
+The collaborative workflows use `provider: fixture` so every documented path can be demonstrated offline. Treat them as templates: replace fixture providers, repository-specific artifact inputs, file scopes, notification channels, and limits before using them in a live repository.
+
+Both examples include approved, changes-requested, and unresolved fixtures. The changes-requested path exhausts the bounded review loop and pauses for human disagreement resolution; the unresolved path routes directly to an explicit user question.
+
+```sh
+bun run build
+bun run dist/agent-flow.js validate examples/workflows/implement-review-collab.yml
+bun run dist/agent-flow.js simulate examples/workflows/implement-review-collab.yml \
+  --fixture examples/fixtures/implement-review-collab/approved.json
+bun run dist/agent-flow.js run examples/workflows/implement-review-collab.yml \
+  --id implement-review-demo \
+  --fixture examples/fixtures/implement-review-collab/approved.json
+```
+
+`implement-review-collab.yml` demonstrates formal code review, a bounded revision loop, explicit implementation approval, a retained decision record, and human escalation. `content-review-collab.yml` adds advisory product feedback before formal review, explicit product approval, and a retained content decision record.
+
+Use the corresponding fixture directories to substitute `changes-requested.json` or `unresolved.json`. Fixture runs create `.agent-flow/` state in the current repository; use a unique run ID for each run.
+
 ## Notes
 
 `jira-ticket-spec.yml` uses the built-in `jira_ticket_to_markdown` transform.

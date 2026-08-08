@@ -31,6 +31,13 @@ try {
     "dist/cli/router.js",
     "dist/cli/router.d.ts",
     "dist/agent-flow.js",
+    "examples/README.md",
+    "examples/workflows/implement-review-collab.yml",
+    "examples/workflows/content-review-collab.yml",
+    "examples/prompts/implement-ticket.md",
+    "examples/prompts/draft-feature-copy.md",
+    "examples/fixtures/implement-review-collab/approved.json",
+    "examples/fixtures/content-review-collab/approved.json",
     "schemas/approval.schema.json",
     "schemas/challenge.schema.json",
     "schemas/config.schema.json",
@@ -45,7 +52,7 @@ try {
   }
 
   const forbidden = files.filter((file) =>
-    /(^|\/)(?:src|tests?|fixtures?|examples?|coverage|node_modules|\.git)(?:\/|$)/i.test(file)
+    /(^|\/)(?:src|tests?|coverage|node_modules|\.git)(?:\/|$)/i.test(file)
     || /(^|\/)\.env(?:\.|$)/i.test(file)
     || /\.(?:sqlite|db|pem|key|log)$/i.test(file)
   );

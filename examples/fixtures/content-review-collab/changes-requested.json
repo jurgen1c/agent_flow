@@ -1,0 +1,56 @@
+{
+  "inputs": {
+    "feature_name": "Review Inbox"
+  },
+  "artifacts": {
+    "product/feature-brief.md": "Help teams review actionable feedback without losing context.\n"
+  },
+  "steps": {
+    "draft_copy": {
+      "outputs": {
+        "content/feature-copy.md": "Resolve every review automatically.\n"
+      }
+    },
+    "product_advice": {
+      "outputs": {
+        "consultations/product-guidance.json": {
+          "status": "advice",
+          "blocking": false,
+          "summary": "Do not promise automatic resolution.",
+          "recommendations": [
+            {
+              "recommendation": "Describe supported review coordination instead.",
+              "priority": "high"
+            }
+          ]
+        }
+      }
+    },
+    "product_review": {
+      "outputs": {
+        "reviews/product-copy-review.json": {
+          "status": "changes_requested",
+          "findings": [
+            {
+              "summary": "Replace the unsupported automatic-resolution claim."
+            }
+          ],
+          "summary": "The draft overstates the product behavior."
+        }
+      }
+    },
+    "revise_copy": {
+      "outputs": {
+        "content/feature-copy.md": "Coordinate review feedback with the context your team needs.\n"
+      }
+    },
+    "approve_content": {
+      "outputs": {
+        "approvals/approve_content.json": {
+          "status": "approved",
+          "decision": "Human disagreement resolution approved the revised content evidence."
+        }
+      }
+    }
+  }
+}

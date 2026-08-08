@@ -1,0 +1,30 @@
+{
+  "artifacts": {
+    "git.diff": "Fixture diff for the reviewed implementation.\n",
+    "spec.md": "Implement the smallest ticket-scoped change with regression coverage.\n"
+  },
+  "steps": {
+    "implement": {
+      "outputs": {
+        "implementation-summary.md": "Implemented the ticket and added focused tests.\n"
+      }
+    },
+    "review": {
+      "outputs": {
+        "reviews/code-review.json": {
+          "status": "approved",
+          "findings": [],
+          "summary": "The implementation satisfies the supplied specification."
+        }
+      }
+    },
+    "approve_implementation": {
+      "outputs": {
+        "approvals/approve_implementation.json": {
+          "status": "approved",
+          "decision": "The reviewed implementation evidence is current and complete."
+        }
+      }
+    }
+  }
+}

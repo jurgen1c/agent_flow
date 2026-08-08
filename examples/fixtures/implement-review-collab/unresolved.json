@@ -1,0 +1,26 @@
+{
+  "artifacts": {
+    "git.diff": "Fixture diff with an unresolved product choice.\n",
+    "spec.md": "Implement the ticket without inventing missing product requirements.\n"
+  },
+  "steps": {
+    "implement": {
+      "outputs": {
+        "implementation-summary.md": "Stopped at the ambiguous product boundary.\n"
+      }
+    },
+    "review": {
+      "outputs": {
+        "reviews/code-review.json": {
+          "status": "unresolved",
+          "findings": [
+            {
+              "summary": "The expected behavior depends on a product decision."
+            }
+          ],
+          "summary": "Human direction is required."
+        }
+      }
+    }
+  }
+}

@@ -17,7 +17,7 @@ inputs:
 
 sessions:
   marketing:
-    provider: frontier
+    provider: fixture
     resume: true
     role: copywriter
     authority:
@@ -25,23 +25,35 @@ sessions:
     file_scope:
       include: [content/**]
   product:
-    provider: local
+    provider: fixture
     resume: true
     role: product_reviewer
     authority:
       can_request_changes: true
       can_approve: true
+      can_advise: true
       can_block: true
 
 steps:
   - id: draft_copy
     type: session_request
     session: marketing
-    prompt: prompts/draft-feature-copy.md
+    prompt: examples/prompts/draft-feature-copy.md
     inputs:
       - product/feature-brief.md
     outputs:
       - content/feature-copy.md
+
+  - id: product_advice
+    type: consult
+    from: marketing
+    to: product
+    question: "Which product constraints and user outcomes should the copy preserve before formal review?"
+    artifacts:
+      - product/feature-brief.md
+      - content/feature-copy.md
+    output: consultations/product-guidance.json
+    blocking: false
 
   - id: product_review
     type: review
@@ -50,14 +62,16 @@ steps:
     artifacts:
       - content/feature-copy.md
       - product/feature-brief.md
+      - consultations/product-guidance.json
     outputs:
       - reviews/product-copy-review.json
+    overwrite: true
 
   - id: route_review
     type: condition
     branches:
       - if: reviews.product_copy_review.status == "approved"
-        then: record_approval
+        then: approve_content
       - if: reviews.product_copy_review.status == "changes_requested"
         then: revise_copy
     else: ask_user
@@ -65,28 +79,68 @@ steps:
   - id: revise_copy
     type: session_request
     session: marketing
-    prompt: prompts/revise-feature-copy.md
+    prompt: examples/prompts/revise-feature-copy.md
     inputs:
       - reviews/product-copy-review.json
+      - consultations/product-guidance.json
       - content/feature-copy.md
     outputs:
       - content/feature-copy.md
+    overwrite: true
     then: product_review
+
+  - id: revise_rejected_copy
+    type: session_request
+    session: marketing
+    prompt: examples/prompts/revise-feature-copy.md
+    inputs:
+      - approvals/approve_content.json
+      - reviews/product-copy-review.json
+      - consultations/product-guidance.json
+      - content/feature-copy.md
+    outputs:
+      - content/feature-copy.md
+    overwrite: true
+    then: product_review
+
+  - id: approve_content
+    type: approval
+    reviewer: product
+    message: "Approve the reviewed copy and product guidance before recording the content decision."
+    artifacts:
+      - content/feature-copy.md
+      - consultations/product-guidance.json
+      - reviews/product-copy-review.json
+    on_approve: record_approval
+    on_reject: revise_rejected_copy
 
   - id: record_approval
     type: decision_record
     owner: product
     topic: "Feature copy approved"
     rationale_summary: "Product approved the copy against the feature brief."
+    consulted: [product]
     approved_by: [product]
     artifacts:
       - content/feature-copy.md
+      - consultations/product-guidance.json
       - reviews/product-copy-review.json
+      - approvals/approve_content.json
+
+  - id: complete
+    type: result
+    status: completed
 
   - id: ask_user
     type: input_request
     question: "Product and marketing did not reach agreement. What should the final direction be?"
     save_as: user-input/content-decision.md
+
+approvals:
+  approve_content:
+    invalidated_by:
+      - content/feature-copy.md
+      - reviews/product-copy-review.json
 
 limits:
   max_frontier_calls: 4
