@@ -38,12 +38,14 @@ import {
   executeAgentFlowApproval,
   executeAgentFlowChallenge,
   executeAgentFlowConsult,
+  executeAgentFlowDisagreementResolution,
   executeAgentFlowReview,
   executeAgentFlowSessionRequest,
   invokeAgentFlowSessionProvider,
   readAgentFlowSessionInput,
   readAgentFlowSessionPrompt,
   reserveAgentFlowSessionModelCallBudgets,
+  validateAgentFlowSessionOutputSize,
   validateAgentFlowSessionProviderMetadata,
   validateAgentFlowSessionProviderResponse,
   type AgentFlowSessionRequestArtifact
@@ -105,6 +107,14 @@ import {
   staleApprovalStepIdsAcrossLineage
 } from "./approval_state";
 import { defaultAgentFlowDecisionRecordPath, executeAgentFlowDecisionRecord } from "./decision_record";
+import {
+  collectAgentFlowReviewCyclePathReviewIds,
+  collectAgentFlowReviewCycleStepIds,
+  defaultAgentFlowDisagreementOutputPath,
+  parseAgentFlowDisagreementPolicy,
+  type AgentFlowDisagreementDecision,
+  type AgentFlowDisagreementPolicy
+} from "./disagreement";
 
 const MAX_CAPTURE_BYTES = 10 * 1024 * 1024;
 const RECOVERY_CONTEXT_INPUT_PATH = "recovery-context/injected.md";
@@ -126,10 +136,10 @@ export type AgentFlowPipelineResumeInput =
   | { answer: AgentFlowRunStateValue };
 
 interface AgentFlowPipelineWaitingState {
-  kind: "approval" | "manual_gate" | "input_request";
+  kind: "approval" | "manual_gate" | "input_request" | "disagreement";
   stepId: string;
   attempt: number;
-  reason: "approval" | "manual_approval" | "missing_input";
+  reason: "approval" | "manual_approval" | "missing_input" | "disagreement";
   prompt: string;
   validOutcomes: string[];
   saveAs?: string;
@@ -301,6 +311,7 @@ async function runAgentFlowCommandPipeline(
     const stoppedBeforeStep = stoppedPipelineResult(store, runId, completedSteps);
     if (stoppedBeforeStep !== undefined) return stoppedBeforeStep;
     const stepId = requiredStepId(step);
+    const stepType = normalizedTarget(step.type);
     const staleApprovalIds = mergeContinuationStaleApprovals(store, runId, workflow, step);
     if (staleApprovalIds.length > 0) {
       return finishFailure(store, runId, completedSteps, stepId, {
@@ -311,8 +322,29 @@ async function runAgentFlowCommandPipeline(
     }
     const recoveryGuard = recoveryGuardFailure(store, runId, workflow, completedSteps, stepId, step, routingBudget);
     if (recoveryGuard !== undefined) return recoveryGuard;
+    if (stepType === "review" && routingBudget.reviewCycleStepIds.has(stepId)
+        && routingBudget.maxReviewCycles !== undefined
+        && (routingBudget.attempts.get(stepId) ?? 0) >= routingBudget.maxReviewCycles) {
+      const disagreement = await resolveReviewDisagreement(
+        store,
+        runId,
+        workflow,
+        step,
+        completedSteps,
+        routingBudget,
+        sessionProviders
+      );
+      if ("result" in disagreement) return disagreement.result;
+      completedSteps.push(stepId);
+      const routed = routeAfterSuccessfulStep(
+        store, runId, completedSteps, stepId, step, currentSteps, stepIndex, stepLocations, routingBudget
+      );
+      if ("result" in routed) return routed.result;
+      currentSteps = routed.steps;
+      stepIndex = routed.nextIndex;
+      continue;
+    }
     routingBudget.visits.set(stepId, (routingBudget.visits.get(stepId) ?? 0) + 1);
-    const stepType = normalizedTarget(step.type);
     if (stepType === "approval" && normalizedTarget(step.reviewer) === "human") {
       const attempt = allocateStepAttempt(routingBudget, stepId);
       if (attempt === undefined) return stepAttemptLimitResult(store, runId, completedSteps, stepId, routingBudget);
@@ -1083,10 +1115,15 @@ interface RuntimeStepLocation {
 interface SuccessfulRoutingBudget {
   terminalEffects: AgentFlowPipelineTerminalEffects;
   maxRecoveryCycles?: number;
+  maxReviewCycles?: number;
   stepAttemptLimits: Map<string, number>;
+  reviewCyclePathReviewIds: Map<string, Set<string>>;
+  reviewCycleStepIds: Set<string>;
   visits: Map<string, number>;
   recoveryCycles: Map<string, number>;
   recoveryInvocations: Map<string, number>;
+  disagreementEpisodes: Map<string, number>;
+  disagreementRounds: Map<string, number>;
   attempts: Map<string, number>;
 }
 
@@ -1097,16 +1134,355 @@ interface AgentFlowPipelineTerminalEffects {
 
 interface SerializedSuccessfulRoutingBudget {
   maxRecoveryCycles?: number;
+  maxReviewCycles?: number;
   stepAttemptLimits: Record<string, number>;
   visits: Record<string, number>;
   recoveryCycles: Record<string, number>;
   recoveryInvocations: Record<string, number>;
+  disagreementEpisodes: Record<string, number>;
+  disagreementRounds: Record<string, number>;
   attempts: Record<string, number>;
 }
 
 type ResumedWaitingStep =
   | { steps: AgentFlowWorkflowStep[]; nextIndex: number; completedSteps: string[]; routingBudget: SuccessfulRoutingBudget }
   | { result: AgentFlowCommandPipelineResult };
+
+type ReviewDisagreementControl =
+  | { resolved: true }
+  | { result: AgentFlowCommandPipelineResult };
+
+async function resolveReviewDisagreement(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  workflow: AgentFlowWorkflow,
+  reviewStep: AgentFlowWorkflowStep,
+  completedSteps: string[],
+  routingBudget: SuccessfulRoutingBudget,
+  sessionProviders: AgentFlowSessionProviderRegistry
+): Promise<ReviewDisagreementControl> {
+  const stepId = requiredStepId(reviewStep);
+  const reviewer = requiredStaticString(reviewStep.reviewer, `Review ${stepId} reviewer`);
+  const subject = requiredStaticString(reviewStep.subject, `Review ${stepId} subject`);
+  const collaboration = mapping(workflow.collaboration);
+  const policy = parseAgentFlowDisagreementPolicy(collaboration?.on_disagreement);
+  const completedReviewCycles = routingBudget.attempts.get(stepId) ?? 0;
+  store.appendRunEvent(runId, {
+    type: "collaboration.disagreement",
+    stepId,
+    payload: {
+      reviewer,
+      subject,
+      completedReviewCycles,
+      maxReviewCycles: routingBudget.maxReviewCycles!,
+      strategy: policy.strategy
+    }
+  });
+
+  if (policy.strategy === "ask_user") {
+    return { result: pauseForReviewDisagreement(store, runId, reviewStep, completedSteps, routingBudget, policy) };
+  }
+  if (policy.strategy === "fail") {
+    return {
+      result: finishReviewDisagreementFailure(
+        store,
+        runId,
+        completedSteps,
+        stepId,
+        `Review ${stepId} exceeded collaboration.max_review_cycles ${routingBudget.maxReviewCycles}; disagreement strategy fail ended the workflow.`,
+        routingBudget,
+        policy
+      )
+    };
+  }
+
+  const resolver = policy.strategy === "owner_decides" ? subject : policy.arbiter!;
+  const maxRounds = policy.strategy === "owner_decides" ? 1 : policy.maxRounds!;
+  const episode = (routingBudget.disagreementEpisodes.get(stepId) ?? 0) + 1;
+  routingBudget.disagreementEpisodes.set(stepId, episode);
+  let round = routingBudget.disagreementRounds.get(stepId) ?? 0;
+  while (round < maxRounds) {
+    round += 1;
+    routingBudget.disagreementRounds.set(stepId, round);
+    const outputPath = defaultAgentFlowDisagreementOutputPath(stepId, round, episode);
+    try {
+      const resolved = await executeAgentFlowDisagreementResolution(
+        store,
+        runId,
+        workflow,
+        reviewStep,
+        resolver,
+        round,
+        outputPath,
+        sessionProviders,
+        { stopStatus: () => activeStopStatus(store, runId) }
+      );
+      const result = resolved.disagreementResult!;
+      store.appendRunEvent(runId, {
+        type: "collaboration.disagreement.round_completed",
+        stepId,
+        payload: { strategy: policy.strategy, resolver, episode, round, output: outputPath, status: result.status }
+      });
+      if (result.status === "unresolved") continue;
+      const resolutionEvidence = resolved.outputArtifacts.map((artifact) => {
+        if (artifact.checksum === null) {
+          throw new AgentFlowRunStateError(
+            `Disagreement resolution artifact ${artifact.declaredPath} must have a persisted checksum.`,
+            "AGENT_FLOW_DISAGREEMENT_INVALID"
+          );
+        }
+        return { path: artifact.declaredPath, checksum: artifact.checksum };
+      });
+      const attempt = completedReviewCycles + round;
+      store.withRunFinalizationTransaction(runId, () => {
+        publishReviewDisagreementDecision(
+          store,
+          runId,
+          reviewStep,
+          result.decision!,
+          result.rationale,
+          resolver,
+          policy.strategy,
+          round,
+          [...resolved.inputEvidence, ...resolutionEvidence]
+        );
+        const output = {
+          attempt,
+          resolution: result.decision!,
+          resolutionArtifact: outputPath,
+          resolver,
+          strategy: policy.strategy,
+          episode,
+          round
+        };
+        store.upsertStep({
+          runId,
+          stepId,
+          attempt,
+          sessionId: resolver,
+          status: "completed",
+          output
+        });
+        store.appendRunEvent(runId, { type: "step.completed", stepId, payload: output });
+        store.appendRunEvent(runId, {
+          type: "collaboration.disagreement.resolved",
+          stepId,
+          payload: {
+            strategy: policy.strategy,
+            path: policy.strategy === "owner_decides" ? "owner" : "arbiter",
+            resolver,
+            episode,
+            round,
+            decision: result.decision!,
+            output: outputPath
+          }
+        });
+      });
+      routingBudget.disagreementRounds.set(stepId, 0);
+      routingBudget.attempts.set(stepId, attempt);
+      return { resolved: true };
+    } catch (error) {
+      const message = redactAgentFlowSensitiveText(error instanceof Error ? error.message : String(error));
+      if (error instanceof AgentFlowSessionPolicyError) {
+        const attempt = completedReviewCycles + round;
+        const outcome = error.status === "pause" ? "pause" : "fail";
+        persistSessionRequestFailure(
+          store, runId, stepId, resolver, message, false, outcome, true, attempt,
+          modelLimitDetails(error)
+        );
+        recordModelLimitDecision(store, runId, stepId, workflow, error, false);
+        return {
+          result: finishFailure(store, runId, completedSteps, stepId, {
+            exitCode: null,
+            timedOut: false,
+            message
+          }, error.status === "pause" ? "paused" : "failed", routingBudget.terminalEffects)
+        };
+      }
+      store.appendRunEvent(runId, {
+        type: "collaboration.disagreement.round_failed",
+        stepId,
+        payload: { strategy: policy.strategy, resolver, episode, round, message }
+      });
+      if (activeStopStatus(store, runId) !== undefined) {
+        return { result: stoppedPipelineResult(store, runId, completedSteps)! };
+      }
+    }
+  }
+
+  if (policy.strategy === "arbiter_then_user") {
+    return { result: pauseForReviewDisagreement(store, runId, reviewStep, completedSteps, routingBudget, policy) };
+  }
+  return {
+    result: finishReviewDisagreementFailure(
+      store,
+      runId,
+      completedSteps,
+      stepId,
+      `Review ${stepId} disagreement remained unresolved after ${maxRounds} ${policy.strategy === "owner_decides" ? "owner" : "arbiter"} round(s).`,
+      routingBudget,
+      policy
+    )
+  };
+}
+
+function publishReviewDisagreementDecision(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  reviewStep: AgentFlowWorkflowStep,
+  decision: AgentFlowDisagreementDecision,
+  rationale: string,
+  resolver: string,
+  strategy: AgentFlowDisagreementPolicy["strategy"],
+  round: number,
+  requiredArtifacts?: AgentFlowWaitingEvidence[]
+): void {
+  const stepId = requiredStepId(reviewStep);
+  const outputs = normalizedStringList(reviewStep.outputs);
+  const reviewResult = {
+    status: decision,
+    findings: decision === "changes_requested" ? [{ summary: rationale }] : [],
+    summary: rationale
+  };
+  const content = `${JSON.stringify(reviewResult)}\n`;
+  const contentBytes = Buffer.byteLength(content);
+  let totalBytes = 0;
+  for (const outputPath of outputs) {
+    totalBytes += contentBytes;
+    validateAgentFlowSessionOutputSize(stepId, outputPath, contentBytes, totalBytes, "Synthesized review");
+  }
+  store.writeArtifactsAtomically(outputs.map((outputPath, index) => {
+    const existing = store.getArtifact(runId, outputPath);
+    const mayReplaceExisting = reviewStep.overwrite === true || existing?.producerStepId === stepId;
+    return {
+      id: mayReplaceExisting && existing !== null
+        ? existing.id
+        : `review-output:${safeId(stepId)}:${safeId(outputPath)}`,
+      runId,
+      stepId,
+      path: outputPath,
+      kind: "review_output",
+      contentType: "application/json; charset=utf-8",
+      content,
+      overwrite: mayReplaceExisting,
+      requiredRunStatus: "running" as const,
+      ...(index === 0 && requiredArtifacts !== undefined ? { requiredArtifacts } : {}),
+      metadata: { sessionId: resolver, disagreementStrategy: strategy, disagreementRound: round }
+    };
+  }));
+}
+
+function reviewDisagreementEvidencePaths(reviewStep: AgentFlowWorkflowStep): string[] {
+  return [...new Set([
+    ...normalizedStringList(reviewStep.artifacts),
+    ...normalizedStringList(reviewStep.outputs)
+  ])];
+}
+
+function pauseForReviewDisagreement(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  reviewStep: AgentFlowWorkflowStep,
+  completedSteps: string[],
+  routingBudget: SuccessfulRoutingBudget,
+  policy: AgentFlowDisagreementPolicy
+): AgentFlowCommandPipelineResult {
+  const stepId = requiredStepId(reviewStep);
+  const attempt = (routingBudget.attempts.get(stepId) ?? 0) + 1;
+  routingBudget.attempts.set(stepId, attempt);
+  const validOutcomes = ["approve", "request_changes", "fail", "cancel"];
+  const prompt = `Review ${stepId} reached its disagreement limit. Choose one outcome: ${validOutcomes.join(", ")}.`;
+  const run = store.getRun(runId)!;
+  const evidence = reviewDisagreementEvidencePaths(reviewStep).map((artifactPath) => {
+    const artifact = store.readArtifact(runId, artifactPath).artifact;
+    if (artifact.checksum === null) {
+      throw new AgentFlowRunStateError(
+        `Review disagreement ${stepId} artifacts must have persisted checksums.`,
+        "AGENT_FLOW_DISAGREEMENT_INVALID"
+      );
+    }
+    return { path: artifact.declaredPath, checksum: artifact.checksum };
+  });
+  const waiting: AgentFlowPipelineWaitingState = {
+    kind: "disagreement",
+    stepId,
+    attempt,
+    reason: "disagreement",
+    prompt,
+    validOutcomes,
+    evidence,
+    completedSteps: [...completedSteps],
+    routing: serializeRoutingBudget(routingBudget)
+  };
+  store.updateRun(runId, {
+    currentStepId: stepId,
+    context: { ...run.context, waiting: waiting as unknown as AgentFlowRunStateValue },
+    error: null
+  });
+  store.upsertStep({
+    runId,
+    stepId,
+    attempt,
+    status: "waiting",
+    input: { attempt, type: "disagreement", question: prompt, options: validOutcomes }
+  });
+  store.appendRunEvent(runId, {
+    type: "collaboration.disagreement.waiting",
+    stepId,
+    payload: { strategy: policy.strategy, path: "user", attempt, prompt, validOutcomes }
+  });
+  const message = `Review ${stepId} disagreement is waiting for user resolution.`;
+  const finalized = finalizePipelineRun(store, runId, routingBudget.terminalEffects, {
+    intendedStatus: "paused",
+    completedSteps,
+    currentStepId: stepId,
+    message,
+    eventPayload: { stepId, reason: "disagreement", strategy: policy.strategy, prompt, validOutcomes },
+    eventStepId: stepId,
+    failureContext: run.context
+  });
+  return { status: finalized.status, completedSteps, message: finalized.message ?? message };
+}
+
+function finishReviewDisagreementFailure(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  completedSteps: string[],
+  stepId: string,
+  message: string,
+  routingBudget: SuccessfulRoutingBudget,
+  policy: AgentFlowDisagreementPolicy
+): AgentFlowCommandPipelineResult {
+  const attempt = Math.max(1, routingBudget.attempts.get(stepId) ?? 0);
+  const failure = { attempt, message, outcome: "fail" as const };
+  persistAgentFlowFailurePayload(store, {
+    id: `disagreement:${safeId(stepId)}:attempt-${attempt}`,
+    runId,
+    stepId,
+    stepType: "review",
+    attempt,
+    exitCode: null,
+    summary: message,
+    classification: "collaboration_disagreement",
+    retryable: false,
+    outcome: "fail",
+    indexPayload: failure
+  });
+  store.appendRunEvent(runId, {
+    type: "collaboration.disagreement.resolved",
+    stepId,
+    payload: { strategy: policy.strategy, path: "fail", message }
+  });
+  return finishFailure(
+    store,
+    runId,
+    completedSteps,
+    stepId,
+    { exitCode: null, timedOut: false, message },
+    "failed",
+    routingBudget.terminalEffects
+  );
+}
 
 function pauseForInteraction(
   store: AgentFlowRunStateStore,
@@ -1262,7 +1638,8 @@ function resumeWaitingStep(
     );
   }
   const step = location.steps[location.index]!;
-  if (normalizedTarget(step.type) !== waiting.kind) {
+  const waitingStepType = waiting.kind === "disagreement" ? "review" : waiting.kind;
+  if (normalizedTarget(step.type) !== waitingStepType) {
     throw new AgentFlowRunStateError(
       `Agent Flow run ${runId} waiting state does not match workflow step ${waiting.stepId}.`,
       "AGENT_FLOW_RESUME_STATE"
@@ -1289,6 +1666,15 @@ function resumeWaitingStep(
         "AGENT_FLOW_RESUME_STATE"
       );
     }
+  } else if (waiting.kind === "disagreement") {
+    const declaredEvidence = reviewDisagreementEvidencePaths(step);
+    if (declaredEvidence.length === 0
+        || !isDeepStrictEqual(waiting.evidence?.map(({ path }) => path), declaredEvidence)) {
+      throw new AgentFlowRunStateError(
+        `Agent Flow run ${runId} disagreement waiting state does not match workflow step ${waiting.stepId}.`,
+        "AGENT_FLOW_RESUME_STATE"
+      );
+    }
   }
 
   const routingBudget = deserializeRoutingBudget(waiting.routing, workflow, notifications);
@@ -1296,7 +1682,105 @@ function resumeWaitingStep(
   let selectedTarget: string | undefined;
   let output: Record<string, AgentFlowRunStateValue>;
 
-  if (waiting.kind === "manual_gate" || waiting.kind === "approval") {
+  if (waiting.kind === "disagreement") {
+    if (!("outcome" in response)) {
+      throw new AgentFlowRunStateError(
+        `Disagreement ${waiting.stepId} requires an explicit --outcome value.`,
+        "AGENT_FLOW_GATE_OUTCOME_REQUIRED"
+      );
+    }
+    const outcome = response.outcome.trim();
+    if (!waiting.validOutcomes.includes(outcome)) {
+      throw new AgentFlowRunStateError(
+        `Disagreement ${waiting.stepId} rejected outcome ${JSON.stringify(outcome)}; valid outcomes are: ${waiting.validOutcomes.join(", ")}.`,
+        "AGENT_FLOW_GATE_OUTCOME_INVALID"
+      );
+    }
+    if (response.decidedBy !== undefined && response.decidedBy.trim().length === 0) {
+      throw new AgentFlowRunStateError(
+        `Disagreement ${waiting.stepId} decision actor must be non-empty text.`,
+        "AGENT_FLOW_INTERACTION_INVALID"
+      );
+    }
+    const decision = outcome === "approve" ? "approved"
+      : outcome === "request_changes" ? "changes_requested" : undefined;
+    const policy = parseAgentFlowDisagreementPolicy(mapping(workflow.collaboration)?.on_disagreement);
+    let evidenceChanged = false;
+    store.withRunFinalizationTransaction(runId, () => {
+      if (decision !== undefined) {
+        let currentEvidence: AgentFlowWaitingEvidence[] = [];
+        let evidenceChange: string | undefined;
+        try {
+          currentEvidence = waiting.evidence!.map(({ path }) => {
+            const artifact = store.readArtifact(runId, path).artifact;
+            if (artifact.checksum === null) throw new Error(`Artifact ${path} does not have a persisted checksum.`);
+            return { path: artifact.declaredPath, checksum: artifact.checksum };
+          });
+        } catch (error) {
+          evidenceChange = `evidence is no longer available: ${error instanceof Error ? error.message : String(error)}`;
+        }
+        if (evidenceChange !== undefined || !isDeepStrictEqual(currentEvidence, waiting.evidence)) {
+          const message = evidenceChange ?? "evidence changed while the run was paused";
+          evidenceChanged = true;
+          store.transitionRunWithEvent(runId, {
+            status: "running",
+            allowedFrom: ["paused"],
+            event: { type: "collaboration.disagreement.evidence_changed", stepId: waiting.stepId, payload: { message } }
+          });
+          store.upsertStep({
+            runId,
+            stepId: waiting.stepId,
+            attempt: waiting.attempt,
+            status: "cancelled",
+            output: { reason: "evidence_changed" }
+          });
+          const { waiting: _waiting, ...restartedContext } = store.getRun(runId)!.context;
+          store.updateRun(runId, { context: restartedContext, error: null });
+          return;
+        }
+      }
+      store.transitionRunWithEvent(runId, {
+        status: "running",
+        allowedFrom: ["paused"],
+        event: { type: "run.resume", stepId: waiting.stepId, payload: { outcome } }
+      });
+      if (decision !== undefined) {
+        publishReviewDisagreementDecision(
+          store,
+          runId,
+          step,
+          decision,
+          `User selected ${outcome} for review disagreement ${waiting.stepId}.`,
+          response.decidedBy?.trim() || "human",
+          policy.strategy,
+          routingBudget.disagreementRounds.get(waiting.stepId) ?? 0,
+          waiting.evidence
+        );
+      }
+      store.appendRunEvent(runId, {
+        type: "collaboration.disagreement.resolved",
+        stepId: waiting.stepId,
+        payload: {
+          strategy: policy.strategy,
+          path: "user",
+          decidedBy: response.decidedBy?.trim() || "human",
+          outcome,
+          ...(decision === undefined ? {} : { decision })
+        }
+      });
+    });
+    routingBudget.disagreementRounds.set(waiting.stepId, 0);
+    if (evidenceChanged) {
+      return {
+        steps: location.steps,
+        nextIndex: location.index,
+        completedSteps,
+        routingBudget
+      };
+    }
+    output = { attempt: waiting.attempt, outcome, decidedBy: response.decidedBy?.trim() || "human" };
+    selectedTarget = outcome === "fail" ? "fail" : outcome === "cancel" ? "cancel" : undefined;
+  } else if (waiting.kind === "manual_gate" || waiting.kind === "approval") {
     if (!("outcome" in response)) {
       throw new AgentFlowRunStateError(
         `${waiting.kind === "approval" ? "Approval" : "Manual gate"} ${waiting.stepId} requires an explicit --outcome value.`,
@@ -1539,10 +2023,13 @@ function manualGateOutcomeTarget(step: AgentFlowWorkflowStep, outcome: string): 
 function serializeRoutingBudget(budget: SuccessfulRoutingBudget): SerializedSuccessfulRoutingBudget {
   return {
     ...(budget.maxRecoveryCycles === undefined ? {} : { maxRecoveryCycles: budget.maxRecoveryCycles }),
+    ...(budget.maxReviewCycles === undefined ? {} : { maxReviewCycles: budget.maxReviewCycles }),
     stepAttemptLimits: Object.fromEntries([...budget.stepAttemptLimits].sort(([left], [right]) => left.localeCompare(right))),
     visits: Object.fromEntries([...budget.visits].sort(([left], [right]) => left.localeCompare(right))),
     recoveryCycles: Object.fromEntries([...budget.recoveryCycles].sort(([left], [right]) => left.localeCompare(right))),
     recoveryInvocations: Object.fromEntries([...budget.recoveryInvocations].sort(([left], [right]) => left.localeCompare(right))),
+    disagreementEpisodes: Object.fromEntries([...budget.disagreementEpisodes].sort(([left], [right]) => left.localeCompare(right))),
+    disagreementRounds: Object.fromEntries([...budget.disagreementRounds].sort(([left], [right]) => left.localeCompare(right))),
     attempts: Object.fromEntries([...budget.attempts].sort(([left], [right]) => left.localeCompare(right)))
   };
 }
@@ -1556,10 +2043,15 @@ function deserializeRoutingBudget(
   return {
     terminalEffects: configured.terminalEffects,
     maxRecoveryCycles: configured.maxRecoveryCycles,
+    maxReviewCycles: configured.maxReviewCycles,
     stepAttemptLimits: configured.stepAttemptLimits,
+    reviewCyclePathReviewIds: configured.reviewCyclePathReviewIds,
+    reviewCycleStepIds: configured.reviewCycleStepIds,
     visits: new Map(Object.entries(serialized.visits)),
     recoveryCycles: new Map(Object.entries(serialized.recoveryCycles)),
     recoveryInvocations: new Map(Object.entries(serialized.recoveryInvocations)),
+    disagreementEpisodes: new Map(Object.entries(serialized.disagreementEpisodes)),
+    disagreementRounds: new Map(Object.entries(serialized.disagreementRounds)),
     attempts: new Map(Object.entries(serialized.attempts))
   };
 }
@@ -1582,8 +2074,9 @@ function parseWaitingState(value: AgentFlowRunStateValue | undefined): AgentFlow
   const routing = mapping(record.routing);
   const reasonMatchesKind = kind === "approval" ? reason === "approval"
     : kind === "manual_gate" ? reason === "manual_approval"
-      : kind === "input_request" ? reason === "missing_input" : false;
-  if ((kind !== "approval" && kind !== "manual_gate" && kind !== "input_request")
+      : kind === "input_request" ? reason === "missing_input"
+        : kind === "disagreement" ? reason === "disagreement" : false;
+  if ((kind !== "approval" && kind !== "manual_gate" && kind !== "input_request" && kind !== "disagreement")
       || stepId === undefined
       || !Number.isSafeInteger(attempt)
       || (attempt as number) < 1
@@ -1615,6 +2108,8 @@ function parseWaitingState(value: AgentFlowRunStateValue | undefined): AgentFlow
   if (((kind === "approval" || kind === "manual_gate") && (validOutcomes.length === 0 || approvalId === undefined))
       || (kind === "approval" && !isDeepStrictEqual(validOutcomes, ["approve", "reject", "cancel"]))
       || (kind === "approval" && (evidence.length === 0 || evidence.length !== (record.evidence as unknown[] | undefined)?.length))
+      || (kind === "disagreement" && !isDeepStrictEqual(validOutcomes, ["approve", "request_changes", "fail", "cancel"]))
+      || (kind === "disagreement" && (evidence.length === 0 || evidence.length !== (record.evidence as unknown[] | undefined)?.length))
       || (kind === "input_request" && saveAs === undefined)) {
     throw new AgentFlowRunStateError(
       "Paused Agent Flow run has incomplete persisted interaction state.",
@@ -1627,12 +2122,12 @@ function parseWaitingState(value: AgentFlowRunStateValue | undefined): AgentFlow
     attempt: attempt as number,
     reason: kind === "approval" ? "approval"
       : kind === "manual_gate" ? "manual_approval"
-        : "missing_input",
+        : kind === "input_request" ? "missing_input" : "disagreement",
     prompt,
     validOutcomes,
     ...(saveAs === undefined ? {} : { saveAs }),
     ...(approvalId === undefined ? {} : { approvalId }),
-    ...(kind === "approval" ? { evidence } : {}),
+    ...(kind === "approval" || kind === "disagreement" ? { evidence } : {}),
     completedSteps,
     routing: serialized
   };
@@ -1640,7 +2135,7 @@ function parseWaitingState(value: AgentFlowRunStateValue | undefined): AgentFlow
 
 function parseSerializedRoutingBudget(value: AgentFlowYamlMapping): SerializedSuccessfulRoutingBudget {
   const parseMap = (
-    field: "stepAttemptLimits" | "visits" | "recoveryCycles" | "recoveryInvocations" | "attempts",
+    field: "stepAttemptLimits" | "visits" | "recoveryCycles" | "recoveryInvocations" | "disagreementEpisodes" | "disagreementRounds" | "attempts",
     valid: (value: unknown) => boolean
   ): Record<string, number> => {
     const candidate = mapping(value[field]);
@@ -1661,7 +2156,7 @@ function parseSerializedRoutingBudget(value: AgentFlowYamlMapping): SerializedSu
   };
   const parsed: Pick<
     SerializedSuccessfulRoutingBudget,
-    "stepAttemptLimits" | "visits" | "recoveryCycles" | "recoveryInvocations" | "attempts"
+    "stepAttemptLimits" | "visits" | "recoveryCycles" | "recoveryInvocations" | "disagreementEpisodes" | "disagreementRounds" | "attempts"
   > = {
     stepAttemptLimits: parseMap(
       "stepAttemptLimits",
@@ -1672,12 +2167,21 @@ function parseSerializedRoutingBudget(value: AgentFlowYamlMapping): SerializedSu
     recoveryInvocations: mapping(value.recoveryInvocations) === undefined
       ? {}
       : parseMap("recoveryInvocations", (entry) => Number.isSafeInteger(entry) && (entry as number) >= 0),
+    disagreementEpisodes: mapping(value.disagreementEpisodes) === undefined
+      ? {}
+      : parseMap("disagreementEpisodes", (entry) => Number.isSafeInteger(entry) && (entry as number) >= 0),
+    disagreementRounds: mapping(value.disagreementRounds) === undefined
+      ? {}
+      : parseMap("disagreementRounds", (entry) => Number.isSafeInteger(entry) && (entry as number) >= 0),
     attempts: parseMap("attempts", (entry) => Number.isSafeInteger(entry) && (entry as number) >= 0)
   };
   return {
     ...parsed,
     ...(Number.isSafeInteger(value.maxRecoveryCycles) && (value.maxRecoveryCycles as number) > 0
       ? { maxRecoveryCycles: value.maxRecoveryCycles as number }
+      : {}),
+    ...(Number.isSafeInteger(value.maxReviewCycles) && (value.maxReviewCycles as number) > 0
+      ? { maxReviewCycles: value.maxReviewCycles as number }
       : {})
   };
 }
@@ -3661,14 +4165,20 @@ function successfulTransitionFailure(
   target: string,
   budget: SuccessfulRoutingBudget
 ): AgentFlowCommandPipelineResult | undefined {
+  const entersDisagreement = budget.reviewCycleStepIds.has(target)
+    && budget.maxReviewCycles !== undefined
+    && (budget.attempts.get(target) ?? 0) >= budget.maxReviewCycles;
   const attemptLimit = budget.stepAttemptLimits.get(target);
-  if (attemptLimit !== undefined && (budget.attempts.get(target) ?? 0) + 1 > attemptLimit) {
+  if (!entersDisagreement && attemptLimit !== undefined && (budget.attempts.get(target) ?? 0) + 1 > attemptLimit) {
     return finishRoutingFailure(store, runId, completedSteps, stepId, target, {
       exitCode: null,
       timedOut: false,
       message: `Step ${stepId} cannot route to ${target} because limits.max_step_attempts allows ${attemptLimit} attempt(s).`
     }, budget, "max_step_attempts");
   }
+  const staysWithinBoundedReviewCycle = budget.maxReviewCycles !== undefined
+    && advancesBoundedReviewCycle(stepId, target, budget);
+  if (staysWithinBoundedReviewCycle) return undefined;
   if ((budget.visits.get(target) ?? 0) === 0) return undefined;
   if (budget.maxRecoveryCycles === undefined) {
     return finishRoutingFailure(store, runId, completedSteps, stepId, target, {
@@ -3685,6 +4195,19 @@ function successfulTransitionFailure(
     timedOut: false,
     message: `Step ${stepId} exceeded limits.max_recovery_cycles ${budget.maxRecoveryCycles} while routing to ${target}.`
   }, budget, "max_recovery_cycles");
+}
+
+function advancesBoundedReviewCycle(
+  stepId: string,
+  target: string,
+  budget: SuccessfulRoutingBudget
+): boolean {
+  const sourceReviewIds = budget.reviewCyclePathReviewIds.get(stepId);
+  const targetReviewIds = budget.reviewCyclePathReviewIds.get(target);
+  if (sourceReviewIds === undefined || targetReviewIds === undefined) return false;
+  return [...sourceReviewIds].some((reviewId) => targetReviewIds.has(reviewId)
+    && (target === reviewId
+      || (budget.visits.get(target) ?? 0) < (budget.attempts.get(reviewId) ?? 0)));
 }
 
 function recoveryInvocationBudgetFailure(
@@ -3781,13 +4304,27 @@ function createSuccessfulRoutingBudget(
     && Number.isSafeInteger(limits.max_recovery_cycles) && limits.max_recovery_cycles > 0
     ? limits.max_recovery_cycles
     : undefined;
+  const collaboration = mapping(workflow.collaboration);
+  const maxReviewCycles = workflow.style === "collaborative"
+    && typeof collaboration?.max_review_cycles === "number"
+    && Number.isSafeInteger(collaboration.max_review_cycles)
+    && collaboration.max_review_cycles > 0
+    ? collaboration.max_review_cycles
+    : undefined;
+  const reviewCycleStepIds = collectAgentFlowReviewCycleStepIds(workflow.steps);
+  const reviewCyclePathReviewIds = collectAgentFlowReviewCyclePathReviewIds(workflow.steps);
   return {
     terminalEffects: { workflow, notifications },
     maxRecoveryCycles,
+    maxReviewCycles,
     stepAttemptLimits,
+    reviewCyclePathReviewIds,
+    reviewCycleStepIds,
     visits: new Map(),
     recoveryCycles: new Map(),
     recoveryInvocations: new Map(),
+    disagreementEpisodes: new Map(),
+    disagreementRounds: new Map(),
     attempts: new Map()
   };
 }

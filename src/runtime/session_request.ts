@@ -22,6 +22,12 @@ import {
 } from "./collaboration";
 import type { AgentFlowConsultResult } from "./collaboration";
 import {
+  createAgentFlowDisagreementPrompt,
+  parseAgentFlowDisagreementResult,
+  type AgentFlowDisagreementDecision,
+  type AgentFlowDisagreementResult
+} from "./disagreement";
+import {
   createAgentFlowApprovalPrompt,
   defaultAgentFlowApprovalOutputPath,
   parseAgentFlowApprovalResult,
@@ -32,6 +38,7 @@ import {
   staleApprovalMessage,
   staleApprovalStepIdsAcrossLineage
 } from "./approval_state";
+import { redactAgentFlowSensitiveText } from "./failure_payload";
 
 export const MAX_AGENT_FLOW_SESSION_PROMPT_BYTES = 1024 * 1024;
 export const MAX_AGENT_FLOW_SESSION_INPUT_BYTES = 10 * 1024 * 1024;
@@ -52,6 +59,7 @@ export interface AgentFlowSessionProviderRequest {
   stepId: string;
   sessionId: string;
   provider: string;
+  kind?: "review" | "consult" | "challenge" | "approval" | "disagreement" | "session_request";
   resume: boolean;
   externalSessionId?: string;
   prompt: { path: string; content: string; checksum: string };
@@ -83,6 +91,7 @@ export interface AgentFlowSessionRequestExecutionResult {
   inputEvidence: Array<{ path: string; checksum: string }>;
   externalSessionId?: string;
   consultResult?: AgentFlowConsultResult;
+  disagreementResult?: AgentFlowDisagreementResult;
   approvalResult?: AgentFlowApprovalResult;
 }
 
@@ -94,7 +103,10 @@ export interface ExecuteAgentFlowSessionRequestOptions {
 }
 
 interface ExecuteAgentFlowSessionStepOptions extends ExecuteAgentFlowSessionRequestOptions {
-  kind?: "review" | "consult" | "challenge" | "approval";
+  kind?: "review" | "consult" | "challenge" | "approval" | "disagreement";
+  resolverSessionId?: string;
+  disagreementRound?: number;
+  disagreementOutput?: string;
 }
 
 export class AgentFlowSessionRequestError extends Error {
@@ -154,14 +166,43 @@ export function createAgentFlowSessionProviderRegistry(): AgentFlowSessionProvid
 
 export function createAgentFlowFixtureSessionProvider(
   responses: Record<string, AgentFlowSessionProviderResponse>,
-  outcomes: Record<string, "succeeded" | "failed" | Array<"succeeded" | "failed">> = {}
+  outcomes: Record<string, "succeeded" | "failed" | Array<"succeeded" | "failed">> = {},
+  disagreements: Record<
+    string,
+    AgentFlowDisagreementDecision | "unresolved" | "failed"
+      | Array<AgentFlowDisagreementDecision | "unresolved" | "failed">
+  > = {}
 ): AgentFlowSessionProviderAdapter {
   const fixtures = new Map(Object.entries(responses));
   const attempts = new Map<string, number>();
   return (request) => {
-    const attemptKey = `${request.runId}\0${request.stepId}`;
+    const attemptKey = `${request.runId}\0${request.stepId}\0${request.kind ?? "session_request"}`;
     const attempt = attempts.get(attemptKey) ?? 0;
     attempts.set(attemptKey, attempt + 1);
+    if (request.kind === "disagreement") {
+      const declaredDecision = disagreements[request.stepId];
+      if (declaredDecision === undefined) {
+        throw new AgentFlowSessionRequestError(
+          `Fixture session provider has no disagreement response for step ${request.stepId}.`,
+          "AGENT_FLOW_SESSION_FIXTURE_MISSING"
+        );
+      }
+      const decision = Array.isArray(declaredDecision)
+        ? declaredDecision[Math.min(attempt, declaredDecision.length - 1)]!
+        : declaredDecision;
+      if (decision === "failed") {
+        throw new AgentFlowSessionRequestError(
+          `Fixture marks disagreement round ${attempt + 1} for step ${request.stepId} as failed.`,
+          "AGENT_FLOW_SESSION_FIXTURE_FAILED"
+        );
+      }
+      const result = decision === "unresolved"
+        ? { status: "unresolved", rationale: `Fixture left disagreement round ${attempt + 1} unresolved.` }
+        : { status: "resolved", decision, rationale: `Fixture resolved disagreement round ${attempt + 1} as ${decision}.` };
+      return {
+        outputs: Object.fromEntries(request.outputs.map((output) => [output, `${JSON.stringify(result)}\n`]))
+      };
+    }
     const declaredOutcome = outcomes[request.stepId];
     const outcome = Array.isArray(declaredOutcome)
       ? declaredOutcome[Math.min(attempt, declaredOutcome.length - 1)]
@@ -238,6 +279,26 @@ export async function executeAgentFlowApproval(
   return executeAgentFlowSessionStep(store, runId, workflow, step, registry, { ...options, kind: "approval" });
 }
 
+export async function executeAgentFlowDisagreementResolution(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  workflow: AgentFlowWorkflow,
+  reviewStep: AgentFlowWorkflowStep,
+  resolverSessionId: string,
+  round: number,
+  output: string,
+  registry: AgentFlowSessionProviderRegistry,
+  options: ExecuteAgentFlowSessionRequestOptions = {}
+): Promise<AgentFlowSessionRequestExecutionResult> {
+  return executeAgentFlowSessionStep(store, runId, workflow, reviewStep, registry, {
+    ...options,
+    kind: "disagreement",
+    resolverSessionId,
+    disagreementRound: round,
+    disagreementOutput: output
+  });
+}
+
 async function executeAgentFlowSessionStep(
   store: AgentFlowRunStateStore,
   runId: string,
@@ -262,7 +323,8 @@ async function executeAgentFlowSessionStep(
   const label = kind === "session_request" ? "Session request" : `${kind[0]!.toUpperCase()}${kind.slice(1)}`;
   const stepId = requiredName(step.id, `${label} step ID`);
   const declaredStep = findWorkflowStep(workflow.steps, stepId);
-  if (requiredName(step.type, `${label} ${stepId} type`) !== kind
+  const expectedStepType = kind === "disagreement" ? "review" : kind;
+  if (requiredName(step.type, `${label} ${stepId} type`) !== expectedStepType
       || !isDeepStrictEqual(run.context.workflow, workflow)
       || declaredStep === undefined || !isDeepStrictEqual(declaredStep, step)) {
     throw new AgentFlowSessionRequestError(
@@ -271,7 +333,12 @@ async function executeAgentFlowSessionStep(
     );
   }
   store.validateApprovalInvalidationConfiguration(runId);
-  const sessionId = requiredName(kind === "review" || kind === "approval" ? step.reviewer : kind === "session_request" ? step.session : step.to, `${label} ${stepId} session`);
+  const sessionId = requiredName(
+    kind === "disagreement" ? options.resolverSessionId
+      : kind === "review" || kind === "approval" ? step.reviewer
+        : kind === "session_request" ? step.session : step.to,
+    `${label} ${stepId} session`
+  );
   const session = mapping(workflow.sessions?.[sessionId]);
   if (session === undefined) {
     throw new AgentFlowSessionRequestError(
@@ -307,7 +374,15 @@ async function executeAgentFlowSessionStep(
       );
     }
   }
-  const mergeCapable = kind !== "approval" && kind !== "review"
+  const resolverAuthority = mapping(session.authority);
+  if (kind === "disagreement" && (resolverAuthority?.can_approve !== true
+      || resolverAuthority.can_request_changes !== true)) {
+    throw new AgentFlowSessionRequestError(
+      `Disagreement resolver ${sessionId} must explicitly declare can_approve and can_request_changes authority.`,
+      "AGENT_FLOW_SESSION_AUTHORITY"
+    );
+  }
+  const mergeCapable = kind !== "approval" && kind !== "review" && kind !== "disagreement"
     && mapping(session.authority)?.can_merge === true;
   const staleMergeApprovalError = (verifyArtifacts = true): AgentFlowSessionPolicyError | undefined => {
     if (!mergeCapable) return undefined;
@@ -334,9 +409,16 @@ async function executeAgentFlowSessionStep(
   const previous = store.getSession(runId, sessionId);
   const priorExternalSessionId = resume ? previous?.externalSessionId ?? undefined : undefined;
   const rawInputs = kind === "session_request" ? step.inputs : step.artifacts;
+  const disagreementInputs = kind === "disagreement"
+    ? [...new Set([
+        ...normalizedArtifactPaths(step.artifacts, `Disagreement ${stepId} artifacts`),
+        ...normalizedArtifactPaths(step.outputs, `Disagreement ${stepId} review outputs`)
+      ])]
+    : undefined;
   const rawOutputs = kind === "consult" || kind === "challenge"
     ? [step.output]
-    : kind === "approval" ? [typeof step.output === "string" ? step.output : defaultAgentFlowApprovalOutputPath(stepId)] : step.outputs;
+    : kind === "disagreement" ? [options.disagreementOutput]
+      : kind === "approval" ? [typeof step.output === "string" ? step.output : defaultAgentFlowApprovalOutputPath(stepId)] : step.outputs;
   const outputPaths = normalizedArtifactPaths(rawOutputs, `${label} ${stepId} outputs`);
   const prompt = kind === "approval"
     ? createAgentFlowApprovalPrompt(
@@ -354,6 +436,18 @@ async function executeAgentFlowSessionStep(
       normalizedArtifactPaths(rawInputs, `Review ${stepId} artifacts`),
       outputPaths
     )
+    : kind === "disagreement"
+      ? createAgentFlowDisagreementPrompt(
+        stepId,
+        sessionId,
+        requiredName(step.reviewer, `Review ${stepId} reviewer`),
+        requiredName(step.subject, `Review ${stepId} subject`),
+        disagreementInputs!,
+        outputPaths[0]!,
+        Number.isSafeInteger(options.disagreementRound) && Number(options.disagreementRound) > 0
+          ? Number(options.disagreementRound)
+          : 1
+      )
     : kind === "consult"
       ? createAgentFlowConsultPrompt(
         stepId,
@@ -377,7 +471,7 @@ async function executeAgentFlowSessionStep(
   if (Buffer.byteLength(prompt.content, "utf8") > MAX_AGENT_FLOW_SESSION_PROMPT_BYTES) {
     throw promptTooLarge(prompt.path);
   }
-  const inputPaths = normalizedArtifactPaths(
+  const inputPaths = disagreementInputs ?? normalizedArtifactPaths(
     kind === "session_request" ? resolveSessionInputPaths(rawInputs, run.inputs, stepId) : rawInputs,
     `${label} ${stepId} ${kind === "session_request" ? "inputs" : "artifacts"}`
   );
@@ -417,6 +511,7 @@ async function executeAgentFlowSessionStep(
     stepId,
     sessionId,
     provider,
+    kind,
     resume,
     ...(priorExternalSessionId === undefined
       ? {}
@@ -447,7 +542,7 @@ async function executeAgentFlowSessionStep(
       provider,
       status,
       externalSessionId: priorExternalSessionId ?? null,
-      state: { resume, lastStepId: stepId, error: errorMessage(error) }
+      state: { resume, lastStepId: stepId, error: persistedErrorMessage(error) }
     });
     throw error;
   }
@@ -486,7 +581,7 @@ async function executeAgentFlowSessionStep(
       provider,
       status: "paused",
       externalSessionId: priorExternalSessionId ?? null,
-      state: { resume, lastStepId: stepId, error: errorMessage(error) }
+      state: { resume, lastStepId: stepId, error: persistedErrorMessage(error) }
     });
     if (error instanceof AgentFlowSessionRequestError) throw error;
     throw new AgentFlowSessionRequestError(
@@ -514,11 +609,14 @@ async function executeAgentFlowSessionStep(
   });
   const outputs = validateAgentFlowSessionProviderResponse(stepId, outputPaths, response);
   let consultResult: AgentFlowConsultResult | undefined;
+  let disagreementResult: AgentFlowDisagreementResult | undefined;
   let approvalResult: AgentFlowApprovalResult | undefined;
   if (kind === "review") {
     for (const outputPath of outputPaths) parseAgentFlowReviewResult(outputs.get(outputPath)!, outputPath);
   } else if (kind === "consult") {
     consultResult = parseAgentFlowConsultResult(outputs.get(outputPaths[0]!)!, outputPaths[0]!, step.blocking === true);
+  } else if (kind === "disagreement") {
+    disagreementResult = parseAgentFlowDisagreementResult(outputs.get(outputPaths[0]!)!, outputPaths[0]!);
   } else if (kind === "challenge") {
     parseAgentFlowChallengeResult(outputs.get(outputPaths[0]!)!, outputPaths[0]!);
   } else if (kind === "approval") {
@@ -624,6 +722,7 @@ async function executeAgentFlowSessionStep(
     outputArtifacts,
     inputEvidence: inputs.map((input) => ({ path: input.path, checksum: input.checksum })),
     ...(consultResult === undefined ? {} : { consultResult }),
+    ...(disagreementResult === undefined ? {} : { disagreementResult }),
     ...(approvalResult === undefined ? {} : { approvalResult }),
     ...(externalSessionId === undefined ? {} : { externalSessionId })
   };
@@ -639,7 +738,7 @@ async function executeAgentFlowSessionStep(
       status: stopped ?? "paused",
       externalSessionId: effectiveExternalSessionId ?? null,
       state: stopped === undefined
-        ? { resume, lastStepId: stepId, error: errorMessage(error) }
+        ? { resume, lastStepId: stepId, error: persistedErrorMessage(error) }
         : { resume, lastStepId: stepId, interrupted: stopped }
     });
     if (stopped !== undefined && !(error instanceof AgentFlowSessionRequestInterruptedError)) {
@@ -826,7 +925,7 @@ export function validateAgentFlowSessionProviderResponse(
     if (typeof value === "string" || value instanceof Uint8Array) {
       const size = Buffer.byteLength(value);
       totalBytes += size;
-      validateOutputSize(stepId, outputPath, size, totalBytes);
+      validateAgentFlowSessionOutputSize(stepId, outputPath, size, totalBytes);
       return [outputPath, { content: value }];
     }
     if (!mapping(value) || !(typeof value.content === "string" || value.content instanceof Uint8Array)) {
@@ -837,7 +936,7 @@ export function validateAgentFlowSessionProviderResponse(
     }
     const size = Buffer.byteLength(value.content);
     totalBytes += size;
-    validateOutputSize(stepId, outputPath, size, totalBytes);
+    validateAgentFlowSessionOutputSize(stepId, outputPath, size, totalBytes);
     return [outputPath, {
       content: value.content,
       ...(typeof value.contentType === "string" && value.contentType.trim().length > 0
@@ -847,16 +946,22 @@ export function validateAgentFlowSessionProviderResponse(
   }));
 }
 
-function validateOutputSize(stepId: string, outputPath: string, size: number, totalBytes: number): void {
+export function validateAgentFlowSessionOutputSize(
+  stepId: string,
+  outputPath: string,
+  size: number,
+  totalBytes: number,
+  label = "Session provider"
+): void {
   if (size > MAX_AGENT_FLOW_SESSION_OUTPUT_BYTES) {
     throw new AgentFlowSessionRequestError(
-      `Session provider output ${outputPath} for step ${stepId} exceeds the ${MAX_AGENT_FLOW_SESSION_OUTPUT_BYTES}-byte limit.`,
+      `${label} output ${outputPath} for step ${stepId} exceeds the ${MAX_AGENT_FLOW_SESSION_OUTPUT_BYTES}-byte limit.`,
       "AGENT_FLOW_SESSION_OUTPUT_TOO_LARGE"
     );
   }
   if (totalBytes > MAX_AGENT_FLOW_SESSION_OUTPUT_BYTES) {
     throw new AgentFlowSessionRequestError(
-      `Session provider outputs for step ${stepId} exceed the ${MAX_AGENT_FLOW_SESSION_OUTPUT_BYTES}-byte aggregate limit.`,
+      `${label} outputs for step ${stepId} exceed the ${MAX_AGENT_FLOW_SESSION_OUTPUT_BYTES}-byte aggregate limit.`,
       "AGENT_FLOW_SESSION_OUTPUT_TOO_LARGE"
     );
   }
@@ -869,9 +974,9 @@ function preflightOutputCollisions(
   sessionId: string,
   outputPaths: string[],
   requestPath: string,
-  requestKind: "approval_request" | "challenge_request" | "consult_request" | "review_request" | "session_request",
-  outputKind: "approval_output" | "challenge_output" | "consult_output" | "review_output" | "session_output",
-  requestIdPrefix: "approval-request" | "challenge-request" | "consult-request" | "review-request" | "session-request"
+  requestKind: "approval_request" | "challenge_request" | "consult_request" | "disagreement_request" | "review_request" | "session_request",
+  outputKind: "approval_output" | "challenge_output" | "consult_output" | "disagreement_output" | "review_output" | "session_output",
+  requestIdPrefix: "approval-request" | "challenge-request" | "consult-request" | "disagreement-request" | "review-request" | "session-request"
 ): void {
   const label = requestKind.replace("_request", "").replace(/^./, (value) => value.toUpperCase());
   const outputLabel = `${label} output`;
@@ -907,7 +1012,7 @@ function ownedSessionOutput(
   artifact: AgentFlowArtifactRecord | null,
   stepId: string,
   sessionId: string,
-  outputKind: "approval_output" | "challenge_output" | "consult_output" | "review_output" | "session_output"
+  outputKind: "approval_output" | "challenge_output" | "consult_output" | "disagreement_output" | "review_output" | "session_output"
 ): boolean {
   return artifact?.kind === outputKind
     && artifact.producerStepId === stepId
@@ -1102,4 +1207,8 @@ function sortJson(value: unknown): unknown {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function persistedErrorMessage(error: unknown): string {
+  return redactAgentFlowSensitiveText(errorMessage(error));
 }

@@ -7,6 +7,7 @@ import {
   createAgentFlowNotificationRegistry,
   createAgentFlowFixtureSessionProvider,
   createAgentFlowSessionProviderRegistry,
+  collectAgentFlowReviewCycleStepIds,
   executeAgentFlowCommandPipeline,
   explainAgentFlowWorkflow,
   formatAgentFlowWorkflowIssues,
@@ -15,6 +16,7 @@ import {
   lintAgentFlowWorkflow,
   normalizeAgentFlowArtifactPath,
   parseAgentFlowWorkflow,
+  parseAgentFlowDisagreementPolicy,
   parseAgentFlowSimulationFixture,
   openAgentFlowRunState,
   plannedAgentFlowRuntimeCommands,
@@ -211,10 +213,13 @@ async function runLifecycleCommand(
           stderr: "Session-request workflows require --fixture <file> until a non-fixture provider adapter is configured."
         };
       }
-      const unsupportedProviders = sessionRequestSteps
-        .map((step) => step.type === "review" || step.type === "approval" ? step.reviewer
+      const resolverSessions = collectDisagreementResolverSessions(workflowResult!.workflow, sessionRequestSteps);
+      const unsupportedProviders = [
+        ...sessionRequestSteps.map((step) => step.type === "review" || step.type === "approval" ? step.reviewer
           : step.type === "consult" || step.type === "challenge" ? step.to : step.session)
-        .filter((session): session is string => typeof session === "string")
+          .filter((session): session is string => typeof session === "string"),
+        ...resolverSessions
+      ]
         .map((session) => workflowResult!.workflow.sessions?.[session.trim()])
         .flatMap((session) => session !== null && typeof session === "object" && !Array.isArray(session)
           ? [String((session as Record<string, unknown>).provider ?? "").trim()]
@@ -265,7 +270,11 @@ async function runLifecycleCommand(
         }
       }
       const providers = createAgentFlowSessionProviderRegistry();
-      if (fixture !== null) providers.register("fixture", createAgentFlowFixtureSessionProvider(fixture.responses, fixture.outcomes));
+      if (fixture !== null) providers.register("fixture", createAgentFlowFixtureSessionProvider(
+        fixture.responses,
+        fixture.outcomes,
+        fixture.disagreements
+      ));
       const terminalNotifications: string[] = [];
       const notifications = createAgentFlowNotificationRegistry({
         terminal: (notification) => {
@@ -361,7 +370,11 @@ async function runLifecycleCommand(
       }
       const providers = createAgentFlowSessionProviderRegistry();
       if (fixture !== null) {
-        providers.register("fixture", createAgentFlowFixtureSessionProvider(fixture.responses, fixture.outcomes));
+        providers.register("fixture", createAgentFlowFixtureSessionProvider(
+          fixture.responses,
+          fixture.outcomes,
+          fixture.disagreements
+        ));
       }
       const terminalNotifications: string[] = [];
       const notifications = createAgentFlowNotificationRegistry({
@@ -490,6 +503,11 @@ function readRunFixture(
   artifacts: Record<string, import("../runtime/index").AgentFlowRunStateValue>;
   responses: Record<string, import("../runtime/index").AgentFlowSessionProviderResponse>;
   outcomes: Record<string, "succeeded" | "failed" | Array<"succeeded" | "failed">>;
+  disagreements: Record<
+    string,
+    import("../runtime/index").AgentFlowDisagreementDecision | "unresolved" | "failed"
+      | Array<import("../runtime/index").AgentFlowDisagreementDecision | "unresolved" | "failed">
+  >;
   arrayOutputSteps: Set<string>;
 } | AgentFlowCliResult {
   const resolvedPath = cwd === undefined ? fixturePath : path.resolve(cwd, fixturePath);
@@ -503,9 +521,15 @@ function readRunFixture(
   if (!parsed.ok) return { exitCode: 2, stderr: `Could not parse Agent Flow run fixture ${fixturePath}: ${parsed.error}` };
   const responses: Record<string, import("../runtime/index").AgentFlowSessionProviderResponse> = {};
   const outcomes: Record<string, "succeeded" | "failed" | Array<"succeeded" | "failed">> = {};
+  const disagreements: Record<
+    string,
+    import("../runtime/index").AgentFlowDisagreementDecision | "unresolved" | "failed"
+      | Array<import("../runtime/index").AgentFlowDisagreementDecision | "unresolved" | "failed">
+  > = {};
   const arrayOutputSteps = new Set<string>();
   for (const [stepId, fixture] of Object.entries(parsed.fixture.steps ?? {})) {
     if (fixture.outcome !== undefined) outcomes[stepId] = fixture.outcome;
+    if (fixture.disagreement !== undefined) disagreements[stepId] = fixture.disagreement;
     if (Array.isArray(fixture.outputs)) {
       arrayOutputSteps.add(stepId);
       continue;
@@ -546,6 +570,7 @@ function readRunFixture(
     artifacts,
     responses,
     outcomes,
+    disagreements,
     arrayOutputSteps
   };
 }
@@ -730,6 +755,23 @@ function collectSessionRequestSteps(
   };
   steps.forEach(visit);
   return requests;
+}
+
+function collectDisagreementResolverSessions(
+  workflow: import("../runtime/index").AgentFlowWorkflow,
+  sessionRequestSteps: import("../runtime/index").AgentFlowWorkflowStep[]
+): string[] {
+  const collaboration = workflow.collaboration;
+  if (collaboration === null || typeof collaboration !== "object" || Array.isArray(collaboration)
+      || collaboration.on_disagreement === undefined) return [];
+  const policy = parseAgentFlowDisagreementPolicy(collaboration.on_disagreement);
+  if (policy.arbiter !== undefined) return [policy.arbiter];
+  if (policy.strategy !== "owner_decides") return [];
+  const reviewCycleIds = collectAgentFlowReviewCycleStepIds(workflow.steps);
+  return sessionRequestSteps
+    .filter((step) => step.type === "review" && reviewCycleIds.has(String(step.id ?? "").trim()))
+    .map((step) => String(step.subject ?? "").trim())
+    .filter((session) => session.length > 0);
 }
 
 function isPlannedRuntimeCommand(command: string): boolean {

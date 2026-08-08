@@ -415,6 +415,33 @@ Supported strategies:
 | `owner_decides` | Artifact owner decides |
 | `fail` | End workflow |
 
+`arbiter` and `arbiter_then_user` require a declared `arbiter` session and a
+`max_rounds` bound from 1 through 100. Automated arbiters and owners must explicitly hold
+both `can_approve` and `can_request_changes`, matching every decision their
+resolver contract may return. `max_review_cycles` counts completed executions
+of each review step; once the bound is reached, the runtime stops the ordinary
+review/implementation loop and applies `on_disagreement`.
+
+Arbiters and owners return a strict JSON result:
+
+```json
+{
+  "status": "resolved",
+  "decision": "approved",
+  "rationale": "The implementation satisfies the disputed requirement."
+}
+```
+
+`status` is `resolved` or `unresolved`. Resolved results require an `approved`
+or `changes_requested` decision; unresolved results omit `decision`. Each
+round is persisted below `disagreements/`; later resolution episodes use
+distinct episode paths so prior decisions remain immutable. The
+`collaboration.disagreement`, `collaboration.disagreement.round_completed`,
+and `collaboration.disagreement.resolved` events preserve the trigger, round,
+and selected resolution path. Human escalation pauses with explicit
+`approve`, `request_changes`, `fail`, and `cancel` outcomes and can be resumed
+through the normal run-resume interface.
+
 ## 15. Collaboration Edge Cases
 
 | Edge Case | Required Behavior |

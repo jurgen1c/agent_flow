@@ -30,6 +30,7 @@ describe("standalone Agent Flow architecture", () => {
       "./schemas/config",
       "./schemas/consult",
       "./schemas/decision-record",
+      "./schemas/disagreement",
       "./schemas/failure-classification",
       "./schemas/review",
       "./schemas/workflow"
@@ -50,6 +51,27 @@ describe("standalone Agent Flow architecture", () => {
     }))).toEqual([
       { status: "advice", blocking: false },
       { status: "blocked", blocking: true }
+    ]);
+  });
+
+  test("publishes the durable disagreement result contract", () => {
+    const schema = JSON.parse(
+      fs.readFileSync(path.join(repositoryRoot, "schemas/disagreement.schema.json"), "utf8")
+    ) as {
+      required?: string[];
+      oneOf?: Array<{ properties?: Record<string, { const?: unknown }>; required?: string[]; not?: { required?: string[] } }>;
+    };
+
+    expect(schema.required).toEqual(["status", "rationale"]);
+    expect(schema.oneOf).toEqual([
+      {
+        properties: { status: { const: "resolved" } },
+        required: ["decision"]
+      },
+      {
+        properties: { status: { const: "unresolved" } },
+        not: { required: ["decision"] }
+      }
     ]);
   });
 

@@ -337,6 +337,7 @@ steps:
 
     expect(validateAgentFlowWorkflow(workflow).errors.map((issue) => issue.code)).toEqual([
       "workflow.session.undeclared",
+      "workflow.collaboration.on_disagreement.required",
       "workflow.collaboration.review_cycles.unbounded"
     ]);
   });
@@ -3086,7 +3087,7 @@ steps: []
       },
       {
         code: "workflow.collaboration.on_disagreement.invalid",
-        message: "Collaboration on_disagreement must be a non-empty strategy name or a mapping.",
+        message: "Collaboration on_disagreement must be a strategy name or mapping.",
         path: "collaboration.on_disagreement"
       }
     ]);
@@ -3179,8 +3180,15 @@ steps: []
     });
     expect(schema.$defs.collaboration.properties).toMatchObject({
       on_disagreement: {
-        oneOf: expect.arrayContaining([{ type: "string", minLength: 1, pattern: "\\S" }])
+        oneOf: expect.arrayContaining([{
+          type: "string",
+          enum: ["ask_user", "owner_decides", "fail"]
+        }])
       }
+    });
+    expect(schema.$defs.disagreementStrategy).toEqual({
+      type: "string",
+      enum: ["ask_user", "arbiter", "arbiter_then_user", "owner_decides", "fail"]
     });
     expect(Object.keys(schema.$defs.session.properties ?? {}).sort()).toEqual([
       "authority", "file_scope", "owns", "provider", "resume", "role"

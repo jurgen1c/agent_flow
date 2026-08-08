@@ -30,6 +30,13 @@ import { defaultAgentFlowApprovalOutputPath, parseAgentFlowApprovalResult } from
 import { defaultAgentFlowDecisionRecordPath, resolveAgentFlowDecisionRecordContract } from "./decision_record";
 import { parseAgentFlowChallengeResult, parseAgentFlowConsultResult } from "./collaboration";
 import {
+  collectAgentFlowReviewCyclePathReviewIds,
+  collectAgentFlowReviewCycleStepIds,
+  defaultAgentFlowDisagreementOutputPath,
+  parseAgentFlowDisagreementPolicy,
+  type AgentFlowDisagreementDecision
+} from "./disagreement";
+import {
   agentFlowAmbiguousSuccessTargetMessage,
   collectAgentFlowAmbiguousSuccessTargets
 } from "./success_routing";
@@ -46,6 +53,8 @@ export interface AgentFlowSimulationStepFixture {
   loop_termination?: "condition_met" | "max_iterations" | "max_duration";
   input?: AgentFlowYamlValue;
   recovery?: "remediated" | "unresolved";
+  disagreement?: AgentFlowDisagreementDecision | "unresolved" | "failed"
+    | Array<AgentFlowDisagreementDecision | "unresolved" | "failed">;
 }
 
 export interface AgentFlowSimulationFixture {
@@ -120,6 +129,12 @@ interface SimulationState {
   modelBudgetUsage: Map<string, number>;
   recoveryCycles: Map<string, number>;
   maxRecoveryCycles?: number;
+  maxReviewCycles?: number;
+  reviewCyclePathReviewIds: Map<string, Set<string>>;
+  reviewCycleStepIds: Set<string>;
+  disagreementEpisodes: Map<string, number>;
+  disagreementFixturePositions: Map<string, number>;
+  disagreementRounds: Map<string, number>;
   stepAttemptLimits: Map<string, number>;
   stepLocations: Map<string, SimulationStepLocation>;
   transitionCount: number;
@@ -134,7 +149,7 @@ interface SimulationStepLocation {
 
 type SequenceControl =
   | { kind: "done" }
-  | { kind: "target"; target: string; budgetChecked?: boolean }
+  | { kind: "target"; target: string; budgetChecked?: boolean; reviewCycleSource?: string }
   | { kind: "break_loop" }
   | { kind: "terminal"; status: AgentFlowSimulationStatus };
 
@@ -176,7 +191,7 @@ export function parseAgentFlowSimulationFixture(source: string): AgentFlowSimula
       if (!isRecord(stepFixture)) {
         return { ok: false, error: `Simulation fixture step ${stepId} must be an object.` };
       }
-      const stepFields = new Set(["outcome", "outputs", "choice", "iterations", "loop_termination", "input", "recovery"]);
+      const stepFields = new Set(["outcome", "outputs", "choice", "iterations", "loop_termination", "input", "recovery", "disagreement"]);
       const unknownStepField = Object.keys(stepFixture).find((field) => !stepFields.has(field));
       if (unknownStepField !== undefined) {
         return { ok: false, error: `Unknown simulation fixture field steps.${stepId}.${unknownStepField}.` };
@@ -199,6 +214,9 @@ export function parseAgentFlowSimulationFixture(source: string): AgentFlowSimula
       }
       if (stepFixture.recovery !== undefined && !["remediated", "unresolved"].includes(String(stepFixture.recovery))) {
         return { ok: false, error: `Simulation fixture step ${stepId}.recovery must be remediated or unresolved.` };
+      }
+      if (!validDisagreement(stepFixture.disagreement)) {
+        return { ok: false, error: `Simulation fixture step ${stepId}.disagreement must be approved, changes_requested, unresolved, failed, or a non-empty list of those values.` };
       }
     }
   }
@@ -236,6 +254,12 @@ export function simulateAgentFlowWorkflow(
     modelBudgetUsage: new Map(),
     recoveryCycles: new Map(),
     maxRecoveryCycles: workflowRecoveryLimit(workflow),
+    maxReviewCycles: workflowReviewLimit(workflow),
+    reviewCyclePathReviewIds: collectAgentFlowReviewCyclePathReviewIds(workflow.steps),
+    reviewCycleStepIds: collectAgentFlowReviewCycleStepIds(workflow.steps),
+    disagreementEpisodes: new Map(),
+    disagreementFixturePositions: new Map(),
+    disagreementRounds: new Map(),
     stepAttemptLimits: workflowStepAttemptLimits(workflow),
     stepLocations: collectSimulationStepLocations(workflow.steps),
     transitionCount: 0
@@ -376,7 +400,13 @@ function runSequence(
     if (control.kind === "done") {
       const fallthroughTarget = nonEmptyString(steps[index + 1]?.id);
       if (fallthroughTarget !== undefined) {
-        control = checkTargetBudget({ kind: "target", target: fallthroughTarget }, state);
+        const fallthroughControl = controlForTarget(
+          fallthroughTarget,
+          nonEmptyString(steps[index]?.id) ?? "workflow",
+          state
+        );
+        if (fallthroughControl.kind !== "target") return fallthroughControl;
+        control = checkTargetBudget(fallthroughControl, state);
         if (control.kind !== "target") return control;
       }
       index += 1;
@@ -399,6 +429,12 @@ function runSequence(
 function runStep(step: AgentFlowWorkflowStep, state: SimulationState, insideLoop: boolean): SequenceControl {
   const id = nonEmptyString(step.id) ?? "(unnamed)";
   const type = nonEmptyString(step.type) ?? "unknown";
+  const priorVisits = state.visits.get(id) ?? 0;
+  const stepFixture = state.fixture.steps?.[id] ?? {};
+  if (type === "review" && state.reviewCycleStepIds.has(id)
+      && state.maxReviewCycles !== undefined && priorVisits >= state.maxReviewCycles) {
+    return simulateReviewDisagreement(step, stepFixture, id, state);
+  }
   if (type !== "approval" && type !== "review" && simulationStepCanMerge(step, state)) {
     const staleApprovalIds = staleSimulationApprovalIds(state);
     if (staleApprovalIds.length > 0) {
@@ -411,7 +447,7 @@ function runStep(step: AgentFlowWorkflowStep, state: SimulationState, insideLoop
     const guardControl = simulationRecoveryGuard(step, id, state);
     if (guardControl !== undefined) return guardControl;
   }
-  const visit = state.visits.get(id) ?? 0;
+  const visit = priorVisits;
   const attemptLimit = state.stepAttemptLimits.get(id);
   if (attemptLimit !== undefined && visit + 1 > attemptLimit) {
     const status = simulationRecoveryLimitStatus(state);
@@ -419,7 +455,6 @@ function runStep(step: AgentFlowWorkflowStep, state: SimulationState, insideLoop
     return { kind: "terminal", status };
   }
   state.visits.set(id, visit + 1);
-  const stepFixture = state.fixture.steps?.[id] ?? {};
   const outcome = pickAt(stepFixture.outcome, visit) ?? "succeeded";
 
   state.visitedSteps.push({ id, type, outcome: type === "condition" && outcome === "succeeded" ? "selected" : outcome });
@@ -609,6 +644,166 @@ function runStep(step: AgentFlowWorkflowStep, state: SimulationState, insideLoop
 
   const target = staticTarget(step.then) ?? staticTarget(step.goto);
   return target === undefined ? { kind: "done" } : controlForTarget(target, id, state);
+}
+
+function simulateReviewDisagreement(
+  step: AgentFlowWorkflowStep,
+  fixture: AgentFlowSimulationStepFixture,
+  stepId: string,
+  state: SimulationState
+): SequenceControl {
+  const collaboration = isRecord(state.workflow.collaboration) ? state.workflow.collaboration : undefined;
+  let policy;
+  try {
+    policy = parseAgentFlowDisagreementPolicy(collaboration?.on_disagreement);
+  } catch (error) {
+    addUnresolved(state, stepId, error instanceof Error ? error.message : String(error));
+    return { kind: "terminal", status: "unresolved" };
+  }
+  if (policy.strategy === "fail") {
+    state.terminalStates.push({ stepId, status: "failed" });
+    return { kind: "terminal", status: "failed" };
+  }
+  if (policy.strategy === "ask_user") return simulateUserDisagreement(step, fixture, stepId, state);
+
+  const resolver = policy.strategy === "owner_decides"
+    ? nonEmptyString(step.subject) ?? "owner"
+    : policy.arbiter!;
+  const maxRounds = policy.strategy === "owner_decides" ? 1 : policy.maxRounds!;
+  const episode = (state.disagreementEpisodes.get(stepId) ?? 0) + 1;
+  state.disagreementEpisodes.set(stepId, episode);
+  let round = state.disagreementRounds.get(stepId) ?? 0;
+  while (round < maxRounds) {
+    round += 1;
+    state.disagreementRounds.set(stepId, round);
+    const fixturePosition = state.disagreementFixturePositions.get(stepId) ?? 0;
+    state.disagreementFixturePositions.set(stepId, fixturePosition + 1);
+    const decision = pickAt(fixture.disagreement, fixturePosition) ?? "unresolved";
+    const disagreementStepId = `${stepId}:disagreement:${resolver}:episode-${episode}:round-${round}`;
+    state.visitedSteps.push({
+      id: disagreementStepId,
+      type: "disagreement",
+      outcome: "selected"
+    });
+    const budgetControl = simulationSessionBudgetControl(resolver, disagreementStepId, state);
+    if (budgetControl !== undefined) {
+      state.visitedSteps.at(-1)!.outcome = "failed";
+      return budgetControl;
+    }
+    if (decision === "failed") {
+      state.visitedSteps.at(-1)!.outcome = "failed";
+      continue;
+    }
+    const rationale = decision === "unresolved"
+      ? `${resolver} left round ${round} unresolved.`
+      : `${resolver} resolved round ${round}.`;
+    const outputPath = defaultAgentFlowDisagreementOutputPath(stepId, round, episode);
+    if (state.artifacts.has(outputPath)
+        && state.artifactProducers.get(outputPath) !== stepId
+        && step.overwrite !== true) {
+      state.visitedSteps.at(-1)!.outcome = "failed";
+      addUnresolved(
+        state,
+        stepId,
+        `Artifact ${outputPath} already exists; declare overwrite: true to replace it during simulation.`
+      );
+      return { kind: "terminal", status: "unresolved" };
+    }
+    markArtifactProduced(
+      state,
+      outputPath,
+      stepId,
+      {
+        status: decision === "unresolved" ? "unresolved" : "resolved",
+        ...(decision === "unresolved" ? {} : { decision }),
+        rationale
+      },
+      true
+    );
+    if (decision === "unresolved") continue;
+    if (!publishSimulationReviewDecision(step, stepId, decision, state, rationale)) {
+      return { kind: "terminal", status: "unresolved" };
+    }
+    state.disagreementRounds.set(stepId, 0);
+    return controlAfterResolvedDisagreement(step, stepId, state);
+  }
+  if (policy.strategy === "arbiter_then_user") return simulateUserDisagreement(step, fixture, stepId, state);
+  state.terminalStates.push({ stepId, status: "failed" });
+  return { kind: "terminal", status: "failed" };
+}
+
+function simulateUserDisagreement(
+  step: AgentFlowWorkflowStep,
+  fixture: AgentFlowSimulationStepFixture,
+  stepId: string,
+  state: SimulationState
+): SequenceControl {
+  const outcome = typeof fixture.input === "string" ? fixture.input.trim() : undefined;
+  state.visitedSteps.push({ id: `${stepId}:disagreement:user`, type: "disagreement", outcome: "selected" });
+  if (outcome === undefined) {
+    state.terminalStates.push({ stepId, status: "paused" });
+    return { kind: "terminal", status: "paused" };
+  }
+  if (outcome === "approve" || outcome === "request_changes") {
+    if (!publishSimulationReviewDecision(
+      step,
+      stepId,
+      outcome === "approve" ? "approved" : "changes_requested",
+      state,
+      `User selected ${outcome}.`
+    )) return { kind: "terminal", status: "unresolved" };
+    state.disagreementRounds.set(stepId, 0);
+    return controlAfterResolvedDisagreement(step, stepId, state);
+  }
+  if (outcome === "fail" || outcome === "cancel") {
+    const status = outcome === "fail" ? "failed" : "cancelled";
+    state.terminalStates.push({ stepId, status });
+    return { kind: "terminal", status };
+  }
+  addUnresolved(state, stepId, "Disagreement fixture input must be one of: approve, request_changes, fail, cancel.");
+  return { kind: "terminal", status: "unresolved" };
+}
+
+function controlAfterResolvedDisagreement(
+  step: AgentFlowWorkflowStep,
+  stepId: string,
+  state: SimulationState
+): SequenceControl {
+  const target = staticTarget(step.then) ?? staticTarget(step.goto);
+  return target === undefined ? { kind: "done" } : controlForTarget(target, stepId, state);
+}
+
+function publishSimulationReviewDecision(
+  step: AgentFlowWorkflowStep,
+  stepId: string,
+  decision: AgentFlowDisagreementDecision,
+  state: SimulationState,
+  summary: string
+): boolean {
+  const collision = declaredOutputArtifacts(step).find((output) =>
+    state.artifacts.has(output)
+    && state.artifactProducers.get(output) !== stepId
+    && step.overwrite !== true
+  );
+  if (collision !== undefined) {
+    const visit = state.visitedSteps.at(-1);
+    if (visit?.type === "disagreement") visit.outcome = "failed";
+    addUnresolved(
+      state,
+      stepId,
+      `Artifact ${collision} already exists; declare overwrite: true to replace it during simulation.`
+    );
+    return false;
+  }
+  state.visits.set(stepId, (state.visits.get(stepId) ?? 0) + 1);
+  for (const output of declaredOutputArtifacts(step)) {
+    markArtifactProduced(state, output, stepId, {
+      status: decision,
+      findings: decision === "changes_requested" ? [{ summary }] : [],
+      summary
+    }, true);
+  }
+  return true;
 }
 
 function simulationRecoveryGuard(
@@ -1518,7 +1713,15 @@ function conditionTargets(step: AgentFlowWorkflowStep): Set<string> {
 }
 
 function controlForTarget(target: string, stepId: string, state: SimulationState): SequenceControl {
-  if (state.stepLocations.has(target)) return { kind: "target", target };
+  if (state.stepLocations.has(target)) {
+    return {
+      kind: "target",
+      target,
+      ...(state.reviewCyclePathReviewIds.has(stepId) && state.reviewCyclePathReviewIds.has(target)
+        ? { reviewCycleSource: stepId }
+        : {})
+    };
+  }
   if (target === "continue" || target === "ignore") return { kind: "done" };
   if (!TERMINAL_TARGETS.has(target)) return { kind: "target", target };
   const status = statusFromTerminal(target);
@@ -1625,13 +1828,31 @@ function nestedArtifactNames(value: AgentFlowYamlValue | undefined, state: Simul
 }
 
 function checkTargetBudget(control: Extract<SequenceControl, { kind: "target" }>, state: SimulationState): SequenceControl {
+  const entersDisagreement = state.reviewCycleStepIds.has(control.target)
+    && state.maxReviewCycles !== undefined
+    && (state.visits.get(control.target) ?? 0) >= state.maxReviewCycles;
   const attemptLimit = state.stepAttemptLimits.get(control.target);
-  if (attemptLimit !== undefined && (state.visits.get(control.target) ?? 0) + 1 > attemptLimit) {
+  if (!entersDisagreement && attemptLimit !== undefined && (state.visits.get(control.target) ?? 0) + 1 > attemptLimit) {
     const status = simulationRecoveryLimitStatus(state);
     state.terminalStates.push({ stepId: control.target, status });
     return { kind: "terminal", status };
   }
-  if (control.budgetChecked || state.maxRecoveryCycles === undefined || (state.visits.get(control.target) ?? 0) === 0) {
+  const staysWithinBoundedReviewCycle = state.maxReviewCycles !== undefined
+    && control.reviewCycleSource !== undefined
+    && advancesSimulatedReviewCycle(control.reviewCycleSource, control.target, state);
+  if (staysWithinBoundedReviewCycle) {
+    return { ...control, budgetChecked: true };
+  }
+  if (control.budgetChecked || (state.visits.get(control.target) ?? 0) === 0) {
+    return { ...control, budgetChecked: true };
+  }
+
+  if (state.maxRecoveryCycles === undefined) {
+    if (control.reviewCycleSource !== undefined) {
+      const status = simulationRecoveryLimitStatus(state);
+      state.terminalStates.push({ stepId: control.target, status });
+      return { kind: "terminal", status };
+    }
     return { ...control, budgetChecked: true };
   }
 
@@ -1642,6 +1863,15 @@ function checkTargetBudget(control: Extract<SequenceControl, { kind: "target" }>
   const status = simulationRecoveryLimitStatus(state);
   state.terminalStates.push({ stepId: control.target, status });
   return { kind: "terminal", status };
+}
+
+function advancesSimulatedReviewCycle(stepId: string, target: string, state: SimulationState): boolean {
+  const sourceReviewIds = state.reviewCyclePathReviewIds.get(stepId);
+  const targetReviewIds = state.reviewCyclePathReviewIds.get(target);
+  if (sourceReviewIds === undefined || targetReviewIds === undefined) return false;
+  return [...sourceReviewIds].some((reviewId) => targetReviewIds.has(reviewId)
+    && (target === reviewId
+      || (state.visits.get(target) ?? 0) < (state.visits.get(reviewId) ?? 0)));
 }
 
 function simulationRecoveryLimitStatus(state: SimulationState): "failed" | "paused" {
@@ -1689,6 +1919,14 @@ function workflowRecoveryLimit(workflow: AgentFlowWorkflow): number | undefined 
   return workflow.style !== "pipeline" && typeof limits?.max_recovery_cycles === "number"
     && Number.isSafeInteger(limits.max_recovery_cycles) && limits.max_recovery_cycles > 0
     ? limits.max_recovery_cycles
+    : undefined;
+}
+
+function workflowReviewLimit(workflow: AgentFlowWorkflow): number | undefined {
+  const collaboration = isRecord(workflow.collaboration) ? workflow.collaboration : undefined;
+  return workflow.style === "collaborative" && typeof collaboration?.max_review_cycles === "number"
+    && Number.isSafeInteger(collaboration.max_review_cycles) && collaboration.max_review_cycles > 0
+    ? collaboration.max_review_cycles
     : undefined;
 }
 
@@ -1834,6 +2072,13 @@ function validChoice(value: AgentFlowYamlValue | undefined): boolean {
   return Array.isArray(value)
     ? value.length > 0 && value.every((entry) => nonEmptyString(entry) !== undefined)
     : nonEmptyString(value) !== undefined;
+}
+
+function validDisagreement(value: AgentFlowYamlValue | undefined): boolean {
+  if (value === undefined) return true;
+  const valid = (entry: unknown) => entry === "approved" || entry === "changes_requested"
+    || entry === "unresolved" || entry === "failed";
+  return Array.isArray(value) ? value.length > 0 && value.every(valid) : valid(value);
 }
 
 function collectSimulationStepIdCounts(
