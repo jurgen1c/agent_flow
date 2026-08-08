@@ -86,9 +86,16 @@ export function explainAgentFlowWorkflow(workflow: AgentFlowWorkflow): string {
 
   const collaboration = record(workflow.collaboration);
   if (collaboration !== undefined) {
+    const disagreement = record(collaboration.on_disagreement);
     const details = [
       collaboration.enabled === true ? "enabled" : "disabled",
-      ...namedScalarDetails(collaboration, ["max_review_cycles", "on_disagreement"])
+      ...namedScalarDetails(collaboration, ["max_review_cycles"]),
+      ...(typeof collaboration.on_disagreement === "string"
+        ? [`on_disagreement=${collaboration.on_disagreement}`]
+        : disagreement === undefined ? [] : [
+          `on_disagreement=${String(disagreement.strategy)}`,
+          ...namedScalarDetails(disagreement, ["arbiter", "max_rounds"])
+        ])
     ];
     lines.push(`Collaboration: ${details.join("; ")}`);
   }

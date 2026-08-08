@@ -24,6 +24,12 @@ import { AGENT_FLOW_FINAL_SUMMARY_PATH } from "./retention";
 import { MAX_AGENT_FLOW_COLLABORATION_QUESTION_BYTES } from "./collaboration";
 import { defaultAgentFlowApprovalOutputPath } from "./approval";
 import { defaultAgentFlowDecisionRecordPath } from "./decision_record";
+import {
+  AgentFlowDisagreementError,
+  collectAgentFlowReviewCycleStepIds,
+  defaultAgentFlowDisagreementOutputPath,
+  parseAgentFlowDisagreementPolicy
+} from "./disagreement";
 
 export const MAX_AGENT_FLOW_COMMAND_TIMEOUT_SECONDS = 2_147_483.647;
 
@@ -143,14 +149,21 @@ export function validateAgentFlowWorkflow(workflow: AgentFlowWorkflow): AgentFlo
   validateControlFlowCycles(workflow, executableContexts, errors);
   validateInputReferences(workflow, contexts, errors);
   validateArtifactPaths(executableContexts, errors);
-  validateReviewArtifactPaths(executableContexts, errors);
+  validateReviewArtifactPaths(workflow, executableContexts, errors);
+  validateDisagreementArtifactOutputs(workflow, executableContexts, errors);
   validateCollaborationExchangeContracts(executableContexts, errors);
   validateArtifactOutputs(workflow, contexts, errors);
   validateApprovals(executableContexts, errors);
   validateApprovalInvalidation(workflow, executableContexts, errors);
   validateParallelContracts(workflow, executableContexts, errors);
   validateParallelWriters(workflow, executableContexts, errors);
-  validateCollaborativeReviewBounds(workflow, contexts, errors);
+  const reviewContexts = [
+    ...contexts,
+    ...directBranchContexts.filter((direct) =>
+      direct.type !== undefined && !contexts.some((context) => context.path === direct.path)
+    )
+  ];
+  validateCollaborativeReviewBounds(workflow, reviewContexts, errors);
 
   return { valid: errors.length === 0, errors };
 }
@@ -437,13 +450,36 @@ function validateSessionDefinitions(workflow: AgentFlowWorkflow, errors: AgentFl
     });
   }
 
-  if (collaboration?.on_disagreement !== undefined &&
-      nonEmptyString(collaboration.on_disagreement) === undefined && !isRecord(collaboration.on_disagreement)) {
-    errors.push({
-      code: "workflow.collaboration.on_disagreement.invalid",
-      message: "Collaboration on_disagreement must be a non-empty strategy name or a mapping.",
-      path: "collaboration.on_disagreement"
-    });
+  if (collaboration?.on_disagreement !== undefined) {
+    try {
+      const policy = parseAgentFlowDisagreementPolicy(collaboration.on_disagreement);
+      if (policy.arbiter !== undefined) {
+        const arbiter = workflow.sessions?.[policy.arbiter];
+        if (!isRecord(arbiter)) {
+          errors.push({
+            code: "workflow.collaboration.on_disagreement.arbiter.undeclared",
+            message: `Collaboration disagreement arbiter session ${JSON.stringify(policy.arbiter)} is not declared.`,
+            path: "collaboration.on_disagreement.arbiter"
+          });
+        } else if (!isRecord(arbiter.authority)
+            || arbiter.authority.can_approve !== true
+            || arbiter.authority.can_request_changes !== true) {
+          errors.push({
+            code: "workflow.collaboration.on_disagreement.arbiter.authority.required",
+            message: `Collaboration disagreement arbiter session ${JSON.stringify(policy.arbiter)} must explicitly declare can_approve and can_request_changes authority.`,
+            path: "collaboration.on_disagreement.arbiter"
+          });
+        }
+      }
+    } catch (error) {
+      errors.push({
+        code: "workflow.collaboration.on_disagreement.invalid",
+        message: error instanceof AgentFlowDisagreementError
+          ? error.message
+          : "Collaboration on_disagreement is invalid.",
+        path: "collaboration.on_disagreement"
+      });
+    }
   }
 
   if (workflow.style === "collaborative" &&
@@ -1637,6 +1673,44 @@ function validateArtifactOutputs(
   }
 }
 
+function validateDisagreementArtifactOutputs(
+  workflow: AgentFlowWorkflow,
+  contexts: StepContext[],
+  errors: AgentFlowWorkflowIssue[]
+): void {
+  if (workflow.style !== "collaborative") return;
+  let policy;
+  try {
+    policy = parseAgentFlowDisagreementPolicy(
+      isRecord(workflow.collaboration) ? workflow.collaboration.on_disagreement : undefined
+    );
+  } catch {
+    return;
+  }
+  if (policy.strategy === "ask_user" || policy.strategy === "fail") return;
+  const reservations = [...collectAgentFlowReviewCycleStepIds(workflow.steps)].map((reviewId) => {
+    const firstOutput = defaultAgentFlowDisagreementOutputPath(reviewId, 1);
+    return { reviewId, prefix: firstOutput.slice(0, firstOutput.lastIndexOf("/") + 1) };
+  });
+
+  for (const context of contexts) {
+    for (const output of stepOutputs(context.step)) {
+      const normalized = normalizedStaticArtifactPath(output);
+      const reservation = normalized === undefined
+        ? undefined
+        : reservations.find(({ prefix }) => normalized.startsWith(prefix));
+      if (reservation === undefined) continue;
+      addStepIssue(
+        errors,
+        context,
+        "workflow.artifact.output.disagreement_reserved",
+        outputField(context.step),
+        `Artifact ${JSON.stringify(normalized)} is inside the generated disagreement namespace for review ${JSON.stringify(reservation.reviewId)}.`
+      );
+    }
+  }
+}
+
 function validateArtifactPaths(contexts: StepContext[], errors: AgentFlowWorkflowIssue[]): void {
   for (const context of contexts) {
     if (context.type === "manual_gate" || context.type === "input_request") {
@@ -1925,7 +1999,21 @@ function normalizedStaticArtifactPath(value: string): string | undefined {
   }
 }
 
-function validateReviewArtifactPaths(contexts: StepContext[], errors: AgentFlowWorkflowIssue[]): void {
+function validateReviewArtifactPaths(
+  workflow: AgentFlowWorkflow,
+  contexts: StepContext[],
+  errors: AgentFlowWorkflowIssue[]
+): void {
+  let disagreementUsesResolver = false;
+  try {
+    const strategy = parseAgentFlowDisagreementPolicy(
+      isRecord(workflow.collaboration) ? workflow.collaboration.on_disagreement : undefined
+    ).strategy;
+    disagreementUsesResolver = strategy === "arbiter" || strategy === "arbiter_then_user" || strategy === "owner_decides";
+  } catch {
+    // The collaboration validator reports missing or malformed disagreement policies.
+  }
+  const graph = buildControlFlowGraph(contexts);
   for (const context of contexts) {
     if (context.type !== "review") continue;
     if (context.step.on_failure !== undefined) {
@@ -1935,6 +2023,21 @@ function validateReviewArtifactPaths(contexts: StepContext[], errors: AgentFlowW
         "workflow.review.on_failure.unsupported",
         "on_failure",
         "Review steps do not support on_failure policies in this runtime phase."
+      );
+    }
+    const disagreementInputCount = new Set([
+      ...stringList(context.step.artifacts),
+      ...stringList(context.step.outputs)
+    ]).size;
+    if (disagreementUsesResolver && context.id !== undefined
+        && nodeParticipatesInCycle(context.id, graph)
+        && disagreementInputCount > MAX_AGENT_FLOW_SESSION_INPUTS) {
+      addStepIssue(
+        errors,
+        context,
+        "workflow.review.disagreement.inputs.limit",
+        "artifacts",
+        `Review disagreement resolvers may receive at most ${MAX_AGENT_FLOW_SESSION_INPUTS} combined artifacts and review outputs.`
       );
     }
     for (const field of ["artifacts", "outputs"] as const) {
@@ -2502,16 +2605,24 @@ function validateCollaborativeReviewBounds(
     return;
   }
 
-  const graph = buildControlFlowGraph(contexts);
-  const hasBackEdge = contexts.some((context) =>
-    context.type === "review" && context.id !== undefined && nodeParticipatesInCycle(context.id, graph)
+  const cyclicReviewIds = collectAgentFlowReviewCycleStepIds(workflow.steps);
+  const cyclicReviews = contexts.filter((context) =>
+    context.type === "review" && context.id !== undefined && cyclicReviewIds.has(context.id)
   );
 
-  if (!hasBackEdge) {
+  if (cyclicReviews.length === 0) {
     return;
   }
 
   const collaboration = isRecord(workflow.collaboration) ? workflow.collaboration : undefined;
+
+  if (collaboration?.on_disagreement === undefined) {
+    errors.push({
+      code: "workflow.collaboration.on_disagreement.required",
+      message: "Collaborative review cycles must declare collaboration.on_disagreement with a terminal strategy.",
+      path: "collaboration.on_disagreement"
+    });
+  }
 
   if (!(typeof collaboration?.max_review_cycles === "number" && collaboration.max_review_cycles > 0)) {
     errors.push({
@@ -2519,6 +2630,30 @@ function validateCollaborativeReviewBounds(
       message: "Collaborative review cycles must declare a positive collaboration.max_review_cycles bound.",
       path: "collaboration.max_review_cycles"
     });
+  }
+
+  let policy;
+  try {
+    policy = parseAgentFlowDisagreementPolicy(collaboration?.on_disagreement);
+  } catch {
+    return;
+  }
+  if (policy.strategy !== "owner_decides") return;
+  for (const context of cyclicReviews) {
+    const ownerId = nonEmptyString(context.step.subject);
+    const owner = ownerId === undefined ? undefined : workflow.sessions?.[ownerId];
+    if (!isRecord(owner)) continue;
+    if (!isRecord(owner.authority)
+        || owner.authority.can_approve !== true
+        || owner.authority.can_request_changes !== true) {
+      addStepIssue(
+        errors,
+        context,
+        "workflow.collaboration.on_disagreement.owner.authority.required",
+        "subject",
+        `Review owner session ${JSON.stringify(ownerId)} must explicitly declare can_approve and can_request_changes authority to resolve disagreements.`
+      );
+    }
   }
 }
 
@@ -2619,7 +2754,10 @@ function lintComplexity(contexts: StepContext[], warnings: AgentFlowWorkflowIssu
   }
 }
 
-function lintArtifactOverwrites(contexts: StepContext[], warnings: AgentFlowWorkflowIssue[]): void {
+function lintArtifactOverwrites(
+  contexts: StepContext[],
+  warnings: AgentFlowWorkflowIssue[]
+): void {
   const producers = new Map<string, StepContext[]>();
   const seenOutputs = new Map<string, StepContext>();
   const dominators = controlFlowDominators(contexts);
@@ -2632,8 +2770,12 @@ function lintArtifactOverwrites(contexts: StepContext[], warnings: AgentFlowWork
   }
 
   for (const context of contexts) {
-    lintDirectParallelBranchInputs(context, contexts, producers, dominators, warnings);
-    lintConditionArtifactInputs(context, contexts, producers, dominators, warnings);
+    lintDirectParallelBranchInputs(
+      context, contexts, producers, dominators, warnings
+    );
+    lintConditionArtifactInputs(
+      context, contexts, producers, dominators, warnings
+    );
 
     for (const input of stepInputs(context.step)) {
       const inputKey = normalizeArtifactPath(input);

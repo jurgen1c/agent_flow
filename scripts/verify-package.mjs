@@ -36,6 +36,7 @@ try {
     "schemas/config.schema.json",
     "schemas/consult.schema.json",
     "schemas/decision-record.schema.json",
+    "schemas/disagreement.schema.json",
     "schemas/failure-classification.schema.json",
     "schemas/review.schema.json",
     "schemas/workflow.schema.json"

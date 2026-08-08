@@ -72,6 +72,7 @@ Schemas are exported from `@jurgen1c/agent-flow/schemas/approval`,
 `@jurgen1c/agent-flow/schemas/challenge`,
 `@jurgen1c/agent-flow/schemas/config`, `@jurgen1c/agent-flow/schemas/consult`,
 `@jurgen1c/agent-flow/schemas/decision-record`,
+`@jurgen1c/agent-flow/schemas/disagreement`,
 `@jurgen1c/agent-flow/schemas/failure-classification`,
 `@jurgen1c/agent-flow/schemas/review`, and
 `@jurgen1c/agent-flow/schemas/workflow`.
@@ -101,6 +102,11 @@ Collaborative `parallel` steps must declare `strategy: fail_fast`. Read-only
 sessions may share scopes, while writers need non-overlapping effective
 `file_scope` declarations unless `allow_overlap: true` and a non-empty
 `conflict_policy` explicitly authorize reconciliation.
+Collaborative review loops declare both `max_review_cycles` and an
+`on_disagreement` terminal policy. Policies may ask the user, invoke a bounded
+arbiter, fall back from an arbiter to the user, let the reviewed owner decide,
+or fail. Resolution rounds are persisted under unique per-episode paths below
+`disagreements/`, and the run event log records the selected resolution path.
 
 ## Architecture
 

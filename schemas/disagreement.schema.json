@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/jurgen1c/agent_flow/schemas/disagreement.schema.json",
+  "title": "Agent Flow Disagreement Resolution Result",
+  "type": "object",
+  "required": ["status", "rationale"],
+  "properties": {
+    "status": { "enum": ["resolved", "unresolved"] },
+    "decision": { "enum": ["approved", "changes_requested"] },
+    "rationale": { "type": "string", "minLength": 1, "pattern": "\\S" }
+  },
+  "oneOf": [
+    {
+      "properties": { "status": { "const": "resolved" } },
+      "required": ["decision"]
+    },
+    {
+      "properties": { "status": { "const": "unresolved" } },
+      "not": { "required": ["decision"] }
+    }
+  ],
+  "additionalProperties": true
+}

@@ -541,6 +541,81 @@ steps:
     expect(fs.existsSync(path.join(repo, "should-not-exist.txt"))).toBe(false);
   });
 
+  test("runs automated disagreement rounds from CLI fixtures", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-disagreement-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.writeFileSync(path.join(repo, "workflow.yml"), `name: fixture-disagreement
+version: 1
+style: collaborative
+maturity: experimental
+collaboration:
+  enabled: true
+  max_review_cycles: 1
+  on_disagreement: { strategy: arbiter, arbiter: arbiter, max_rounds: 1 }
+sessions:
+  implementer: { provider: fixture, role: implementer }
+  reviewer: { provider: fixture, role: reviewer, authority: { can_request_changes: true, can_approve: true } }
+  arbiter: { provider: fixture, role: arbiter, authority: { can_request_changes: true, can_approve: true } }
+steps:
+  - { id: review, type: review, reviewer: reviewer, subject: implementer, artifacts: [implementation.md], outputs: [review.json], then: route }
+  - id: route
+    type: condition
+    branches:
+      - { if: 'artifacts.review.status == "approved"', then: done }
+      - { if: 'artifacts.review.status == "changes_requested"', then: revise }
+    else: fail
+  - { id: revise, type: command, command: "true", then: review }
+  - { id: done, type: result, status: completed }
+`);
+    fs.writeFileSync(path.join(repo, "fixture.json"), JSON.stringify({
+      artifacts: { "implementation.md": "Implementation" },
+      steps: {
+        review: {
+          outputs: {
+            "review.json": {
+              status: "changes_requested",
+              findings: [{ summary: "Needs another revision." }]
+            }
+          },
+          disagreement: "approved"
+        }
+      }
+    }));
+
+    const run = await captureCli([
+      "run", "workflow.yml", "--id", "fixture-disagreement", "--fixture", "fixture.json"
+    ], repo);
+
+    expect(run).toMatchObject({ exitCode: 0 });
+    expect(run.stdout).toContain("Status: completed");
+    expect((await captureCli(["artifacts", "fixture-disagreement"], repo)).stdout)
+      .toContain("disagreements/review-c97ace4c8fef/round-1.json");
+
+    fs.writeFileSync(path.join(repo, "unsupported-resolver.yml"), fs.readFileSync(path.join(repo, "workflow.yml"), "utf8")
+      .replace("arbiter: { provider: fixture", "arbiter: { provider: local")
+      .replace("steps:\n", 'steps:\n  - { id: side_effect, type: command, command: "printf side-effect > should-not-exist.txt" }\n'));
+    const unsupportedResolver = await captureCli([
+      "run", "unsupported-resolver.yml", "--id", "unsupported-resolver", "--fixture", "fixture.json"
+    ], repo);
+    expect(unsupportedResolver).toMatchObject({ exitCode: 1 });
+    expect(unsupportedResolver.stderr).toContain('unsupported providers: local');
+    expect(fs.existsSync(path.join(repo, "should-not-exist.txt"))).toBe(false);
+
+    fs.writeFileSync(path.join(repo, "unsupported-owner.yml"), fs.readFileSync(path.join(repo, "workflow.yml"), "utf8")
+      .replace("on_disagreement: { strategy: arbiter, arbiter: arbiter, max_rounds: 1 }", "on_disagreement: { strategy: owner_decides }")
+      .replace(
+        "implementer: { provider: fixture, role: implementer }",
+        "implementer: { provider: local, role: implementer, authority: { can_request_changes: true, can_approve: true } }"
+      )
+      .replace("steps:\n", 'steps:\n  - { id: owner_side_effect, type: command, command: "printf side-effect > owner-side-effect.txt" }\n'));
+    const unsupportedOwner = await captureCli([
+      "run", "unsupported-owner.yml", "--id", "unsupported-owner", "--fixture", "fixture.json"
+    ], repo);
+    expect(unsupportedOwner).toMatchObject({ exitCode: 1 });
+    expect(unsupportedOwner.stderr).toContain('unsupported providers: local');
+    expect(fs.existsSync(path.join(repo, "owner-side-effect.txt"))).toBe(false);
+  });
+
   test("surfaces validation warnings while preserving a successful exit", () => {
     const fixturePath = path.join(repoRoot, "tests/fixtures/agent-flow/invalid/missing-artifact.yml");
     const result = dispatch(["validate", fixturePath]);

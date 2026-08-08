@@ -126,6 +126,23 @@ export {
   parseAgentFlowChallengeResult,
   parseAgentFlowConsultResult
 } from "./collaboration";
+export {
+  AGENT_FLOW_DISAGREEMENT_STRATEGIES,
+  AgentFlowDisagreementError,
+  MAX_AGENT_FLOW_DISAGREEMENT_ROUNDS,
+  collectAgentFlowReviewCycleStepIds,
+  createAgentFlowDisagreementPrompt,
+  defaultAgentFlowDisagreementOutputPath,
+  parseAgentFlowDisagreementPolicy,
+  parseAgentFlowDisagreementResult
+} from "./disagreement";
+export type {
+  AgentFlowDisagreementDecision,
+  AgentFlowDisagreementPolicy,
+  AgentFlowDisagreementPrompt,
+  AgentFlowDisagreementResult,
+  AgentFlowDisagreementStrategy
+} from "./disagreement";
 export type {
   AgentFlowChallengeResult,
   AgentFlowConsultRecommendation,

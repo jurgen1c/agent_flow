@@ -37,6 +37,7 @@
     "./schemas/challenge": "./schemas/challenge.schema.json",
     "./schemas/consult": "./schemas/consult.schema.json",
     "./schemas/decision-record": "./schemas/decision-record.schema.json",
+    "./schemas/disagreement": "./schemas/disagreement.schema.json",
     "./schemas/failure-classification": "./schemas/failure-classification.schema.json",
     "./schemas/review": "./schemas/review.schema.json",
     "./schemas/workflow": "./schemas/workflow.schema.json"
