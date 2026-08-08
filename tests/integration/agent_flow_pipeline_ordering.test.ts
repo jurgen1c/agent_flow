@@ -141,6 +141,7 @@ steps:
   - { id: start, type: command, command: echo start, then: complete }
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: complete, session: worker }
 `);

@@ -2704,6 +2704,7 @@ steps:
   - { id: prepare, type: command, command: "printf Source > source.md", outputs: [source.md], then: record }
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: record, type: decision_record, session: owner, owner: owner, topic: Direct branch decision, artifacts: [source.md] }
 `);
@@ -2733,6 +2734,7 @@ steps:
   - { id: prepare, type: command, command: "printf Evidence > evidence.md", outputs: [evidence.md], then: approve }
   - id: parallel_work
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: approve, type: approval, session: reviewer, reviewer: reviewer, artifacts: [evidence.md] }
 `);

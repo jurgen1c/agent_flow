@@ -515,6 +515,7 @@ sessions: { worker: { provider: frontier } }
 steps:
   - id: parallel
     type: parallel
+    strategy: fail_fast
     branches:
       - { id: worker-branch, session: worker, outputs: [result.json] }
   - { id: automate, type: command, command: automate }
@@ -782,6 +783,7 @@ maturity: experimental
 steps:
   - id: parallel
     type: parallel
+    strategy: fail_fast
     branches:
       - id: worker
         session: worker

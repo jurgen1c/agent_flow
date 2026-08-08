@@ -97,6 +97,10 @@ fresh attempt is required before workflow completion or a `can_merge` session.
 Decision-record steps publish durable JSON under `decision-records/` by
 default, validate every referenced artifact at execution time, and are exempt
 from default retention deletion.
+Collaborative `parallel` steps must declare `strategy: fail_fast`. Read-only
+sessions may share scopes, while writers need non-overlapping effective
+`file_scope` declarations unless `allow_overlap: true` and a non-empty
+`conflict_policy` explicitly authorize reconciliation.
 
 ## Architecture
 

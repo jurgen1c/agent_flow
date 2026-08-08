@@ -130,6 +130,7 @@ sessions:
 steps:
   - id: split
     type: parallel
+    strategy: fail_fast
     branches:
       - id: draft
         session: writer
@@ -197,6 +198,7 @@ sessions:
 steps:
   - id: split
     type: parallel
+    strategy: fail_fast
     branches:
       - id: approve
         type: approval
