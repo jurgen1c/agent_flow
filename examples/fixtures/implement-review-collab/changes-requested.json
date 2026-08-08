@@ -1,0 +1,39 @@
+{
+  "artifacts": {
+    "git.diff": "Fixture diff missing one regression case.\n",
+    "spec.md": "Implement the ticket and cover the failure path.\n"
+  },
+  "steps": {
+    "implement": {
+      "outputs": {
+        "implementation-summary.md": "Implemented the primary path.\n"
+      }
+    },
+    "review": {
+      "outputs": {
+        "reviews/code-review.json": {
+          "status": "changes_requested",
+          "findings": [
+            {
+              "summary": "Add regression coverage for the failure path."
+            }
+          ],
+          "summary": "The implementation needs a focused test update."
+        }
+      }
+    },
+    "address_review": {
+      "outputs": {
+        "implementation-summary.md": "Added the requested failure-path regression coverage.\n"
+      }
+    },
+    "approve_implementation": {
+      "outputs": {
+        "approvals/approve_implementation.json": {
+          "status": "approved",
+          "decision": "Human disagreement resolution approved the revised implementation evidence."
+        }
+      }
+    }
+  }
+}

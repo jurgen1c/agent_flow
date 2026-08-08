@@ -1,0 +1,47 @@
+{
+  "inputs": {
+    "feature_name": "Review Inbox"
+  },
+  "artifacts": {
+    "product/feature-brief.md": "Help teams review actionable feedback without losing context.\n"
+  },
+  "steps": {
+    "draft_copy": {
+      "outputs": {
+        "content/feature-copy.md": "Review feedback with the context your team needs.\n"
+      }
+    },
+    "product_advice": {
+      "outputs": {
+        "consultations/product-guidance.json": {
+          "status": "advice",
+          "blocking": false,
+          "summary": "Keep the promise focused on review context and team coordination.",
+          "recommendations": [
+            {
+              "recommendation": "Avoid claiming automatic issue resolution.",
+              "priority": "high"
+            }
+          ]
+        }
+      }
+    },
+    "product_review": {
+      "outputs": {
+        "reviews/product-copy-review.json": {
+          "status": "approved",
+          "findings": [],
+          "summary": "The copy follows the feature brief and product guidance."
+        }
+      }
+    },
+    "approve_content": {
+      "outputs": {
+        "approvals/approve_content.json": {
+          "status": "approved",
+          "decision": "The reviewed copy is ready for the documented audience."
+        }
+      }
+    }
+  }
+}

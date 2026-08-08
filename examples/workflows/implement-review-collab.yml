@@ -13,7 +13,7 @@ collaboration:
 
 sessions:
   implementer:
-    provider: frontier
+    provider: fixture
     resume: true
     role: code_implementer
     authority:
@@ -21,7 +21,7 @@ sessions:
     file_scope:
       include: [app/**, packages/**, tests/**, docs/**]
   reviewer:
-    provider: frontier
+    provider: fixture
     resume: true
     role: code_reviewer
     authority:
@@ -33,7 +33,7 @@ steps:
   - id: implement
     type: session_request
     session: implementer
-    prompt: prompts/implement-ticket.md
+    prompt: examples/prompts/implement-ticket.md
     inputs:
       - spec.md
     outputs:
@@ -48,6 +48,7 @@ steps:
       - git.diff
     outputs:
       - reviews/code-review.json
+    overwrite: true
 
   - id: route_review
     type: condition
@@ -61,12 +62,13 @@ steps:
   - id: address_review
     type: session_request
     session: implementer
-    prompt: prompts/address-review.md
+    prompt: examples/prompts/address-review.md
     inputs:
       - reviews/code-review.json
       - implementation-summary.md
     outputs:
       - implementation-summary.md
+    overwrite: true
     then: review
 
   - id: approve_implementation
@@ -89,6 +91,11 @@ steps:
     artifacts:
       - reviews/code-review.json
       - implementation-summary.md
+      - approvals/approve_implementation.json
+
+  - id: complete
+    type: result
+    status: completed
 
   - id: ask_user
     type: input_request

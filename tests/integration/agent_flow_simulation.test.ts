@@ -99,7 +99,7 @@ describe("Agent Flow workflow simulation", () => {
       "route_review",
       "approve_implementation",
       "record_approval",
-      "ask_user"
+      "complete"
     ]);
     expect(result.missingArtifacts).toEqual([]);
   });

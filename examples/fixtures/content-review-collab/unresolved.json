@@ -1,0 +1,43 @@
+{
+  "inputs": {
+    "feature_name": "Review Inbox"
+  },
+  "artifacts": {
+    "product/feature-brief.md": "Define the final audience after stakeholder research.\n"
+  },
+  "steps": {
+    "draft_copy": {
+      "outputs": {
+        "content/feature-copy.md": "A draft awaiting audience direction.\n"
+      }
+    },
+    "product_advice": {
+      "outputs": {
+        "consultations/product-guidance.json": {
+          "status": "advice",
+          "blocking": false,
+          "summary": "The target audience is not yet settled.",
+          "recommendations": [
+            {
+              "recommendation": "Ask the product owner to select the primary audience.",
+              "priority": "high"
+            }
+          ]
+        }
+      }
+    },
+    "product_review": {
+      "outputs": {
+        "reviews/product-copy-review.json": {
+          "status": "unresolved",
+          "findings": [
+            {
+              "summary": "A human must choose the primary audience before approval."
+            }
+          ],
+          "summary": "Product direction is required."
+        }
+      }
+    }
+  }
+}
