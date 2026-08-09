@@ -1273,6 +1273,23 @@ notify:
   });
 
   test("validates notification rules and reserves the runtime summary path in pipeline workflows", async () => {
+    const schema = JSON.parse(
+      fs.readFileSync(path.join(import.meta.dir, "../../schemas/workflow.schema.json"), "utf8")
+    ) as {
+      $defs: {
+        notificationRule: {
+          properties: {
+            on: { pattern?: string };
+            channels: { items: { pattern?: string } };
+          };
+        };
+      };
+    };
+    expect(schema.$defs.notificationRule.properties).toMatchObject({
+      on: { pattern: "\\S" },
+      channels: { items: { pattern: "\\S" } }
+    });
+
     const workflow = parseAgentFlowWorkflowOrThrow(`
 name: invalid-notifications
 version: 1
