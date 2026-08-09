@@ -1613,13 +1613,16 @@ function pauseForInteraction(
         kind,
         approvalNotification.requiredFailure,
         routingBudget.terminalEffects,
-        () => store.upsertApproval({
-          id: approvalId!,
-          runId,
-          stepId,
-          status: "cancelled",
-          decision: "notification_failure"
-        })
+        {
+          failureContext: run.context,
+          beforeFailure: () => store.upsertApproval({
+            id: approvalId!,
+            runId,
+            stepId,
+            status: "cancelled",
+            decision: "notification_failure"
+          })
+        }
       );
     }
   }
@@ -5094,7 +5097,10 @@ function finishRequiredStepNotificationFailure(
   stepType: string,
   failure: NonNullable<AgentFlowNotificationDeliveryResult["requiredFailure"]>,
   terminalEffects: AgentFlowPipelineTerminalEffects,
-  beforeFailure?: () => void
+  options?: {
+    failureContext?: Record<string, AgentFlowRunStateValue>;
+    beforeFailure?: () => void;
+  }
 ): AgentFlowCommandPipelineResult {
   const message = `Required ${failure.channel} notification for ${failure.event} failed: ${failure.message}`;
   const error = {
@@ -5114,8 +5120,9 @@ function finishRequiredStepNotificationFailure(
     message,
     eventPayload: { stepId, ...error },
     eventStepId: stepId,
+    failureContext: options?.failureContext,
     beforeTerminalEffects: () => {
-      beforeFailure?.();
+      options?.beforeFailure?.();
       const persisted = persistAgentFlowFailurePayload(store, {
         id: `notification:${safeId(stepId)}:attempt-${attempt}:${safeId(failure.event)}`,
         runId,

@@ -254,6 +254,7 @@ notify:
       });
       const store = await openAgentFlowRunState({ cwd: repoRoot });
       createAgentFlowLifecycleRun(store, { id: runId, workflow });
+      const initialContext = store.getRun(runId)!.context;
       store.writeArtifact({
         id: "release",
         runId,
@@ -293,6 +294,7 @@ notify:
         expect(store.getRun(runId)).toMatchObject({
           error: { code: "notification.required.failed", event: "approval.waiting" }
         });
+        expect(store.getRun(runId)?.context).toEqual(initialContext);
         expect(store.listFailures(runId)).toContainEqual(expect.objectContaining({
           classification: "notification_failure",
           stepId: "approve"
