@@ -427,40 +427,8 @@ notify:
 
   test("notifies collaborative disagreement events with step context", async () => {
     const repoRoot = temporaryRepo();
-    const workflow = parseAgentFlowWorkflowOrThrow(`
-name: notified-disagreement
-version: 1
-style: collaborative
-maturity: experimental
-collaboration: { enabled: true, max_review_cycles: 1, on_disagreement: ask_user }
-sessions:
-  implementer: { provider: fixture, role: implementer }
-  reviewer:
-    provider: fixture
-    role: reviewer
-    authority: { can_request_changes: true, can_approve: true }
-steps:
-  - { id: review, type: review, reviewer: reviewer, subject: implementer, artifacts: [implementation.md], outputs: [reviews/review.json], then: route }
-  - id: route
-    type: condition
-    branches:
-      - { if: 'artifacts.reviews.review.status == "approved"', then: done }
-      - { if: 'artifacts.reviews.review.status == "changes_requested"', then: revise }
-    else: fail
-  - { id: revise, type: command, command: "true", then: review }
-  - { id: done, type: result, status: completed }
-notify:
-  - { on: collaboration.disagreement, channels: [slack] }
-`);
-    const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => ({
-      outputs: {
-        [request.outputs[0]!]: JSON.stringify({
-          status: "changes_requested",
-          findings: [{ summary: "Needs another revision." }],
-          summary: "Needs another revision."
-        })
-      }
-    }));
+    const workflow = notifiedDisagreementWorkflow("notified-disagreement");
+    const providers = disagreementChangesRequestedProviders();
     const delivered: Array<{ event: string; stepId?: string }> = [];
     const notifications = createAgentFlowNotificationRegistry({
       slack: ({ event, stepId }) => {
@@ -492,6 +460,92 @@ notify:
       type: "notification.delivered",
       stepId: "review",
       payload: expect.objectContaining({ event: "collaboration.disagreement", stepId: "review" })
+    }));
+    store.close();
+  });
+
+  test("stops disagreement handling when notification delivery cancels the run", async () => {
+    const repoRoot = temporaryRepo();
+    const runId = "cancelled-disagreement-notification";
+    const workflow = notifiedDisagreementWorkflow(runId);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    const competitor = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: runId, workflow });
+    store.writeArtifact({
+      id: "implementation",
+      runId,
+      path: "implementation.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Implementation"
+    });
+    const notifications = createAgentFlowNotificationRegistry({
+      slack: () => {
+        transitionAgentFlowLifecycleRun(competitor, runId, "cancel");
+      }
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      runId,
+      workflow,
+      undefined,
+      disagreementChangesRequestedProviders(),
+      undefined,
+      notifications
+    );
+
+    expect(result.status).toBe("cancelled");
+    expect(store.getRun(runId)).toMatchObject({ status: "cancelled", context: { workflow } });
+    expect(store.getRun(runId)?.context.waiting).toBeUndefined();
+    expect(store.listEvents(runId).map((event) => event.type))
+      .not.toContain("collaboration.disagreement.waiting");
+    competitor.close();
+    store.close();
+  });
+
+  test("records required disagreement notification failure on a fresh review attempt", async () => {
+    const repoRoot = temporaryRepo();
+    const runId = "required-disagreement-notification";
+    const workflow = notifiedDisagreementWorkflow(runId, true);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: runId, workflow });
+    store.writeArtifact({
+      id: "implementation",
+      runId,
+      path: "implementation.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Implementation"
+    });
+    const notifications = createAgentFlowNotificationRegistry({
+      slack: () => {
+        throw new Error("slack unavailable");
+      }
+    });
+
+    expect((await executeAgentFlowCommandPipeline(
+      store,
+      runId,
+      workflow,
+      undefined,
+      disagreementChangesRequestedProviders(),
+      undefined,
+      notifications
+    )).status).toBe("failed");
+
+    const database = new Database(store.databasePath, { readonly: true });
+    expect(database.query(
+      "SELECT attempt, status FROM run_steps WHERE run_id = ? AND step_id = ? ORDER BY attempt"
+    ).all(runId, "review")).toEqual([
+      { attempt: 1, status: "completed" },
+      { attempt: 2, status: "failed" }
+    ]);
+    database.close();
+    expect(store.listEvents(runId)).toContainEqual(expect.objectContaining({
+      type: "step.failed",
+      stepId: "review",
+      payload: expect.objectContaining({ attempt: 2 })
     }));
     store.close();
   });
@@ -2168,4 +2222,44 @@ function temporaryRepo(): string {
   const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agent-flow-notifications-"));
   fs.mkdirSync(path.join(repoRoot, ".git"));
   return repoRoot;
+}
+
+function notifiedDisagreementWorkflow(name: string, required = false) {
+  return parseAgentFlowWorkflowOrThrow(`
+name: ${name}
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true, max_review_cycles: 1, on_disagreement: ask_user }
+sessions:
+  implementer: { provider: fixture, role: implementer }
+  reviewer:
+    provider: fixture
+    role: reviewer
+    authority: { can_request_changes: true, can_approve: true }
+steps:
+  - { id: review, type: review, reviewer: reviewer, subject: implementer, artifacts: [implementation.md], outputs: [reviews/review.json], then: route }
+  - id: route
+    type: condition
+    branches:
+      - { if: 'artifacts.reviews.review.status == "approved"', then: done }
+      - { if: 'artifacts.reviews.review.status == "changes_requested"', then: revise }
+    else: fail
+  - { id: revise, type: command, command: "true", then: review }
+  - { id: done, type: result, status: completed }
+notify:
+  - { on: collaboration.disagreement, channels: [slack], required: ${String(required)} }
+`);
+}
+
+function disagreementChangesRequestedProviders() {
+  return createAgentFlowSessionProviderRegistry().register("fixture", (request) => ({
+    outputs: {
+      [request.outputs[0]!]: JSON.stringify({
+        status: "changes_requested",
+        findings: [{ summary: "Needs another revision." }],
+        summary: "Needs another revision."
+      })
+    }
+  }));
 }

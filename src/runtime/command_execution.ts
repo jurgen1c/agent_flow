@@ -1197,6 +1197,10 @@ async function resolveReviewDisagreement(
       }
     }
   );
+  const stoppedAfterNotification = stoppedPipelineResult(store, runId, completedSteps);
+  if (stoppedAfterNotification !== undefined) {
+    return { result: stoppedAfterNotification };
+  }
   if (disagreementNotification.requiredFailure !== undefined) {
     return {
       result: finishRequiredStepNotificationFailure(
@@ -1204,7 +1208,7 @@ async function resolveReviewDisagreement(
         runId,
         completedSteps,
         stepId,
-        Math.max(1, completedReviewCycles),
+        Math.max(1, completedReviewCycles + 1),
         "review",
         disagreementNotification.requiredFailure,
         routingBudget.terminalEffects
@@ -1425,7 +1429,6 @@ function pauseForReviewDisagreement(
   routingBudget.attempts.set(stepId, attempt);
   const validOutcomes = ["approve", "request_changes", "fail", "cancel"];
   const prompt = `Review ${stepId} reached its disagreement limit. Choose one outcome: ${validOutcomes.join(", ")}.`;
-  const run = store.getRun(runId)!;
   const evidence = reviewDisagreementEvidencePaths(reviewStep).map((artifactPath) => {
     const artifact = store.readArtifact(runId, artifactPath).artifact;
     if (artifact.checksum === null) {
@@ -1447,34 +1450,39 @@ function pauseForReviewDisagreement(
     completedSteps: [...completedSteps],
     routing: serializeRoutingBudget(routingBudget)
   };
-  store.updateRun(runId, {
-    currentStepId: stepId,
-    context: { ...run.context, waiting: waiting as unknown as AgentFlowRunStateValue },
-    error: null
+  return store.withRunFinalizationTransaction(runId, () => {
+    const stopped = stoppedPipelineResult(store, runId, completedSteps);
+    if (stopped !== undefined) return stopped;
+    const run = store.getRun(runId)!;
+    store.updateRun(runId, {
+      currentStepId: stepId,
+      context: { ...run.context, waiting: waiting as unknown as AgentFlowRunStateValue },
+      error: null
+    });
+    store.upsertStep({
+      runId,
+      stepId,
+      attempt,
+      status: "waiting",
+      input: { attempt, type: "disagreement", question: prompt, options: validOutcomes }
+    });
+    store.appendRunEvent(runId, {
+      type: "collaboration.disagreement.waiting",
+      stepId,
+      payload: { strategy: policy.strategy, path: "user", attempt, prompt, validOutcomes }
+    });
+    const message = `Review ${stepId} disagreement is waiting for user resolution.`;
+    const finalized = finalizePipelineRun(store, runId, routingBudget.terminalEffects, {
+      intendedStatus: "paused",
+      completedSteps,
+      currentStepId: stepId,
+      message,
+      eventPayload: { stepId, reason: "disagreement", strategy: policy.strategy, prompt, validOutcomes },
+      eventStepId: stepId,
+      failureContext: run.context
+    });
+    return { status: finalized.status, completedSteps, message: finalized.message ?? message };
   });
-  store.upsertStep({
-    runId,
-    stepId,
-    attempt,
-    status: "waiting",
-    input: { attempt, type: "disagreement", question: prompt, options: validOutcomes }
-  });
-  store.appendRunEvent(runId, {
-    type: "collaboration.disagreement.waiting",
-    stepId,
-    payload: { strategy: policy.strategy, path: "user", attempt, prompt, validOutcomes }
-  });
-  const message = `Review ${stepId} disagreement is waiting for user resolution.`;
-  const finalized = finalizePipelineRun(store, runId, routingBudget.terminalEffects, {
-    intendedStatus: "paused",
-    completedSteps,
-    currentStepId: stepId,
-    message,
-    eventPayload: { stepId, reason: "disagreement", strategy: policy.strategy, prompt, validOutcomes },
-    eventStepId: stepId,
-    failureContext: run.context
-  });
-  return { status: finalized.status, completedSteps, message: finalized.message ?? message };
 }
 
 function finishReviewDisagreementFailure(
