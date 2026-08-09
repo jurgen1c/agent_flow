@@ -304,6 +304,127 @@ notify:
     }
   });
 
+  test("rolls back approval waiting state when notification event persistence fails", async () => {
+    for (const adapterFailure of [false, true]) {
+      const runId = adapterFailure ? "approval-failed-event-rollback" : "approval-delivered-event-rollback";
+      const rejectedEvent = adapterFailure ? "notification.failed" : "notification.delivered";
+      const repoRoot = temporaryRepo();
+      const workflow = parseAgentFlowWorkflowOrThrow(`
+name: ${runId}
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+steps:
+  - { id: approve, type: approval, reviewer: human, artifacts: [release.md] }
+notify:
+  - { on: approval.waiting, channels: [terminal] }
+`);
+      const store = await openAgentFlowRunState({ cwd: repoRoot });
+      createAgentFlowLifecycleRun(store, { id: runId, workflow });
+      const initialContext = store.getRun(runId)!.context;
+      store.writeArtifact({
+        id: "release",
+        runId,
+        path: "release.md",
+        kind: "fixture",
+        contentType: "text/markdown",
+        content: "Release candidate"
+      });
+      const database = new Database(store.databasePath);
+      database.exec(`
+        CREATE TRIGGER reject_approval_notification_event
+        BEFORE INSERT ON events
+        WHEN NEW.type = '${rejectedEvent}'
+        BEGIN
+          SELECT RAISE(ABORT, 'reject approval notification event');
+        END
+      `);
+      database.close();
+      let deliveries = 0;
+      const notifications = createAgentFlowNotificationRegistry({
+        terminal: () => {
+          deliveries += 1;
+          if (adapterFailure) throw new Error("terminal unavailable");
+        }
+      });
+
+      const result = await executeAgentFlowCommandPipeline(
+        store,
+        runId,
+        workflow,
+        undefined,
+        undefined,
+        undefined,
+        notifications
+      );
+
+      expect(result).toMatchObject({ status: "failed", failedStep: "approve" });
+      expect(deliveries).toBe(1);
+      expect(store.getRun(runId)).toMatchObject({ status: "failed", context: initialContext });
+      expect(store.listApprovals(runId)).toEqual([]);
+      expect(store.listEvents(runId).map((event) => event.type)).toEqual([
+        "run.created",
+        "run.started",
+        "step.failed",
+        "run.failed"
+      ]);
+      store.close();
+    }
+  });
+
+  test("does not deliver terminal notifications after a non-pipeline run is stopped concurrently", async () => {
+    for (const action of ["pause", "cancel"] as const) {
+      const runId = `collaborative-${action}-finalization-race`;
+      const repoRoot = temporaryRepo();
+      const workflow = parseAgentFlowWorkflowOrThrow(`
+name: ${runId}
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+steps: []
+notify:
+  - { on: workflow.completed, channels: [terminal] }
+`);
+      const store = await openAgentFlowRunState({ cwd: repoRoot });
+      const competitor = await openAgentFlowRunState({ cwd: repoRoot });
+      createAgentFlowLifecycleRun(store, { id: runId, workflow });
+      let deliveries = 0;
+      const notifications = createAgentFlowNotificationRegistry({
+        terminal: () => {
+          deliveries += 1;
+        }
+      });
+      const originalFinalization = store.withRunFinalizationTransaction.bind(store);
+      let raced = false;
+      store.withRunFinalizationTransaction = ((transactionRunId, callback) => {
+        if (!raced) {
+          raced = true;
+          transitionAgentFlowLifecycleRun(competitor, runId, action);
+        }
+        return originalFinalization(transactionRunId, callback);
+      }) as typeof store.withRunFinalizationTransaction;
+
+      const result = await executeAgentFlowCommandPipeline(
+        store,
+        runId,
+        workflow,
+        undefined,
+        undefined,
+        undefined,
+        notifications
+      );
+
+      expect(result.status).toBe(action === "pause" ? "paused" : "cancelled");
+      expect(deliveries).toBe(0);
+      expect(store.listEvents(runId).map((event) => event.type)).not.toContain("notification.delivered");
+      expect(store.getRun(runId)?.status).toBe(action === "pause" ? "paused" : "cancelled");
+      competitor.close();
+      store.close();
+    }
+  });
+
   test("notifies collaborative disagreement events with step context", async () => {
     const repoRoot = temporaryRepo();
     const workflow = parseAgentFlowWorkflowOrThrow(`

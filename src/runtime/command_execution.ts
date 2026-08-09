@@ -1568,121 +1568,126 @@ function pauseForInteraction(
     ? { attempt, type: kind, message: prompt, options: validOutcomes }
     : { attempt, type: kind, question: prompt, saveAs: saveAs! };
 
-  store.updateRun(runId, {
-    currentStepId: stepId,
-    context: { ...run.context, waiting: waiting as unknown as AgentFlowRunStateValue },
-    error: null
-  });
-  store.upsertStep({ runId, stepId, attempt, status: "waiting", input });
-  store.appendRunEvent(runId, { type: "step.waiting", stepId, payload: input });
-  if (approvalId !== undefined) {
-    store.upsertApproval({
-      id: approvalId,
-      runId,
-      stepId,
-      status: "requested",
-      ...(kind === "approval" ? { requestedBy: "human" } : {}),
-      context: {
-        message: prompt,
-        options: validOutcomes,
-        ...(evidence === undefined ? {} : {
-          evidence: evidence as unknown as AgentFlowRunStateValue,
-          output: typeof step.output === "string" && step.output.trim().length > 0
-            ? step.output.trim()
-            : defaultAgentFlowApprovalOutputPath(stepId)
-        })
-      }
+  const persistWaiting = (): AgentFlowCommandPipelineResult => {
+    store.updateRun(runId, {
+      currentStepId: stepId,
+      context: { ...run.context, waiting: waiting as unknown as AgentFlowRunStateValue },
+      error: null
     });
-  }
-  if (kind === "approval") {
-    const approvalNotification = deliverAgentFlowNotificationEvent(
-      store,
-      runId,
-      routingBudget.terminalEffects.workflow,
-      "approval.waiting",
-      routingBudget.terminalEffects.notifications,
-      { stepId, payload: { attempt, prompt, validOutcomes } }
-    );
-    if (approvalNotification.requiredFailure !== undefined) {
-      return finishRequiredStepNotificationFailure(
+    store.upsertStep({ runId, stepId, attempt, status: "waiting", input });
+    store.appendRunEvent(runId, { type: "step.waiting", stepId, payload: input });
+    if (approvalId !== undefined) {
+      store.upsertApproval({
+        id: approvalId,
+        runId,
+        stepId,
+        status: "requested",
+        ...(kind === "approval" ? { requestedBy: "human" } : {}),
+        context: {
+          message: prompt,
+          options: validOutcomes,
+          ...(evidence === undefined ? {} : {
+            evidence: evidence as unknown as AgentFlowRunStateValue,
+            output: typeof step.output === "string" && step.output.trim().length > 0
+              ? step.output.trim()
+              : defaultAgentFlowApprovalOutputPath(stepId)
+          })
+        }
+      });
+    }
+    if (kind === "approval") {
+      const approvalNotification = deliverAgentFlowNotificationEvent(
         store,
         runId,
-        completedSteps,
+        routingBudget.terminalEffects.workflow,
+        "approval.waiting",
+        routingBudget.terminalEffects.notifications,
+        { stepId, payload: { attempt, prompt, validOutcomes } }
+      );
+      if (approvalNotification.requiredFailure !== undefined) {
+        return finishRequiredStepNotificationFailure(
+          store,
+          runId,
+          completedSteps,
+          stepId,
+          attempt,
+          kind,
+          approvalNotification.requiredFailure,
+          routingBudget.terminalEffects,
+          {
+            failureContext: run.context,
+            beforeFailure: () => store.upsertApproval({
+              id: approvalId!,
+              runId,
+              stepId,
+              status: "cancelled",
+              decision: "notification_failure"
+            })
+          }
+        );
+      }
+    }
+    const resultMessage = kind === "manual_gate" || kind === "approval"
+      ? `${kind === "approval" ? "Approval" : "Manual gate"} ${stepId} is waiting for one of: ${validOutcomes.join(", ")}.`
+      : `Input request ${stepId} is waiting for an answer to be saved as ${saveAs}.`;
+    const finalized = finalizePipelineRun(store, runId, routingBudget.terminalEffects, {
+      intendedStatus: "paused",
+      completedSteps,
+      currentStepId: stepId,
+      message: resultMessage,
+      eventPayload: {
         stepId,
-        attempt,
-        kind,
-        approvalNotification.requiredFailure,
-        routingBudget.terminalEffects,
-        {
-          failureContext: run.context,
-          beforeFailure: () => store.upsertApproval({
-            id: approvalId!,
+        reason: waiting.reason,
+        prompt,
+        validOutcomes,
+        ...(saveAs === undefined ? {} : { saveAs })
+      },
+      eventStepId: stepId,
+      failureContext: run.context,
+      onFinalStatus: (status, message) => {
+        if (status !== "failed") return;
+        const failureMessage = message ?? "Required paused notification failed.";
+        const error = {
+          attempt,
+          message: failureMessage,
+          outcome: "fail"
+        };
+        const persisted = persistAgentFlowFailurePayload(store, {
+          id: `interaction:${safeId(stepId)}:attempt-${attempt}:notification`,
+          runId,
+          stepId,
+          stepType: kind,
+          attempt,
+          exitCode: null,
+          summary: failureMessage,
+          classification: "notification_failure",
+          retryable: false,
+          outcome: "fail",
+          indexPayload: error
+        });
+        const indexedError = { ...persisted.indexPayload, ...failureReference(persisted) };
+        store.upsertStep({ runId, stepId, attempt, status: "failed", error: indexedError });
+        store.appendRunEvent(runId, { type: "step.failed", stepId, payload: indexedError });
+        if (approvalId !== undefined) {
+          store.upsertApproval({
+            id: approvalId,
             runId,
             stepId,
             status: "cancelled",
             decision: "notification_failure"
-          })
+          });
         }
-      );
-    }
-  }
-  const resultMessage = kind === "manual_gate" || kind === "approval"
-    ? `${kind === "approval" ? "Approval" : "Manual gate"} ${stepId} is waiting for one of: ${validOutcomes.join(", ")}.`
-    : `Input request ${stepId} is waiting for an answer to be saved as ${saveAs}.`;
-  const finalized = finalizePipelineRun(store, runId, routingBudget.terminalEffects, {
-    intendedStatus: "paused",
-    completedSteps,
-    currentStepId: stepId,
-    message: resultMessage,
-    eventPayload: {
-      stepId,
-      reason: waiting.reason,
-      prompt,
-      validOutcomes,
-      ...(saveAs === undefined ? {} : { saveAs })
-    },
-    eventStepId: stepId,
-    failureContext: run.context,
-    onFinalStatus: (status, message) => {
-      if (status !== "failed") return;
-      const failureMessage = message ?? "Required paused notification failed.";
-      const error = {
-        attempt,
-        message: failureMessage,
-        outcome: "fail"
-      };
-      const persisted = persistAgentFlowFailurePayload(store, {
-        id: `interaction:${safeId(stepId)}:attempt-${attempt}:notification`,
-        runId,
-        stepId,
-        stepType: kind,
-        attempt,
-        exitCode: null,
-        summary: failureMessage,
-        classification: "notification_failure",
-        retryable: false,
-        outcome: "fail",
-        indexPayload: error
-      });
-      const indexedError = { ...persisted.indexPayload, ...failureReference(persisted) };
-      store.upsertStep({ runId, stepId, attempt, status: "failed", error: indexedError });
-      store.appendRunEvent(runId, { type: "step.failed", stepId, payload: indexedError });
-      if (approvalId !== undefined) {
-        store.upsertApproval({
-          id: approvalId,
-          runId,
-          stepId,
-          status: "cancelled",
-          decision: "notification_failure"
-        });
       }
-    }
-  });
-  return {
-    status: finalized.status,
-    completedSteps,
-    message: finalized.message ?? resultMessage
+    });
+    return {
+      status: finalized.status,
+      completedSteps,
+      message: finalized.message ?? resultMessage
+    };
   };
+  return kind === "approval"
+    ? store.withRunFinalizationTransaction(runId, persistWaiting)
+    : persistWaiting();
 }
 
 function resumeWaitingStep(
@@ -4541,6 +4546,10 @@ function finalizePipelineRun(
 } {
   if (terminalEffects.workflow.style !== "pipeline") {
     return store.withRunFinalizationTransaction(runId, () => {
+      const current = store.getRun(runId);
+      if (current?.status !== "running") {
+        return finalizationResultForCurrentRun(store, runId, input);
+      }
       input = staleApprovalFailureInput(store, runId, input);
       let status = input.intendedStatus;
       let message = input.message;
