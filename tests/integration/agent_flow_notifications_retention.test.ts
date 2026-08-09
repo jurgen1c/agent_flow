@@ -425,6 +425,43 @@ notify:
     }
   });
 
+  test("preserves a non-pipeline lifecycle stop triggered during terminal notification delivery", async () => {
+    const runId = "collaborative-reentrant-notification-stop";
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: ${runId}
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+steps: []
+notify:
+  - { on: workflow.completed, channels: [terminal] }
+`);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: runId, workflow });
+    const notifications = createAgentFlowNotificationRegistry({
+      terminal: () => {
+        transitionAgentFlowLifecycleRun(store, runId, "pause");
+      }
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      runId,
+      workflow,
+      undefined,
+      undefined,
+      undefined,
+      notifications
+    );
+
+    expect(result.status).toBe("paused");
+    expect(store.getRun(runId)?.status).toBe("paused");
+    expect(store.listEvents(runId).map((event) => event.type)).not.toContain("run.completed");
+    store.close();
+  });
+
   test("notifies collaborative disagreement events with step context", async () => {
     const repoRoot = temporaryRepo();
     const workflow = notifiedDisagreementWorkflow("notified-disagreement");
@@ -547,6 +584,58 @@ notify:
       stepId: "review",
       payload: expect.objectContaining({ attempt: 2 })
     }));
+    store.close();
+  });
+
+  test("returns a concurrent stop that wins required disagreement failure finalization", async () => {
+    const repoRoot = temporaryRepo();
+    const runId = "cancelled-required-disagreement-notification";
+    const workflow = notifiedDisagreementWorkflow(runId, true);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    const competitor = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: runId, workflow });
+    store.writeArtifact({
+      id: "implementation",
+      runId,
+      path: "implementation.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Implementation"
+    });
+    let notificationFailed = false;
+    const notifications = createAgentFlowNotificationRegistry({
+      slack: () => {
+        notificationFailed = true;
+        throw new Error("slack unavailable");
+      }
+    });
+    const originalFinalization = store.withRunFinalizationTransaction.bind(store);
+    let raced = false;
+    store.withRunFinalizationTransaction = ((transactionRunId, callback) => {
+      if (notificationFailed && !raced) {
+        raced = true;
+        transitionAgentFlowLifecycleRun(competitor, runId, "cancel");
+      }
+      return originalFinalization(transactionRunId, callback);
+    }) as typeof store.withRunFinalizationTransaction;
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      runId,
+      workflow,
+      undefined,
+      disagreementChangesRequestedProviders(),
+      undefined,
+      notifications
+    );
+
+    expect(result.status).toBe("cancelled");
+    expect(result).not.toHaveProperty("failedStep");
+    expect(result).not.toHaveProperty("failureOutcome");
+    expect(store.getRun(runId)?.status).toBe("cancelled");
+    expect(store.listEvents(runId).map((event) => event.type)).not.toContain("step.failed");
+    expect(store.listFailures(runId)).toEqual([]);
+    competitor.close();
     store.close();
   });
 

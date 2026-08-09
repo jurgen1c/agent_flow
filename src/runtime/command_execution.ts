@@ -4570,6 +4570,10 @@ function finalizePipelineRun(
         status,
         terminalEffects.notifications
       );
+      const currentAfterDelivery = store.getRun(runId);
+      if (currentAfterDelivery?.status !== "running") {
+        return finalizationResultForCurrentRun(store, runId, input);
+      }
       if (delivery.requiredFailure !== undefined && status !== "failed") {
         status = "failed";
         message = `Required ${delivery.requiredFailure.channel} notification for ${delivery.requiredFailure.event} failed: ${delivery.requiredFailure.message}`;
@@ -5158,6 +5162,10 @@ function finishRequiredStepNotificationFailure(
       store.appendRunEvent(runId, { type: "step.failed", stepId, payload: indexedError });
     }
   });
+  if (finalized.status !== "failed") {
+    const stopped = stoppedPipelineResult(store, runId, completedSteps);
+    if (stopped !== undefined) return stopped;
+  }
   return {
     status: finalized.status,
     completedSteps,
