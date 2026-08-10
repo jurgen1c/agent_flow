@@ -1843,7 +1843,7 @@ notify:
       $defs: {
         notificationRule: {
           properties: {
-            on: { enum?: string[] };
+            on: { pattern?: string };
             channels: { items: { pattern?: string } };
           };
         };
@@ -1851,16 +1851,24 @@ notify:
     };
     expect(schema.$defs.notificationRule.properties).toMatchObject({
       on: {
-        enum: [
-          "workflow.completed",
-          "workflow.failed",
-          "workflow.paused",
-          "approval.waiting",
-          "collaboration.disagreement"
-        ]
+        pattern: "^\\s*(workflow\\.completed|workflow\\.failed|workflow\\.paused|approval\\.waiting|collaboration\\.disagreement)\\s*$"
       },
       channels: { items: { pattern: "\\S" } }
     });
+    const notificationEventPattern = new RegExp(schema.$defs.notificationRule.properties.on.pattern!);
+    expect(notificationEventPattern.test(" workflow.completed ")).toBe(true);
+    expect(notificationEventPattern.test("workflow.cancelled")).toBe(false);
+
+    const paddedEventWorkflow = parseAgentFlowWorkflowOrThrow(`
+name: padded-notification-event
+version: 1
+style: pipeline
+maturity: experimental
+steps: []
+notify:
+  - { on: " workflow.completed ", channels: [terminal] }
+`);
+    expect(validateAgentFlowWorkflow(paddedEventWorkflow).valid).toBe(true);
 
     const workflow = parseAgentFlowWorkflowOrThrow(`
 name: invalid-notifications

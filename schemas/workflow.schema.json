@@ -345,13 +345,8 @@
       "required": ["on", "channels"],
       "properties": {
         "on": {
-          "enum": [
-            "workflow.completed",
-            "workflow.failed",
-            "workflow.paused",
-            "approval.waiting",
-            "collaboration.disagreement"
-          ]
+          "type": "string",
+          "pattern": "^\\s*(workflow\\.completed|workflow\\.failed|workflow\\.paused|approval\\.waiting|collaboration\\.disagreement)\\s*$"
         },
         "channels": {
           "type": "array",
