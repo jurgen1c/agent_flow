@@ -223,6 +223,50 @@ notify:
     store.close();
   });
 
+  test("stops remaining notification channels after an adapter changes run status", async () => {
+    const repoRoot = temporaryRepo();
+    const runId = "notification-adapter-pauses-run";
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: ${runId}
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+steps: []
+notify:
+  - { on: workflow.completed, channels: [terminal, email] }
+`);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: runId, workflow });
+    const delivered: string[] = [];
+    const notifications = createAgentFlowNotificationRegistry({
+      terminal: ({ channel }) => {
+        delivered.push(channel);
+        transitionAgentFlowLifecycleRun(store, runId, "pause");
+      },
+      email: ({ channel }) => {
+        delivered.push(channel);
+      }
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      runId,
+      workflow,
+      undefined,
+      undefined,
+      undefined,
+      notifications
+    );
+
+    expect(result.status).toBe("paused");
+    expect(delivered).toEqual(["terminal"]);
+    expect(store.getRun(runId)?.status).toBe("paused");
+    expect(store.listEvents(runId).filter((event) => event.type === "notification.delivered"))
+      .toHaveLength(1);
+    store.close();
+  });
+
   test("notifies approval waiting and applies required delivery policy", async () => {
     for (const required of [false, true]) {
       const runId = required ? "required-approval-notification" : "optional-approval-notification";
@@ -1387,6 +1431,43 @@ notify:
     expect(events.filter((event) => event.type === "notification.delivered")).toHaveLength(1);
     expect(events.filter((event) => event.type === "pipeline.effects.finalized")).toHaveLength(1);
     reopened.close();
+  });
+
+  test("preserves a cancellation triggered by a pause notification adapter", async () => {
+    for (const required of [false, true]) {
+      const repoRoot = temporaryRepo();
+      const runId = required ? "required-pause-adapter-cancel" : "optional-pause-adapter-cancel";
+      const workflow = parseAgentFlowWorkflowOrThrow(`
+name: ${runId}
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+steps: []
+notify:
+  - { on: workflow.paused, channels: [terminal], required: ${String(required)} }
+`);
+      const store = await openAgentFlowRunState({ cwd: repoRoot });
+      createAgentFlowLifecycleRun(store, { id: runId, workflow });
+      const notifications = createAgentFlowNotificationRegistry({
+        terminal: () => {
+          transitionAgentFlowLifecycleRun(store, runId, "cancel");
+          if (required) throw new Error("delivery failed after cancellation");
+        }
+      });
+
+      const result = transitionAgentFlowLifecycleRun(store, runId, "pause", notifications);
+
+      expect(result.run.status).toBe("cancelled");
+      expect(store.getRun(runId)?.status).toBe("cancelled");
+      expect(store.listEvents(runId).map((event) => event.type)).toEqual([
+        "run.created",
+        "run.pause",
+        "run.cancel",
+        required ? "notification.failed" : "notification.delivered"
+      ]);
+      store.close();
+    }
   });
 
   test("stops an active executor when a required operator-pause notification fails", async () => {

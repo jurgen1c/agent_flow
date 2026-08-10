@@ -160,12 +160,16 @@ export function deliverAgentFlowNotificationEvent(
   context: AgentFlowNotificationContext = {}
 ): AgentFlowNotificationDeliveryResult {
   let requiredFailure: AgentFlowNotificationDeliveryResult["requiredFailure"];
+  const initialStatus = store.getRun(runId)?.status;
 
   for (const value of workflow.notify ?? []) {
     const rule = mapping(value);
     if (nonEmptyString(rule?.on) !== event) continue;
     const required = rule?.required === true;
     for (const channel of stringList(rule?.channels)) {
+      if (store.getRun(runId)?.status !== initialStatus) {
+        return requiredFailure === undefined ? {} : { requiredFailure };
+      }
       const notification = buildNotification(runId, workflow.name, event, channel, required, context);
       let failureMessage: string | undefined;
       try {

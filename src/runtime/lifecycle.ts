@@ -220,6 +220,10 @@ function finalizeLifecycleSideEffects(
   }
 
   const delivery = deliverAgentFlowNotifications(store, runId, workflow, "paused", notifications);
+  const currentAfterDelivery = store.getRun(runId)!;
+  if (currentAfterDelivery.status !== "paused") {
+    return { changed: result.changed, run: currentAfterDelivery };
+  }
   if (delivery.requiredFailure === undefined) {
     if (workflow.style === "pipeline") markAgentFlowPipelineEffectsFinalized(store, runId, "paused");
     markLifecycleFinalized(store, runId, action, "paused");
