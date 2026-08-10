@@ -39,6 +39,7 @@ export interface AgentFlowNotificationAdapters {
 export interface AgentFlowNotificationContext {
   stepId?: string;
   payload?: AgentFlowRunStateValue;
+  requiredRunStatus?: AgentFlowRunStatus;
 }
 
 export interface AgentFlowNotificationDeliveryResult {
@@ -161,6 +162,7 @@ export function deliverAgentFlowNotificationEvent(
 ): AgentFlowNotificationDeliveryResult {
   let requiredFailure: AgentFlowNotificationDeliveryResult["requiredFailure"];
   const initialStatus = store.getRun(runId)?.status;
+  if (context.requiredRunStatus !== undefined && initialStatus !== context.requiredRunStatus) return {};
 
   for (const value of workflow.notify ?? []) {
     const rule = mapping(value);

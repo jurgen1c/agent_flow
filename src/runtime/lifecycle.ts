@@ -252,6 +252,10 @@ function finalizeLifecycleSideEffects(
     }
   }
   deliverAgentFlowNotifications(store, runId, workflow, "failed", notifications);
+  const currentAfterFailureDelivery = store.getRun(runId)!;
+  if (currentAfterFailureDelivery.status !== "paused") {
+    return { changed: result.changed, run: currentAfterFailureDelivery };
+  }
   store.updateRun(runId, { currentStepId: null, error });
   const failed = store.transitionRunWithEvent(runId, {
     status: "failed",

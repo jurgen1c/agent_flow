@@ -699,6 +699,60 @@ notify:
     store.close();
   });
 
+  test("skips disagreement delivery when cancellation lands between the precheck and delivery", async () => {
+    const repoRoot = temporaryRepo();
+    const runId = "cancelled-at-disagreement-delivery";
+    const workflow = notifiedDisagreementWorkflow(runId);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    const competitor = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: runId, workflow });
+    store.writeArtifact({
+      id: "implementation",
+      runId,
+      path: "implementation.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Implementation"
+    });
+    let deliveries = 0;
+    const notifications = createAgentFlowNotificationRegistry({
+      slack: () => {
+        deliveries += 1;
+      }
+    });
+    const originalGetRun = store.getRun.bind(store);
+    let readsAfterDisagreement = 0;
+    store.getRun = ((requestedRunId) => {
+      const current = originalGetRun(requestedRunId);
+      const disagreementPublished = store.listEvents(runId)
+        .some((event) => event.type === "collaboration.disagreement");
+      if (requestedRunId === runId && current?.status === "running" && disagreementPublished) {
+        readsAfterDisagreement += 1;
+        if (readsAfterDisagreement === 2) {
+          transitionAgentFlowLifecycleRun(competitor, runId, "cancel");
+          return originalGetRun(requestedRunId);
+        }
+      }
+      return current;
+    }) as typeof store.getRun;
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      runId,
+      workflow,
+      undefined,
+      disagreementChangesRequestedProviders(),
+      undefined,
+      notifications
+    );
+
+    expect(result.status).toBe("cancelled");
+    expect(deliveries).toBe(0);
+    expect(store.listEvents(runId).map((event) => event.type)).not.toContain("notification.delivered");
+    competitor.close();
+    store.close();
+  });
+
   test("records required disagreement notification failure on a fresh review attempt", async () => {
     const repoRoot = temporaryRepo();
     const runId = "required-disagreement-notification";
@@ -1466,6 +1520,55 @@ notify:
         "run.cancel",
         required ? "notification.failed" : "notification.delivered"
       ]);
+      store.close();
+    }
+  });
+
+  test("preserves cancellation triggered by fallback failure notifications", async () => {
+    for (const source of ["completion", "pause"] as const) {
+      const repoRoot = temporaryRepo();
+      const runId = `fallback-cancel-${source}`;
+      const sourceEvent = source === "completion" ? "workflow.completed" : "workflow.paused";
+      const workflow = parseAgentFlowWorkflowOrThrow(`
+name: ${runId}
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+steps: []
+notify:
+  - { on: ${sourceEvent}, channels: [terminal], required: true }
+  - { on: workflow.failed, channels: [email] }
+`);
+      const store = await openAgentFlowRunState({ cwd: repoRoot });
+      createAgentFlowLifecycleRun(store, { id: runId, workflow });
+      let failureDeliveries = 0;
+      const notifications = createAgentFlowNotificationRegistry({
+        terminal: () => {
+          throw new Error("source delivery failed");
+        },
+        email: () => {
+          failureDeliveries += 1;
+          transitionAgentFlowLifecycleRun(store, runId, "cancel");
+        }
+      });
+
+      const status = source === "completion"
+        ? (await executeAgentFlowCommandPipeline(
+            store,
+            runId,
+            workflow,
+            undefined,
+            undefined,
+            undefined,
+            notifications
+          )).status
+        : transitionAgentFlowLifecycleRun(store, runId, "pause", notifications).run.status;
+
+      expect(status).toBe("cancelled");
+      expect(failureDeliveries).toBe(1);
+      expect(store.getRun(runId)?.status).toBe("cancelled");
+      expect(store.listEvents(runId).map((event) => event.type)).not.toContain("run.failed");
       store.close();
     }
   });

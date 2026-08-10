@@ -1203,7 +1203,8 @@ async function resolveReviewDisagreement(
         completedReviewCycles,
         maxReviewCycles: routingBudget.maxReviewCycles!,
         strategy: policy.strategy
-      }
+      },
+      requiredRunStatus: "running"
     }
   );
   const stoppedAfterNotification = stoppedPipelineResult(store, runId, completedSteps);
@@ -1621,7 +1622,7 @@ function pauseForInteraction(
         routingBudget.terminalEffects.workflow,
         "approval.waiting",
         routingBudget.terminalEffects.notifications,
-        { stepId, payload: { attempt, prompt, validOutcomes } }
+        { stepId, payload: { attempt, prompt, validOutcomes }, requiredRunStatus: "running" }
       );
       if (approvalNotification.requiredFailure !== undefined) {
         return finishRequiredStepNotificationFailure(
@@ -4585,15 +4586,21 @@ function finalizePipelineRun(
       if (currentAfterDelivery?.status !== "running") {
         return finalizationResultForCurrentRun(store, runId, input);
       }
-      if (delivery.requiredFailure !== undefined && status !== "failed") {
+      const fallbackFailure = delivery.requiredFailure !== undefined && status !== "failed"
+        ? delivery.requiredFailure
+        : undefined;
+      if (fallbackFailure !== undefined) {
         status = "failed";
-        message = `Required ${delivery.requiredFailure.channel} notification for ${delivery.requiredFailure.event} failed: ${delivery.requiredFailure.message}`;
+        message = `Required ${fallbackFailure.channel} notification for ${fallbackFailure.event} failed: ${fallbackFailure.message}`;
         error = {
           code: "notification.required.failed",
-          channel: delivery.requiredFailure.channel,
-          event: delivery.requiredFailure.event,
+          channel: fallbackFailure.channel,
+          event: fallbackFailure.event,
           message
         };
+      }
+      input.onFinalStatus?.(status, message);
+      if (fallbackFailure !== undefined) {
         deliverAgentFlowNotifications(
           store,
           runId,
@@ -4601,8 +4608,10 @@ function finalizePipelineRun(
           "failed",
           terminalEffects.notifications
         );
+        if (store.getRun(runId)?.status !== "running") {
+          return finalizationResultForCurrentRun(store, runId, input);
+        }
       }
-      input.onFinalStatus?.(status, message);
       store.updateRun(runId, {
         currentStepId: input.currentStepId,
         ...(status === "failed" && input.failureContext !== undefined ? { context: input.failureContext } : {}),
@@ -4744,6 +4753,8 @@ function finalizePipelineRunLocked(
     }
   }
 
+  input.onFinalStatus?.(status, message);
+
   if (input.intendedStatus !== "failed" && status === "failed") {
     deliverAgentFlowNotifications(
       store,
@@ -4752,9 +4763,11 @@ function finalizePipelineRunLocked(
       "failed",
       terminalEffects.notifications
     );
+    if (store.getRun(runId)?.status !== "running") {
+      return finalizationResultForCurrentRun(store, runId, input);
+    }
   }
 
-  input.onFinalStatus?.(status, message);
   store.updateRun(runId, {
     currentStepId: input.currentStepId,
     ...(status === "failed" && input.failureContext !== undefined ? { context: input.failureContext } : {}),
