@@ -1169,17 +1169,26 @@ async function resolveReviewDisagreement(
   const collaboration = mapping(workflow.collaboration);
   const policy = parseAgentFlowDisagreementPolicy(collaboration?.on_disagreement);
   const completedReviewCycles = routingBudget.attempts.get(stepId) ?? 0;
-  store.appendRunEvent(runId, {
-    type: "collaboration.disagreement",
-    stepId,
-    payload: {
+  const stoppedBeforeDisagreement = store.withRunFinalizationTransaction(runId, () => {
+    const stopped = stoppedPipelineResult(store, runId, completedSteps);
+    if (stopped !== undefined) return stopped;
+    const payload = {
       reviewer,
       subject,
       completedReviewCycles,
       maxReviewCycles: routingBudget.maxReviewCycles!,
       strategy: policy.strategy
-    }
+    };
+    store.appendRunEvent(runId, {
+      type: "collaboration.disagreement",
+      stepId,
+      payload
+    });
+    return undefined;
   });
+  if (stoppedBeforeDisagreement !== undefined) return { result: stoppedBeforeDisagreement };
+  const stoppedBeforeNotification = stoppedPipelineResult(store, runId, completedSteps);
+  if (stoppedBeforeNotification !== undefined) return { result: stoppedBeforeNotification };
   const disagreementNotification = deliverAgentFlowNotificationEvent(
     store,
     runId,
@@ -1577,6 +1586,8 @@ function pauseForInteraction(
     : { attempt, type: kind, question: prompt, saveAs: saveAs! };
 
   const persistWaiting = (): AgentFlowCommandPipelineResult => {
+    const stopped = stoppedPipelineResult(store, runId, completedSteps);
+    if (stopped !== undefined) return stopped;
     store.updateRun(runId, {
       currentStepId: stepId,
       context: { ...run.context, waiting: waiting as unknown as AgentFlowRunStateValue },

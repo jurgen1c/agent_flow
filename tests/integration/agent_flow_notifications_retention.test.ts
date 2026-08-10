@@ -373,6 +373,69 @@ notify:
     }
   });
 
+  test("does not publish an approval wait after a concurrent cancellation wins the transaction", async () => {
+    const repoRoot = temporaryRepo();
+    const runId = "cancelled-before-approval-wait";
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: ${runId}
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+steps:
+  - { id: approve, type: approval, reviewer: human, artifacts: [release.md] }
+notify:
+  - { on: approval.waiting, channels: [email] }
+`);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    const competitor = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: runId, workflow });
+    store.writeArtifact({
+      id: "release",
+      runId,
+      path: "release.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Release candidate"
+    });
+    let deliveries = 0;
+    const notifications = createAgentFlowNotificationRegistry({
+      email: () => {
+        deliveries += 1;
+      }
+    });
+    const originalFinalization = store.withRunFinalizationTransaction.bind(store);
+    let raced = false;
+    store.withRunFinalizationTransaction = ((transactionRunId, callback) => {
+      if (!raced) {
+        raced = true;
+        transitionAgentFlowLifecycleRun(competitor, runId, "cancel");
+      }
+      return originalFinalization(transactionRunId, callback);
+    }) as typeof store.withRunFinalizationTransaction;
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      runId,
+      workflow,
+      undefined,
+      undefined,
+      undefined,
+      notifications
+    );
+
+    expect(result.status).toBe("cancelled");
+    expect(deliveries).toBe(0);
+    expect(store.listApprovals(runId)).toEqual([]);
+    expect(store.listEvents(runId).map((event) => event.type)).toEqual([
+      "run.created",
+      "run.started",
+      "run.cancel"
+    ]);
+    competitor.close();
+    store.close();
+  });
+
   test("does not deliver terminal notifications after a non-pipeline run is stopped concurrently", async () => {
     for (const action of ["pause", "cancel"] as const) {
       const runId = `collaborative-${action}-finalization-race`;
@@ -537,6 +600,57 @@ notify:
     expect(store.getRun(runId)?.context.waiting).toBeUndefined();
     expect(store.listEvents(runId).map((event) => event.type))
       .not.toContain("collaboration.disagreement.waiting");
+    competitor.close();
+    store.close();
+  });
+
+  test("does not publish disagreement events after a concurrent cancellation wins the transaction", async () => {
+    const repoRoot = temporaryRepo();
+    const runId = "cancelled-before-disagreement-notification";
+    const workflow = notifiedDisagreementWorkflow(runId);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    const competitor = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: runId, workflow });
+    store.writeArtifact({
+      id: "implementation",
+      runId,
+      path: "implementation.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Implementation"
+    });
+    let deliveries = 0;
+    const notifications = createAgentFlowNotificationRegistry({
+      slack: () => {
+        deliveries += 1;
+      }
+    });
+    const originalFinalization = store.withRunFinalizationTransaction.bind(store);
+    let raced = false;
+    store.withRunFinalizationTransaction = ((transactionRunId, callback) => {
+      const events = store.listEvents(runId);
+      const readyToDisagree = events.some((event) => event.type === "step.completed" && event.stepId === "revise");
+      if (readyToDisagree && !raced) {
+        raced = true;
+        transitionAgentFlowLifecycleRun(competitor, runId, "cancel");
+      }
+      return originalFinalization(transactionRunId, callback);
+    }) as typeof store.withRunFinalizationTransaction;
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      runId,
+      workflow,
+      undefined,
+      disagreementChangesRequestedProviders(),
+      undefined,
+      notifications
+    );
+
+    expect(result.status).toBe("cancelled");
+    expect(deliveries).toBe(0);
+    expect(store.listEvents(runId).map((event) => event.type)).not.toContain("collaboration.disagreement");
+    expect(store.listEvents(runId).map((event) => event.type)).not.toContain("notification.delivered");
     competitor.close();
     store.close();
   });
@@ -1545,14 +1659,22 @@ notify:
       $defs: {
         notificationRule: {
           properties: {
-            on: { pattern?: string };
+            on: { enum?: string[] };
             channels: { items: { pattern?: string } };
           };
         };
       };
     };
     expect(schema.$defs.notificationRule.properties).toMatchObject({
-      on: { pattern: "\\S" },
+      on: {
+        enum: [
+          "workflow.completed",
+          "workflow.failed",
+          "workflow.paused",
+          "approval.waiting",
+          "collaboration.disagreement"
+        ]
+      },
       channels: { items: { pattern: "\\S" } }
     });
 

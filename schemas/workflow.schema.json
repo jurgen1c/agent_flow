@@ -345,9 +345,13 @@
       "required": ["on", "channels"],
       "properties": {
         "on": {
-          "type": "string",
-          "minLength": 1,
-          "pattern": "\\S"
+          "enum": [
+            "workflow.completed",
+            "workflow.failed",
+            "workflow.paused",
+            "approval.waiting",
+            "collaboration.disagreement"
+          ]
         },
         "channels": {
           "type": "array",
