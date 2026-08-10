@@ -348,6 +348,69 @@ notify:
     }
   });
 
+  test("keeps approval waiting state consistent when its failure notification pauses the run", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: approval-failure-notification-pause
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+steps:
+  - { id: approve, type: approval, reviewer: human, artifacts: [release.md] }
+notify:
+  - { on: approval.waiting, channels: [email], required: true }
+  - { on: workflow.failed, channels: [terminal] }
+`);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: "approval-failure-notification-pause", workflow });
+    store.writeArtifact({
+      id: "release",
+      runId: "approval-failure-notification-pause",
+      path: "release.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Release candidate"
+    });
+    const notifications = createAgentFlowNotificationRegistry({
+      email: () => {
+        throw new Error("email service unavailable");
+      },
+      terminal: () => {
+        transitionAgentFlowLifecycleRun(store, "approval-failure-notification-pause", "pause");
+      }
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      "approval-failure-notification-pause",
+      workflow,
+      undefined,
+      undefined,
+      undefined,
+      notifications
+    );
+
+    expect(result.status).toBe("paused");
+    expect(store.getRun("approval-failure-notification-pause")).toMatchObject({
+      status: "paused",
+      context: { waiting: { kind: "approval", stepId: "approve" } }
+    });
+    expect(store.listApprovals("approval-failure-notification-pause")[0]).toMatchObject({
+      status: "requested",
+      decision: null
+    });
+    expect(store.listFailures("approval-failure-notification-pause")).toEqual([]);
+    expect(store.listEvents("approval-failure-notification-pause").map((event) => event.type))
+      .not.toContain("step.failed");
+    const database = new Database(store.databasePath, { readonly: true });
+    expect(database.query(
+      "SELECT status FROM run_steps WHERE run_id = ? AND step_id = ?"
+    ).get("approval-failure-notification-pause", "approve")).toEqual({ status: "waiting" });
+    database.close();
+    store.close();
+  });
+
   test("rolls back approval waiting state when notification event persistence fails", async () => {
     for (const adapterFailure of [false, true]) {
       const runId = adapterFailure ? "approval-failed-event-rollback" : "approval-delivered-event-rollback";
@@ -1772,6 +1835,67 @@ notify:
       step_type: "manual_gate",
       classification: "notification_failure"
     });
+    store.close();
+  });
+
+  test("keeps a manual gate waiting when its fallback failure notification pauses the run", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: gate-failure-notification-pause
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+steps:
+  - { id: approve, type: manual_gate, message: Continue?, options: [approve, cancel] }
+notify:
+  - { on: workflow.paused, channels: [terminal], required: true }
+  - { on: workflow.failed, channels: [email] }
+`);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: "gate-failure-notification-pause", workflow });
+    const lifecycleNotifications = createAgentFlowNotificationRegistry({ terminal: () => {} });
+    const notifications = createAgentFlowNotificationRegistry({
+      terminal: () => {
+        throw new Error("terminal unavailable");
+      },
+      email: () => {
+        transitionAgentFlowLifecycleRun(
+          store,
+          "gate-failure-notification-pause",
+          "pause",
+          lifecycleNotifications
+        );
+      }
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      "gate-failure-notification-pause",
+      workflow,
+      undefined,
+      undefined,
+      undefined,
+      notifications
+    );
+
+    expect(result.status).toBe("paused");
+    expect(store.getRun("gate-failure-notification-pause")).toMatchObject({
+      status: "paused",
+      context: { waiting: { kind: "manual_gate", stepId: "approve" } }
+    });
+    expect(store.listApprovals("gate-failure-notification-pause")[0]).toMatchObject({
+      status: "requested",
+      decision: null
+    });
+    expect(store.listFailures("gate-failure-notification-pause")).toEqual([]);
+    expect(store.listEvents("gate-failure-notification-pause").map((event) => event.type))
+      .not.toContain("step.failed");
+    const database = new Database(store.databasePath, { readonly: true });
+    expect(database.query(
+      "SELECT status FROM run_steps WHERE run_id = ? AND step_id = ?"
+    ).get("gate-failure-notification-pause", "approve")).toEqual({ status: "waiting" });
+    database.close();
     store.close();
   });
 

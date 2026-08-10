@@ -1664,7 +1664,7 @@ function pauseForInteraction(
       },
       eventStepId: stepId,
       failureContext: run.context,
-      onFinalStatus: (status, message) => {
+      beforeFinalTransition: (status, message) => {
         if (status !== "failed") return;
         const failureMessage = message ?? "Required paused notification failed.";
         const error = {
@@ -4553,6 +4553,10 @@ interface FinalizePipelineRunInput {
     status: Extract<AgentFlowRunStatus, "completed" | "failed" | "paused" | "cancelled">,
     message: string | undefined
   ) => void;
+  beforeFinalTransition?: (
+    status: Extract<AgentFlowRunStatus, "completed" | "failed" | "paused" | "cancelled">,
+    message: string | undefined
+  ) => void;
 }
 
 function finalizePipelineRun(
@@ -4612,6 +4616,7 @@ function finalizePipelineRun(
           return finalizationResultForCurrentRun(store, runId, input);
         }
       }
+      input.beforeFinalTransition?.(status, message);
       store.updateRun(runId, {
         currentStepId: input.currentStepId,
         ...(status === "failed" && input.failureContext !== undefined ? { context: input.failureContext } : {}),
@@ -4768,6 +4773,7 @@ function finalizePipelineRunLocked(
     }
   }
 
+  input.beforeFinalTransition?.(status, message);
   store.updateRun(runId, {
     currentStepId: input.currentStepId,
     ...(status === "failed" && input.failureContext !== undefined ? { context: input.failureContext } : {}),
@@ -5166,7 +5172,7 @@ function finishRequiredStepNotificationFailure(
     eventPayload: { stepId, ...error },
     eventStepId: stepId,
     failureContext: options?.failureContext,
-    beforeTerminalEffects: () => {
+    beforeFinalTransition: () => {
       options?.beforeFailure?.();
       const persisted = persistAgentFlowFailurePayload(store, {
         id: `notification:${safeId(stepId)}:attempt-${attempt}:${safeId(failure.event)}`,
