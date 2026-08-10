@@ -4548,6 +4548,7 @@ interface FinalizePipelineRunInput {
   eventPayload: AgentFlowRunStateValue;
   eventStepId?: string;
   failureContext?: Record<string, AgentFlowRunStateValue>;
+  terminalNotificationDelivered?: boolean;
   beforeTerminalEffects?: () => void;
   onFinalStatus?: (
     status: Extract<AgentFlowRunStatus, "completed" | "failed" | "paused" | "cancelled">,
@@ -4579,13 +4580,15 @@ function finalizePipelineRun(
       let message = input.message;
       let error = input.error;
       input.beforeTerminalEffects?.();
-      const delivery = deliverAgentFlowNotifications(
-        store,
-        runId,
-        terminalEffects.workflow,
-        status,
-        terminalEffects.notifications
-      );
+      const delivery = input.terminalNotificationDelivered === true
+        ? {}
+        : deliverAgentFlowNotifications(
+            store,
+            runId,
+            terminalEffects.workflow,
+            status,
+            terminalEffects.notifications
+          );
       const currentAfterDelivery = store.getRun(runId);
       if (currentAfterDelivery?.status !== "running") {
         return finalizationResultForCurrentRun(store, runId, input);
@@ -4729,7 +4732,7 @@ function finalizePipelineRunLocked(
     }
   }
 
-  if (summaryReady || input.intendedStatus === "failed") {
+  if (input.terminalNotificationDelivered !== true && (summaryReady || input.intendedStatus === "failed")) {
     const delivery = deliverAgentFlowNotifications(
       store,
       runId,
@@ -5162,6 +5165,18 @@ function finishRequiredStepNotificationFailure(
     message,
     outcome: "fail" as const
   };
+  const terminalNotificationDelivered = terminalEffects.workflow.style === "pipeline";
+  if (terminalNotificationDelivered) {
+    deliverAgentFlowNotifications(
+      store,
+      runId,
+      terminalEffects.workflow,
+      "failed",
+      terminalEffects.notifications
+    );
+    const stopped = stoppedPipelineResult(store, runId, completedSteps);
+    if (stopped !== undefined) return stopped;
+  }
   const finalized = finalizePipelineRun(store, runId, terminalEffects, {
     intendedStatus: "failed",
     completedSteps,
@@ -5172,6 +5187,7 @@ function finishRequiredStepNotificationFailure(
     eventPayload: { stepId, ...error },
     eventStepId: stepId,
     failureContext: options?.failureContext,
+    terminalNotificationDelivered,
     beforeFinalTransition: () => {
       options?.beforeFailure?.();
       const persisted = persistAgentFlowFailurePayload(store, {

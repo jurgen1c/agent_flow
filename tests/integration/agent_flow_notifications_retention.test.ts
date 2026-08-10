@@ -411,6 +411,66 @@ notify:
     store.close();
   });
 
+  test("lets fallback failure adapters stop pipeline approval failure finalization", async () => {
+    for (const action of ["pause", "cancel"] as const) {
+      const runId = `pipeline-approval-failure-${action}`;
+      const repoRoot = temporaryRepo();
+      const workflow = parseAgentFlowWorkflowOrThrow(`
+name: ${runId}
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: approve, type: approval, reviewer: human, artifacts: [release.md] }
+notify:
+  - { on: approval.waiting, channels: [email], required: true }
+  - { on: workflow.failed, channels: [terminal] }
+`);
+      const store = await openAgentFlowRunState({ cwd: repoRoot });
+      createAgentFlowLifecycleRun(store, { id: runId, workflow });
+      store.writeArtifact({
+        id: "release",
+        runId,
+        path: "release.md",
+        kind: "fixture",
+        contentType: "text/markdown",
+        content: "Release candidate"
+      });
+      const notifications = createAgentFlowNotificationRegistry({
+        email: () => {
+          throw new Error("email service unavailable");
+        },
+        terminal: () => {
+          transitionAgentFlowLifecycleRun(store, runId, action);
+        }
+      });
+
+      const result = await executeAgentFlowCommandPipeline(
+        store,
+        runId,
+        workflow,
+        undefined,
+        undefined,
+        undefined,
+        notifications
+      );
+
+      expect(result.status).toBe(action === "pause" ? "paused" : "cancelled");
+      expect(store.getRun(runId)?.status).toBe(action === "pause" ? "paused" : "cancelled");
+      expect(store.listFailures(runId)).toEqual([]);
+      expect(store.listEvents(runId).map((event) => event.type)).not.toContain("step.failed");
+      expect(store.listApprovals(runId)[0]).toMatchObject(action === "pause"
+        ? { status: "requested", decision: null }
+        : { status: "cancelled", decision: "cancel" });
+      const database = new Database(store.databasePath, { readonly: true });
+      expect(database.query(
+        "SELECT status FROM run_steps WHERE run_id = ? AND step_id = ?"
+      ).get(runId, "approve")).toEqual({ status: action === "pause" ? "waiting" : "cancelled" });
+      database.close();
+      store.close();
+    }
+  });
+
   test("rolls back approval waiting state when notification event persistence fails", async () => {
     for (const adapterFailure of [false, true]) {
       const runId = adapterFailure ? "approval-failed-event-rollback" : "approval-delivered-event-rollback";
