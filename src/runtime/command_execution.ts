@@ -4101,8 +4101,19 @@ function finishResultStep(
       ...(resultStatus === "remediated" && beforeRemediatedResult !== undefined
         ? {
             beforeTerminalEffects: beforeRemediatedResult,
-            onFinalStatus: (status: AgentFlowCommandPipelineResult["status"], message: string | undefined) => {
+            onFinalStatus: (
+              status: AgentFlowCommandPipelineResult["status"],
+              message: string | undefined,
+              notificationFailure: AgentFlowNotificationDeliveryResult["requiredFailure"],
+              notificationAttempts: AgentFlowNotificationDeliveryResult["attempts"]
+            ) => {
               if (status !== "completed") {
+                if (notificationFailure !== undefined) {
+                  throw new RequiredNotificationPromotionRollbackError(
+                    notificationFailure,
+                    notificationAttempts ?? []
+                  );
+                }
                 throw new AgentFlowRunStateError(
                   message ?? "Nested recovery finalization did not complete after output promotion.",
                   "AGENT_FLOW_RECOVERY_PROMOTION_ROLLBACK"
@@ -4113,6 +4124,19 @@ function finishResultStep(
         : {})
     });
   } catch (error) {
+    if (error instanceof RequiredNotificationPromotionRollbackError) {
+      error.attempts.forEach((attempt) => store.appendRunEvent(runId, attempt));
+      return finishRequiredStepNotificationFailure(
+        store,
+        runId,
+        completedSteps,
+        stepId,
+        attempt,
+        "result",
+        error.failure,
+        terminalEffects
+      );
+    }
     return finishFailure(store, runId, completedSteps, stepId, {
       exitCode: null,
       timedOut: false,
@@ -4552,12 +4576,24 @@ interface FinalizePipelineRunInput {
   beforeTerminalEffects?: () => void;
   onFinalStatus?: (
     status: Extract<AgentFlowRunStatus, "completed" | "failed" | "paused" | "cancelled">,
-    message: string | undefined
+    message: string | undefined,
+    notificationFailure: AgentFlowNotificationDeliveryResult["requiredFailure"],
+    notificationAttempts: AgentFlowNotificationDeliveryResult["attempts"]
   ) => void;
   beforeFinalTransition?: (
     status: Extract<AgentFlowRunStatus, "completed" | "failed" | "paused" | "cancelled">,
     message: string | undefined
   ) => void;
+}
+
+class RequiredNotificationPromotionRollbackError extends Error {
+  constructor(
+    readonly failure: NonNullable<AgentFlowNotificationDeliveryResult["requiredFailure"]>,
+    readonly attempts: NonNullable<AgentFlowNotificationDeliveryResult["attempts"]>
+  ) {
+    super(`Required ${failure.channel} notification for ${failure.event} failed: ${failure.message}`);
+    this.name = "RequiredNotificationPromotionRollbackError";
+  }
 }
 
 function finalizePipelineRun(
@@ -4591,7 +4627,9 @@ function finalizePipelineRun(
           );
       const currentAfterDelivery = store.getRun(runId);
       if (currentAfterDelivery?.status !== "running") {
-        return finalizationResultForCurrentRun(store, runId, input);
+        const stopped = finalizationResultForCurrentRun(store, runId, input);
+        input.onFinalStatus?.(stopped.status, stopped.message, undefined, undefined);
+        return stopped;
       }
       const fallbackFailure = delivery.requiredFailure !== undefined && status !== "failed"
         ? delivery.requiredFailure
@@ -4606,7 +4644,7 @@ function finalizePipelineRun(
           message
         };
       }
-      input.onFinalStatus?.(status, message);
+      input.onFinalStatus?.(status, message, fallbackFailure, fallbackFailure === undefined ? undefined : delivery.attempts);
       if (fallbackFailure !== undefined) {
         deliverAgentFlowNotifications(
           store,
@@ -4716,6 +4754,8 @@ function finalizePipelineRunLocked(
   let message = input.message;
   let error = input.error;
   let summaryReady = status === "paused";
+  let notificationFailure: AgentFlowNotificationDeliveryResult["requiredFailure"];
+  let notificationAttempts: AgentFlowNotificationDeliveryResult["attempts"];
 
   input.beforeTerminalEffects?.();
 
@@ -4741,6 +4781,8 @@ function finalizePipelineRunLocked(
       terminalEffects.notifications
     );
     if (delivery.requiredFailure !== undefined && input.intendedStatus !== "failed") {
+      notificationFailure = delivery.requiredFailure;
+      notificationAttempts = delivery.attempts;
       status = "failed";
       message = `Required ${delivery.requiredFailure.channel} notification for ${delivery.requiredFailure.event} failed: ${delivery.requiredFailure.message}`;
       error = {
@@ -4761,7 +4803,7 @@ function finalizePipelineRunLocked(
     }
   }
 
-  input.onFinalStatus?.(status, message);
+  input.onFinalStatus?.(status, message, notificationFailure, notificationAttempts);
 
   if (input.intendedStatus !== "failed" && status === "failed") {
     deliverAgentFlowNotifications(
@@ -5131,6 +5173,10 @@ function finishFailure(
     eventPayload: { stepId, ...persistedFailure },
     eventStepId: stepId
   });
+  if (finalized.status === "cancelled") {
+    const stopped = stoppedPipelineResult(store, runId, completedSteps);
+    if (stopped !== undefined) return stopped;
+  }
   const finalFailureOutcome = finalized.status === "failed" ? "fail" : "pause";
   return {
     status: finalized.status,

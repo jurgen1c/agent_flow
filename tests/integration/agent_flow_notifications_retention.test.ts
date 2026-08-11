@@ -736,7 +736,6 @@ notify:
     const runId = "cancelled-disagreement-notification";
     const workflow = notifiedDisagreementWorkflow(runId);
     const store = await openAgentFlowRunState({ cwd: repoRoot });
-    const competitor = await openAgentFlowRunState({ cwd: repoRoot });
     createAgentFlowLifecycleRun(store, { id: runId, workflow });
     store.writeArtifact({
       id: "implementation",
@@ -748,7 +747,7 @@ notify:
     });
     const notifications = createAgentFlowNotificationRegistry({
       slack: () => {
-        transitionAgentFlowLifecycleRun(competitor, runId, "cancel");
+        transitionAgentFlowLifecycleRun(store, runId, "cancel");
       }
     });
 
@@ -767,7 +766,6 @@ notify:
     expect(store.getRun(runId)?.context.waiting).toBeUndefined();
     expect(store.listEvents(runId).map((event) => event.type))
       .not.toContain("collaboration.disagreement.waiting");
-    competitor.close();
     store.close();
   });
 
@@ -843,21 +841,17 @@ notify:
         deliveries += 1;
       }
     });
-    const originalGetRun = store.getRun.bind(store);
-    let readsAfterDisagreement = 0;
-    store.getRun = ((requestedRunId) => {
-      const current = originalGetRun(requestedRunId);
+    const originalFinalization = store.withRunFinalizationTransaction.bind(store);
+    let raced = false;
+    store.withRunFinalizationTransaction = ((transactionRunId, callback) => {
       const disagreementPublished = store.listEvents(runId)
         .some((event) => event.type === "collaboration.disagreement");
-      if (requestedRunId === runId && current?.status === "running" && disagreementPublished) {
-        readsAfterDisagreement += 1;
-        if (readsAfterDisagreement === 2) {
-          transitionAgentFlowLifecycleRun(competitor, runId, "cancel");
-          return originalGetRun(requestedRunId);
-        }
+      if (disagreementPublished && !raced) {
+        raced = true;
+        transitionAgentFlowLifecycleRun(competitor, runId, "cancel");
       }
-      return current;
-    }) as typeof store.getRun;
+      return originalFinalization(transactionRunId, callback);
+    }) as typeof store.withRunFinalizationTransaction;
 
     const result = await executeAgentFlowCommandPipeline(
       store,
@@ -871,6 +865,7 @@ notify:
 
     expect(result.status).toBe("cancelled");
     expect(deliveries).toBe(0);
+    expect(store.listEvents(runId).map((event) => event.type)).toContain("collaboration.disagreement");
     expect(store.listEvents(runId).map((event) => event.type)).not.toContain("notification.delivered");
     competitor.close();
     store.close();
@@ -1694,6 +1689,45 @@ notify:
       expect(store.listEvents(runId).map((event) => event.type)).not.toContain("run.failed");
       store.close();
     }
+  });
+
+  test("returns cancellation without stale failure metadata when failure delivery cancels", async () => {
+    const repoRoot = temporaryRepo();
+    const runId = "failure-notification-cancel-result";
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: ${runId}
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+steps:
+  - { id: broken, type: command, command: "exit 2", on_failure: { then: fail } }
+notify:
+  - { on: workflow.failed, channels: [terminal] }
+`);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: runId, workflow });
+    const notifications = createAgentFlowNotificationRegistry({
+      terminal: () => {
+        transitionAgentFlowLifecycleRun(store, runId, "cancel");
+      }
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      runId,
+      workflow,
+      undefined,
+      undefined,
+      undefined,
+      notifications
+    );
+
+    expect(result.status).toBe("cancelled");
+    expect(result).not.toHaveProperty("failedStep");
+    expect(result).not.toHaveProperty("failureOutcome");
+    expect(store.getRun(runId)?.status).toBe("cancelled");
+    store.close();
   });
 
   test("stops an active executor when a required operator-pause notification fails", async () => {

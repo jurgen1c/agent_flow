@@ -48,6 +48,17 @@ export interface AgentFlowNotificationDeliveryResult {
     event: AgentFlowNotificationEvent;
     message: string;
   };
+  attempts?: Array<{
+    type: "notification.delivered" | "notification.failed";
+    stepId?: string;
+    payload: {
+      channel: string;
+      event: AgentFlowNotificationEvent;
+      message?: string;
+      required: boolean;
+      stepId?: string;
+    };
+  }>;
 }
 
 export interface AgentFlowNotificationIssue {
@@ -160,7 +171,24 @@ export function deliverAgentFlowNotificationEvent(
   registry: AgentFlowNotificationRegistry,
   context: AgentFlowNotificationContext = {}
 ): AgentFlowNotificationDeliveryResult {
+  if (context.requiredRunStatus !== undefined) {
+    return store.withRunFinalizationTransaction(runId, () =>
+      deliverAgentFlowNotificationEventUnlocked(store, runId, workflow, event, registry, context)
+    );
+  }
+  return deliverAgentFlowNotificationEventUnlocked(store, runId, workflow, event, registry, context);
+}
+
+function deliverAgentFlowNotificationEventUnlocked(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  workflow: AgentFlowWorkflow,
+  event: AgentFlowNotificationEvent,
+  registry: AgentFlowNotificationRegistry,
+  context: AgentFlowNotificationContext
+): AgentFlowNotificationDeliveryResult {
   let requiredFailure: AgentFlowNotificationDeliveryResult["requiredFailure"];
+  const attempts: NonNullable<AgentFlowNotificationDeliveryResult["attempts"]> = [];
   const initialStatus = store.getRun(runId)?.status;
   if (context.requiredRunStatus !== undefined && initialStatus !== context.requiredRunStatus) return {};
 
@@ -170,7 +198,7 @@ export function deliverAgentFlowNotificationEvent(
     const required = rule?.required === true;
     for (const channel of stringList(rule?.channels)) {
       if (store.getRun(runId)?.status !== initialStatus) {
-        return requiredFailure === undefined ? {} : { requiredFailure };
+        return requiredFailure === undefined ? {} : { requiredFailure, attempts };
       }
       const notification = buildNotification(runId, workflow.name, event, channel, required, context);
       let failureMessage: string | undefined;
@@ -189,7 +217,7 @@ export function deliverAgentFlowNotificationEvent(
       }
 
       if (failureMessage === undefined) {
-        store.appendRunEvent(runId, {
+        const attempt = {
           type: "notification.delivered",
           ...(context.stepId === undefined ? {} : { stepId: context.stepId }),
           payload: {
@@ -198,9 +226,11 @@ export function deliverAgentFlowNotificationEvent(
             required,
             ...(context.stepId === undefined ? {} : { stepId: context.stepId })
           }
-        });
+        } as const;
+        store.appendRunEvent(runId, attempt);
+        attempts.push(attempt);
       } else {
-        store.appendRunEvent(runId, {
+        const attempt = {
           type: "notification.failed",
           ...(context.stepId === undefined ? {} : { stepId: context.stepId }),
           payload: {
@@ -210,7 +240,9 @@ export function deliverAgentFlowNotificationEvent(
             required,
             ...(context.stepId === undefined ? {} : { stepId: context.stepId })
           }
-        });
+        } as const;
+        store.appendRunEvent(runId, attempt);
+        attempts.push(attempt);
         if (required && requiredFailure === undefined) {
           requiredFailure = { channel, event, message: failureMessage };
         }
@@ -218,7 +250,7 @@ export function deliverAgentFlowNotificationEvent(
     }
   }
 
-  return requiredFailure === undefined ? {} : { requiredFailure };
+  return requiredFailure === undefined ? {} : { requiredFailure, attempts };
 }
 
 const NOTIFICATION_EVENTS = new Set<AgentFlowNotificationEvent>([
