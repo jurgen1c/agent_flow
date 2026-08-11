@@ -7,6 +7,7 @@ import path from "node:path";
 import {
   createAgentFlowLifecycleRun,
   createAgentFlowNotificationRegistry,
+  createAgentFlowSessionProviderRegistry,
   executeAgentFlowCommandPipeline,
   openAgentFlowRunState,
   parseAgentFlowWorkflowOrThrow,
@@ -175,6 +176,981 @@ notify:
         required: false
       }
     }));
+    store.close();
+  });
+
+  test("registers explicit email, Slack, webhook, and command adapter contracts", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: external-notification-adapters
+version: 1
+style: pipeline
+maturity: experimental
+steps: []
+notify:
+  - on: workflow.completed
+    channels: [email, slack, webhook, command]
+`);
+    const delivered: Array<[string, string]> = [];
+    const adapter = (notification: { channel: string; event: string }): undefined => {
+      delivered.push([notification.channel, notification.event]);
+      return undefined;
+    };
+    const notifications = createAgentFlowNotificationRegistry({
+      email: adapter,
+      slack: adapter,
+      webhook: adapter,
+      command: adapter
+    });
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: "external-notification-adapters", workflow });
+
+    expect((await executeAgentFlowCommandPipeline(
+      store,
+      "external-notification-adapters",
+      workflow,
+      undefined,
+      undefined,
+      undefined,
+      notifications
+    )).status).toBe("completed");
+    expect(delivered).toEqual([
+      ["email", "workflow.completed"],
+      ["slack", "workflow.completed"],
+      ["webhook", "workflow.completed"],
+      ["command", "workflow.completed"]
+    ]);
+    store.close();
+  });
+
+  test("stops remaining notification channels after an adapter changes run status", async () => {
+    const repoRoot = temporaryRepo();
+    const runId = "notification-adapter-pauses-run";
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: ${runId}
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+steps: []
+notify:
+  - { on: workflow.completed, channels: [terminal, email] }
+`);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: runId, workflow });
+    const delivered: string[] = [];
+    const notifications = createAgentFlowNotificationRegistry({
+      terminal: ({ channel }) => {
+        delivered.push(channel);
+        transitionAgentFlowLifecycleRun(store, runId, "pause");
+      },
+      email: ({ channel }) => {
+        delivered.push(channel);
+      }
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      runId,
+      workflow,
+      undefined,
+      undefined,
+      undefined,
+      notifications
+    );
+
+    expect(result.status).toBe("paused");
+    expect(delivered).toEqual(["terminal"]);
+    expect(store.getRun(runId)?.status).toBe("paused");
+    expect(store.listEvents(runId).filter((event) => event.type === "notification.delivered"))
+      .toHaveLength(1);
+    store.close();
+  });
+
+  test("notifies approval waiting and applies required delivery policy", async () => {
+    for (const required of [false, true]) {
+      const runId = required ? "required-approval-notification" : "optional-approval-notification";
+      const repoRoot = temporaryRepo();
+      const workflow = parseAgentFlowWorkflowOrThrow(`
+name: ${runId}
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+steps:
+  - id: approve
+    type: approval
+    reviewer: human
+    artifacts: [release.md]
+notify:
+  - { on: approval.waiting, channels: [email], required: ${String(required)} }
+  - { on: workflow.paused, channels: [terminal] }
+  - { on: workflow.failed, channels: [terminal] }
+`);
+      const delivered: string[] = [];
+      const notifications = createAgentFlowNotificationRegistry({
+        email: () => {
+          throw new Error("email service unavailable");
+        },
+        terminal: ({ event }) => {
+          delivered.push(event);
+        }
+      });
+      const store = await openAgentFlowRunState({ cwd: repoRoot });
+      createAgentFlowLifecycleRun(store, { id: runId, workflow });
+      const initialContext = store.getRun(runId)!.context;
+      store.writeArtifact({
+        id: "release",
+        runId,
+        path: "release.md",
+        kind: "fixture",
+        contentType: "text/markdown",
+        content: "Release candidate"
+      });
+
+      const result = await executeAgentFlowCommandPipeline(
+        store,
+        runId,
+        workflow,
+        undefined,
+        undefined,
+        undefined,
+        notifications
+      );
+
+      expect(result.status).toBe(required ? "failed" : "paused");
+      expect(delivered).toEqual([required ? "workflow.failed" : "workflow.paused"]);
+      expect(store.listEvents(runId)).toContainEqual(expect.objectContaining({
+        type: "notification.failed",
+        stepId: "approve",
+        payload: expect.objectContaining({
+          channel: "email",
+          event: "approval.waiting",
+          required,
+          stepId: "approve"
+        })
+      }));
+      expect(store.listApprovals(runId)[0]).toMatchObject({
+        status: required ? "cancelled" : "requested",
+        ...(required ? { decision: "notification_failure" } : {})
+      });
+      if (required) {
+        expect(store.getRun(runId)).toMatchObject({
+          error: { code: "notification.required.failed", event: "approval.waiting" }
+        });
+        expect(store.getRun(runId)?.context).toEqual(initialContext);
+        expect(store.listFailures(runId)).toContainEqual(expect.objectContaining({
+          classification: "notification_failure",
+          stepId: "approve"
+        }));
+      }
+      store.close();
+    }
+  });
+
+  test("keeps approval waiting state consistent when its failure notification pauses the run", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: approval-failure-notification-pause
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+steps:
+  - { id: approve, type: approval, reviewer: human, artifacts: [release.md] }
+notify:
+  - { on: approval.waiting, channels: [email], required: true }
+  - { on: workflow.failed, channels: [terminal] }
+`);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: "approval-failure-notification-pause", workflow });
+    store.writeArtifact({
+      id: "release",
+      runId: "approval-failure-notification-pause",
+      path: "release.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Release candidate"
+    });
+    const notifications = createAgentFlowNotificationRegistry({
+      email: () => {
+        throw new Error("email service unavailable");
+      },
+      terminal: () => {
+        transitionAgentFlowLifecycleRun(store, "approval-failure-notification-pause", "pause");
+      }
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      "approval-failure-notification-pause",
+      workflow,
+      undefined,
+      undefined,
+      undefined,
+      notifications
+    );
+
+    expect(result.status).toBe("paused");
+    expect(store.getRun("approval-failure-notification-pause")).toMatchObject({
+      status: "paused",
+      context: { waiting: { kind: "approval", stepId: "approve" } }
+    });
+    expect(store.listApprovals("approval-failure-notification-pause")[0]).toMatchObject({
+      status: "requested",
+      decision: null
+    });
+    expect(store.listFailures("approval-failure-notification-pause")).toEqual([]);
+    expect(store.listEvents("approval-failure-notification-pause").map((event) => event.type))
+      .not.toContain("step.failed");
+    const database = new Database(store.databasePath, { readonly: true });
+    expect(database.query(
+      "SELECT status FROM run_steps WHERE run_id = ? AND step_id = ?"
+    ).get("approval-failure-notification-pause", "approve")).toEqual({ status: "waiting" });
+    database.close();
+    store.close();
+  });
+
+  test("clears approval waiting state when its failure-notification pause also fails", async () => {
+    const repoRoot = temporaryRepo();
+    const runId = "approval-failure-notification-pause-fails";
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: ${runId}
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: approve, type: approval, reviewer: human, artifacts: [release.md] }
+notify:
+  - { on: approval.waiting, channels: [email], required: true }
+  - { on: workflow.failed, channels: [terminal] }
+  - { on: workflow.paused, channels: [system], required: true }
+`);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: runId, workflow });
+    const initialContext = store.getRun(runId)!.context;
+    store.writeArtifact({
+      id: "release",
+      runId,
+      path: "release.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Release candidate"
+    });
+    const lifecycleNotifications = createAgentFlowNotificationRegistry({
+      system: () => {
+        throw new Error("pause notification unavailable");
+      }
+    });
+    const notifications = createAgentFlowNotificationRegistry({
+      email: () => {
+        throw new Error("email service unavailable");
+      },
+      terminal: () => {
+        transitionAgentFlowLifecycleRun(store, runId, "pause", lifecycleNotifications);
+      }
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      runId,
+      workflow,
+      undefined,
+      undefined,
+      undefined,
+      notifications
+    );
+
+    expect(result).toMatchObject({ status: "failed" });
+    expect(store.getRun(runId)).toMatchObject({
+      status: "failed",
+      context: initialContext,
+      error: { code: "notification.required.failed", event: "workflow.paused" }
+    });
+    expect(store.listApprovals(runId)[0]).toMatchObject({
+      status: "cancelled",
+      decision: "notification_failure"
+    });
+    expect(store.listFailures(runId)).toContainEqual(expect.objectContaining({
+      classification: "notification_failure",
+      stepId: "approve"
+    }));
+    const database = new Database(store.databasePath, { readonly: true });
+    expect(database.query(
+      "SELECT status FROM run_steps WHERE run_id = ? AND step_id = ?"
+    ).get(runId, "approve")).toEqual({ status: "failed" });
+    database.close();
+    store.close();
+  });
+
+  test("lets fallback failure adapters stop pipeline approval failure finalization", async () => {
+    for (const action of ["pause", "cancel"] as const) {
+      const runId = `pipeline-approval-failure-${action}`;
+      const repoRoot = temporaryRepo();
+      const workflow = parseAgentFlowWorkflowOrThrow(`
+name: ${runId}
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: approve, type: approval, reviewer: human, artifacts: [release.md] }
+notify:
+  - { on: approval.waiting, channels: [email], required: true }
+  - { on: workflow.failed, channels: [terminal] }
+`);
+      const store = await openAgentFlowRunState({ cwd: repoRoot });
+      createAgentFlowLifecycleRun(store, { id: runId, workflow });
+      store.writeArtifact({
+        id: "release",
+        runId,
+        path: "release.md",
+        kind: "fixture",
+        contentType: "text/markdown",
+        content: "Release candidate"
+      });
+      const notifications = createAgentFlowNotificationRegistry({
+        email: () => {
+          throw new Error("email service unavailable");
+        },
+        terminal: () => {
+          transitionAgentFlowLifecycleRun(store, runId, action);
+        }
+      });
+
+      const result = await executeAgentFlowCommandPipeline(
+        store,
+        runId,
+        workflow,
+        undefined,
+        undefined,
+        undefined,
+        notifications
+      );
+
+      expect(result.status).toBe(action === "pause" ? "paused" : "cancelled");
+      expect(store.getRun(runId)?.status).toBe(action === "pause" ? "paused" : "cancelled");
+      expect(store.listFailures(runId)).toEqual([]);
+      expect(store.listEvents(runId).map((event) => event.type)).not.toContain("step.failed");
+      expect(store.listApprovals(runId)[0]).toMatchObject(action === "pause"
+        ? { status: "requested", decision: null }
+        : { status: "cancelled", decision: "cancel" });
+      const database = new Database(store.databasePath, { readonly: true });
+      expect(database.query(
+        "SELECT status FROM run_steps WHERE run_id = ? AND step_id = ?"
+      ).get(runId, "approve")).toEqual({ status: action === "pause" ? "waiting" : "cancelled" });
+      database.close();
+      store.close();
+    }
+  });
+
+  test("does not send fallback failure notifications after a later approval channel stops the run", async () => {
+    for (const action of ["pause", "cancel"] as const) {
+      const runId = `approval-channel-stop-before-fallback-${action}`;
+      const repoRoot = temporaryRepo();
+      const workflow = parseAgentFlowWorkflowOrThrow(`
+name: ${runId}
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: approve, type: approval, reviewer: human, artifacts: [release.md] }
+notify:
+  - { on: approval.waiting, channels: [email, slack], required: true }
+  - { on: workflow.failed, channels: [webhook] }
+`);
+      const store = await openAgentFlowRunState({ cwd: repoRoot });
+      createAgentFlowLifecycleRun(store, { id: runId, workflow });
+      store.writeArtifact({
+        id: "release",
+        runId,
+        path: "release.md",
+        kind: "fixture",
+        contentType: "text/markdown",
+        content: "Release candidate"
+      });
+      let failureDeliveries = 0;
+      const notifications = createAgentFlowNotificationRegistry({
+        email: () => {
+          throw new Error("email service unavailable");
+        },
+        slack: () => {
+          transitionAgentFlowLifecycleRun(store, runId, action);
+        },
+        webhook: () => {
+          failureDeliveries += 1;
+        }
+      });
+
+      const result = await executeAgentFlowCommandPipeline(
+        store,
+        runId,
+        workflow,
+        undefined,
+        undefined,
+        undefined,
+        notifications
+      );
+
+      expect(result.status).toBe(action === "pause" ? "paused" : "cancelled");
+      expect(failureDeliveries).toBe(0);
+      expect(store.listEvents(runId).filter((event) =>
+        event.type === "notification.delivered" && event.payload.event === "workflow.failed"
+      )).toEqual([]);
+      store.close();
+    }
+  });
+
+  test("rolls back approval waiting state when notification event persistence fails", async () => {
+    for (const adapterFailure of [false, true]) {
+      const runId = adapterFailure ? "approval-failed-event-rollback" : "approval-delivered-event-rollback";
+      const rejectedEvent = adapterFailure ? "notification.failed" : "notification.delivered";
+      const repoRoot = temporaryRepo();
+      const workflow = parseAgentFlowWorkflowOrThrow(`
+name: ${runId}
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+steps:
+  - { id: approve, type: approval, reviewer: human, artifacts: [release.md] }
+notify:
+  - { on: approval.waiting, channels: [terminal] }
+`);
+      const store = await openAgentFlowRunState({ cwd: repoRoot });
+      createAgentFlowLifecycleRun(store, { id: runId, workflow });
+      const initialContext = store.getRun(runId)!.context;
+      store.writeArtifact({
+        id: "release",
+        runId,
+        path: "release.md",
+        kind: "fixture",
+        contentType: "text/markdown",
+        content: "Release candidate"
+      });
+      const database = new Database(store.databasePath);
+      database.exec(`
+        CREATE TRIGGER reject_approval_notification_event
+        BEFORE INSERT ON events
+        WHEN NEW.type = '${rejectedEvent}'
+        BEGIN
+          SELECT RAISE(ABORT, 'reject approval notification event');
+        END
+      `);
+      database.close();
+      let deliveries = 0;
+      const notifications = createAgentFlowNotificationRegistry({
+        terminal: () => {
+          deliveries += 1;
+          if (adapterFailure) throw new Error("terminal unavailable");
+        }
+      });
+
+      const result = await executeAgentFlowCommandPipeline(
+        store,
+        runId,
+        workflow,
+        undefined,
+        undefined,
+        undefined,
+        notifications
+      );
+
+      expect(result).toMatchObject({ status: "failed", failedStep: "approve" });
+      expect(deliveries).toBe(1);
+      expect(store.getRun(runId)).toMatchObject({ status: "failed", context: initialContext });
+      expect(store.listApprovals(runId)).toEqual([]);
+      expect(store.listEvents(runId).map((event) => event.type)).toEqual([
+        "run.created",
+        "run.started",
+        "step.failed",
+        "run.failed"
+      ]);
+      store.close();
+    }
+  });
+
+  test("does not publish an approval wait after a concurrent cancellation wins the transaction", async () => {
+    const repoRoot = temporaryRepo();
+    const runId = "cancelled-before-approval-wait";
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: ${runId}
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+steps:
+  - { id: approve, type: approval, reviewer: human, artifacts: [release.md] }
+notify:
+  - { on: approval.waiting, channels: [email] }
+`);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    const competitor = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: runId, workflow });
+    store.writeArtifact({
+      id: "release",
+      runId,
+      path: "release.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Release candidate"
+    });
+    let deliveries = 0;
+    const notifications = createAgentFlowNotificationRegistry({
+      email: () => {
+        deliveries += 1;
+      }
+    });
+    const originalFinalization = store.withRunFinalizationTransaction.bind(store);
+    let raced = false;
+    store.withRunFinalizationTransaction = ((transactionRunId, callback) => {
+      if (!raced) {
+        raced = true;
+        transitionAgentFlowLifecycleRun(competitor, runId, "cancel");
+      }
+      return originalFinalization(transactionRunId, callback);
+    }) as typeof store.withRunFinalizationTransaction;
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      runId,
+      workflow,
+      undefined,
+      undefined,
+      undefined,
+      notifications
+    );
+
+    expect(result.status).toBe("cancelled");
+    expect(deliveries).toBe(0);
+    expect(store.listApprovals(runId)).toEqual([]);
+    expect(store.listEvents(runId).map((event) => event.type)).toEqual([
+      "run.created",
+      "run.started",
+      "run.cancel"
+    ]);
+    competitor.close();
+    store.close();
+  });
+
+  test("does not deliver terminal notifications after a non-pipeline run is stopped concurrently", async () => {
+    for (const action of ["pause", "cancel"] as const) {
+      const runId = `collaborative-${action}-finalization-race`;
+      const repoRoot = temporaryRepo();
+      const workflow = parseAgentFlowWorkflowOrThrow(`
+name: ${runId}
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+steps: []
+notify:
+  - { on: workflow.completed, channels: [terminal] }
+`);
+      const store = await openAgentFlowRunState({ cwd: repoRoot });
+      const competitor = await openAgentFlowRunState({ cwd: repoRoot });
+      createAgentFlowLifecycleRun(store, { id: runId, workflow });
+      let deliveries = 0;
+      const notifications = createAgentFlowNotificationRegistry({
+        terminal: () => {
+          deliveries += 1;
+        }
+      });
+      const originalFinalization = store.withRunFinalizationTransaction.bind(store);
+      let raced = false;
+      store.withRunFinalizationTransaction = ((transactionRunId, callback) => {
+        if (!raced) {
+          raced = true;
+          transitionAgentFlowLifecycleRun(competitor, runId, action);
+        }
+        return originalFinalization(transactionRunId, callback);
+      }) as typeof store.withRunFinalizationTransaction;
+
+      const result = await executeAgentFlowCommandPipeline(
+        store,
+        runId,
+        workflow,
+        undefined,
+        undefined,
+        undefined,
+        notifications
+      );
+
+      expect(result.status).toBe(action === "pause" ? "paused" : "cancelled");
+      expect(deliveries).toBe(0);
+      expect(store.listEvents(runId).map((event) => event.type)).not.toContain("notification.delivered");
+      expect(store.getRun(runId)?.status).toBe(action === "pause" ? "paused" : "cancelled");
+      competitor.close();
+      store.close();
+    }
+  });
+
+  test("preserves a non-pipeline lifecycle stop triggered during terminal notification delivery", async () => {
+    const runId = "collaborative-reentrant-notification-stop";
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: ${runId}
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+steps: []
+notify:
+  - { on: workflow.completed, channels: [terminal] }
+`);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: runId, workflow });
+    const notifications = createAgentFlowNotificationRegistry({
+      terminal: () => {
+        transitionAgentFlowLifecycleRun(store, runId, "pause");
+      }
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      runId,
+      workflow,
+      undefined,
+      undefined,
+      undefined,
+      notifications
+    );
+
+    expect(result.status).toBe("paused");
+    expect(store.getRun(runId)?.status).toBe("paused");
+    expect(store.listEvents(runId).map((event) => event.type)).not.toContain("run.completed");
+    store.close();
+  });
+
+  test("notifies collaborative disagreement events with step context", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = notifiedDisagreementWorkflow("notified-disagreement");
+    const providers = disagreementChangesRequestedProviders();
+    const delivered: Array<{ event: string; stepId?: string }> = [];
+    const notifications = createAgentFlowNotificationRegistry({
+      slack: ({ event, stepId }) => {
+        delivered.push({ event, stepId });
+      }
+    });
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: "notified-disagreement", workflow });
+    store.writeArtifact({
+      id: "implementation",
+      runId: "notified-disagreement",
+      path: "implementation.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Implementation"
+    });
+
+    expect((await executeAgentFlowCommandPipeline(
+      store,
+      "notified-disagreement",
+      workflow,
+      undefined,
+      providers,
+      undefined,
+      notifications
+    )).status).toBe("paused");
+    expect(delivered).toEqual([{ event: "collaboration.disagreement", stepId: "review" }]);
+    expect(store.listEvents("notified-disagreement")).toContainEqual(expect.objectContaining({
+      type: "notification.delivered",
+      stepId: "review",
+      payload: expect.objectContaining({ event: "collaboration.disagreement", stepId: "review" })
+    }));
+    store.close();
+  });
+
+  test("stops disagreement handling when notification delivery cancels the run", async () => {
+    const repoRoot = temporaryRepo();
+    const runId = "cancelled-disagreement-notification";
+    const workflow = notifiedDisagreementWorkflow(runId);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: runId, workflow });
+    store.writeArtifact({
+      id: "implementation",
+      runId,
+      path: "implementation.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Implementation"
+    });
+    const notifications = createAgentFlowNotificationRegistry({
+      slack: () => {
+        transitionAgentFlowLifecycleRun(store, runId, "cancel");
+      }
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      runId,
+      workflow,
+      undefined,
+      disagreementChangesRequestedProviders(),
+      undefined,
+      notifications
+    );
+
+    expect(result.status).toBe("cancelled");
+    expect(store.getRun(runId)).toMatchObject({ status: "cancelled", context: { workflow } });
+    expect(store.getRun(runId)?.context.waiting).toBeUndefined();
+    expect(store.listEvents(runId).map((event) => event.type))
+      .not.toContain("collaboration.disagreement.waiting");
+    store.close();
+  });
+
+  test("keeps an ask-user disagreement resumable when notification delivery pauses the run", async () => {
+    const repoRoot = temporaryRepo();
+    const runId = "paused-disagreement-notification";
+    const workflow = notifiedDisagreementWorkflow(runId);
+    const providers = disagreementChangesRequestedProviders();
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: runId, workflow });
+    store.writeArtifact({
+      id: "implementation",
+      runId,
+      path: "implementation.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Implementation"
+    });
+    const notifications = createAgentFlowNotificationRegistry({
+      slack: () => {
+        transitionAgentFlowLifecycleRun(store, runId, "pause");
+      }
+    });
+
+    const paused = await executeAgentFlowCommandPipeline(
+      store,
+      runId,
+      workflow,
+      undefined,
+      providers,
+      undefined,
+      notifications
+    );
+
+    expect(paused.status).toBe("paused");
+    expect(store.getRun(runId)).toMatchObject({
+      status: "paused",
+      currentStepId: "review",
+      context: { waiting: { kind: "disagreement", stepId: "review" } }
+    });
+    expect(store.listEvents(runId).map((event) => event.type))
+      .toContain("collaboration.disagreement.waiting");
+
+    const resumed = await resumeAgentFlowCommandPipeline(
+      store,
+      runId,
+      workflow,
+      { outcome: "approve" },
+      undefined,
+      providers,
+      undefined,
+      notifications
+    );
+
+    expect(resumed.status).toBe("completed");
+    expect(store.getRun(runId)?.context.waiting).toBeUndefined();
+    store.close();
+  });
+
+  test("does not publish disagreement events after a concurrent cancellation wins the transaction", async () => {
+    const repoRoot = temporaryRepo();
+    const runId = "cancelled-before-disagreement-notification";
+    const workflow = notifiedDisagreementWorkflow(runId);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    const competitor = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: runId, workflow });
+    store.writeArtifact({
+      id: "implementation",
+      runId,
+      path: "implementation.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Implementation"
+    });
+    let deliveries = 0;
+    const notifications = createAgentFlowNotificationRegistry({
+      slack: () => {
+        deliveries += 1;
+      }
+    });
+    const originalFinalization = store.withRunFinalizationTransaction.bind(store);
+    let raced = false;
+    store.withRunFinalizationTransaction = ((transactionRunId, callback) => {
+      const events = store.listEvents(runId);
+      const readyToDisagree = events.some((event) => event.type === "step.completed" && event.stepId === "revise");
+      if (readyToDisagree && !raced) {
+        raced = true;
+        transitionAgentFlowLifecycleRun(competitor, runId, "cancel");
+      }
+      return originalFinalization(transactionRunId, callback);
+    }) as typeof store.withRunFinalizationTransaction;
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      runId,
+      workflow,
+      undefined,
+      disagreementChangesRequestedProviders(),
+      undefined,
+      notifications
+    );
+
+    expect(result.status).toBe("cancelled");
+    expect(deliveries).toBe(0);
+    expect(store.listEvents(runId).map((event) => event.type)).not.toContain("collaboration.disagreement");
+    expect(store.listEvents(runId).map((event) => event.type)).not.toContain("notification.delivered");
+    competitor.close();
+    store.close();
+  });
+
+  test("skips disagreement delivery when cancellation lands between the precheck and delivery", async () => {
+    const repoRoot = temporaryRepo();
+    const runId = "cancelled-at-disagreement-delivery";
+    const workflow = notifiedDisagreementWorkflow(runId);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    const competitor = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: runId, workflow });
+    store.writeArtifact({
+      id: "implementation",
+      runId,
+      path: "implementation.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Implementation"
+    });
+    let deliveries = 0;
+    const notifications = createAgentFlowNotificationRegistry({
+      slack: () => {
+        deliveries += 1;
+      }
+    });
+    const originalFinalization = store.withRunFinalizationTransaction.bind(store);
+    let raced = false;
+    store.withRunFinalizationTransaction = ((transactionRunId, callback) => {
+      const disagreementPublished = store.listEvents(runId)
+        .some((event) => event.type === "collaboration.disagreement");
+      if (disagreementPublished && !raced) {
+        raced = true;
+        transitionAgentFlowLifecycleRun(competitor, runId, "cancel");
+      }
+      return originalFinalization(transactionRunId, callback);
+    }) as typeof store.withRunFinalizationTransaction;
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      runId,
+      workflow,
+      undefined,
+      disagreementChangesRequestedProviders(),
+      undefined,
+      notifications
+    );
+
+    expect(result.status).toBe("cancelled");
+    expect(deliveries).toBe(0);
+    expect(store.listEvents(runId).map((event) => event.type)).toContain("collaboration.disagreement");
+    expect(store.listEvents(runId).map((event) => event.type)).not.toContain("notification.delivered");
+    competitor.close();
+    store.close();
+  });
+
+  test("records required disagreement notification failure on a fresh review attempt", async () => {
+    const repoRoot = temporaryRepo();
+    const runId = "required-disagreement-notification";
+    const workflow = notifiedDisagreementWorkflow(runId, true);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: runId, workflow });
+    store.writeArtifact({
+      id: "implementation",
+      runId,
+      path: "implementation.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Implementation"
+    });
+    const notifications = createAgentFlowNotificationRegistry({
+      slack: () => {
+        throw new Error("slack unavailable");
+      }
+    });
+
+    expect((await executeAgentFlowCommandPipeline(
+      store,
+      runId,
+      workflow,
+      undefined,
+      disagreementChangesRequestedProviders(),
+      undefined,
+      notifications
+    )).status).toBe("failed");
+
+    const database = new Database(store.databasePath, { readonly: true });
+    expect(database.query(
+      "SELECT attempt, status FROM run_steps WHERE run_id = ? AND step_id = ? ORDER BY attempt"
+    ).all(runId, "review")).toEqual([
+      { attempt: 1, status: "completed" },
+      { attempt: 2, status: "failed" }
+    ]);
+    database.close();
+    expect(store.listEvents(runId)).toContainEqual(expect.objectContaining({
+      type: "step.failed",
+      stepId: "review",
+      payload: expect.objectContaining({ attempt: 2 })
+    }));
+    store.close();
+  });
+
+  test("returns a concurrent stop that wins required disagreement failure finalization", async () => {
+    const repoRoot = temporaryRepo();
+    const runId = "cancelled-required-disagreement-notification";
+    const workflow = notifiedDisagreementWorkflow(runId, true);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    const competitor = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: runId, workflow });
+    store.writeArtifact({
+      id: "implementation",
+      runId,
+      path: "implementation.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Implementation"
+    });
+    let notificationFailed = false;
+    const notifications = createAgentFlowNotificationRegistry({
+      slack: () => {
+        notificationFailed = true;
+        throw new Error("slack unavailable");
+      }
+    });
+    const originalFinalization = store.withRunFinalizationTransaction.bind(store);
+    let raced = false;
+    store.withRunFinalizationTransaction = ((transactionRunId, callback) => {
+      if (notificationFailed && !raced) {
+        raced = true;
+        transitionAgentFlowLifecycleRun(competitor, runId, "cancel");
+      }
+      return originalFinalization(transactionRunId, callback);
+    }) as typeof store.withRunFinalizationTransaction;
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      runId,
+      workflow,
+      undefined,
+      disagreementChangesRequestedProviders(),
+      undefined,
+      notifications
+    );
+
+    expect(result.status).toBe("cancelled");
+    expect(result).not.toHaveProperty("failedStep");
+    expect(result).not.toHaveProperty("failureOutcome");
+    expect(store.getRun(runId)?.status).toBe("cancelled");
+    expect(store.listEvents(runId).map((event) => event.type)).not.toContain("step.failed");
+    expect(store.listFailures(runId)).toEqual([]);
+    competitor.close();
     store.close();
   });
 
@@ -814,6 +1790,131 @@ notify:
     reopened.close();
   });
 
+  test("preserves a cancellation triggered by a pause notification adapter", async () => {
+    for (const required of [false, true]) {
+      const repoRoot = temporaryRepo();
+      const runId = required ? "required-pause-adapter-cancel" : "optional-pause-adapter-cancel";
+      const workflow = parseAgentFlowWorkflowOrThrow(`
+name: ${runId}
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+steps: []
+notify:
+  - { on: workflow.paused, channels: [terminal], required: ${String(required)} }
+`);
+      const store = await openAgentFlowRunState({ cwd: repoRoot });
+      createAgentFlowLifecycleRun(store, { id: runId, workflow });
+      const notifications = createAgentFlowNotificationRegistry({
+        terminal: () => {
+          transitionAgentFlowLifecycleRun(store, runId, "cancel");
+          if (required) throw new Error("delivery failed after cancellation");
+        }
+      });
+
+      const result = transitionAgentFlowLifecycleRun(store, runId, "pause", notifications);
+
+      expect(result.run.status).toBe("cancelled");
+      expect(store.getRun(runId)?.status).toBe("cancelled");
+      expect(store.listEvents(runId).map((event) => event.type)).toEqual([
+        "run.created",
+        "run.pause",
+        "run.cancel",
+        required ? "notification.failed" : "notification.delivered"
+      ]);
+      store.close();
+    }
+  });
+
+  test("preserves cancellation triggered by fallback failure notifications", async () => {
+    for (const source of ["completion", "pause"] as const) {
+      const repoRoot = temporaryRepo();
+      const runId = `fallback-cancel-${source}`;
+      const sourceEvent = source === "completion" ? "workflow.completed" : "workflow.paused";
+      const workflow = parseAgentFlowWorkflowOrThrow(`
+name: ${runId}
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+steps: []
+notify:
+  - { on: ${sourceEvent}, channels: [terminal], required: true }
+  - { on: workflow.failed, channels: [email] }
+`);
+      const store = await openAgentFlowRunState({ cwd: repoRoot });
+      createAgentFlowLifecycleRun(store, { id: runId, workflow });
+      let failureDeliveries = 0;
+      const notifications = createAgentFlowNotificationRegistry({
+        terminal: () => {
+          throw new Error("source delivery failed");
+        },
+        email: () => {
+          failureDeliveries += 1;
+          transitionAgentFlowLifecycleRun(store, runId, "cancel");
+        }
+      });
+
+      const status = source === "completion"
+        ? (await executeAgentFlowCommandPipeline(
+            store,
+            runId,
+            workflow,
+            undefined,
+            undefined,
+            undefined,
+            notifications
+          )).status
+        : transitionAgentFlowLifecycleRun(store, runId, "pause", notifications).run.status;
+
+      expect(status).toBe("cancelled");
+      expect(failureDeliveries).toBe(1);
+      expect(store.getRun(runId)?.status).toBe("cancelled");
+      expect(store.listEvents(runId).map((event) => event.type)).not.toContain("run.failed");
+      store.close();
+    }
+  });
+
+  test("returns cancellation without stale failure metadata when failure delivery cancels", async () => {
+    const repoRoot = temporaryRepo();
+    const runId = "failure-notification-cancel-result";
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: ${runId}
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+steps:
+  - { id: broken, type: command, command: "exit 2", on_failure: { then: fail } }
+notify:
+  - { on: workflow.failed, channels: [terminal] }
+`);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: runId, workflow });
+    const notifications = createAgentFlowNotificationRegistry({
+      terminal: () => {
+        transitionAgentFlowLifecycleRun(store, runId, "cancel");
+      }
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      runId,
+      workflow,
+      undefined,
+      undefined,
+      undefined,
+      notifications
+    );
+
+    expect(result.status).toBe("cancelled");
+    expect(result).not.toHaveProperty("failedStep");
+    expect(result).not.toHaveProperty("failureOutcome");
+    expect(store.getRun(runId)?.status).toBe("cancelled");
+    store.close();
+  });
+
   test("stops an active executor when a required operator-pause notification fails", async () => {
     const repoRoot = temporaryRepo();
     const marker = path.join(repoRoot, "continued");
@@ -923,7 +2024,7 @@ retention:
     store.close();
   });
 
-  test("keeps notification finalization and the summary reservation scoped to pipeline workflows", async () => {
+  test("delivers notifications across workflow styles while keeping summary reservation pipeline-scoped", async () => {
     const repoRoot = temporaryRepo();
     const workflow = parseAgentFlowWorkflowOrThrow(`
 name: recovery-with-notify-data
@@ -936,13 +2037,12 @@ steps:
     command: "printf recovered > final-summary.md"
     outputs: [final-summary.md]
 notify:
-  - { on: workflow.completed, channels: [system], required: yes }
+  - { on: workflow.completed, channels: [system], required: true }
 `);
     let delivered = false;
     const notifications = createAgentFlowNotificationRegistry({
       system: () => {
         delivered = true;
-        throw new Error("unavailable");
       }
     });
     const store = await openAgentFlowRunState({ cwd: repoRoot });
@@ -957,7 +2057,7 @@ notify:
       undefined,
       notifications
     )).status).toBe("completed");
-    expect(delivered).toBe(false);
+    expect(delivered).toBe(true);
     expect(store.readArtifact("recovery-with-notify-data", "final-summary.md").content.toString("utf8"))
       .toBe("recovered");
     store.close();
@@ -1014,6 +2114,67 @@ notify:
       step_type: "manual_gate",
       classification: "notification_failure"
     });
+    store.close();
+  });
+
+  test("keeps a manual gate waiting when its fallback failure notification pauses the run", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: gate-failure-notification-pause
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+steps:
+  - { id: approve, type: manual_gate, message: Continue?, options: [approve, cancel] }
+notify:
+  - { on: workflow.paused, channels: [terminal], required: true }
+  - { on: workflow.failed, channels: [email] }
+`);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: "gate-failure-notification-pause", workflow });
+    const lifecycleNotifications = createAgentFlowNotificationRegistry({ terminal: () => {} });
+    const notifications = createAgentFlowNotificationRegistry({
+      terminal: () => {
+        throw new Error("terminal unavailable");
+      },
+      email: () => {
+        transitionAgentFlowLifecycleRun(
+          store,
+          "gate-failure-notification-pause",
+          "pause",
+          lifecycleNotifications
+        );
+      }
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      "gate-failure-notification-pause",
+      workflow,
+      undefined,
+      undefined,
+      undefined,
+      notifications
+    );
+
+    expect(result.status).toBe("paused");
+    expect(store.getRun("gate-failure-notification-pause")).toMatchObject({
+      status: "paused",
+      context: { waiting: { kind: "manual_gate", stepId: "approve" } }
+    });
+    expect(store.listApprovals("gate-failure-notification-pause")[0]).toMatchObject({
+      status: "requested",
+      decision: null
+    });
+    expect(store.listFailures("gate-failure-notification-pause")).toEqual([]);
+    expect(store.listEvents("gate-failure-notification-pause").map((event) => event.type))
+      .not.toContain("step.failed");
+    const database = new Database(store.databasePath, { readonly: true });
+    expect(database.query(
+      "SELECT status FROM run_steps WHERE run_id = ? AND step_id = ?"
+    ).get("gate-failure-notification-pause", "approve")).toEqual({ status: "waiting" });
+    database.close();
     store.close();
   });
 
@@ -1079,6 +2240,39 @@ notify:
   });
 
   test("validates notification rules and reserves the runtime summary path in pipeline workflows", async () => {
+    const schema = JSON.parse(
+      fs.readFileSync(path.join(import.meta.dir, "../../schemas/workflow.schema.json"), "utf8")
+    ) as {
+      $defs: {
+        notificationRule: {
+          properties: {
+            on: { pattern?: string };
+            channels: { items: { pattern?: string } };
+          };
+        };
+      };
+    };
+    expect(schema.$defs.notificationRule.properties).toMatchObject({
+      on: {
+        pattern: "^\\s*(workflow\\.completed|workflow\\.failed|workflow\\.paused|approval\\.waiting|collaboration\\.disagreement)\\s*$"
+      },
+      channels: { items: { pattern: "\\S" } }
+    });
+    const notificationEventPattern = new RegExp(schema.$defs.notificationRule.properties.on.pattern!);
+    expect(notificationEventPattern.test(" workflow.completed ")).toBe(true);
+    expect(notificationEventPattern.test("workflow.cancelled")).toBe(false);
+
+    const paddedEventWorkflow = parseAgentFlowWorkflowOrThrow(`
+name: padded-notification-event
+version: 1
+style: pipeline
+maturity: experimental
+steps: []
+notify:
+  - { on: " workflow.completed ", channels: [terminal] }
+`);
+    expect(validateAgentFlowWorkflow(paddedEventWorkflow).valid).toBe(true);
+
     const workflow = parseAgentFlowWorkflowOrThrow(`
 name: invalid-notifications
 version: 1
@@ -1834,4 +3028,44 @@ function temporaryRepo(): string {
   const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agent-flow-notifications-"));
   fs.mkdirSync(path.join(repoRoot, ".git"));
   return repoRoot;
+}
+
+function notifiedDisagreementWorkflow(name: string, required = false) {
+  return parseAgentFlowWorkflowOrThrow(`
+name: ${name}
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true, max_review_cycles: 1, on_disagreement: ask_user }
+sessions:
+  implementer: { provider: fixture, role: implementer }
+  reviewer:
+    provider: fixture
+    role: reviewer
+    authority: { can_request_changes: true, can_approve: true }
+steps:
+  - { id: review, type: review, reviewer: reviewer, subject: implementer, artifacts: [implementation.md], outputs: [reviews/review.json], then: route }
+  - id: route
+    type: condition
+    branches:
+      - { if: 'artifacts.reviews.review.status == "approved"', then: done }
+      - { if: 'artifacts.reviews.review.status == "changes_requested"', then: revise }
+    else: fail
+  - { id: revise, type: command, command: "true", then: review }
+  - { id: done, type: result, status: completed }
+notify:
+  - { on: collaboration.disagreement, channels: [slack], required: ${String(required)} }
+`);
+}
+
+function disagreementChangesRequestedProviders() {
+  return createAgentFlowSessionProviderRegistry().register("fixture", (request) => ({
+    outputs: {
+      [request.outputs[0]!]: JSON.stringify({
+        status: "changes_requested",
+        findings: [{ summary: "Needs another revision." }],
+        summary: "Needs another revision."
+      })
+    }
+  }));
 }

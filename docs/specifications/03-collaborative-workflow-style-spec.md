@@ -473,10 +473,15 @@ notify:
   - on: approval.waiting
     channels: [system, terminal]
   - on: collaboration.disagreement
-    channels: [email_personal]
+    channels: [email]
   - on: workflow.paused
-    channels: [email_personal, terminal]
+    channels: [email, terminal]
 ```
+
+Approval and disagreement notifications include the originating step ID and
+event payload in the adapter request. Delivery failure is diagnostic unless
+the rule declares `required: true`, in which case the workflow fails and the
+failure is persisted.
 
 ## 17. Validation Rules
 

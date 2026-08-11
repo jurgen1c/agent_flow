@@ -107,6 +107,11 @@ Collaborative review loops declare both `max_review_cycles` and an
 arbiter, fall back from an arbiter to the user, let the reviewed owner decide,
 or fail. Resolution rounds are persisted under unique per-episode paths below
 `disagreements/`, and the run event log records the selected resolution path.
+Workflow completion, failure, pause, human approval waiting, and collaborative
+disagreement events can notify configured channels. `terminal` and `system`
+are built in; applications can inject synchronous `email`, `slack`, `webhook`,
+and `command` adapters or register other named channels. Delivery failures are
+recorded and remain non-terminal unless the notification rule is required.
 
 ## Architecture
 

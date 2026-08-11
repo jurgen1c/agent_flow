@@ -167,6 +167,7 @@ export {
 export {
   AgentFlowNotificationRegistry,
   createAgentFlowNotificationRegistry,
+  deliverAgentFlowNotificationEvent,
   deliverAgentFlowNotifications,
   validateAgentFlowNotifications
 } from "./notifications";
@@ -298,6 +299,12 @@ export type {
 export type {
   AgentFlowNotification,
   AgentFlowNotificationAdapter,
+  AgentFlowNotificationAdapters,
+  AgentFlowNotificationContext,
+  AgentFlowEmailNotificationAdapter,
+  AgentFlowSlackNotificationAdapter,
+  AgentFlowWebhookNotificationAdapter,
+  AgentFlowCommandNotificationAdapter,
   AgentFlowNotificationDeliveryResult,
   AgentFlowNotificationEvent,
   AgentFlowNotificationIssue

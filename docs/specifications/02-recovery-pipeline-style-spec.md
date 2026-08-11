@@ -419,11 +419,8 @@ Recommended:
 
 ```yaml
 notify:
-  - on: step.failed
-    channels: [terminal]
-    throttle_seconds: 300
   - on: workflow.paused
-    channels: [system, email_personal]
+    channels: [system, email_personal, terminal]
   - on: workflow.failed
     channels: [email_personal]
   - on: workflow.completed

@@ -133,7 +133,7 @@ export function transitionAgentFlowLifecycleRun(
       "AGENT_FLOW_WORKFLOW_INVALID"
     );
   }
-  if (workflow.style === "pipeline" && (action === "pause" || action === "cancel")) {
+  if (action === "pause" || (workflow.style === "pipeline" && action === "cancel")) {
     return withAgentFlowPipelineFinalization(
       store,
       runId,
@@ -192,8 +192,9 @@ function transitionAgentFlowLifecycleRunUnlocked(
   });
   if (action !== "pause" && action !== "cancel") return result;
 
-  if (workflow.style !== "pipeline") return result;
-  if (!result.changed && agentFlowPipelineEffectsFinalized(store, runId, "paused")) return result;
+  if (workflow.style !== "pipeline" && action !== "pause") return result;
+  if (!result.changed && (workflow.style !== "pipeline"
+      || agentFlowPipelineEffectsFinalized(store, runId, "paused"))) return result;
   return finalizeLifecycleSideEffects(
     store,
     runId,
@@ -219,8 +220,12 @@ function finalizeLifecycleSideEffects(
   }
 
   const delivery = deliverAgentFlowNotifications(store, runId, workflow, "paused", notifications);
+  const currentAfterDelivery = store.getRun(runId)!;
+  if (currentAfterDelivery.status !== "paused") {
+    return { changed: result.changed, run: currentAfterDelivery };
+  }
   if (delivery.requiredFailure === undefined) {
-    markAgentFlowPipelineEffectsFinalized(store, runId, "paused");
+    if (workflow.style === "pipeline") markAgentFlowPipelineEffectsFinalized(store, runId, "paused");
     markLifecycleFinalized(store, runId, action, "paused");
     return { changed: result.changed, run: store.getRun(runId)! };
   }
@@ -231,20 +236,26 @@ function finalizeLifecycleSideEffects(
     event: delivery.requiredFailure.event,
     message
   };
-  try {
-    writeAgentFlowFinalSummary(store, runId, workflow, { status: "failed", completedSteps, message });
-  } catch (summaryError) {
-    return failLifecycleSummary(
-      store,
-      runId,
-      action,
-      workflow,
-      completedSteps,
-      notifications,
-      summaryError
-    );
+  if (workflow.style === "pipeline") {
+    try {
+      writeAgentFlowFinalSummary(store, runId, workflow, { status: "failed", completedSteps, message });
+    } catch (summaryError) {
+      return failLifecycleSummary(
+        store,
+        runId,
+        action,
+        workflow,
+        completedSteps,
+        notifications,
+        summaryError
+      );
+    }
   }
   deliverAgentFlowNotifications(store, runId, workflow, "failed", notifications);
+  const currentAfterFailureDelivery = store.getRun(runId)!;
+  if (currentAfterFailureDelivery.status !== "paused") {
+    return { changed: result.changed, run: currentAfterFailureDelivery };
+  }
   store.updateRun(runId, { currentStepId: null, error });
   const failed = store.transitionRunWithEvent(runId, {
     status: "failed",
@@ -254,8 +265,10 @@ function finalizeLifecycleSideEffects(
       payload: { code: "notification.required.failed", completedSteps, message }
     }
   });
-  applyAgentFlowRetention(store, runId, workflow, "failed");
-  markAgentFlowPipelineEffectsFinalized(store, runId, "failed");
+  if (workflow.style === "pipeline") {
+    applyAgentFlowRetention(store, runId, workflow, "failed");
+    markAgentFlowPipelineEffectsFinalized(store, runId, "failed");
+  }
   markLifecycleFinalized(store, runId, action, "failed");
   return failed;
 }

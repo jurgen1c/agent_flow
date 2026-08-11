@@ -659,6 +659,169 @@ notify:
     store.close();
   });
 
+  test("delivers one failure notification when required nested completion delivery fails", async () => {
+    const root = temporaryRepo();
+    const parent = parseAgentFlowWorkflowOrThrow(`name: notification-failure-parent
+version: 1
+style: recovery_pipeline
+maturity: experimental
+limits: { max_recovery_cycles: 1, max_step_attempts: { check: 1 } }
+steps:
+  - id: check
+    type: command
+    command: exit 1
+    on_failure:
+      route_to: { workflow: notification-failure-child }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+    const child = parseAgentFlowWorkflowOrThrow(`name: notification-failure-child
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - { id: done, type: result, status: remediated }
+notify:
+  - { on: workflow.completed, channels: [email, terminal], required: true }
+  - { on: workflow.failed, channels: [email] }
+`);
+    let successfulCompletionDeliveries = 0;
+    let completionDeliveries = 0;
+    let failureDeliveries = 0;
+    const notifications = createAgentFlowNotificationRegistry({
+      email: ({ event }) => {
+        if (event === "workflow.completed") successfulCompletionDeliveries += 1;
+        else failureDeliveries += 1;
+      },
+      terminal: () => {
+        completionDeliveries += 1;
+        throw new Error("completion delivery failed");
+      }
+    });
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "notification-failure-parent", workflow: parent });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      "notification-failure-parent",
+      parent,
+      undefined,
+      undefined,
+      undefined,
+      notifications,
+      createAgentFlowWorkflowRegistry().register("notification-failure-child", child)
+    );
+
+    expect(result.status).toBe("paused");
+    expect(successfulCompletionDeliveries).toBe(1);
+    expect(completionDeliveries).toBe(1);
+    expect(failureDeliveries).toBe(1);
+    const failure = store.listFailures("notification-failure-parent")[0]!;
+    const recoveryRunId = (failure.payload as { recovery: { recoveryRunId: string } }).recovery.recoveryRunId;
+    expect(store.getRun(recoveryRunId)).toMatchObject({
+      status: "failed",
+      error: {
+        code: "notification.required.failed",
+        channel: "terminal",
+        event: "workflow.completed"
+      }
+    });
+    expect(store.listEvents(recoveryRunId).map((event) => event.type)).toEqual([
+      "run.created",
+      "run.started",
+      "step.completed",
+      "notification.delivered",
+      "notification.failed",
+      "notification.delivered",
+      "step.failed",
+      "run.failed"
+    ]);
+    expect(store.listFailures(recoveryRunId)[0]).toMatchObject({
+      classification: "notification_failure",
+      payload: { channel: "terminal", event: "workflow.completed" }
+    });
+    store.close();
+  });
+
+  test("rolls back promoted outputs when a completion adapter stops nested recovery", async () => {
+    for (const [action, deliveryFails] of [
+      ["pause", false],
+      ["pause", true],
+      ["cancel", false]
+    ] as const) {
+      const root = temporaryRepo();
+      const variant = deliveryFails ? `${action}-failure` : action;
+      const parentRunId = `stopped-promotion-parent-${variant}`;
+      const childName = `stopped-promotion-child-${variant}`;
+      const parent = parseAgentFlowWorkflowOrThrow(`name: ${parentRunId}
+version: 1
+style: recovery_pipeline
+maturity: experimental
+limits: { max_recovery_cycles: 1, max_step_attempts: { check: 1 } }
+steps:
+  - id: check
+    type: command
+    command: exit 1
+    on_failure:
+      route_to: { workflow: ${childName}, file_scope: { include: [repaired.txt] } }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+      const child = parseAgentFlowWorkflowOrThrow(`name: ${childName}
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - { id: repair, type: command, command: "echo repaired > repaired.txt", outputs: [repaired.txt] }
+  - { id: done, type: result, status: remediated }
+notify:
+  - { on: workflow.completed, channels: [terminal], required: ${String(deliveryFails)} }
+`);
+      const store = await openAgentFlowRunState({ cwd: root });
+      createAgentFlowLifecycleRun(store, { id: parentRunId, workflow: parent });
+      const notifications = createAgentFlowNotificationRegistry({
+        terminal: ({ runId }) => {
+          transitionAgentFlowLifecycleRun(store, runId, action);
+          if (deliveryFails) throw new Error("completion delivery failed after pause");
+        }
+      });
+
+      const result = await executeAgentFlowCommandPipeline(
+        store,
+        parentRunId,
+        parent,
+        undefined,
+        undefined,
+        undefined,
+        notifications,
+        createAgentFlowWorkflowRegistry().register(childName, child)
+      );
+
+      expect(result.status).toBe("paused");
+      expect(store.getArtifact(parentRunId, "repaired.txt")).toBeNull();
+      expect(store.listEvents(parentRunId).map((event) => event.type))
+        .not.toContain("recovery.outputs.promoted");
+      const parentFailure = store.listFailures(parentRunId)[0]!;
+      const recoveryRunId = (parentFailure.payload as { recovery: { recoveryRunId: string } })
+        .recovery.recoveryRunId;
+      expect(store.getRun(recoveryRunId)).toMatchObject({
+        status: "failed",
+        ...(deliveryFails ? { error: { code: "notification.required.failed" } } : {})
+      });
+      expect(store.listEvents(recoveryRunId)).toContainEqual(expect.objectContaining({
+        type: deliveryFails ? "notification.failed" : "notification.delivered",
+        payload: expect.objectContaining({ event: "workflow.completed", required: deliveryFails })
+      }));
+      if (deliveryFails) {
+        expect(store.listFailures(recoveryRunId)[0]).toMatchObject({
+          classification: "notification_failure",
+          payload: { event: "workflow.completed" }
+        });
+      }
+      store.close();
+    }
+  });
+
   test("does not promote copied recovery inputs that no child step produced", async () => {
     const root = temporaryRepo();
     const parent = parseAgentFlowWorkflowOrThrow(`name: skipped-artifact-parent

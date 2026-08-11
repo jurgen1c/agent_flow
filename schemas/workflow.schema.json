@@ -87,7 +87,10 @@
       },
       "additionalProperties": true
     },
-    "notify": { "type": "array" },
+    "notify": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/notificationRule" }
+    },
     "retention": {
       "type": "object",
       "properties": {
@@ -134,20 +137,6 @@
       },
       "then": {
         "properties": { "short_circuit_if": false }
-      }
-    },
-    {
-      "if": {
-        "properties": { "style": { "const": "pipeline" } },
-        "required": ["style"]
-      },
-      "then": {
-        "properties": {
-          "notify": {
-            "type": "array",
-            "items": { "$ref": "#/$defs/notificationRule" }
-          }
-        }
       }
     }
   ],
@@ -357,13 +346,13 @@
       "properties": {
         "on": {
           "type": "string",
-          "minLength": 1
+          "pattern": "^\\s*(workflow\\.completed|workflow\\.failed|workflow\\.paused|approval\\.waiting|collaboration\\.disagreement)\\s*$"
         },
         "channels": {
           "type": "array",
           "minItems": 1,
           "uniqueItems": true,
-          "items": { "type": "string", "minLength": 1 }
+          "items": { "type": "string", "minLength": 1, "pattern": "\\S" }
         },
         "required": { "type": "boolean" }
       },

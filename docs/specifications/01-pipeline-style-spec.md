@@ -250,15 +250,20 @@ use an updated deterministic response set.
 
 ## 11. Notifications
 
-Pipeline notifications are emitted for configured completion, failure, and
-paused outcomes. The built-in runtime channels are `terminal` and `system`;
-embedders can register additional named channel adapters. Delivery attempts are
-currently synchronous; a promise-returning adapter is rejected as a delivery
-failure so a required channel cannot be recorded as delivered before it settles.
-Each attempt is recorded in the ordered run event log. A failed delivery is
-diagnostic by default and does not change the pipeline outcome. Set
-`required: true` on a notification rule when failure to deliver any channel
-must fail a completed or paused pipeline.
+Workflow notifications are emitted for configured completion, failure, and
+paused outcomes. Human approvals also emit `approval.waiting`, and bounded
+collaborative review loops emit `collaboration.disagreement` when they enter
+disagreement handling. The built-in runtime channels are `terminal` and
+`system`; embedders can inject explicit `email`, `slack`, `webhook`, and
+`command` adapters or register another named adapter. External adapters own
+their credentials, destinations, and transport behavior.
+
+Delivery attempts are synchronous; a promise-returning adapter is rejected as
+a delivery failure so a required channel cannot be recorded as delivered
+before it settles. Each attempt is recorded in the ordered run event log. A
+failed delivery is diagnostic by default and does not change the workflow
+outcome. Set `required: true` on a notification rule when failure to deliver any
+channel must fail the workflow.
 
 ```yaml
 notify:
@@ -269,6 +274,10 @@ notify:
   - on: workflow.paused
     channels: [terminal, system]
     required: true
+  - on: approval.waiting
+    channels: [email]
+  - on: collaboration.disagreement
+    channels: [slack]
 ```
 
 ## 12. Cleanup
