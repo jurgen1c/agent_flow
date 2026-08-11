@@ -198,7 +198,7 @@ function deliverAgentFlowNotificationEventUnlocked(
     const required = rule?.required === true;
     for (const channel of stringList(rule?.channels)) {
       if (store.getRun(runId)?.status !== initialStatus) {
-        return requiredFailure === undefined ? {} : { requiredFailure, attempts };
+        return deliveryResult(requiredFailure, attempts, true);
       }
       const notification = buildNotification(runId, workflow.name, event, channel, required, context);
       let failureMessage: string | undefined;
@@ -250,7 +250,16 @@ function deliverAgentFlowNotificationEventUnlocked(
     }
   }
 
-  return requiredFailure === undefined ? {} : { requiredFailure, attempts };
+  return deliveryResult(requiredFailure, attempts, store.getRun(runId)?.status !== initialStatus);
+}
+
+function deliveryResult(
+  requiredFailure: AgentFlowNotificationDeliveryResult["requiredFailure"],
+  attempts: NonNullable<AgentFlowNotificationDeliveryResult["attempts"]>,
+  stopped: boolean
+): AgentFlowNotificationDeliveryResult {
+  if (requiredFailure !== undefined) return { requiredFailure, attempts };
+  return stopped && attempts.length > 0 ? { attempts } : {};
 }
 
 const NOTIFICATION_EVENTS = new Set<AgentFlowNotificationEvent>([

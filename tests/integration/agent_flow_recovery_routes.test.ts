@@ -744,10 +744,15 @@ notify:
   });
 
   test("rolls back promoted outputs when a completion adapter stops nested recovery", async () => {
-    for (const action of ["pause", "cancel"] as const) {
+    for (const [action, deliveryFails] of [
+      ["pause", false],
+      ["pause", true],
+      ["cancel", false]
+    ] as const) {
       const root = temporaryRepo();
-      const parentRunId = `stopped-promotion-parent-${action}`;
-      const childName = `stopped-promotion-child-${action}`;
+      const variant = deliveryFails ? `${action}-failure` : action;
+      const parentRunId = `stopped-promotion-parent-${variant}`;
+      const childName = `stopped-promotion-child-${variant}`;
       const parent = parseAgentFlowWorkflowOrThrow(`name: ${parentRunId}
 version: 1
 style: recovery_pipeline
@@ -770,13 +775,14 @@ steps:
   - { id: repair, type: command, command: "echo repaired > repaired.txt", outputs: [repaired.txt] }
   - { id: done, type: result, status: remediated }
 notify:
-  - { on: workflow.completed, channels: [terminal] }
+  - { on: workflow.completed, channels: [terminal], required: ${String(deliveryFails)} }
 `);
       const store = await openAgentFlowRunState({ cwd: root });
       createAgentFlowLifecycleRun(store, { id: parentRunId, workflow: parent });
       const notifications = createAgentFlowNotificationRegistry({
         terminal: ({ runId }) => {
           transitionAgentFlowLifecycleRun(store, runId, action);
+          if (deliveryFails) throw new Error("completion delivery failed after pause");
         }
       });
 
@@ -798,7 +804,20 @@ notify:
       const parentFailure = store.listFailures(parentRunId)[0]!;
       const recoveryRunId = (parentFailure.payload as { recovery: { recoveryRunId: string } })
         .recovery.recoveryRunId;
-      expect(store.getRun(recoveryRunId)?.status).toBe("failed");
+      expect(store.getRun(recoveryRunId)).toMatchObject({
+        status: "failed",
+        ...(deliveryFails ? { error: { code: "notification.required.failed" } } : {})
+      });
+      expect(store.listEvents(recoveryRunId)).toContainEqual(expect.objectContaining({
+        type: deliveryFails ? "notification.failed" : "notification.delivered",
+        payload: expect.objectContaining({ event: "workflow.completed", required: deliveryFails })
+      }));
+      if (deliveryFails) {
+        expect(store.listFailures(recoveryRunId)[0]).toMatchObject({
+          classification: "notification_failure",
+          payload: { event: "workflow.completed" }
+        });
+      }
       store.close();
     }
   });

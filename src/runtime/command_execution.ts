@@ -1209,6 +1209,19 @@ async function resolveReviewDisagreement(
   );
   const stoppedAfterNotification = stoppedPipelineResult(store, runId, completedSteps);
   if (stoppedAfterNotification !== undefined) {
+    if (stoppedAfterNotification.status === "paused" && policy.strategy === "ask_user") {
+      return {
+        result: pauseForReviewDisagreement(
+          store,
+          runId,
+          reviewStep,
+          completedSteps,
+          routingBudget,
+          policy,
+          true
+        )
+      };
+    }
     return { result: stoppedAfterNotification };
   }
   if (disagreementNotification.requiredFailure !== undefined) {
@@ -1432,7 +1445,8 @@ function pauseForReviewDisagreement(
   reviewStep: AgentFlowWorkflowStep,
   completedSteps: string[],
   routingBudget: SuccessfulRoutingBudget,
-  policy: AgentFlowDisagreementPolicy
+  policy: AgentFlowDisagreementPolicy,
+  acceptExistingPause = false
 ): AgentFlowCommandPipelineResult {
   const stepId = requiredStepId(reviewStep);
   const attempt = (routingBudget.attempts.get(stepId) ?? 0) + 1;
@@ -1462,7 +1476,7 @@ function pauseForReviewDisagreement(
   };
   return store.withRunFinalizationTransaction(runId, () => {
     const stopped = stoppedPipelineResult(store, runId, completedSteps);
-    if (stopped !== undefined) return stopped;
+    if (stopped !== undefined && !(acceptExistingPause && stopped.status === "paused")) return stopped;
     const run = store.getRun(runId)!;
     store.updateRun(runId, {
       currentStepId: stepId,
@@ -1482,6 +1496,9 @@ function pauseForReviewDisagreement(
       payload: { strategy: policy.strategy, path: "user", attempt, prompt, validOutcomes }
     });
     const message = `Review ${stepId} disagreement is waiting for user resolution.`;
+    if (stopped?.status === "paused") {
+      return { status: "paused", completedSteps, message };
+    }
     const finalized = finalizePipelineRun(store, runId, routingBudget.terminalEffects, {
       intendedStatus: "paused",
       completedSteps,
@@ -1615,6 +1632,38 @@ function pauseForInteraction(
         }
       });
     }
+    const failWaitingInteraction = (failureMessage: string): void => {
+      const error = {
+        attempt,
+        message: failureMessage,
+        outcome: "fail" as const
+      };
+      const persisted = persistAgentFlowFailurePayload(store, {
+        id: `interaction:${safeId(stepId)}:attempt-${attempt}:notification`,
+        runId,
+        stepId,
+        stepType: kind,
+        attempt,
+        exitCode: null,
+        summary: failureMessage,
+        classification: "notification_failure",
+        retryable: false,
+        outcome: "fail",
+        indexPayload: error
+      });
+      const indexedError = { ...persisted.indexPayload, ...failureReference(persisted) };
+      store.upsertStep({ runId, stepId, attempt, status: "failed", error: indexedError });
+      store.appendRunEvent(runId, { type: "step.failed", stepId, payload: indexedError });
+      if (approvalId !== undefined) {
+        store.upsertApproval({
+          id: approvalId,
+          runId,
+          stepId,
+          status: "cancelled",
+          decision: "notification_failure"
+        });
+      }
+    };
     if (kind === "approval") {
       const approvalNotification = deliverAgentFlowNotificationEvent(
         store,
@@ -1666,39 +1715,19 @@ function pauseForInteraction(
       failureContext: run.context,
       beforeFinalTransition: (status, message) => {
         if (status !== "failed") return;
-        const failureMessage = message ?? "Required paused notification failed.";
-        const error = {
-          attempt,
-          message: failureMessage,
-          outcome: "fail"
-        };
-        const persisted = persistAgentFlowFailurePayload(store, {
-          id: `interaction:${safeId(stepId)}:attempt-${attempt}:notification`,
-          runId,
-          stepId,
-          stepType: kind,
-          attempt,
-          exitCode: null,
-          summary: failureMessage,
-          classification: "notification_failure",
-          retryable: false,
-          outcome: "fail",
-          indexPayload: error
-        });
-        const indexedError = { ...persisted.indexPayload, ...failureReference(persisted) };
-        store.upsertStep({ runId, stepId, attempt, status: "failed", error: indexedError });
-        store.appendRunEvent(runId, { type: "step.failed", stepId, payload: indexedError });
-        if (approvalId !== undefined) {
-          store.upsertApproval({
-            id: approvalId,
-            runId,
-            stepId,
-            status: "cancelled",
-            decision: "notification_failure"
-          });
-        }
+        failWaitingInteraction(message ?? "Required paused notification failed.");
       }
     });
+    const finalizedRun = store.getRun(runId);
+    if (finalized.status === "failed" && finalizedRun?.context.waiting !== undefined) {
+      const failureMessage = finalized.message
+        ?? (finalizedRun.error !== null && typeof finalizedRun.error === "object"
+          && !Array.isArray(finalizedRun.error) && typeof finalizedRun.error.message === "string"
+          ? finalizedRun.error.message
+          : "Required paused notification failed.");
+      failWaitingInteraction(failureMessage);
+      store.updateRun(runId, { currentStepId: null, context: run.context });
+    }
     return {
       status: finalized.status,
       completedSteps,
@@ -4108,15 +4137,10 @@ function finishResultStep(
               notificationAttempts: AgentFlowNotificationDeliveryResult["attempts"]
             ) => {
               if (status !== "completed") {
-                if (notificationFailure !== undefined) {
-                  throw new RequiredNotificationPromotionRollbackError(
-                    notificationFailure,
-                    notificationAttempts ?? []
-                  );
-                }
-                throw new AgentFlowRunStateError(
+                throw new NotificationPromotionRollbackError(
                   message ?? "Nested recovery finalization did not complete after output promotion.",
-                  "AGENT_FLOW_RECOVERY_PROMOTION_ROLLBACK"
+                  notificationFailure,
+                  notificationAttempts ?? []
                 );
               }
             }
@@ -4124,18 +4148,20 @@ function finishResultStep(
         : {})
     });
   } catch (error) {
-    if (error instanceof RequiredNotificationPromotionRollbackError) {
+    if (error instanceof NotificationPromotionRollbackError) {
       error.attempts.forEach((attempt) => store.appendRunEvent(runId, attempt));
-      return finishRequiredStepNotificationFailure(
-        store,
-        runId,
-        completedSteps,
-        stepId,
-        attempt,
-        "result",
-        error.failure,
-        terminalEffects
-      );
+      if (error.failure !== undefined) {
+        return finishRequiredStepNotificationFailure(
+          store,
+          runId,
+          completedSteps,
+          stepId,
+          attempt,
+          "result",
+          error.failure,
+          terminalEffects
+        );
+      }
     }
     return finishFailure(store, runId, completedSteps, stepId, {
       exitCode: null,
@@ -4586,13 +4612,14 @@ interface FinalizePipelineRunInput {
   ) => void;
 }
 
-class RequiredNotificationPromotionRollbackError extends Error {
+class NotificationPromotionRollbackError extends Error {
   constructor(
-    readonly failure: NonNullable<AgentFlowNotificationDeliveryResult["requiredFailure"]>,
+    message: string,
+    readonly failure: AgentFlowNotificationDeliveryResult["requiredFailure"],
     readonly attempts: NonNullable<AgentFlowNotificationDeliveryResult["attempts"]>
   ) {
-    super(`Required ${failure.channel} notification for ${failure.event} failed: ${failure.message}`);
-    this.name = "RequiredNotificationPromotionRollbackError";
+    super(message);
+    this.name = "NotificationPromotionRollbackError";
   }
 }
 
@@ -4628,7 +4655,12 @@ function finalizePipelineRun(
       const currentAfterDelivery = store.getRun(runId);
       if (currentAfterDelivery?.status !== "running") {
         const stopped = finalizationResultForCurrentRun(store, runId, input);
-        input.onFinalStatus?.(stopped.status, stopped.message, undefined, undefined);
+        input.onFinalStatus?.(
+          stopped.status,
+          stopped.message,
+          delivery.requiredFailure,
+          delivery.attempts
+        );
         return stopped;
       }
       const fallbackFailure = delivery.requiredFailure !== undefined && status !== "failed"
@@ -5211,8 +5243,37 @@ function finishRequiredStepNotificationFailure(
     message,
     outcome: "fail" as const
   };
+  const persistFailure = (): void => {
+    options?.beforeFailure?.();
+    const persisted = persistAgentFlowFailurePayload(store, {
+      id: `notification:${safeId(stepId)}:attempt-${attempt}:${safeId(failure.event)}`,
+      runId,
+      stepId,
+      stepType,
+      attempt,
+      exitCode: null,
+      summary: message,
+      classification: "notification_failure",
+      retryable: false,
+      outcome: "fail",
+      indexPayload: error
+    });
+    const indexedError = { ...persisted.indexPayload, ...failureReference(persisted) };
+    store.upsertStep({ runId, stepId, attempt, status: "failed", error: indexedError });
+    store.appendRunEvent(runId, { type: "step.failed", stepId, payload: indexedError });
+  };
   const terminalNotificationDelivered = terminalEffects.workflow.style === "pipeline";
   if (terminalNotificationDelivered) {
+    const stoppedBeforeFailureDelivery = stoppedPipelineResult(store, runId, completedSteps);
+    if (stoppedBeforeFailureDelivery !== undefined) {
+      if (stoppedBeforeFailureDelivery.status === "failed") {
+        persistFailure();
+        if (options?.failureContext !== undefined) {
+          store.updateRun(runId, { currentStepId: null, context: options.failureContext });
+        }
+      }
+      return stoppedBeforeFailureDelivery;
+    }
     deliverAgentFlowNotifications(
       store,
       runId,
@@ -5221,7 +5282,15 @@ function finishRequiredStepNotificationFailure(
       terminalEffects.notifications
     );
     const stopped = stoppedPipelineResult(store, runId, completedSteps);
-    if (stopped !== undefined) return stopped;
+    if (stopped !== undefined) {
+      if (stopped.status === "failed") {
+        persistFailure();
+        if (options?.failureContext !== undefined) {
+          store.updateRun(runId, { currentStepId: null, context: options.failureContext });
+        }
+      }
+      return stopped;
+    }
   }
   const finalized = finalizePipelineRun(store, runId, terminalEffects, {
     intendedStatus: "failed",
@@ -5234,25 +5303,7 @@ function finishRequiredStepNotificationFailure(
     eventStepId: stepId,
     failureContext: options?.failureContext,
     terminalNotificationDelivered,
-    beforeFinalTransition: () => {
-      options?.beforeFailure?.();
-      const persisted = persistAgentFlowFailurePayload(store, {
-        id: `notification:${safeId(stepId)}:attempt-${attempt}:${safeId(failure.event)}`,
-        runId,
-        stepId,
-        stepType,
-        attempt,
-        exitCode: null,
-        summary: message,
-        classification: "notification_failure",
-        retryable: false,
-        outcome: "fail",
-        indexPayload: error
-      });
-      const indexedError = { ...persisted.indexPayload, ...failureReference(persisted) };
-      store.upsertStep({ runId, stepId, attempt, status: "failed", error: indexedError });
-      store.appendRunEvent(runId, { type: "step.failed", stepId, payload: indexedError });
-    }
+    beforeFinalTransition: persistFailure
   });
   if (finalized.status !== "failed") {
     const stopped = stoppedPipelineResult(store, runId, completedSteps);
