@@ -2320,7 +2320,7 @@ export class AgentFlowRunStateStore {
           status = "stale";
         } else {
           const stat = fs.statSync(target);
-          if (!stat.isFile() || row.checksum === null || (row.size_bytes !== null && stat.size !== row.size_bytes)) {
+          if (!stat.isFile() || row.checksum === null || row.size_bytes === null || stat.size !== row.size_bytes) {
             status = "stale";
           } else {
             actualChecksum = artifactChecksum(target);

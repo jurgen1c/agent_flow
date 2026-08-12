@@ -617,6 +617,47 @@ steps: []
     store.close();
   });
 
+  test("excludes legacy artifact content whose registered size is missing", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-archive-missing-size-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: archive-missing-size
+version: 1
+style: pipeline
+maturity: experimental
+steps: []
+`);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, { id: "archive-missing-size", workflow });
+    store.writeArtifact({
+      id: "legacy-artifact",
+      runId: "archive-missing-size",
+      path: "legacy/output.txt",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "legacy content"
+    });
+    const database = new Database(store.databasePath);
+    database.run(
+      "UPDATE artifacts SET size_bytes = NULL WHERE run_id = ? AND id = ?",
+      ["archive-missing-size", "legacy-artifact"]
+    );
+    database.close();
+
+    writeAgentFlowPortableArchive(store, "archive-missing-size", "portable/missing-size.zip");
+
+    const entries = readStoredZip(fs.readFileSync(path.join(repo, "portable", "missing-size.zip")));
+    const manifest = JSON.parse(entries.get("manifest.json")!.toString("utf8")) as {
+      artifacts: Array<{ id: string; status: string; archivePath?: string }>;
+    };
+    expect(manifest.artifacts.find((artifact) => artifact.id === "legacy-artifact"))
+      .toMatchObject({ status: "stale" });
+    expect(manifest.artifacts.find((artifact) => artifact.id === "legacy-artifact")?.archivePath)
+      .toBeUndefined();
+    expect(entries.has("artifacts/legacy/output.txt")).toBe(false);
+    store.close();
+  });
+
   test("bounds archive names, snapshots state, and never replaces raced destinations", async () => {
     expect(defaultAgentFlowArchivePath("a/b")).not.toBe(defaultAgentFlowArchivePath("a b"));
     expect(defaultAgentFlowArchivePath(" archive-safety ")).toBe(defaultAgentFlowArchivePath("archive-safety"));
