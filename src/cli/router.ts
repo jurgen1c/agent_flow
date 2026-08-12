@@ -3,12 +3,15 @@ import path from "node:path";
 import {
   AgentFlowWorkflowGraphError,
   AgentFlowRunStateError,
+  applyAgentFlowRetention,
   createAgentFlowLifecycleRun,
   createAgentFlowNotificationRegistry,
   createAgentFlowFixtureSessionProvider,
   createAgentFlowSessionProviderRegistry,
   collectAgentFlowReviewCycleStepIds,
   executeAgentFlowCommandPipeline,
+  defaultAgentFlowArchivePath,
+  defaultAgentFlowExportPath,
   explainAgentFlowWorkflow,
   formatAgentFlowWorkflowIssues,
   formatWorkflowParseIssues,
@@ -25,7 +28,8 @@ import {
   resumeAgentFlowCommandPipeline,
   simulateAgentFlowWorkflow,
   transitionAgentFlowLifecycleRun,
-  validateAgentFlowWorkflow
+  validateAgentFlowWorkflow,
+  writeAgentFlowPortableArchive
 } from "../runtime/index";
 
 export interface AgentFlowCliStreams {
@@ -43,7 +47,9 @@ export interface AgentFlowCliOptions {
   cwd?: string;
 }
 
-const ACTIVE_LIFECYCLE_COMMANDS = ["run", "resume", "inject", "status", "logs", "artifacts", "pause", "cancel"] as const;
+const ACTIVE_LIFECYCLE_COMMANDS = [
+  "run", "resume", "inject", "status", "logs", "artifacts", "pause", "cancel", "cleanup", "archive", "export"
+] as const;
 type ActiveLifecycleCommand = (typeof ACTIVE_LIFECYCLE_COMMANDS)[number];
 
 export async function runCli(
@@ -162,6 +168,10 @@ function renderHelp(topic?: string): string {
     "  agent-flow artifacts <run-id>",
     "  agent-flow pause <run-id>",
     "  agent-flow cancel <run-id>",
+    "  agent-flow cleanup <run-id>",
+    "  agent-flow cleanup --older-than <duration> [--status <status>]",
+    "  agent-flow archive <run-id>",
+    "  agent-flow export <run-id> --format zip",
     "",
     "Available now:",
     "  help       Show this help output.",
@@ -179,11 +189,15 @@ function renderHelp(topic?: string): string {
     "  artifacts <run-id>    List registered run artifacts.",
     "  pause <run-id>        Pause an active run.",
     "  cancel <run-id>       Cancel a non-terminal run.",
+    "  cleanup <run-id>      Apply the run's declared retention policy.",
+    "  cleanup --older-than <duration> [--status <status>]  Clean matching runs.",
+    "  archive <run-id>      Write a portable ZIP under .agent-flow/archives.",
+    "  export <run-id> --format zip  Export a portable ZIP in the repository root.",
     "",
     "Reserved placeholders:",
     `  ${plannedAgentFlowRuntimeCommands.filter((command) => !["validate", "lint", "explain", "graph", "simulate", ...ACTIVE_LIFECYCLE_COMMANDS].includes(command as ActiveLifecycleCommand)).join(", ")}`,
     "",
-    "Command and artifact-transform pipeline execution, including session-request, review, approval, and decision-record steps, plus persistent lifecycle state are active."
+    "Command and artifact-transform pipeline execution, including session-request, review, approval, decision-record, retention, archive, and export operations, plus persistent lifecycle state are active."
   ].join("\n");
 }
 
@@ -202,6 +216,23 @@ async function runLifecycleCommand(
   let store: Awaited<ReturnType<typeof openAgentFlowRunState>> | undefined;
   try {
     store = await openAgentFlowRunState({ cwd: options.cwd });
+
+    if (command === "cleanup") {
+      return runCleanupCommand(store, args);
+    }
+
+    if (command === "archive" || command === "export") {
+      const portable = parsePortableArgs(command, args)!;
+      requireRun(store, portable.runId);
+      const outputPath = portable.outputPath ?? (command === "archive"
+        ? defaultAgentFlowArchivePath(portable.runId)
+        : defaultAgentFlowExportPath(portable.runId));
+      const result = writeAgentFlowPortableArchive(store, portable.runId, outputPath);
+      return {
+        exitCode: 0,
+        stdout: `${command === "archive" ? "Archived" : "Exported"} Agent Flow run ${portable.runId} to ${result.outputPath}.\nEntries: ${result.entryCount}\nSize: ${result.sizeBytes} bytes`
+      };
+    }
 
     if (command === "run") {
       const fixture = args.length === 5 ? readRunFixture(args[4], options.cwd) : null;
@@ -466,6 +497,8 @@ function validLifecycleArgs(command: ActiveLifecycleCommand, args: string[]): bo
   if (command === "inject") {
     return args.length === 3 && args.every((entry) => entry.length > 0);
   }
+  if (command === "cleanup") return parseCleanupArgs(args) !== null;
+  if (command === "archive" || command === "export") return parsePortableArgs(command, args) !== null;
   return args.length === 1 && args[0].length > 0;
 }
 
@@ -473,8 +506,173 @@ function lifecycleUsage(topic: string): string | null {
   if (topic === "run") return "Usage: agent-flow run <workflow> --id <run-id> [--fixture <file>]";
   if (topic === "resume") return "Usage: agent-flow resume <run-id> (--outcome <choice> | --answer <value>) [--fixture <file>]";
   if (topic === "inject") return "Usage: agent-flow inject <run-id> <session-name> <context>";
+  if (topic === "cleanup") return "Usage: agent-flow cleanup ([--] <run-id> | --older-than <duration> [--status <status>]) [--approve]";
+  if (topic === "archive") return "Usage: agent-flow archive [--] <run-id> [--output <file>]";
+  if (topic === "export") return "Usage: agent-flow export [--] <run-id> --format zip [--output <file>]";
   if (isActiveLifecycleCommand(topic)) return `Usage: agent-flow ${topic} <run-id>`;
   return null;
+}
+
+function runCleanupCommand(
+  store: Awaited<ReturnType<typeof openAgentFlowRunState>>,
+  args: string[]
+): AgentFlowCliResult {
+  const input = parseCleanupArgs(args)!;
+  const now = Date.parse(store.currentTimestamp());
+  const runs = input.runId === undefined
+    ? store.listRuns().filter((run) => {
+        if (input.status !== undefined && run.status !== input.status) return false;
+        return ageDays(run.finishedAt ?? run.updatedAt, now) >= input.olderThanDays!;
+      })
+    : [requireRun(store, input.runId)];
+  if (runs.length === 0) {
+    return { exitCode: 0, stdout: "No Agent Flow runs matched the cleanup filters." };
+  }
+
+  const lines: string[] = [];
+  let totalDeleted = 0;
+  let totalSkipped = 0;
+  let totalFailed = 0;
+  let totalRunErrors = 0;
+  for (const run of runs) {
+    let workflow: import("../runtime/index").AgentFlowWorkflow;
+    try {
+      workflow = persistedWorkflow(run);
+    } catch (error) {
+      if (input.runId !== undefined || !(error instanceof AgentFlowRunStateError)
+        || error.code !== "AGENT_FLOW_RETENTION_STATE") {
+        throw error;
+      }
+      totalRunErrors += 1;
+      lines.push(`${run.id}\t${run.status}\tworkflow_error\tdeleted=0\tskipped=0\tfailed=0`);
+      continue;
+    }
+    const result = store.withRunFinalizationTransaction(run.id, () => applyAgentFlowRetention(
+      store,
+      run.id,
+      workflow,
+      run.status,
+      {
+        explicit: true,
+        ageDays: ageDays(run.finishedAt ?? run.updatedAt, now),
+        ...(input.approved ? { approvalStatus: "approved" as const } : {})
+      }
+    ));
+    totalDeleted += result.deleted.length;
+    totalSkipped += result.skipped.length;
+    totalFailed += result.failed.length;
+    lines.push(
+      `${run.id}\t${run.status}\t${result.status}\tdeleted=${result.deleted.length}`
+      + `\tskipped=${result.skipped.length}\tfailed=${result.failed.length}`
+    );
+  }
+  const errors: string[] = [];
+  if (totalFailed > 0) {
+    errors.push(`Cleanup could not delete ${totalFailed} artifact${totalFailed === 1 ? "" : "s"}.`);
+  }
+  if (totalRunErrors > 0) {
+    errors.push(`Cleanup could not process ${totalRunErrors} run${totalRunErrors === 1 ? "" : "s"} with missing or invalid persisted workflows.`);
+  }
+  return {
+    exitCode: errors.length === 0 ? 0 : 2,
+    stdout: [
+      `Cleanup processed ${runs.length} Agent Flow run${runs.length === 1 ? "" : "s"}.`,
+      `Deleted artifacts: ${totalDeleted}`,
+      `Skipped artifacts: ${totalSkipped}`,
+      `Failed deletions: ${totalFailed}`,
+      `Run errors: ${totalRunErrors}`,
+      ...lines
+    ].join("\n"),
+    ...(errors.length === 0 ? {} : { stderr: errors.join("\n") })
+  };
+}
+
+function persistedWorkflow(
+  run: import("../runtime/index").AgentFlowRunRecord
+): import("../runtime/index").AgentFlowWorkflow {
+  const workflow = run.context.workflow;
+  if (workflow === null || typeof workflow !== "object" || Array.isArray(workflow)) {
+    throw new AgentFlowRunStateError(
+      `Agent Flow run ${run.id} does not contain its persisted workflow definition.`,
+      "AGENT_FLOW_RETENTION_STATE"
+    );
+  }
+  const typed = workflow as unknown as import("../runtime/index").AgentFlowWorkflow;
+  const validation = validateAgentFlowWorkflow(typed);
+  if (!validation.valid) {
+    throw new AgentFlowRunStateError(
+      `Agent Flow run ${run.id} contains an invalid persisted workflow definition.\n${formatAgentFlowWorkflowIssues(validation.errors)}`,
+      "AGENT_FLOW_RETENTION_STATE"
+    );
+  }
+  return typed;
+}
+
+function ageDays(timestamp: string, now: number): number {
+  const then = Date.parse(timestamp);
+  if (!Number.isFinite(then) || !Number.isFinite(now)) return 0;
+  return Math.max(0, (now - then) / 86_400_000);
+}
+
+function parseCleanupArgs(args: string[]): {
+  runId?: string;
+  olderThanDays?: number;
+  status?: import("../runtime/index").AgentFlowRunStatus;
+  approved: boolean;
+} | null {
+  const escapedRunId = args[0] === "--";
+  const values = escapedRunId ? args.slice(1) : args.slice();
+  if (escapedRunId || values[0] !== "--older-than") {
+    if (values.length === 1 && values[0]!.length > 0) {
+      return { runId: values[0], approved: false };
+    }
+    if (values.length === 2 && values[0]!.length > 0 && values[1] === "--approve") {
+      return { runId: values[0], approved: true };
+    }
+    return null;
+  }
+  const approved = values.at(-1) === "--approve";
+  if (approved) values.pop();
+  if (values.length !== 2 && values.length !== 4) return null;
+  if (values[0] !== "--older-than") return null;
+  const olderThanDays = parseDurationDays(values[1]!);
+  if (olderThanDays === null) return null;
+  if (values.length === 2) return { olderThanDays, approved };
+  if (values[2] !== "--status" || !isRunStatus(values[3]!)) return null;
+  return { olderThanDays, status: values[3], approved };
+}
+
+function parsePortableArgs(
+  command: "archive" | "export",
+  args: string[]
+): { runId: string; outputPath?: string } | null {
+  const values = args[0] === "--" ? args.slice(1) : args;
+  if (values.length === 0 || values[0]!.length === 0) return null;
+  const runId = values[0]!;
+  let index = 1;
+  if (command === "export") {
+    if (values[index] !== "--format" || values[index + 1] !== "zip") return null;
+    index += 2;
+  }
+  if (index === values.length) return { runId };
+  if (values.length === index + 2 && values[index] === "--output" && values[index + 1]!.length > 0) {
+    return { runId, outputPath: values[index + 1] };
+  }
+  return null;
+}
+
+function parseDurationDays(value: string): number | null {
+  const match = /^(\d+)([mhd])$/.exec(value);
+  if (match === null) return null;
+  const amount = Number(match[1]);
+  if (!Number.isSafeInteger(amount)) return null;
+  if (match[2] === "m") return amount / 1_440;
+  if (match[2] === "h") return amount / 24;
+  return amount;
+}
+
+function isRunStatus(value: string): value is import("../runtime/index").AgentFlowRunStatus {
+  return ["pending", "running", "waiting", "paused", "completed", "failed", "cancelled"].includes(value);
 }
 
 function parseCliAnswer(value: string): import("../runtime/index").AgentFlowRunStateValue {

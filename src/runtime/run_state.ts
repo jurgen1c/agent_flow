@@ -40,6 +40,15 @@ export interface OpenAgentFlowRunStateOptions {
   busyTimeoutMs?: number;
 }
 
+export interface AgentFlowRecordPage {
+  offset?: number;
+  limit: number;
+  after?: {
+    sortValue: string | number;
+    id?: string;
+  };
+}
+
 export interface AgentFlowRunRecord {
   id: string;
   workflowName: string;
@@ -437,6 +446,11 @@ export class AgentFlowRunStateStore {
     return currentTimestamp(this.now);
   }
 
+  hasActiveFinalizationTransaction(): boolean {
+    this.assertOpen();
+    return this.finalizationTransactionActive;
+  }
+
   createRun(input: CreateAgentFlowRunInput): AgentFlowRunRecord {
     this.assertOpen();
     const id = requiredString(input.id, "Run ID");
@@ -508,6 +522,13 @@ export class AgentFlowRunStateStore {
     this.assertOpen();
     const row = this.database.get<RunRow>("SELECT * FROM runs WHERE id = ?", [requiredString(id, "Run ID")]);
     return row === null ? null : hydrateRun(row);
+  }
+
+  listRuns(): AgentFlowRunRecord[] {
+    this.assertOpen();
+    return this.database.all<RunRow>(
+      "SELECT * FROM runs ORDER BY created_at ASC, id ASC"
+    ).map(hydrateRun);
   }
 
   withRunFinalizationTransaction<T>(runId: string, callback: () => T): T {
@@ -1138,13 +1159,14 @@ export class AgentFlowRunStateStore {
     }
   }
 
-  listArtifacts(runId: string): AgentFlowArtifactRecord[] {
+  listArtifacts(runId: string, page?: AgentFlowRecordPage): AgentFlowArtifactRecord[] {
     this.assertOpen();
     const normalizedRunId = artifactRunId(runId);
     this.requireRun(normalizedRunId);
+    const pagination = recordPage(page, "path");
     const rows = this.database.all<ArtifactRow>(
-      "SELECT * FROM artifacts WHERE run_id = ? ORDER BY path ASC, id ASC",
-      [normalizedRunId]
+      `SELECT * FROM artifacts WHERE run_id = ?${pagination.where} ORDER BY path ASC, id ASC${pagination.sql}`,
+      [normalizedRunId, ...pagination.parameters]
     );
     return rows.map((row) => this.inspectArtifact(row));
   }
@@ -1286,7 +1308,8 @@ export class AgentFlowRunStateStore {
     const normalizedRunId = artifactRunId(runId);
     this.requireRun(normalizedRunId);
     const normalizedPath = normalizeAgentFlowArtifactPath(declaredPath);
-    this.database.exec("BEGIN IMMEDIATE");
+    const manageTransaction = !this.finalizationTransactionActive;
+    if (manageTransaction) this.database.exec("BEGIN IMMEDIATE");
     try {
       const row = this.database.get<Pick<ArtifactRow, "checksum" | "status">>(
         "SELECT checksum, status FROM artifacts WHERE run_id = ? AND path = ?",
@@ -1300,9 +1323,9 @@ export class AgentFlowRunStateStore {
       );
       recoverArtifactStaging(target, temporaryPath, backupPath, row?.checksum ?? null);
       recoverArtifactDeletionStaging(target, deletionBackupPath, row);
-      this.database.exec("COMMIT");
+      if (manageTransaction) this.database.exec("COMMIT");
     } catch (error) {
-      rollback(this.database);
+      if (manageTransaction) rollback(this.database);
       throw error;
     }
   }
@@ -1460,13 +1483,14 @@ export class AgentFlowRunStateStore {
     }
   }
 
-  listEvents(runId: string): AgentFlowEventRecord[] {
+  listEvents(runId: string, page?: AgentFlowRecordPage): AgentFlowEventRecord[] {
     this.assertOpen();
     const normalizedRunId = requiredString(runId, "Run ID");
     this.requireRun(normalizedRunId);
+    const pagination = recordPage(page, "sequence");
     return this.database.all<EventRow>(
-      "SELECT * FROM events WHERE run_id = ? ORDER BY sequence ASC, id ASC",
-      [normalizedRunId]
+      `SELECT * FROM events WHERE run_id = ?${pagination.where} ORDER BY sequence ASC, id ASC${pagination.sql}`,
+      [normalizedRunId, ...pagination.parameters]
     ).map(hydrateEvent);
   }
 
@@ -1581,13 +1605,14 @@ export class AgentFlowRunStateStore {
     return row === null ? null : hydrateSession(row);
   }
 
-  listSessions(runId: string): AgentFlowSessionRecord[] {
+  listSessions(runId: string, page?: AgentFlowRecordPage): AgentFlowSessionRecord[] {
     this.assertOpen();
     const normalizedRunId = requiredString(runId, "Run ID");
     this.requireRun(normalizedRunId);
+    const pagination = recordPage(page, "id", null);
     return this.database.all<SessionRow>(
-      "SELECT * FROM sessions WHERE run_id = ? ORDER BY id ASC",
-      [normalizedRunId]
+      `SELECT * FROM sessions WHERE run_id = ?${pagination.where} ORDER BY id ASC${pagination.sql}`,
+      [normalizedRunId, ...pagination.parameters]
     ).map(hydrateSession);
   }
 
@@ -1767,13 +1792,15 @@ export class AgentFlowRunStateStore {
     ]);
   }
 
-  listFailures(runId: string): AgentFlowFailureRecord[] {
+  listFailures(runId: string, page?: AgentFlowRecordPage): AgentFlowFailureRecord[] {
     this.assertOpen();
     const normalizedRunId = requiredString(runId, "Run ID");
     this.requireRun(normalizedRunId);
+    const pagination = recordPage(page, "created_at");
+    const order = page?.after === undefined ? "created_at ASC, rowid ASC" : "created_at ASC, id ASC";
     return this.database.all<FailureRow>(
-      "SELECT * FROM failures WHERE run_id = ? ORDER BY created_at ASC, rowid ASC",
-      [normalizedRunId]
+      `SELECT * FROM failures WHERE run_id = ?${pagination.where} ORDER BY ${order}${pagination.sql}`,
+      [normalizedRunId, ...pagination.parameters]
     ).map((row) => {
       const failure = hydrateFailure(row);
       if (failure.payloadPath === null) return failure;
@@ -1927,14 +1954,82 @@ export class AgentFlowRunStateStore {
     ]);
   }
 
-  listApprovals(runId: string): AgentFlowApprovalRecord[] {
+  listApprovals(runId: string, page?: AgentFlowRecordPage): AgentFlowApprovalRecord[] {
     this.assertOpen();
     const normalizedRunId = requiredString(runId, "Run ID");
     this.requireRun(normalizedRunId);
+    const pagination = recordPage(page, "created_at");
     return this.database.all<ApprovalRow>(
-      "SELECT * FROM approvals WHERE run_id = ? ORDER BY created_at ASC, id ASC",
-      [normalizedRunId]
+      `SELECT * FROM approvals WHERE run_id = ?${pagination.where} ORDER BY created_at ASC, id ASC${pagination.sql}`,
+      [normalizedRunId, ...pagination.parameters]
     ).map(hydrateApproval);
+  }
+
+  runSnapshotStructuredBytes(runId: string): number {
+    this.assertOpen();
+    const normalizedRunId = requiredString(runId, "Run ID");
+    this.requireRun(normalizedRunId);
+    const row = this.database.get<{ bytes: number }>(`SELECT
+      COALESCE((SELECT SUM(
+        length(CAST(id AS BLOB)) + length(CAST(workflow_name AS BLOB))
+        + length(CAST(workflow_style AS BLOB)) + length(CAST(workflow_maturity AS BLOB))
+        + length(CAST(status AS BLOB)) + length(CAST(COALESCE(parent_run_id, '') AS BLOB))
+        + length(CAST(COALESCE(recovery_of_run_id, '') AS BLOB))
+        + length(CAST(COALESCE(current_step_id, '') AS BLOB))
+        + length(CAST(inputs_json AS BLOB)) + length(CAST(context_json AS BLOB))
+        + length(CAST(COALESCE(output_json, '') AS BLOB)) + length(CAST(COALESCE(error_json, '') AS BLOB))
+        + length(CAST(created_at AS BLOB)) + length(CAST(updated_at AS BLOB))
+        + length(CAST(COALESCE(started_at, '') AS BLOB)) + length(CAST(COALESCE(finished_at, '') AS BLOB))
+      ) FROM runs WHERE id = ?), 0)
+      + COALESCE((SELECT SUM(
+        length(CAST(run_id AS BLOB)) + length(CAST(id AS BLOB))
+        + length(CAST(COALESCE(step_id, '') AS BLOB)) + length(CAST(path AS BLOB))
+        + length(CAST(kind AS BLOB)) + length(CAST(content_type AS BLOB))
+        + length(CAST(COALESCE(checksum, '') AS BLOB)) + length(CAST(status AS BLOB))
+        + length(CAST(COALESCE(previous_checksum, '') AS BLOB)) + length(CAST(metadata_json AS BLOB))
+        + length(CAST(created_at AS BLOB)) + length(CAST(updated_at AS BLOB))
+        + length(CAST(COALESCE(written_at, '') AS BLOB)) + length(CAST(COALESCE(checked_at, '') AS BLOB))
+      ) FROM artifacts WHERE run_id = ?), 0)
+      + COALESCE((SELECT SUM(
+        length(CAST(run_id AS BLOB)) + length(CAST(id AS BLOB))
+        + length(CAST(COALESCE(step_id, '') AS BLOB)) + length(CAST(COALESCE(session_id, '') AS BLOB))
+        + length(CAST(type AS BLOB)) + length(CAST(COALESCE(payload_json, '') AS BLOB))
+        + length(CAST(created_at AS BLOB))
+      ) FROM events WHERE run_id = ?), 0)
+      + COALESCE((SELECT SUM(
+        length(CAST(run_id AS BLOB)) + length(CAST(id AS BLOB))
+        + length(CAST(COALESCE(step_id, '') AS BLOB)) + length(CAST(provider AS BLOB))
+        + length(CAST(COALESCE(external_session_id, '') AS BLOB)) + length(CAST(status AS BLOB))
+        + length(CAST(state_json AS BLOB)) + length(CAST(created_at AS BLOB))
+        + length(CAST(updated_at AS BLOB)) + length(CAST(COALESCE(started_at, '') AS BLOB))
+        + length(CAST(COALESCE(finished_at, '') AS BLOB))
+      ) FROM sessions WHERE run_id = ?), 0)
+      + COALESCE((SELECT SUM(
+        length(CAST(run_id AS BLOB)) + length(CAST(id AS BLOB))
+        + length(CAST(COALESCE(step_id, '') AS BLOB)) + length(CAST(COALESCE(session_id, '') AS BLOB))
+        + length(CAST(classification AS BLOB)) + length(CAST(message AS BLOB))
+        + length(CAST(COALESCE(payload_json, '') AS BLOB)) + length(CAST(created_at AS BLOB))
+        + length(CAST(COALESCE(resolved_at, '') AS BLOB))
+      ) FROM failures WHERE run_id = ?), 0)
+      + COALESCE((SELECT SUM(
+        length(CAST(run_id AS BLOB)) + length(CAST(id AS BLOB))
+        + length(CAST(COALESCE(step_id, '') AS BLOB)) + length(CAST(status AS BLOB))
+        + length(CAST(COALESCE(requested_by, '') AS BLOB)) + length(CAST(COALESCE(decided_by, '') AS BLOB))
+        + length(CAST(COALESCE(decision, '') AS BLOB)) + length(CAST(context_json AS BLOB))
+        + length(CAST(created_at AS BLOB)) + length(CAST(updated_at AS BLOB))
+        + length(CAST(COALESCE(decided_at, '') AS BLOB))
+      ) FROM approvals WHERE run_id = ?), 0)
+      AS bytes`, Array(6).fill(normalizedRunId));
+    return row?.bytes ?? 0;
+  }
+
+  runSnapshotArtifactBytes(runId: string): number {
+    this.assertOpen();
+    const normalizedRunId = requiredString(runId, "Run ID");
+    this.requireRun(normalizedRunId);
+    const rows = this.database.all<ArtifactRow>(`SELECT * FROM artifacts
+      WHERE run_id = ? AND status IN ('available', 'overwritten')`, [normalizedRunId]);
+    return rows.reduce((bytes, row) => bytes + currentArtifactBackingSize(this.repoRoot, row), 0);
   }
 
   validateApprovalInvalidationConfiguration(runId: string): void {
@@ -2809,6 +2904,28 @@ function artifactStagingPaths(
   };
 }
 
+function currentArtifactBackingSize(repoRoot: string, row: ArtifactRow): number {
+  if (row.size_bytes === null || row.checksum === null) return 0;
+  const target = artifactStoragePath(repoRoot, row.run_id, row.path, false, true);
+  const targetSize = regularFileSize(target);
+  if (targetSize !== null) {
+    return targetSize === row.size_bytes && artifactChecksum(target) === row.checksum ? row.size_bytes : 0;
+  }
+  const deletionBackupPath = artifactStagingPaths(repoRoot, row.run_id, row.path).deletionBackupPath;
+  const backupSize = regularFileSize(deletionBackupPath);
+  return backupSize === row.size_bytes && artifactChecksum(deletionBackupPath) === row.checksum ? row.size_bytes : 0;
+}
+
+function regularFileSize(candidate: string): number | null {
+  try {
+    const stat = fs.lstatSync(candidate);
+    return stat.isFile() && !stat.isSymbolicLink() ? stat.size : null;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+}
+
 function verifyArtifactPath(repoRoot: string, candidate: string, createDirectories: boolean): void {
   const relative = path.relative(repoRoot, candidate);
   const segments = relative.split(path.sep).filter(Boolean);
@@ -2954,6 +3071,43 @@ function artifactTargetExists(candidate: string): boolean {
     throw new AgentFlowRunStateError(`Artifact target is not a regular file: ${candidate}`, "AGENT_FLOW_ARTIFACT_PATH");
   }
   return true;
+}
+
+function recordPage(
+  page: AgentFlowRecordPage | undefined,
+  sortColumn: "path" | "sequence" | "id" | "created_at",
+  tieColumn: "id" | null = "id"
+): { where: string; sql: string; parameters: SqliteValue[] } {
+  if (page === undefined) return { where: "", sql: "", parameters: [] };
+  const offset = page.offset ?? 0;
+  if (!Number.isSafeInteger(offset) || offset < 0
+      || !Number.isSafeInteger(page.limit) || page.limit < 1 || page.limit > 1_000
+      || (page.after !== undefined && page.offset !== undefined)) {
+    throw new AgentFlowRunStateError(
+      "Record pages require either a non-negative offset or an after cursor, plus a limit between 1 and 1000.",
+      "AGENT_FLOW_RUN_STATE_PAGE"
+    );
+  }
+  if (page.after === undefined) {
+    return { where: "", sql: " LIMIT ? OFFSET ?", parameters: [page.limit, offset] };
+  }
+  const sortValue = page.after.sortValue;
+  if ((typeof sortValue !== "string" && typeof sortValue !== "number")
+      || (typeof sortValue === "number" && !Number.isSafeInteger(sortValue))) {
+    throw new AgentFlowRunStateError("Record page cursors require a valid sort value.", "AGENT_FLOW_RUN_STATE_PAGE");
+  }
+  if (tieColumn === null) {
+    return { where: ` AND ${sortColumn} > ?`, sql: " LIMIT ?", parameters: [sortValue, page.limit] };
+  }
+  const id = page.after.id;
+  if (typeof id !== "string") {
+    throw new AgentFlowRunStateError("Record page cursors require an ID tie-breaker.", "AGENT_FLOW_RUN_STATE_PAGE");
+  }
+  return {
+    where: ` AND (${sortColumn} > ? OR (${sortColumn} = ? AND ${tieColumn} > ?))`,
+    sql: " LIMIT ?",
+    parameters: [sortValue, sortValue, id, page.limit]
+  };
 }
 
 function requiredString(value: unknown, label: string): string {

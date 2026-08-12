@@ -1,6 +1,7 @@
 import { evaluateAgentFlowPolicy } from "./policy";
 import { mapping, matchesPolicyGlob, stringList } from "./policy_utils";
 import type {
+  AgentFlowApprovalStatus,
   AgentFlowArtifactRecord,
   AgentFlowEventRecord,
   AgentFlowRunStateStore,
@@ -15,6 +16,19 @@ export interface AgentFlowFinalSummaryInput {
   status: Extract<AgentFlowRunStatus, "completed" | "failed" | "paused" | "cancelled">;
   completedSteps: string[];
   message?: string;
+}
+
+export interface ApplyAgentFlowRetentionOptions {
+  ageDays?: number;
+  approvalStatus?: AgentFlowApprovalStatus;
+  explicit?: boolean;
+}
+
+export interface AgentFlowRetentionResult {
+  status: "applied" | "deferred" | "not_configured";
+  deleted: string[];
+  skipped: string[];
+  failed: string[];
 }
 
 export function writeAgentFlowFinalSummary(
@@ -72,16 +86,22 @@ export function applyAgentFlowRetention(
   store: AgentFlowRunStateStore,
   runId: string,
   workflow: AgentFlowWorkflow,
-  status: AgentFlowRunStatus
-): void {
+  status: AgentFlowRunStatus,
+  options: ApplyAgentFlowRetentionOptions = {}
+): AgentFlowRetentionResult {
   const ruleName = retentionRuleName(status);
   const rule = ruleName === undefined ? undefined : mapping(workflow.retention?.[ruleName]);
-  if (ruleName === undefined || rule === undefined) return;
+  if (ruleName === undefined || rule === undefined) {
+    return { status: "not_configured", deleted: [], skipped: [], failed: [] };
+  }
 
   const afterDays = number(rule.after_days);
   const keepAllForDays = number(rule.keep_all_for_days);
-  if ((afterDays ?? 0) > 0 || (keepAllForDays ?? 0) > 0 || rule.ask_user === true) {
-    if (hasRetentionEvent(store, runId, "retention.deferred", ruleName)) return;
+  if (options.explicit !== true
+      && ((afterDays ?? 0) > 0 || (keepAllForDays ?? 0) > 0 || rule.ask_user === true)) {
+    if (hasRetentionEvent(store, runId, "retention.deferred", ruleName)) {
+      return { status: "deferred", deleted: [], skipped: [], failed: [] };
+    }
     store.appendRunEvent(runId, {
       type: "retention.deferred",
       payload: {
@@ -91,11 +111,15 @@ export function applyAgentFlowRetention(
         ...(rule.ask_user === true ? { approvalRequired: true } : {})
       }
     });
-    return;
+    return { status: "deferred", deleted: [], skipped: [], failed: [] };
   }
 
   const deletions = stringList(rule.delete);
-  if (deletions.length === 0) return;
+  const deleteAllAfterGuard = deletions.length === 0
+    && (afterDays !== undefined || keepAllForDays !== undefined || rule.ask_user === true);
+  if (deletions.length === 0 && !deleteAllAfterGuard) {
+    return { status: "applied", deleted: [], skipped: [], failed: [] };
+  }
   const keepPatterns = stringList(rule.keep);
   const protectedPaths = new Set([
     AGENT_FLOW_FINAL_SUMMARY_PATH,
@@ -107,12 +131,14 @@ export function applyAgentFlowRetention(
       && artifact.kind !== "failure_payload"
       && artifact.kind !== "failure_attachment"
       && artifact.kind !== "decision_record"
-      && deletions.some((pattern) => matchesPolicyGlob(artifact.declaredPath, pattern))
+      && (deleteAllAfterGuard || deletions.some((pattern) => matchesPolicyGlob(artifact.declaredPath, pattern)))
       && !protectedPaths.has(artifact.declaredPath)
       && !keepPatterns.some((pattern) => matchesPolicyGlob(artifact.declaredPath, pattern))
     )
     .sort((left, right) => left.declaredPath.localeCompare(right.declaredPath));
   const deleted: string[] = [];
+  const skipped: string[] = [];
+  const failed: string[] = [];
 
   for (const artifact of candidates) {
     const decision = evaluateAgentFlowPolicy(workflow, {
@@ -121,9 +147,11 @@ export function applyAgentFlowRetention(
       recursive: false,
       runStatus: status,
       paths: [artifact.declaredPath],
-      ageDays: 0
+      ageDays: options.ageDays ?? 0,
+      approvalStatus: options.approvalStatus
     });
     if (decision.status !== "allow") {
+      skipped.push(artifact.declaredPath);
       const eventType = decision.status === "pause" ? "retention.deferred" : "retention.skipped";
       if (!hasRetentionEvent(store, runId, eventType, ruleName, artifact.declaredPath)) {
         store.appendRunEvent(runId, {
@@ -142,6 +170,7 @@ export function applyAgentFlowRetention(
       store.deleteArtifactBacking(runId, artifact.declaredPath);
       deleted.push(artifact.declaredPath);
     } catch (error) {
+      failed.push(artifact.declaredPath);
       store.appendRunEvent(runId, {
         type: "retention.failed",
         payload: {
@@ -159,6 +188,7 @@ export function applyAgentFlowRetention(
       payload: { rule: ruleName, artifacts: deleted }
     });
   }
+  return { status: "applied", deleted, skipped, failed };
 }
 
 function approvedArtifactPaths(
