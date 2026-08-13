@@ -89,6 +89,34 @@ describe("Agent Flow run-state SQLite store", () => {
     store.close();
   });
 
+  test("keeps failure ordering stable across bounded cursor pages", async () => {
+    const repoRoot = temporaryRepo();
+    const store = await openAgentFlowRunState({ cwd: repoRoot, now: () => FIXED_TIME });
+    store.createRun({
+      id: "failure-pages",
+      workflow: { name: "failure-pages", version: 1, style: "pipeline", maturity: "experimental" }
+    });
+    const expectedIds = Array.from({ length: 130 }, (_, index) => `failure-${String(index).padStart(3, "0")}`);
+    for (const id of [...expectedIds].reverse()) {
+      store.recordFailure({
+        id,
+        runId: "failure-pages",
+        classification: "fixture",
+        message: "failed"
+      });
+    }
+
+    const firstPage = store.listFailures("failure-pages", { limit: 128 });
+    const last = firstPage.at(-1)!;
+    const secondPage = store.listFailures("failure-pages", {
+      limit: 128,
+      after: { sortValue: last.createdAt, id: last.id }
+    });
+
+    expect([...firstPage, ...secondPage].map((failure) => failure.id)).toEqual(expectedIds);
+    store.close();
+  });
+
   test("exposes only failure payload paths with a currently readable backing", async () => {
     const repoRoot = temporaryRepo();
     const store = await openAgentFlowRunState({ cwd: repoRoot, now: () => FIXED_TIME });

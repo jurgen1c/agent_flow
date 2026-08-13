@@ -348,6 +348,56 @@ retention:
     inspected.close();
   });
 
+  test("continues batch cleanup after a run retention transaction fails", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-cleanup-run-error-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: cleanup-run-error
+version: 1
+style: pipeline
+maturity: experimental
+steps: []
+retention:
+  on_success: { delete: [temp/**] }
+`);
+    const store = await openAgentFlowRunState({ cwd: repo, now: () => "2026-01-01T00:00:00.000Z" });
+    for (const runId of ["a-broken", "z-cleanup-candidate"]) {
+      createAgentFlowLifecycleRun(store, { id: runId, workflow });
+      store.updateRun(runId, { status: "completed" });
+      store.writeArtifact({
+        id: `${runId}-temporary`,
+        runId,
+        path: "temp/output.txt",
+        kind: "temporary",
+        contentType: "text/plain",
+        content: "cleanup candidate"
+      });
+    }
+    const databasePath = store.databasePath;
+    store.close();
+    const database = new Database(databasePath);
+    database.exec(`
+      CREATE TRIGGER reject_first_run_cleanup_audit
+      BEFORE INSERT ON events
+      WHEN NEW.type = 'retention.deleted' AND NEW.run_id = 'a-broken'
+      BEGIN
+        SELECT RAISE(ABORT, 'reject first run cleanup audit');
+      END
+    `);
+    database.close();
+
+    const result = await captureCli(["cleanup", "--older-than", "30d", "--status", "completed"], repo);
+
+    expect(result.exitCode).toBe(2);
+    expect(result.stdout.includes("a-broken\tcompleted\trun_error")).toBe(true);
+    expect(result.stdout.includes("z-cleanup-candidate\tcompleted\tapplied\tdeleted=1")).toBe(true);
+    expect(result.stderr.includes("could not process 1 run")).toBe(true);
+    const inspected = await openAgentFlowRunState({ cwd: repo });
+    expect(inspected.getArtifact("a-broken", "temp/output.txt")?.status).toBe("available");
+    expect(inspected.getArtifact("z-cleanup-candidate", "temp/output.txt")?.status).toBe("missing");
+    inspected.close();
+  });
+
   test("fails cleanup when an artifact backing cannot be deleted", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-cleanup-failure-"));
     fs.mkdirSync(path.join(repo, ".git"));

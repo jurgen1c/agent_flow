@@ -1797,7 +1797,7 @@ export class AgentFlowRunStateStore {
     const normalizedRunId = requiredString(runId, "Run ID");
     this.requireRun(normalizedRunId);
     const pagination = recordPage(page, "created_at");
-    const order = page?.after === undefined ? "created_at ASC, rowid ASC" : "created_at ASC, id ASC";
+    const order = page === undefined ? "created_at ASC, rowid ASC" : "created_at ASC, id ASC";
     return this.database.all<FailureRow>(
       `SELECT * FROM failures WHERE run_id = ?${pagination.where} ORDER BY ${order}${pagination.sql}`,
       [normalizedRunId, ...pagination.parameters]

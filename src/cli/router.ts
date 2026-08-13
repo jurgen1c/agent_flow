@@ -535,43 +535,41 @@ function runCleanupCommand(
   let totalFailed = 0;
   let totalRunErrors = 0;
   for (const run of runs) {
-    let workflow: import("../runtime/index").AgentFlowWorkflow;
     try {
-      workflow = persistedWorkflow(run);
+      const workflow = persistedWorkflow(run);
+      const result = store.withRunFinalizationTransaction(run.id, () => applyAgentFlowRetention(
+        store,
+        run.id,
+        workflow,
+        run.status,
+        {
+          explicit: true,
+          ageDays: ageDays(run.finishedAt ?? run.updatedAt, now),
+          ...(input.approved ? { approvalStatus: "approved" as const } : {})
+        }
+      ));
+      totalDeleted += result.deleted.length;
+      totalSkipped += result.skipped.length;
+      totalFailed += result.failed.length;
+      lines.push(
+        `${run.id}\t${run.status}\t${result.status}\tdeleted=${result.deleted.length}`
+        + `\tskipped=${result.skipped.length}\tfailed=${result.failed.length}`
+      );
     } catch (error) {
-      if (input.runId !== undefined || !(error instanceof AgentFlowRunStateError)
-        || error.code !== "AGENT_FLOW_RETENTION_STATE") {
-        throw error;
-      }
+      if (input.runId !== undefined) throw error;
       totalRunErrors += 1;
-      lines.push(`${run.id}\t${run.status}\tworkflow_error\tdeleted=0\tskipped=0\tfailed=0`);
-      continue;
+      const status = error instanceof AgentFlowRunStateError && error.code === "AGENT_FLOW_RETENTION_STATE"
+        ? "workflow_error"
+        : "run_error";
+      lines.push(`${run.id}\t${run.status}\t${status}\tdeleted=0\tskipped=0\tfailed=0`);
     }
-    const result = store.withRunFinalizationTransaction(run.id, () => applyAgentFlowRetention(
-      store,
-      run.id,
-      workflow,
-      run.status,
-      {
-        explicit: true,
-        ageDays: ageDays(run.finishedAt ?? run.updatedAt, now),
-        ...(input.approved ? { approvalStatus: "approved" as const } : {})
-      }
-    ));
-    totalDeleted += result.deleted.length;
-    totalSkipped += result.skipped.length;
-    totalFailed += result.failed.length;
-    lines.push(
-      `${run.id}\t${run.status}\t${result.status}\tdeleted=${result.deleted.length}`
-      + `\tskipped=${result.skipped.length}\tfailed=${result.failed.length}`
-    );
   }
   const errors: string[] = [];
   if (totalFailed > 0) {
     errors.push(`Cleanup could not delete ${totalFailed} artifact${totalFailed === 1 ? "" : "s"}.`);
   }
   if (totalRunErrors > 0) {
-    errors.push(`Cleanup could not process ${totalRunErrors} run${totalRunErrors === 1 ? "" : "s"} with missing or invalid persisted workflows.`);
+    errors.push(`Cleanup could not process ${totalRunErrors} run${totalRunErrors === 1 ? "" : "s"}.`);
   }
   return {
     exitCode: errors.length === 0 ? 0 : 2,
