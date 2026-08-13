@@ -45,6 +45,7 @@
   "files": [
     "dist/",
     "examples/",
+    "skills/",
     "schemas/",
     "README.md",
     "LICENSE"

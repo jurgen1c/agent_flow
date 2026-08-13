@@ -16,10 +16,26 @@ npm install @jurgen1c/agent-flow
 
 Node.js 25.9.0 or newer is required. Bun is used for development and testing.
 
+Install the bundled workflow authoring and review skills into the current
+repository's `.agents/skills` directory or into the Codex user skill directory
+(`$CODEX_HOME/skills`, falling back to `~/.codex/skills`):
+
+```bash
+agent-flow skills list
+agent-flow skills install --destination agents
+agent-flow skills install --destination codex
+```
+
+Installation refuses to replace an existing skill directory. The skills only
+author, inspect, review, debug, simplify, or policy-harden workflow YAML; they
+do not invoke workflow lifecycle commands.
+
 ## CLI
 
 ```bash
 agent-flow help
+agent-flow skills list
+agent-flow skills install --destination agents
 agent-flow validate workflow.yml
 agent-flow lint workflow.yml
 agent-flow explain workflow.yml

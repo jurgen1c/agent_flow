@@ -23,6 +23,8 @@ try {
   const files = manifest.files.map((entry) => entry.path);
   const exampleFiles = listFiles(path.join(repositoryRoot, "examples"))
     .map((file) => path.posix.join("examples", file));
+  const skillFiles = listFiles(path.join(repositoryRoot, "skills"))
+    .map((file) => path.posix.join("skills", file));
 
   for (const required of [
     "package.json",
@@ -34,6 +36,7 @@ try {
     "dist/cli/router.d.ts",
     "dist/agent-flow.js",
     ...exampleFiles,
+    ...skillFiles,
     "schemas/approval.schema.json",
     "schemas/challenge.schema.json",
     "schemas/config.schema.json",

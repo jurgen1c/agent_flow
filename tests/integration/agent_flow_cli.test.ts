@@ -28,6 +28,7 @@ describe("Agent Flow CLI", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("Agent Flow");
     expect(result.stdout).toContain("Available now");
+    expect(result.stdout).toContain("skills install --destination <agents|codex>");
     expect(result.stdout).toContain("validate <workflow>");
     expect(result.stdout).toContain("lint <workflow>");
     expect(result.stdout).toContain("explain <workflow>");

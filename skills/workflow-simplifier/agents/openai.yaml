@@ -1,0 +1,4 @@
+interface:
+  display_name: "Workflow Simplifier"
+  short_description: "Simplify Agent Flow workflows"
+  default_prompt: "Use $workflow-simplifier to reduce this Agent Flow workflow while preserving its required behavior."

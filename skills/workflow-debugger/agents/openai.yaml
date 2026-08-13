@@ -1,0 +1,4 @@
+interface:
+  display_name: "Workflow Debugger"
+  short_description: "Diagnose Agent Flow workflow defects"
+  default_prompt: "Use $workflow-debugger to diagnose why this Agent Flow workflow does not validate or simulate as expected."

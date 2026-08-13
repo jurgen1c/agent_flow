@@ -1,0 +1,4 @@
+interface:
+  display_name: "Workflow Designer"
+  short_description: "Design Agent Flow workflows"
+  default_prompt: "Use $workflow-designer to design a safe Agent Flow workflow YAML for this process."
