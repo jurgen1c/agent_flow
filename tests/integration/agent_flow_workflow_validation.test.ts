@@ -12,11 +12,40 @@ import {
 const repoRoot = path.resolve(".");
 const fixtureRoot = path.join(repoRoot, "tests/fixtures/agent-flow");
 const exampleRoot = path.join(repoRoot, "examples/workflows");
+const curatedWorkflowFiles = [
+  "ci-triage.yml",
+  "content-review-collab.yml",
+  "implement-review-collab.yml",
+  "jira-ticket-spec.yml",
+  "pr-feedback-loop.yml",
+  "simple-ci.yml",
+  "ticket-lifecycle.yml"
+];
+const curatedPromptFiles = [
+  "address-review.md",
+  "classify-ci-failure.md",
+  "classify-pr-comments.md",
+  "create-spec.md",
+  "draft-feature-copy.md",
+  "fix-ci-failure.md",
+  "implement-ticket.md",
+  "resolve-pr-comments.md",
+  "review-implementation.md",
+  "revise-feature-copy.md",
+  "triage-gh-failure.md"
+];
+const notificationTemplateFiles = [
+  "workflow-completed.md",
+  "workflow-failed.md",
+  "workflow-paused.md"
+];
 
 describe("Agent Flow workflow validation", () => {
   test("accepts valid examples for every workflow style", () => {
     const files = fs.readdirSync(exampleRoot).filter((file) => file.endsWith(".yml")).sort();
     const styles = new Set<string>();
+
+    expect(files).toEqual(curatedWorkflowFiles);
 
     for (const file of files) {
       const workflow = parseAgentFlowWorkflowOrThrow(fs.readFileSync(path.join(exampleRoot, file), "utf8"));
@@ -25,6 +54,24 @@ describe("Agent Flow workflow validation", () => {
     }
 
     expect(styles).toEqual(new Set(["pipeline", "recovery_pipeline", "collaborative"]));
+  });
+
+  test("ships every related prompt and notification template", () => {
+    expect(fs.readdirSync(path.join(repoRoot, "examples/prompts")).sort()).toEqual(curatedPromptFiles);
+    expect(fs.readdirSync(path.join(repoRoot, "examples/templates")).sort()).toEqual(notificationTemplateFiles);
+
+    const referencedPrompts = new Set<string>();
+    for (const file of curatedWorkflowFiles) {
+      const workflow = parseAgentFlowWorkflowOrThrow(fs.readFileSync(path.join(exampleRoot, file), "utf8"));
+      collectPromptPaths(workflow, referencedPrompts);
+    }
+
+    expect([...referencedPrompts].sort()).toEqual(
+      curatedPromptFiles.map((file) => `examples/prompts/${file}`)
+    );
+    for (const prompt of referencedPrompts) {
+      expect(fs.statSync(path.join(repoRoot, prompt)).isFile()).toBe(true);
+    }
   });
 
   test("returns stable actionable codes for invalid workflow fixtures", () => {
@@ -3219,6 +3266,21 @@ steps: []
     });
   });
 });
+
+function collectPromptPaths(value: unknown, prompts: Set<string>): void {
+  if (Array.isArray(value)) {
+    for (const entry of value) collectPromptPaths(entry, prompts);
+    return;
+  }
+  if (value === null || typeof value !== "object") return;
+
+  for (const [key, entry] of Object.entries(value)) {
+    if (key === "prompt" && typeof entry === "string" && entry.endsWith(".md")) {
+      prompts.add(entry);
+    }
+    collectPromptPaths(entry, prompts);
+  }
+}
 
 describe("Agent Flow workflow lint", () => {
   test("detects qualified sudo executables without matching argument text", () => {

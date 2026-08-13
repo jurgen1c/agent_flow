@@ -21,6 +21,8 @@ try {
   ]);
   const manifest = parsePackOutput(dryRun)[0];
   const files = manifest.files.map((entry) => entry.path);
+  const exampleFiles = listFiles(path.join(repositoryRoot, "examples"))
+    .map((file) => path.posix.join("examples", file));
 
   for (const required of [
     "package.json",
@@ -31,13 +33,7 @@ try {
     "dist/cli/router.js",
     "dist/cli/router.d.ts",
     "dist/agent-flow.js",
-    "examples/README.md",
-    "examples/workflows/implement-review-collab.yml",
-    "examples/workflows/content-review-collab.yml",
-    "examples/prompts/implement-ticket.md",
-    "examples/prompts/draft-feature-copy.md",
-    "examples/fixtures/implement-review-collab/approved.json",
-    "examples/fixtures/content-review-collab/approved.json",
+    ...exampleFiles,
     "schemas/approval.schema.json",
     "schemas/challenge.schema.json",
     "schemas/config.schema.json",
@@ -186,6 +182,17 @@ function parsePackOutput(output) {
   } catch {
     fail(`Could not parse npm pack output:\n${output}`);
   }
+}
+
+function listFiles(root, relativeDirectory = "") {
+  const directory = path.join(root, relativeDirectory);
+  return fs.readdirSync(directory, { withFileTypes: true })
+    .flatMap((entry) => {
+      const relativePath = path.join(relativeDirectory, entry.name);
+      if (entry.isDirectory()) return listFiles(root, relativePath);
+      return entry.isFile() ? [relativePath.split(path.sep).join(path.posix.sep)] : [];
+    })
+    .sort();
 }
 
 function fail(message) {

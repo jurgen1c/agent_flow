@@ -20,7 +20,9 @@ These examples show how Agent Flow workflows can start simple and grow into reco
 2. Run `jira-ticket-spec.yml` to show LM summarization with MCP.
 3. Run `ticket-lifecycle.yml` to show LM/FM orchestration.
 4. Trigger a fake CI failure and show `ci-triage.yml`.
-5. Show `implement-review-collab.yml` to demonstrate collaboration.
+5. Run `pr-feedback-loop.yml` to show bounded PR comment and CI recovery.
+6. Show `implement-review-collab.yml` to demonstrate code collaboration.
+7. Show `content-review-collab.yml` to demonstrate content collaboration and product approval.
 
 ## Collaborative Examples
 

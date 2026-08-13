@@ -36,7 +36,7 @@ steps:
   - id: create_spec
     type: session_request
     session: lm
-    prompt: prompts/create-spec.md
+    prompt: examples/prompts/create-spec.md
     inputs:
       - ticket.json
       - ticket.md
@@ -51,4 +51,3 @@ notify:
     channels: [terminal]
   - on: workflow.paused
     channels: [terminal, system]
-
