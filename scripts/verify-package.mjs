@@ -21,6 +21,8 @@ try {
   ]);
   const manifest = parsePackOutput(dryRun)[0];
   const files = manifest.files.map((entry) => entry.path);
+  const documentationFiles = listFiles(path.join(repositoryRoot, "docs"))
+    .map((file) => path.posix.join("docs", file));
   const exampleFiles = listFiles(path.join(repositoryRoot, "examples"))
     .map((file) => path.posix.join("examples", file));
   const skillFiles = listFiles(path.join(repositoryRoot, "skills"))
@@ -35,6 +37,7 @@ try {
     "dist/cli/router.js",
     "dist/cli/router.d.ts",
     "dist/agent-flow.js",
+    ...documentationFiles,
     ...exampleFiles,
     ...skillFiles,
     "schemas/approval.schema.json",

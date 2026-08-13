@@ -158,6 +158,19 @@ no Memory adapter. The optional integration adapter lives in
 See [docs/architecture.md](docs/architecture.md) for boundaries and
 [docs/specifications](docs/specifications) for workflow behavior.
 
+## Documentation
+
+The [documentation hub](docs/README.md) provides an end-to-end guide:
+
+- [Quickstart](docs/quickstart.md) for installation and a first persistent run.
+- [Command reference](docs/command-reference.md) for every active CLI command.
+- [Concepts and safety](docs/concepts-and-safety.md) for workflow styles,
+  policies, run state, artifacts, and the committed/generated file boundary.
+- [Packages and Memory integration](docs/packages-and-memory.md) for the roles of
+  Agent Flow, Agent Memory, Agentic Development, and Agent Core.
+- [Operations and packaging](docs/operations-and-packaging.md) for validation,
+  simulation, cleanup, archives, package verification, and release expectations.
+
 ## Development
 
 ```bash
