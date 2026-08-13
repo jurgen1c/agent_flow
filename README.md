@@ -32,9 +32,28 @@ agent-flow logs example-run
 agent-flow artifacts example-run
 agent-flow pause example-run
 agent-flow cancel example-run
+agent-flow cleanup example-run
+agent-flow cleanup --older-than 30d --status completed
+agent-flow archive example-run
+agent-flow export example-run --format zip
 ```
 
 Repository-local state is stored in `.agent-flow/`. Do not commit it.
+Cleanup applies each persisted workflow's retention policy while preserving
+SQLite run state and events, final summaries, failure evidence, decision
+records, and approved evidence. `archive` writes to `.agent-flow/archives/`;
+`export` writes a portable ZIP in the repository root. Both ZIP forms contain
+run state, ordered events, artifact metadata, failures, approvals, sessions,
+and every available registered artifact. Use `--output <file>` to select a
+different repository-contained file destination. On Linux, publication walks
+each output directory from a repository-root descriptor and refuses directory
+replacement races; other platforms fail closed until they provide an equivalent
+descriptor-relative primitive. Portable archive
+content is capped at 64 MiB, with JSON encoded incrementally against the same
+bound before buffers are materialized. Publication staging links use randomized
+hidden names and are retained because Node does not expose an identity-bound
+unlink primitive; this avoids deleting a pathname concurrently replaced by
+another process.
 
 ## API
 

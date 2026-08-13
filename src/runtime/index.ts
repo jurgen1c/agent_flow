@@ -176,6 +176,12 @@ export {
   applyAgentFlowRetention,
   writeAgentFlowFinalSummary
 } from "./retention";
+export {
+  MAX_AGENT_FLOW_PORTABLE_ARCHIVE_CONTENT_BYTES,
+  defaultAgentFlowArchivePath,
+  defaultAgentFlowExportPath,
+  writeAgentFlowPortableArchive
+} from "./maintenance";
 export type {
   AgentFlowFailurePayload,
   PersistAgentFlowFailurePayloadInput,
@@ -310,8 +316,11 @@ export type {
   AgentFlowNotificationIssue
 } from "./notifications";
 export type {
+  ApplyAgentFlowRetentionOptions,
+  AgentFlowRetentionResult,
   AgentFlowFinalSummaryInput
 } from "./retention";
+export type { AgentFlowPortableArchiveResult } from "./maintenance";
 
 export const plannedAgentFlowRuntimeCommands = [
   "init",
@@ -327,7 +336,9 @@ export const plannedAgentFlowRuntimeCommands = [
   "artifacts",
   "pause",
   "cancel",
-  "cleanup"
+  "cleanup",
+  "archive",
+  "export"
 ] as const;
 
 export type PlannedAgentFlowRuntimeCommand = (typeof plannedAgentFlowRuntimeCommands)[number];

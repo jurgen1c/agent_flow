@@ -10,7 +10,15 @@ const nodeExecutable = process.env.AGENT_TEST_NODE ?? resolveNodeExecutable();
 describe("built Node CLI", () => {
   test("runs persistent workflows without exposing Node SQLite warnings", () => {
     const build = run(["bun", "run", "build"], repositoryRoot);
-    expect(build.exitCode).toBe(0);
+    if (build.exitCode !== 0) {
+      throw new Error([
+        `bun run build exited with ${build.exitCode}.`,
+        "stdout:",
+        build.stdout || "(empty)",
+        "stderr:",
+        build.stderr || "(empty)"
+      ].join("\n"));
+    }
     expect(fs.readFileSync(builtCli, "utf8").split(/\r?\n/, 1)[0]).toBe(
       "#!/usr/bin/env node"
     );

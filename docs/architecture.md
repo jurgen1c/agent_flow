@@ -50,11 +50,24 @@ Local persistent state stays under:
 ```text
 .agent-flow/
 ├── agent-flow.sqlite
+├── archives/
 └── runs/
 ```
 
 Generated state must remain uncommitted. Repository and artifact paths are
 validated by Agent Core before filesystem access.
+Retention cleanup deletes only policy-matched artifact backings and leaves
+their SQLite metadata inspectable. Portable archives are ZIP32 containers with
+run state, JSONL events, metadata, and available registered artifact content;
+they never expose local artifact storage paths. Archive collection holds the
+run-state write lock for one consistent snapshot. On Linux, publication opens
+each path component relative to a verified repository-root descriptor and
+fails if the directory chain changes; unsupported platforms fail closed.
+Randomized hidden staging links are conservatively retained after publication
+because a separate pathname identity check followed by unlink would permit a
+replacement race.
+A 64 MiB content limit is enforced during incremental JSON encoding before
+buffers are materialized and bounds in-memory ZIP construction.
 
 ## Build and release
 

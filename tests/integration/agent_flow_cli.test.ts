@@ -1,12 +1,21 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { dispatch, runCli } from "../../src/cli/router";
 import {
+  AgentFlowRunStateStore,
+  MAX_AGENT_FLOW_PORTABLE_ARCHIVE_CONTENT_BYTES,
+  applyAgentFlowRetention,
   createAgentFlowLifecycleRun,
+  defaultAgentFlowArchivePath,
+  defaultAgentFlowExportPath,
   openAgentFlowRunState,
   parseAgentFlowWorkflowOrThrow,
-  plannedAgentFlowRuntimeCommands
+  plannedAgentFlowRuntimeCommands,
+  writeAgentFlowPortableArchive,
+  writeAgentFlowFinalSummary
 } from "../../src/runtime";
 
 const repoRoot = path.resolve(".");
@@ -26,6 +35,9 @@ describe("Agent Flow CLI", () => {
     expect(result.stdout).toContain("simulate <workflow> --fixture <file>");
     expect(result.stdout).toContain("run <workflow> --id <run-id>");
     expect(result.stdout).toContain("pause <run-id>");
+    expect(result.stdout).toContain("cleanup <run-id>");
+    expect(result.stdout).toContain("archive <run-id>");
+    expect(result.stdout).toContain("export <run-id> --format zip");
     expect(result.stdout).toContain("Command and artifact-transform pipeline execution");
   });
 
@@ -37,7 +49,7 @@ describe("Agent Flow CLI", () => {
   });
 
   test("keeps remaining execution commands reserved but inactive", () => {
-    for (const command of plannedAgentFlowRuntimeCommands.filter((candidate) => !["validate", "lint", "explain", "graph", "simulate", "run", "resume", "status", "logs", "artifacts", "pause", "cancel"].includes(candidate))) {
+    for (const command of plannedAgentFlowRuntimeCommands.filter((candidate) => !["validate", "lint", "explain", "graph", "simulate", "run", "resume", "status", "logs", "artifacts", "pause", "cancel", "cleanup", "archive", "export"].includes(candidate))) {
       const result = dispatch([command]);
 
       expect(result.exitCode).toBe(7);
@@ -66,6 +78,14 @@ describe("Agent Flow CLI", () => {
     expect(dispatch(["help", "inject"])).toEqual({
       exitCode: 0,
       stdout: "agent-flow inject\n\nUsage: agent-flow inject <run-id> <session-name> <context>"
+    });
+    expect(dispatch(["help", "cleanup"])).toEqual({
+      exitCode: 0,
+      stdout: "agent-flow cleanup\n\nUsage: agent-flow cleanup ([--] <run-id> | --older-than <duration> [--status <status>]) [--approve]"
+    });
+    expect(dispatch(["help", "export"])).toEqual({
+      exitCode: 0,
+      stdout: "agent-flow export\n\nUsage: agent-flow export [--] <run-id> --format zip [--output <file>]"
     });
     expect(dispatch(["help", "missing"])).toEqual({
       exitCode: 7,
@@ -207,6 +227,790 @@ retention:
     const artifacts = await captureCli(["artifacts", "cli-notification"], repo);
     expect(artifacts.stdout).toContain("final-summary.md\tavailable\trun_summary");
     expect(artifacts.stdout).toMatch(/logs\/check-[a-f0-9]{8}\/attempt-1\/stdout\.log\tmissing\tcommand_log/);
+  });
+
+  test("cleans runs by age and status while retaining required evidence", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-cleanup-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: retained-runs
+version: 1
+style: pipeline
+maturity: experimental
+steps: []
+retention:
+  on_success: { delete: ["**"], after_days: 30 }
+  on_failure: { keep_all_for_days: 30 }
+  on_cancelled: { ask_user: true }
+`);
+    const store = await openAgentFlowRunState({ cwd: repo, now: () => "2026-01-01T00:00:00.000Z" });
+    for (const status of ["completed", "failed", "cancelled", "paused"] as const) {
+      const runId = `retained-${status}`;
+      createAgentFlowLifecycleRun(store, { id: runId, workflow });
+      store.updateRun(runId, { status });
+      store.writeArtifact({
+        id: `temporary-${status}`,
+        runId,
+        path: "temp/output.txt",
+        kind: "temporary",
+        contentType: "text/plain",
+        content: status
+      });
+      if (status === "completed") {
+        writeAgentFlowFinalSummary(store, runId, workflow, { status, completedSteps: [] });
+      }
+      if (status === "failed") {
+        store.writeArtifact({
+          id: "failure-evidence",
+          runId,
+          path: "failures/evidence.json",
+          kind: "failure_payload",
+          contentType: "application/json",
+          content: "{}\n"
+        });
+        store.writeArtifact({
+          id: "decision-evidence",
+          runId,
+          path: "decision-records/failure.json",
+          kind: "decision_record",
+          contentType: "application/json",
+          content: "{}\n"
+        });
+      }
+    }
+    store.close();
+
+    expect(await captureCli(["cleanup", "--older-than", "30d", "--status", "completed"], repo))
+      .toMatchObject({ exitCode: 0, stdout: expect.stringContaining("retained-completed") });
+    expect(await captureCli(["cleanup", "--older-than", "30d", "--status", "failed"], repo))
+      .toMatchObject({ exitCode: 0, stdout: expect.stringContaining("retained-failed") });
+    expect(await captureCli(["cleanup", "retained-cancelled"], repo))
+      .toMatchObject({ exitCode: 0, stdout: expect.stringContaining("skipped=1") });
+    let inspected = await openAgentFlowRunState({ cwd: repo });
+    expect(inspected.getArtifact("retained-cancelled", "temp/output.txt")?.status).toBe("available");
+    inspected.close();
+    expect(await captureCli(["cleanup", "retained-cancelled", "--approve"], repo))
+      .toMatchObject({ exitCode: 0, stdout: expect.stringContaining("deleted=1") });
+    expect(await captureCli(["cleanup", "retained-paused"], repo))
+      .toMatchObject({ exitCode: 0, stdout: expect.stringContaining("not_configured") });
+
+    inspected = await openAgentFlowRunState({ cwd: repo });
+    expect(inspected.getArtifact("retained-completed", "temp/output.txt")?.status).toBe("missing");
+    expect(inspected.getArtifact("retained-completed", "final-summary.md")?.status).toBe("available");
+    expect(inspected.getArtifact("retained-failed", "temp/output.txt")?.status).toBe("missing");
+    expect(inspected.getArtifact("retained-failed", "failures/evidence.json")?.status).toBe("available");
+    expect(inspected.getArtifact("retained-failed", "decision-records/failure.json")?.status).toBe("available");
+    expect(inspected.getArtifact("retained-cancelled", "temp/output.txt")?.status).toBe("missing");
+    expect(inspected.getArtifact("retained-paused", "temp/output.txt")?.status).toBe("available");
+    expect(inspected.listEvents("retained-completed").some((event) => event.type === "retention.deleted")).toBe(true);
+    inspected.close();
+  });
+
+  test("continues batch cleanup when a matching run lacks its persisted workflow", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-cleanup-workflow-error-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: cleanup-workflow-error
+version: 1
+style: pipeline
+maturity: experimental
+steps: []
+retention:
+  on_success: { delete: [temp/**] }
+`);
+    const store = await openAgentFlowRunState({ cwd: repo, now: () => "2026-01-01T00:00:00.000Z" });
+    store.createRun({
+      id: "missing-workflow",
+      workflow: { name: "legacy", version: 1, style: "pipeline", maturity: "experimental" },
+      status: "completed"
+    });
+    createAgentFlowLifecycleRun(store, { id: "cleanup-candidate", workflow });
+    store.updateRun("cleanup-candidate", { status: "completed" });
+    store.writeArtifact({
+      id: "cleanup-candidate-temporary",
+      runId: "cleanup-candidate",
+      path: "temp/output.txt",
+      kind: "temporary",
+      contentType: "text/plain",
+      content: "cleanup candidate"
+    });
+    store.close();
+
+    const result = await captureCli(["cleanup", "--older-than", "30d", "--status", "completed"], repo);
+
+    expect(result).toMatchObject({
+      exitCode: 2,
+      stdout: expect.stringContaining("missing-workflow\tcompleted\tworkflow_error"),
+      stderr: expect.stringContaining("could not process 1 run")
+    });
+    const inspected = await openAgentFlowRunState({ cwd: repo });
+    expect(inspected.getArtifact("cleanup-candidate", "temp/output.txt")?.status).toBe("missing");
+    inspected.close();
+  });
+
+  test("continues batch cleanup after a run retention transaction fails", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-cleanup-run-error-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: cleanup-run-error
+version: 1
+style: pipeline
+maturity: experimental
+steps: []
+retention:
+  on_success: { delete: [temp/**] }
+`);
+    const store = await openAgentFlowRunState({ cwd: repo, now: () => "2026-01-01T00:00:00.000Z" });
+    for (const runId of ["a-broken", "z-cleanup-candidate"]) {
+      createAgentFlowLifecycleRun(store, { id: runId, workflow });
+      store.updateRun(runId, { status: "completed" });
+      store.writeArtifact({
+        id: `${runId}-temporary`,
+        runId,
+        path: "temp/output.txt",
+        kind: "temporary",
+        contentType: "text/plain",
+        content: "cleanup candidate"
+      });
+    }
+    const databasePath = store.databasePath;
+    store.close();
+    const database = new Database(databasePath);
+    database.exec(`
+      CREATE TRIGGER reject_first_run_cleanup_audit
+      BEFORE INSERT ON events
+      WHEN NEW.type = 'retention.deleted' AND NEW.run_id = 'a-broken'
+      BEGIN
+        SELECT RAISE(ABORT, 'reject first run cleanup audit');
+      END
+    `);
+    database.close();
+
+    const result = await captureCli(["cleanup", "--older-than", "30d", "--status", "completed"], repo);
+
+    expect(result.exitCode).toBe(2);
+    expect(result.stdout.includes("a-broken\tcompleted\trun_error")).toBe(true);
+    expect(result.stdout.includes("z-cleanup-candidate\tcompleted\tapplied\tdeleted=1")).toBe(true);
+    expect(result.stderr.includes("could not process 1 run")).toBe(true);
+    const inspected = await openAgentFlowRunState({ cwd: repo });
+    expect(inspected.getArtifact("a-broken", "temp/output.txt")?.status).toBe("available");
+    expect(inspected.getArtifact("z-cleanup-candidate", "temp/output.txt")?.status).toBe("missing");
+    inspected.close();
+  });
+
+  test("fails cleanup when an artifact backing cannot be deleted", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-cleanup-failure-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: cleanup-failure
+version: 1
+style: pipeline
+maturity: experimental
+steps: []
+retention:
+  on_success: { delete: ["**"] }
+`);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, { id: "cleanup-failure", workflow });
+    store.updateRun("cleanup-failure", { status: "completed" });
+    store.writeArtifact({
+      id: "temporary",
+      runId: "cleanup-failure",
+      path: "temp/output.txt",
+      kind: "temporary",
+      contentType: "text/plain",
+      content: "retained after failure"
+    });
+    store.close();
+
+    const originalDelete = AgentFlowRunStateStore.prototype.deleteArtifactBacking;
+    const deleteSpy = spyOn(AgentFlowRunStateStore.prototype, "deleteArtifactBacking")
+      .mockImplementation(function (runId, declaredPath) {
+        if (runId === "cleanup-failure") throw new Error("simulated deletion failure");
+        return originalDelete.call(this, runId, declaredPath);
+      });
+    let result: Awaited<ReturnType<typeof captureCli>>;
+    try {
+      result = await captureCli(["cleanup", "cleanup-failure"], repo);
+    } finally {
+      deleteSpy.mockRestore();
+    }
+
+    expect(result).toMatchObject({
+      exitCode: 2,
+      stdout: expect.stringContaining("failed=1"),
+      stderr: expect.stringContaining("could not delete 1 artifact")
+    });
+    const inspected = await openAgentFlowRunState({ cwd: repo });
+    expect(inspected.getArtifact("cleanup-failure", "temp/output.txt")?.status).toBe("available");
+    expect(inspected.listEvents("cleanup-failure").some((event) => event.type === "retention.failed")).toBe(true);
+    inspected.close();
+  });
+
+  test("rolls back explicit cleanup when its deletion audit event cannot be persisted", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-cleanup-audit-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: cleanup-audit
+version: 1
+style: pipeline
+maturity: experimental
+steps: []
+retention:
+  on_success: { delete: [temp/**] }
+`);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, { id: "cleanup-audit", workflow });
+    store.updateRun("cleanup-audit", { status: "completed" });
+    store.writeArtifact({
+      id: "temporary",
+      runId: "cleanup-audit",
+      path: "temp/output.txt",
+      kind: "temporary",
+      contentType: "text/plain",
+      content: "retain when auditing fails"
+    });
+    const databasePath = store.databasePath;
+    store.close();
+
+    const database = new Database(databasePath);
+    database.exec(`
+      CREATE TRIGGER reject_cleanup_audit
+      BEFORE INSERT ON events
+      WHEN NEW.type = 'retention.deleted'
+      BEGIN
+        SELECT RAISE(ABORT, 'reject cleanup audit');
+      END
+    `);
+    database.close();
+
+    expect(await captureCli(["cleanup", "cleanup-audit"], repo))
+      .toMatchObject({ exitCode: 2, stderr: expect.stringContaining("reject cleanup audit") });
+    const inspected = await openAgentFlowRunState({ cwd: repo });
+    expect(inspected.getArtifact("cleanup-audit", "temp/output.txt")?.status).toBe("available");
+    expect(inspected.readArtifact("cleanup-audit", "temp/output.txt").content.toString("utf8"))
+      .toBe("retain when auditing fails");
+    expect(inspected.listEvents("cleanup-audit").some((event) => event.type === "retention.deleted"))
+      .toBe(false);
+    inspected.close();
+  });
+
+  test("applies after-days-only retention once its explicit cleanup threshold elapses", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-cleanup-after-days-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: cleanup-after-days
+version: 1
+style: pipeline
+maturity: experimental
+steps: []
+retention:
+  on_success: { after_days: 30 }
+`);
+    const store = await openAgentFlowRunState({ cwd: repo, now: () => "2026-01-01T00:00:00.000Z" });
+    createAgentFlowLifecycleRun(store, { id: "cleanup-after-days", workflow });
+    store.updateRun("cleanup-after-days", { status: "completed" });
+    store.writeArtifact({
+      id: "temporary",
+      runId: "cleanup-after-days",
+      path: "temp/output.txt",
+      kind: "temporary",
+      contentType: "text/plain",
+      content: "delete after threshold"
+    });
+    writeAgentFlowFinalSummary(store, "cleanup-after-days", workflow, {
+      status: "completed",
+      completedSteps: []
+    });
+    expect(applyAgentFlowRetention(store, "cleanup-after-days", workflow, "completed").status).toBe("deferred");
+    store.close();
+
+    expect(await captureCli(["cleanup", "--older-than", "30d", "--status", "completed"], repo))
+      .toMatchObject({ exitCode: 0, stdout: expect.stringContaining("deleted=1") });
+    const inspected = await openAgentFlowRunState({ cwd: repo });
+    expect(inspected.getArtifact("cleanup-after-days", "temp/output.txt")?.status).toBe("missing");
+    expect(inspected.getArtifact("cleanup-after-days", "final-summary.md")?.status).toBe("available");
+    inspected.close();
+  });
+
+  test("archives and exports inspectable portable ZIP artifacts", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-export-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.writeFileSync(path.join(repo, "workflow.yml"), `
+name: portable-run
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: check, type: command, command: "printf portable-output" }
+`);
+    fs.writeFileSync(path.join(repo, "fixture.json"), '{"inputs":{},"artifacts":{},"steps":{}}\n');
+    expect(await captureCli([
+      "run", "workflow.yml", "--id", "portable-run", "--fixture", "fixture.json"
+    ], repo))
+      .toMatchObject({ exitCode: 0 });
+
+    const archived = await captureCli(["archive", "portable-run", "--output", "portable/archive.zip"], repo);
+    const exported = await captureCli(["export", "portable-run", "--format", "zip", "--output", "portable/export.zip"], repo);
+    expect(archived).toMatchObject({ exitCode: 0, stdout: expect.stringContaining("Archived Agent Flow run portable-run") });
+    expect(exported).toMatchObject({ exitCode: 0, stdout: expect.stringContaining("Exported Agent Flow run portable-run") });
+
+    for (const filename of ["archive.zip", "export.zip"]) {
+      const entries = readStoredZip(fs.readFileSync(path.join(repo, "portable", filename)));
+      expect([...entries.keys()]).toContain("manifest.json");
+      expect([...entries.keys()]).toContain("state.json");
+      expect([...entries.keys()]).toContain("events.jsonl");
+      expect([...entries.keys()]).toContain("artifacts/final-summary.md");
+      expect([...entries.keys()].some((entry) => entry.endsWith("/stdout.log"))).toBe(true);
+      const state = entries.get("state.json")!.toString("utf8");
+      expect(state).toContain('"status": "completed"');
+      expect(state).not.toContain("cliFixturePath");
+      expect(state).not.toContain(repo);
+      expect(entries.get("events.jsonl")!.toString("utf8")).toContain('"type":"run.completed"');
+      expect(entries.get("manifest.json")!.toString("utf8")).not.toContain(repo);
+    }
+    expect(await captureCli(["archive", "portable-run", "--output", "portable/archive.zip"], repo))
+      .toMatchObject({ exitCode: 2, stderr: expect.stringContaining("already exists") });
+    const stagingEntries = fs.readdirSync(path.join(repo, "portable"))
+      .filter((entry) => entry.startsWith(".agent-flow-archive-"));
+    expect(await captureCli(["archive", "portable-run", "--output", "portable/archive.zip"], repo))
+      .toMatchObject({ exitCode: 2, stderr: expect.stringContaining("already exists") });
+    expect(fs.readdirSync(path.join(repo, "portable"))
+      .filter((entry) => entry.startsWith(".agent-flow-archive-"))).toEqual(stagingEntries);
+  });
+
+  test("accepts flag-prefixed run IDs in maintenance commands", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-maintenance-run-id-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: maintenance-run-id
+version: 1
+style: pipeline
+maturity: experimental
+steps: []
+retention:
+  on_success: { delete: [temp/**] }
+`);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    for (const runId of ["--nightly", "--older-than"]) {
+      createAgentFlowLifecycleRun(store, { id: runId, workflow });
+      store.updateRun(runId, { status: "completed" });
+      store.writeArtifact({
+        id: `${runId}-temporary`,
+        runId,
+        path: "temp/output.txt",
+        kind: "temporary",
+        contentType: "text/plain",
+        content: "cleanup candidate"
+      });
+    }
+    store.close();
+
+    expect(await captureCli(["cleanup", "--nightly"], repo))
+      .toMatchObject({ exitCode: 0, stdout: expect.stringContaining("--nightly") });
+    expect(await captureCli(["archive", "--nightly", "--output", "portable/nightly.zip"], repo))
+      .toMatchObject({ exitCode: 0 });
+    expect(await captureCli(["export", "--nightly", "--format", "zip", "--output", "portable/nightly-export.zip"], repo))
+      .toMatchObject({ exitCode: 0 });
+    expect(await captureCli(["cleanup", "--", "--older-than"], repo))
+      .toMatchObject({ exitCode: 0, stdout: expect.stringContaining("--older-than") });
+  });
+
+  test("reconciles approval staleness before enforcing the portable archive size limit", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-archive-reconcile-size-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: archive-reconcile-size
+version: 1
+style: pipeline
+maturity: experimental
+steps: []
+`);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, { id: "archive-reconcile-size", workflow });
+    const approvalOutput = store.writeArtifact({
+      id: "approval-output",
+      runId: "archive-reconcile-size",
+      path: "approval/a-output.bin",
+      kind: "approval_output",
+      contentType: "application/octet-stream",
+      content: Buffer.alloc(MAX_AGENT_FLOW_PORTABLE_ARCHIVE_CONTENT_BYTES)
+    });
+    const approvalEvidence = store.writeArtifact({
+      id: "approval-evidence",
+      runId: "archive-reconcile-size",
+      path: "approval/z-evidence.txt",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "ok"
+    });
+    store.upsertApproval({
+      runId: "archive-reconcile-size",
+      id: "approval",
+      status: "approved",
+      context: {
+        evidence: [{ path: approvalEvidence.declaredPath, checksum: approvalEvidence.checksum! }],
+        output: approvalOutput.declaredPath
+      }
+    });
+    fs.writeFileSync(path.join(repo, approvalEvidence.storagePath), "no");
+
+    writeAgentFlowPortableArchive(store, "archive-reconcile-size", "portable/reconciled-size.zip");
+
+    const entries = readStoredZip(fs.readFileSync(path.join(repo, "portable", "reconciled-size.zip")));
+    const manifest = JSON.parse(entries.get("manifest.json")!.toString("utf8")) as {
+      artifacts: Array<{ declaredPath: string; status: string; archivePath?: string }>;
+    };
+    expect(manifest.artifacts.find((artifact) => artifact.declaredPath === approvalOutput.declaredPath))
+      .toMatchObject({ status: "stale" });
+    expect(entries.has(`artifacts/${approvalOutput.declaredPath}`)).toBe(false);
+    store.close();
+  });
+
+  test("excludes legacy artifact content whose registered size is missing", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-archive-missing-size-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: archive-missing-size
+version: 1
+style: pipeline
+maturity: experimental
+steps: []
+`);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, { id: "archive-missing-size", workflow });
+    store.writeArtifact({
+      id: "legacy-artifact",
+      runId: "archive-missing-size",
+      path: "legacy/output.txt",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "legacy content"
+    });
+    const database = new Database(store.databasePath);
+    database.run(
+      "UPDATE artifacts SET size_bytes = NULL WHERE run_id = ? AND id = ?",
+      ["archive-missing-size", "legacy-artifact"]
+    );
+    database.close();
+
+    writeAgentFlowPortableArchive(store, "archive-missing-size", "portable/missing-size.zip");
+
+    const entries = readStoredZip(fs.readFileSync(path.join(repo, "portable", "missing-size.zip")));
+    const manifest = JSON.parse(entries.get("manifest.json")!.toString("utf8")) as {
+      artifacts: Array<{ id: string; status: string; archivePath?: string }>;
+    };
+    expect(manifest.artifacts.find((artifact) => artifact.id === "legacy-artifact"))
+      .toMatchObject({ status: "stale" });
+    expect(manifest.artifacts.find((artifact) => artifact.id === "legacy-artifact")?.archivePath)
+      .toBeUndefined();
+    expect(entries.has("artifacts/legacy/output.txt")).toBe(false);
+    store.close();
+  });
+
+  test("bounds archive names, snapshots state, and never replaces raced destinations", async () => {
+    expect(defaultAgentFlowArchivePath("a/b")).not.toBe(defaultAgentFlowArchivePath("a b"));
+    expect(defaultAgentFlowArchivePath(" archive-safety ")).toBe(defaultAgentFlowArchivePath("archive-safety"));
+    expect(defaultAgentFlowExportPath("日本語")).not.toBe(defaultAgentFlowExportPath("한국어"));
+    expect(Buffer.byteLength(path.basename(defaultAgentFlowArchivePath("long".repeat(100))), "utf8"))
+      .toBeLessThan(128);
+
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-archive-safety-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: archive-safety
+version: 1
+style: pipeline
+maturity: experimental
+steps: []
+`);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, { id: "archive-safety", workflow });
+    store.updateRun("archive-safety", { status: "completed" });
+    writeAgentFlowFinalSummary(store, "archive-safety", workflow, { status: "completed", completedSteps: [] });
+    const originalSnapshot = store.withRunFinalizationTransaction.bind(store);
+    let snapshotUsed = false;
+    store.withRunFinalizationTransaction = ((runId, callback) => {
+      snapshotUsed = true;
+      return originalSnapshot(runId, callback);
+    }) as typeof store.withRunFinalizationTransaction;
+    writeAgentFlowPortableArchive(store, "archive-safety", "portable/snapshot.zip");
+    expect(snapshotUsed).toBe(true);
+    store.withRunFinalizationTransaction("archive-safety", () => {
+      expect(() => writeAgentFlowPortableArchive(store, "archive-safety", "portable/nested-transaction.zip"))
+        .toThrow(/active finalization transaction/);
+    });
+    expect(fs.existsSync(path.join(repo, "portable", "nested-transaction.zip"))).toBe(false);
+    const maximumLengthOutputName = "x".repeat(255);
+    writeAgentFlowPortableArchive(store, "archive-safety", `portable/${maximumLengthOutputName}`);
+    expect(fs.existsSync(path.join(repo, "portable", maximumLengthOutputName))).toBe(true);
+    writeAgentFlowPortableArchive(store, " archive-safety ", "portable/padded.zip");
+    expect(JSON.parse(readStoredZip(fs.readFileSync(path.join(repo, "portable", "padded.zip")))
+      .get("manifest.json")!.toString("utf8"))).toMatchObject({ runId: "archive-safety" });
+
+    const originalFsync = fs.fsyncSync.bind(fs);
+    let directorySyncs = 0;
+    const fsyncSpy = spyOn(fs, "fsyncSync").mockImplementation((descriptor) => {
+      if (fs.fstatSync(descriptor).isDirectory()) directorySyncs += 1;
+      originalFsync(descriptor);
+    });
+    try {
+      writeAgentFlowPortableArchive(store, "archive-safety", "durable/nested/archive.zip");
+    } finally {
+      fsyncSpy.mockRestore();
+    }
+    expect(directorySyncs).toBeGreaterThanOrEqual(3);
+    const escapedJson = '"\\\u0001'.repeat(100_000);
+    const manyJsonScalars = Array.from({ length: 100_000 }, (_, index) => index % 2 === 0);
+    createAgentFlowLifecycleRun(store, {
+      id: "archive-escaped-json",
+      workflow,
+      inputs: { escapedJson, manyJsonScalars }
+    });
+    writeAgentFlowPortableArchive(store, "archive-escaped-json", "portable/escaped-json.zip");
+    const escapedState = JSON.parse(readStoredZip(fs.readFileSync(path.join(repo, "portable", "escaped-json.zip")))
+      .get("state.json")!.toString("utf8"));
+    expect(escapedState.inputs.escapedJson).toBe(escapedJson);
+    expect(escapedState.inputs.manyJsonScalars).toEqual(manyJsonScalars);
+    const repositoryEntries = fs.readdirSync(repo);
+    expect(() => writeAgentFlowPortableArchive(store, "archive-safety", "."))
+      .toThrow(/must name a file beneath the repository root/);
+    expect(fs.readdirSync(repo)).toEqual(repositoryEntries);
+
+    const racedTarget = path.join(repo, "portable", "raced.zip");
+    const originalLink = fs.linkSync.bind(fs);
+    const linkSpy = spyOn(fs, "linkSync").mockImplementationOnce((source, target) => {
+      fs.writeFileSync(target, "raced destination", { flag: "wx" });
+      originalLink(source, target);
+    });
+    try {
+      expect(() => writeAgentFlowPortableArchive(store, "archive-safety", "portable/raced.zip"))
+        .toThrow(/already exists/);
+    } finally {
+      linkSpy.mockRestore();
+    }
+    expect(fs.readFileSync(racedTarget, "utf8")).toBe("raced destination");
+
+    const replacedStagingTarget = path.join(repo, "portable", "replaced-staging.zip");
+    let replacementPath: string | undefined;
+    const stagingRaceSpy = spyOn(fs, "linkSync").mockImplementationOnce((source, target) => {
+      replacementPath = source.toString();
+      fs.unlinkSync(source);
+      fs.writeFileSync(source, "replacement bytes", { flag: "wx" });
+      originalLink(source, target);
+    });
+    try {
+      expect(() => writeAgentFlowPortableArchive(store, "archive-safety", "portable/replaced-staging.zip"))
+        .toThrow(/staged archive changed during publication/);
+    } finally {
+      stagingRaceSpy.mockRestore();
+      if (replacementPath !== undefined && fs.existsSync(replacementPath)) fs.unlinkSync(replacementPath);
+    }
+    expect(fs.readFileSync(replacedStagingTarget, "utf8")).toBe("replacement bytes");
+    fs.unlinkSync(replacedStagingTarget);
+
+    const concurrentlyReplacedTarget = path.join(repo, "portable", "concurrently-replaced.zip");
+    const targetReplacementSpy = spyOn(fs, "linkSync").mockImplementationOnce((source, target) => {
+      originalLink(source, target);
+      fs.unlinkSync(target);
+      fs.writeFileSync(target, "concurrent destination", { flag: "wx" });
+    });
+    try {
+      expect(() => writeAgentFlowPortableArchive(store, "archive-safety", "portable/concurrently-replaced.zip"))
+        .toThrow(/staged archive changed during publication/);
+    } finally {
+      targetReplacementSpy.mockRestore();
+    }
+    expect(fs.readFileSync(concurrentlyReplacedTarget, "utf8")).toBe("concurrent destination");
+
+    const outside = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-archive-outside-"));
+    const portableParent = path.join(repo, "portable");
+    const movedParent = path.join(repo, "portable-before-race");
+    const directoryRaceSpy = spyOn(fs, "linkSync").mockImplementationOnce((source, target) => {
+      fs.renameSync(portableParent, movedParent);
+      fs.symlinkSync(outside, portableParent, "dir");
+      originalLink(source, target);
+    });
+    try {
+      expect(() => writeAgentFlowPortableArchive(store, "archive-safety", "portable/redirected.zip"))
+        .toThrow(/directory changed during publication/);
+    } finally {
+      directoryRaceSpy.mockRestore();
+      fs.unlinkSync(portableParent);
+      fs.renameSync(movedParent, portableParent);
+    }
+    expect(fs.readdirSync(outside)).toEqual([]);
+    expect(fs.existsSync(path.join(portableParent, "redirected.zip"))).toBe(true);
+
+    const retainedOnSyncFailure = path.join(repo, "portable", "retained-on-sync-failure.zip");
+    const syncFailureSpy = spyOn(fs, "fsyncSync").mockImplementation((descriptor) => {
+      if (fs.fstatSync(descriptor).isDirectory()) throw new Error("simulated directory sync failure");
+      originalFsync(descriptor);
+    });
+    try {
+      expect(() => writeAgentFlowPortableArchive(store, "archive-safety", "portable/retained-on-sync-failure.zip"))
+        .toThrow(/simulated directory sync failure/);
+    } finally {
+      syncFailureSpy.mockRestore();
+    }
+    expect(readStoredZip(fs.readFileSync(retainedOnSyncFailure)).has("manifest.json")).toBe(true);
+
+    const changingArtifact = store.writeArtifact({
+      id: "changing-during-archive",
+      runId: "archive-safety",
+      path: "changing/output.txt",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "changing archive content"
+    });
+    const originalReadArtifact = store.readArtifact.bind(store);
+    const changingReadSpy = spyOn(store, "readArtifact").mockImplementationOnce((runId, declaredPath, options) => {
+      fs.unlinkSync(path.join(repo, changingArtifact.storagePath));
+      return originalReadArtifact(runId, declaredPath, options);
+    });
+    try {
+      expect(() => writeAgentFlowPortableArchive(store, "archive-safety", "portable/changing.zip"))
+        .toThrow(/unavailable/);
+    } finally {
+      changingReadSpy.mockRestore();
+    }
+    expect(fs.existsSync(path.join(portableParent, "changing.zip"))).toBe(false);
+
+    const recoverable = store.writeArtifact({
+      id: "recoverable",
+      runId: "archive-safety",
+      path: "recoverable/output.txt",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "recoverable archive content"
+    });
+    const recoverableTarget = path.join(repo, recoverable.storagePath);
+    const recoverableStaging = path.join(path.dirname(path.dirname(recoverableTarget)), ".staging");
+    const recoverableBackup = path.join(
+      recoverableStaging,
+      `${createHash("sha256").update(recoverable.declaredPath).digest("hex")}.deleted`
+    );
+    fs.mkdirSync(recoverableStaging, { recursive: true });
+    fs.renameSync(recoverableTarget, recoverableBackup);
+    writeAgentFlowPortableArchive(store, "archive-safety", "portable/recovered.zip");
+    expect(fs.readFileSync(recoverableTarget, "utf8")).toBe("recoverable archive content");
+    expect(readStoredZip(fs.readFileSync(path.join(portableParent, "recovered.zip")))
+      .get("artifacts/recoverable/output.txt")?.toString("utf8")).toBe("recoverable archive content");
+
+    const approvalOutput = store.writeArtifact({
+      id: "archive-approval-output",
+      runId: "archive-safety",
+      path: "approval/a-output.json",
+      kind: "approval_output",
+      contentType: "application/json",
+      content: "{}"
+    });
+    const approvalEvidence = store.writeArtifact({
+      id: "archive-approval-evidence",
+      runId: "archive-safety",
+      path: "approval/z-evidence.txt",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "ok"
+    });
+    store.upsertApproval({
+      runId: "archive-safety",
+      id: "archive-approval",
+      status: "approved",
+      context: {
+        evidence: [{ path: approvalEvidence.declaredPath, checksum: approvalEvidence.checksum! }],
+        output: approvalOutput.declaredPath
+      }
+    });
+    fs.writeFileSync(path.join(repo, approvalEvidence.storagePath), "no");
+    writeAgentFlowPortableArchive(store, "archive-safety", "portable/reconciled-approval.zip");
+    const reconciledEntries = readStoredZip(fs.readFileSync(path.join(portableParent, "reconciled-approval.zip")));
+    const reconciledManifest = JSON.parse(reconciledEntries.get("manifest.json")!.toString("utf8")) as {
+      artifacts: Array<{ declaredPath: string; status: string; archivePath?: string }>;
+    };
+    expect(reconciledManifest.artifacts.find((artifact) => artifact.declaredPath === approvalOutput.declaredPath))
+      .toMatchObject({ status: "stale" });
+    expect(reconciledManifest.artifacts.find((artifact) => artifact.declaredPath === approvalOutput.declaredPath)?.archivePath)
+      .toBeUndefined();
+    expect(reconciledEntries.has(`artifacts/${approvalOutput.declaredPath}`)).toBe(false);
+
+    const snapshotBytesBeforeFailure = store.runSnapshotStructuredBytes("archive-safety");
+    const largeFailureMessage = "failure scalar ".repeat(256);
+    store.recordFailure({
+      id: "archive-size-fixture",
+      runId: "archive-safety",
+      classification: "implementation_error",
+      message: largeFailureMessage,
+      retryable: false
+    });
+    expect(store.runSnapshotStructuredBytes("archive-safety") - snapshotBytesBeforeFailure)
+      .toBeGreaterThanOrEqual(Buffer.byteLength(largeFailureMessage, "utf8"));
+
+    const eventPages: Array<{
+      offset?: number;
+      limit: number;
+      after?: { sortValue: string | number; id?: string };
+    } | undefined> = [];
+    for (let sequence = 0; sequence < 130; sequence += 1) {
+      store.appendRunEvent("archive-safety", { type: "archive.page.fixture", payload: { sequence } });
+    }
+    const originalListEvents = store.listEvents.bind(store);
+    const eventPageSpy = spyOn(store, "listEvents").mockImplementation((runId, page) => {
+      eventPages.push(page);
+      return originalListEvents(runId, page);
+    });
+    try {
+      writeAgentFlowPortableArchive(store, "archive-safety", "portable/paged.zip");
+    } finally {
+      eventPageSpy.mockRestore();
+    }
+    expect(eventPages[0]).toEqual({ limit: 128, after: { sortValue: 0, id: "" } });
+    expect(eventPages[1]).toMatchObject({
+      limit: 128,
+      after: { sortValue: expect.any(Number), id: expect.any(String) }
+    });
+    expect(eventPages.every((page) => page?.offset === undefined)).toBe(true);
+
+    const structuredBytesSpy = spyOn(store, "runSnapshotStructuredBytes")
+      .mockReturnValue(MAX_AGENT_FLOW_PORTABLE_ARCHIVE_CONTENT_BYTES + 1);
+    const unboundedEventSpy = spyOn(store, "listEvents");
+    try {
+      expect(() => writeAgentFlowPortableArchive(store, "archive-safety", "portable/oversized-history.zip"))
+        .toThrow(/archive content exceeds/);
+      expect(unboundedEventSpy).not.toHaveBeenCalled();
+    } finally {
+      unboundedEventSpy.mockRestore();
+      structuredBytesSpy.mockRestore();
+    }
+
+    store.writeArtifact({
+      id: "oversized",
+      runId: "archive-safety",
+      path: "oversized.bin",
+      kind: "fixture",
+      contentType: "application/octet-stream",
+      content: Buffer.alloc(MAX_AGENT_FLOW_PORTABLE_ARCHIVE_CONTENT_BYTES)
+    });
+    const artifactInspectionSpy = spyOn(store, "listArtifacts");
+    try {
+      expect(() => writeAgentFlowPortableArchive(store, "archive-safety", "portable/oversized.zip"))
+        .toThrow(/archive content exceeds/);
+      expect(artifactInspectionSpy).toHaveBeenCalled();
+    } finally {
+      artifactInspectionSpy.mockRestore();
+    }
+    expect(fs.existsSync(path.join(repo, "portable", "oversized.zip"))).toBe(false);
+    const oversizedBacking = path.join(repo, store.getArtifact("archive-safety", "oversized.bin")!.storagePath);
+    const oversizedDescriptor = fs.openSync(oversizedBacking, "r+");
+    try {
+      fs.writeSync(oversizedDescriptor, Buffer.from([1]), 0, 1, 0);
+    } finally {
+      fs.closeSync(oversizedDescriptor);
+    }
+    writeAgentFlowPortableArchive(store, "archive-safety", "portable/stale-excluded.zip");
+    expect(fs.existsSync(path.join(repo, "portable", "stale-excluded.zip"))).toBe(true);
+    expect(store.getArtifact("archive-safety", "oversized.bin")?.status).toBe("stale");
+    store.close();
   });
 
   test("returns failure when a required lifecycle notification cannot be delivered", async () => {
@@ -665,4 +1469,22 @@ async function captureCli(args: string[], cwd: string): Promise<{ exitCode: numb
     stderr: { write: (chunk: string) => { stderr += chunk; return true; } }
   }, { cwd });
   return { exitCode, stdout, stderr };
+}
+
+function readStoredZip(archive: Buffer): Map<string, Buffer> {
+  const entries = new Map<string, Buffer>();
+  let offset = 0;
+  while (offset + 4 <= archive.byteLength && archive.readUInt32LE(offset) === 0x04034b50) {
+    const method = archive.readUInt16LE(offset + 8);
+    if (method !== 0) throw new Error(`Expected a stored ZIP entry, received compression method ${method}.`);
+    const size = archive.readUInt32LE(offset + 18);
+    const nameLength = archive.readUInt16LE(offset + 26);
+    const extraLength = archive.readUInt16LE(offset + 28);
+    const nameStart = offset + 30;
+    const contentStart = nameStart + nameLength + extraLength;
+    const contentEnd = contentStart + size;
+    entries.set(archive.subarray(nameStart, nameStart + nameLength).toString("utf8"), archive.subarray(contentStart, contentEnd));
+    offset = contentEnd;
+  }
+  return entries;
 }
