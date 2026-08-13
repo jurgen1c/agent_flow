@@ -28,6 +28,7 @@ export interface InstallAgentFlowSkillsOptions {
   env?: Readonly<Record<string, string | undefined>>;
   homeDir?: string;
   sourceRoot?: string;
+  copyDirectory?: (source: string, destination: string) => void;
 }
 
 export interface InstalledAgentFlowSkills {
@@ -42,6 +43,7 @@ interface AgentFlowSkillsDestination {
 
 export function installAgentFlowSkills(options: InstallAgentFlowSkillsOptions): InstalledAgentFlowSkills {
   const sourceRoot = options.sourceRoot ?? resolveBundledSkillsRoot();
+  const copyDirectory = options.copyDirectory ?? copySkillDirectory;
   const { containmentRoot, destinationRoot } = resolveAgentFlowSkillsDestinationDetails(options);
   const targets = bundledAgentFlowSkillNames.map((name) => ({
     name,
@@ -66,11 +68,7 @@ export function installAgentFlowSkills(options: InstallAgentFlowSkillsOptions): 
     preflightSkillTargets(targets);
     fs.mkdirSync(stagingRoot);
     for (const target of targets) {
-      fs.cpSync(target.source, path.join(stagingRoot, target.name), {
-        recursive: true,
-        errorOnExist: true,
-        force: false
-      });
+      copyDirectory(target.source, path.join(stagingRoot, target.name));
     }
 
     assertSafeDestinationPath(containmentRoot, destinationRoot);
@@ -113,7 +111,7 @@ function resolveAgentFlowSkillsDestinationDetails(
     };
   }
 
-  const env = options.env ?? process.env;
+  const env = { ...process.env, ...options.env };
   const configuredCodexHome = env.CODEX_HOME?.trim();
   const codexHome = configuredCodexHome
     ? path.resolve(configuredCodexHome)
@@ -163,6 +161,14 @@ function removeEmptyDirectory(directory: string): void {
     const code = (error as NodeJS.ErrnoException).code;
     if (code !== "ENOENT" && code !== "ENOTEMPTY") throw error;
   }
+}
+
+function copySkillDirectory(source: string, destination: string): void {
+  fs.cpSync(source, destination, {
+    recursive: true,
+    errorOnExist: true,
+    force: false
+  });
 }
 
 function resolveBundledSkillsRoot(): string {

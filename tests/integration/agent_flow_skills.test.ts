@@ -74,6 +74,25 @@ describe("Agent Flow bundled skills", () => {
     expect(fs.statSync(path.join(codexHome, "skills", "workflow-reviewer", "SKILL.md")).isFile()).toBe(true);
   });
 
+  test("merges partial environment overrides with the process environment", () => {
+    const codexHome = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-skills-env-"));
+    const previousCodexHome = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = codexHome;
+
+    try {
+      const result = dispatch(
+        ["skills", "install", "--destination", "codex"],
+        { env: { AGENT_FLOW_TEST: "true" } }
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(fs.statSync(path.join(codexHome, "skills", "workflow-designer", "SKILL.md")).isFile()).toBe(true);
+    } finally {
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+    }
+  });
+
   test("preflights all targets and preserves an existing skill", () => {
     const repository = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-skills-existing-"));
     fs.mkdirSync(path.join(repository, ".git"));
@@ -119,24 +138,25 @@ describe("Agent Flow bundled skills", () => {
       fs.mkdirSync(source);
       fs.writeFileSync(path.join(source, "SKILL.md"), `---\nname: ${name}\n---\n`);
     }
-    const unreadable = path.join(sourceRoot, "policy-author", "unreadable.txt");
-    fs.writeFileSync(unreadable, "cannot copy\n", { mode: 0 });
+    const result = dispatch(
+      ["skills", "install", "--destination", "agents"],
+      {
+        cwd: repository,
+        skillsSourceRoot: sourceRoot,
+        skillsCopyDirectory: (source, destination) => {
+          if (path.basename(source) === "policy-author") throw new Error("Injected copy failure.");
+          fs.cpSync(source, destination, { recursive: true, errorOnExist: true, force: false });
+        }
+      }
+    );
 
-    try {
-      const result = dispatch(
-        ["skills", "install", "--destination", "agents"],
-        { cwd: repository, skillsSourceRoot: sourceRoot }
-      );
-
-      expect(result.exitCode).toBe(2);
-      const destinationRoot = path.join(repository, ".agents", "skills");
-      expect(bundledAgentFlowSkillNames.some((name) => pathExists(path.join(destinationRoot, name)))).toBe(false);
-      expect(pathExists(destinationRoot)
-        ? fs.readdirSync(destinationRoot).filter((entry) => entry.startsWith(".agent-flow-install-"))
-        : []).toEqual([]);
-    } finally {
-      fs.chmodSync(unreadable, 0o600);
-    }
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr).toContain("Injected copy failure");
+    const destinationRoot = path.join(repository, ".agents", "skills");
+    expect(bundledAgentFlowSkillNames.some((name) => pathExists(path.join(destinationRoot, name)))).toBe(false);
+    expect(pathExists(destinationRoot)
+      ? fs.readdirSync(destinationRoot).filter((entry) => entry.startsWith(".agent-flow-install-"))
+      : []).toEqual([]);
   });
 
   test("keeps every skill concise, reference-backed, and non-executing", () => {

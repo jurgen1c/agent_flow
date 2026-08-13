@@ -53,6 +53,7 @@ export interface AgentFlowCliOptions {
   env?: Readonly<Record<string, string | undefined>>;
   homeDir?: string;
   skillsSourceRoot?: string;
+  skillsCopyDirectory?: (source: string, destination: string) => void;
 }
 
 const ACTIVE_LIFECYCLE_COMMANDS = [
@@ -255,7 +256,8 @@ function manageSkills(args: string[], options: AgentFlowCliOptions): AgentFlowCl
       cwd: options.cwd,
       env: options.env,
       homeDir: options.homeDir,
-      sourceRoot: options.skillsSourceRoot
+      sourceRoot: options.skillsSourceRoot,
+      copyDirectory: options.skillsCopyDirectory
     });
     return {
       exitCode: 0,
