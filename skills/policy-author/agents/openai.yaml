@@ -1,0 +1,4 @@
+interface:
+  display_name: "Policy Author"
+  short_description: "Harden Agent Flow workflow policies"
+  default_prompt: "Use $policy-author to define least-authority policies and bounded budgets for this Agent Flow workflow."

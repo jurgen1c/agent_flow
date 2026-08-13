@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pipeline Designer"
+  short_description: "Design simple Agent Flow pipelines"
+  default_prompt: "Use $pipeline-designer to turn this process into a simple Agent Flow pipeline YAML."

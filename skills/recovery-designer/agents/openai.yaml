@@ -1,0 +1,4 @@
+interface:
+  display_name: "Recovery Designer"
+  short_description: "Design bounded recovery workflows"
+  default_prompt: "Use $recovery-designer to add bounded failure recovery to this Agent Flow workflow."

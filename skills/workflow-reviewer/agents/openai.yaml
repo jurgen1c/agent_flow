@@ -1,0 +1,4 @@
+interface:
+  display_name: "Workflow Reviewer"
+  short_description: "Review Agent Flow workflow safety"
+  default_prompt: "Use $workflow-reviewer to review this Agent Flow YAML for correctness, reachability, policy, and ownership."

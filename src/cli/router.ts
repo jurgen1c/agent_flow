@@ -1,6 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import {
+  bundledAgentFlowSkillNames,
+  installAgentFlowSkills,
+  type AgentFlowSkillDestination
+} from "../skills";
+import {
   AgentFlowWorkflowGraphError,
   AgentFlowRunStateError,
   applyAgentFlowRetention,
@@ -45,6 +50,10 @@ export interface AgentFlowCliResult {
 
 export interface AgentFlowCliOptions {
   cwd?: string;
+  env?: Readonly<Record<string, string | undefined>>;
+  homeDir?: string;
+  skillsSourceRoot?: string;
+  skillsCopyDirectory?: (source: string, destination: string) => void;
 }
 
 const ACTIVE_LIFECYCLE_COMMANDS = [
@@ -59,7 +68,7 @@ export async function runCli(
 ): Promise<number> {
   const result = isActiveLifecycleCommand(args[0])
     ? await runLifecycleCommand(args[0], args.slice(1), options)
-    : dispatch(args);
+    : dispatch(args, options);
 
   if (result.stdout) {
     streams.stdout.write(result.stdout.endsWith("\n") ? result.stdout : `${result.stdout}\n`);
@@ -72,7 +81,7 @@ export async function runCli(
   return result.exitCode;
 }
 
-export function dispatch(args: string[]): AgentFlowCliResult {
+export function dispatch(args: string[], options: AgentFlowCliOptions = {}): AgentFlowCliResult {
   const [command, ...rest] = args;
 
   if (!command || command === "--help" || command === "-h") {
@@ -85,7 +94,7 @@ export function dispatch(args: string[]): AgentFlowCliResult {
   if (command === "help") {
     const topic = rest[0];
 
-    if (topic && !["help", "version", "validate", "lint", "explain", "graph", "simulate"].includes(topic)
+    if (topic && !["help", "version", "skills", "validate", "lint", "explain", "graph", "simulate"].includes(topic)
         && !isActiveLifecycleCommand(topic) && !isPlannedRuntimeCommand(topic)) {
       return {
         exitCode: 7,
@@ -104,6 +113,10 @@ export function dispatch(args: string[]): AgentFlowCliResult {
       exitCode: 0,
       stdout: `agent-flow ${readRootPackageVersion()}`
     };
+  }
+
+  if (command === "skills") {
+    return manageSkills(rest, options);
   }
 
   if (command === "validate" || command === "lint" || command === "explain" || command === "graph") {
@@ -135,6 +148,16 @@ export function dispatch(args: string[]): AgentFlowCliResult {
 }
 
 function renderHelp(topic?: string): string {
+  if (topic === "skills") {
+    return [
+      "agent-flow skills",
+      "",
+      "Usage:",
+      "  agent-flow skills list",
+      "  agent-flow skills install --destination <agents|codex>"
+    ].join("\n");
+  }
+
   if (topic && topic !== "help" && topic !== "version") {
     return [
       `agent-flow ${topic}`,
@@ -153,6 +176,8 @@ function renderHelp(topic?: string): string {
     "Usage:",
     "  agent-flow help",
     "  agent-flow --version",
+    "  agent-flow skills list",
+    "  agent-flow skills install --destination <agents|codex>",
     "  agent-flow validate <workflow>",
     "  agent-flow lint <workflow>",
     "  agent-flow explain <workflow>",
@@ -176,6 +201,7 @@ function renderHelp(topic?: string): string {
     "Available now:",
     "  help       Show this help output.",
     "  version    Print the Agent Flow package version.",
+    "  skills     List or install the bundled authoring and review skills.",
     "  validate <workflow>  Validate workflow structure, references, and safety.",
     "  lint <workflow>      Warn about complexity and risky authoring patterns.",
     "  explain <workflow>   Explain steps, artifacts, policies, and warnings.",
@@ -199,6 +225,50 @@ function renderHelp(topic?: string): string {
     "",
     "Command and artifact-transform pipeline execution, including session-request, review, approval, decision-record, retention, archive, and export operations, plus persistent lifecycle state are active."
   ].join("\n");
+}
+
+function manageSkills(args: string[], options: AgentFlowCliOptions): AgentFlowCliResult {
+  if (args.length === 1 && args[0] === "list") {
+    return {
+      exitCode: 0,
+      stdout: bundledAgentFlowSkillNames.join("\n")
+    };
+  }
+
+  if (args.length !== 3 || args[0] !== "install" || args[1] !== "--destination") {
+    return {
+      exitCode: 1,
+      stderr: "Usage: agent-flow skills install --destination <agents|codex>"
+    };
+  }
+
+  const destination = args[2];
+  if (destination !== "agents" && destination !== "codex") {
+    return {
+      exitCode: 1,
+      stderr: `Unknown skill destination: ${destination}\nExpected one of: agents, codex.`
+    };
+  }
+
+  try {
+    const result = installAgentFlowSkills({
+      destination: destination as AgentFlowSkillDestination,
+      cwd: options.cwd,
+      env: options.env,
+      homeDir: options.homeDir,
+      sourceRoot: options.skillsSourceRoot,
+      copyDirectory: options.skillsCopyDirectory
+    });
+    return {
+      exitCode: 0,
+      stdout: `Installed ${result.skills.length} Agent Flow skills to ${result.destinationRoot}.`
+    };
+  } catch (error) {
+    return {
+      exitCode: 2,
+      stderr: error instanceof Error ? error.message : String(error)
+    };
+  }
 }
 
 async function runLifecycleCommand(

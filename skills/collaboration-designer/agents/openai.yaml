@@ -1,0 +1,4 @@
+interface:
+  display_name: "Collaboration Designer"
+  short_description: "Design collaborative agent workflows"
+  default_prompt: "Use $collaboration-designer to design explicit roles, authority, and ownership for this workflow."
