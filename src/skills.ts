@@ -79,12 +79,12 @@ export function installAgentFlowSkills(options: InstallAgentFlowSkillsOptions): 
     }
   } catch (error) {
     for (const publishedPath of published.reverse()) {
-      fs.rmSync(publishedPath, { recursive: true, force: true });
+      if (!removeDirectoryTreeIfSafe(containmentRoot, destinationRoot, publishedPath)) break;
     }
     throw error;
   } finally {
-    fs.rmSync(stagingRoot, { recursive: true, force: true });
-    if (!destinationExisted && pathExists(destinationRoot)) {
+    removeDirectoryTreeIfSafe(containmentRoot, destinationRoot, stagingRoot);
+    if (!destinationExisted && pathExists(destinationRoot) && pathsRemainContained(containmentRoot, destinationRoot)) {
       removeEmptyDirectory(destinationRoot);
     }
   }
@@ -160,6 +160,25 @@ function removeEmptyDirectory(directory: string): void {
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code !== "ENOENT" && code !== "ENOTEMPTY") throw error;
+  }
+}
+
+function removeDirectoryTreeIfSafe(
+  containmentRoot: string,
+  destinationRoot: string,
+  directory: string
+): boolean {
+  if (!pathsRemainContained(containmentRoot, destinationRoot, directory)) return false;
+  fs.rmSync(directory, { recursive: true, force: true });
+  return true;
+}
+
+function pathsRemainContained(containmentRoot: string, ...paths: string[]): boolean {
+  try {
+    for (const candidate of paths) assertSafeDestinationPath(containmentRoot, candidate);
+    return true;
+  } catch {
+    return false;
   }
 }
 

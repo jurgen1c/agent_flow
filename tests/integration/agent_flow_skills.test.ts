@@ -159,6 +159,47 @@ describe("Agent Flow bundled skills", () => {
       : []).toEqual([]);
   });
 
+  test("does not follow a swapped destination parent during rollback cleanup", () => {
+    const repository = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-skills-swap-"));
+    const sourceRoot = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-skills-swap-source-"));
+    const outside = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-skills-swap-outside-"));
+    fs.mkdirSync(path.join(repository, ".git"));
+
+    for (const name of bundledAgentFlowSkillNames) {
+      const source = path.join(sourceRoot, name);
+      fs.mkdirSync(source);
+      fs.writeFileSync(path.join(source, "SKILL.md"), `---\nname: ${name}\n---\n`);
+    }
+
+    let stagingName = "";
+    const result = dispatch(
+      ["skills", "install", "--destination", "agents"],
+      {
+        cwd: repository,
+        skillsSourceRoot: sourceRoot,
+        skillsCopyDirectory: (source, destination) => {
+          if (path.basename(source) !== "policy-author") {
+            fs.cpSync(source, destination, { recursive: true, errorOnExist: true, force: false });
+            return;
+          }
+
+          stagingName = path.basename(path.dirname(destination));
+          fs.renameSync(path.join(repository, ".agents"), path.join(repository, ".agents-original"));
+          const outsideStaging = path.join(outside, "skills", stagingName);
+          fs.mkdirSync(outsideStaging, { recursive: true });
+          fs.writeFileSync(path.join(outsideStaging, "marker.txt"), "outside\n");
+          fs.symlinkSync(outside, path.join(repository, ".agents"), "dir");
+          throw new Error("Injected parent swap.");
+        }
+      }
+    );
+
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr).toContain("Injected parent swap");
+    expect(fs.readFileSync(path.join(outside, "skills", stagingName, "marker.txt"), "utf8")).toBe("outside\n");
+    expect(pathExists(path.join(repository, ".agents-original", "skills", stagingName))).toBe(true);
+  });
+
   test("keeps every skill concise, reference-backed, and non-executing", () => {
     for (const name of bundledAgentFlowSkillNames) {
       const skill = fs.readFileSync(path.join(skillsRoot, name, "SKILL.md"), "utf8");
