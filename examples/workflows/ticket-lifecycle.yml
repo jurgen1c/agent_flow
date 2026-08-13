@@ -32,7 +32,7 @@ steps:
   - id: create_spec
     type: session_request
     session: lm
-    prompt: prompts/create-spec.md
+    prompt: examples/prompts/create-spec.md
     inputs:
       - ticket.json
     outputs:
@@ -45,7 +45,7 @@ steps:
   - id: implement
     type: session_request
     session: fm
-    prompt: prompts/implement-ticket.md
+    prompt: examples/prompts/implement-ticket.md
     inputs:
       - spec.md
       - ticket.json
@@ -55,7 +55,7 @@ steps:
   - id: fm_review
     type: session_request
     session: fm
-    prompt: prompts/review-implementation.md
+    prompt: examples/prompts/review-implementation.md
     inputs:
       - implementation-summary.md
       - git.diff
@@ -85,7 +85,7 @@ steps:
     on_failure:
       route_to:
         session: lm
-        prompt: prompts/triage-gh-failure.md
+        prompt: examples/prompts/triage-gh-failure.md
       on_remediated:
         return_to: create_pr
       on_unresolved:
@@ -121,4 +121,3 @@ notify:
     channels: [email_personal, terminal]
   - on: workflow.paused
     channels: [system, terminal]
-

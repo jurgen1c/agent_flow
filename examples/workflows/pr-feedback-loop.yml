@@ -39,7 +39,7 @@ steps:
       - id: classify_comments
         type: session_request
         session: lm
-        prompt: prompts/classify-pr-comments.md
+        prompt: examples/prompts/classify-pr-comments.md
         inputs:
           - github/pr-state.json
         outputs:
@@ -54,7 +54,7 @@ steps:
       - id: resolve_comments
         type: session_request
         session: fm
-        prompt: prompts/resolve-pr-comments.md
+        prompt: examples/prompts/resolve-pr-comments.md
         inputs:
           - github/actionable-comments.json
         outputs:
