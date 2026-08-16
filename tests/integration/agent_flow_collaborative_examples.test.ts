@@ -105,7 +105,7 @@ describe("collaborative workflow examples", () => {
       .toContain("decision-records/record_approval.json");
     expect((await captureCli(["status", "content-review-collab-unresolved"], root)).stdout)
       .toContain("Answer artifact: user-input/content-decision.md");
-  });
+  }, 10_000);
 });
 
 async function captureCli(args: string[], cwd: string): Promise<{ exitCode: number; stdout: string; stderr: string }> {

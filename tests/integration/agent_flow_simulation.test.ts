@@ -484,6 +484,53 @@ sessions:
     expect(summary).toContain("inspect: missing input artifact missing.json");
   });
 
+  test("preflights structured prompt paths without parsing unavailable content", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: structured-prompt-simulation
+version: 1
+style: pipeline
+maturity: experimental
+sessions: { worker: { provider: fixture } }
+steps:
+  - { id: inspect, type: session_request, session: worker, prompt: prompts/inspect.json, outputs: [result.json] }
+  - { id: done, type: result, status: completed }
+`);
+
+    const result = simulateAgentFlowWorkflow(workflow, {
+      steps: { inspect: { outputs: { "result.json": { safe: true } } } }
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.unresolvedBranches).toEqual([]);
+
+    for (const policy of ["", "policies: { sensitive_inputs: deny }"] as const) {
+      const unsupported = parseAgentFlowWorkflowOrThrow(`name: unsupported-structured-prompt-simulation
+version: 1
+style: pipeline
+maturity: experimental
+${policy}
+sessions: { worker: { provider: fixture } }
+steps:
+  - { id: inspect, type: session_request, session: worker, prompt: prompts/inspect.csv, outputs: [result.json] }
+`);
+      expect(simulateAgentFlowWorkflow(unsupported, {
+        steps: { inspect: { outputs: { "result.json": { safe: true } } } }
+      })).toMatchObject({ status: "paused", availableArtifacts: [] });
+    }
+
+    const allowed = parseAgentFlowWorkflowOrThrow(`name: allowed-structured-prompt-simulation
+version: 1
+style: pipeline
+maturity: experimental
+policies: { sensitive_inputs: allow }
+sessions: { worker: { provider: fixture } }
+steps:
+  - { id: inspect, type: session_request, session: worker, prompt: prompts/inspect.csv, outputs: [result.json] }
+`);
+    expect(simulateAgentFlowWorkflow(allowed, {
+      steps: { inspect: { outputs: { "result.json": { safe: true } } } }
+    })).toMatchObject({ status: "completed", availableArtifacts: ["result.json"] });
+  });
+
   test("requires declared workflow inputs and evaluates condition fallthrough from fixture values", () => {
     const workflow = parseAgentFlowWorkflowOrThrow(`name: inputs
 version: 1
@@ -919,6 +966,293 @@ steps:
     });
     expect(unresolved.status).toBe("paused");
     expect(unresolved.terminalStates).toEqual([{ stepId: "work", status: "paused" }]);
+  });
+
+  test("preflights sensitive recovery-session prompt paths", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: sensitive-recovery-session
+version: 1
+style: recovery_pipeline
+maturity: experimental
+limits: { max_recovery_cycles: 1 }
+sessions: { fixer: { provider: fixture } }
+steps:
+  - id: work
+    type: command
+    command: echo work
+    on_failure:
+      route_to: { session: fixer, prompt: .env }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+
+    const result = simulateAgentFlowWorkflow(workflow, {
+      steps: { work: { outcome: "failed", recovery: "remediated" } }
+    });
+
+    expect(result.status).toBe("paused");
+    expect(result.unresolvedBranches).toEqual([]);
+    expect(result.terminalStates).toEqual([{ stepId: "work", status: "paused" }]);
+  });
+
+  test("preflights structured recovery prompt paths without parsing unavailable content", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: structured-recovery-prompt
+version: 1
+style: recovery_pipeline
+maturity: experimental
+limits: { max_recovery_cycles: 1 }
+sessions: { fixer: { provider: fixture } }
+steps:
+  - id: work
+    type: command
+    command: echo work
+    on_failure:
+      route_to: { session: fixer, prompt: prompts/fix.yaml }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+  - { id: complete, type: result, status: completed }
+`);
+
+    const result = simulateAgentFlowWorkflow(workflow, {
+      steps: { work: { outcome: "failed", recovery: "remediated" } }
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.unresolvedBranches).toEqual([]);
+
+    const unsupported = parseAgentFlowWorkflowOrThrow(`name: unsupported-structured-recovery-prompt
+version: 1
+style: recovery_pipeline
+maturity: experimental
+limits: { max_recovery_cycles: 1 }
+sessions: { fixer: { provider: fixture } }
+steps:
+  - id: work
+    type: command
+    command: echo work
+    on_failure:
+      route_to: { session: fixer, prompt: prompts/fix.toml }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+  - { id: complete, type: result, status: completed }
+`);
+    expect(simulateAgentFlowWorkflow(unsupported, {
+      steps: { work: { outcome: "failed", recovery: "remediated" } }
+    })).toMatchObject({ status: "paused" });
+  });
+
+  test("preflights sensitive recovery-session route inputs", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: sensitive-recovery-session-input
+version: 1
+style: recovery_pipeline
+maturity: experimental
+limits: { max_recovery_cycles: 1 }
+inputs: { credential: { required: true } }
+sessions: { fixer: { provider: fixture } }
+steps:
+  - id: work
+    type: command
+    command: echo work
+    on_failure:
+      route_to:
+        session: fixer
+        prompt: fix.md
+        inputs: { evidence: "{{ inputs.credential }}" }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+
+    const result = simulateAgentFlowWorkflow(workflow, {
+      inputs: { credential: "credentials.json" },
+      artifacts: { "credentials.json": { key: "ordinary-value" } },
+      steps: { work: { outcome: "failed", recovery: "remediated" } }
+    });
+
+    expect(result.status).toBe("paused");
+    expect(result.unresolvedBranches).toEqual([]);
+    expect(result.terminalStates).toEqual([{ stepId: "work", status: "paused" }]);
+  });
+
+  test("enforces aggregate and count limits only for recovery-session inputs", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: bounded-recovery-session-inputs
+version: 1
+style: recovery_pipeline
+maturity: experimental
+limits: { max_recovery_cycles: 1 }
+sessions: { fixer: { provider: fixture } }
+steps:
+  - id: work
+    type: command
+    command: echo work
+    on_failure:
+      route_to:
+        session: fixer
+        prompt: fix.md
+        inputs: { first: first.txt, second: second.txt }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+  - { id: complete, type: result, status: completed }
+  - { id: pause, type: result, status: paused }
+`);
+    const largeInput = "x".repeat(6 * 1024 * 1024);
+
+    expect(simulateAgentFlowWorkflow(workflow, {
+      artifacts: { "first.txt": largeInput, "second.txt": largeInput },
+      steps: { work: { outcome: "failed", recovery: "remediated" } }
+    })).toMatchObject({ status: "paused" });
+
+    const countLimitedWorkflow = structuredClone(workflow);
+    const route = (countLimitedWorkflow.steps[0]!.on_failure as Record<string, Record<string, unknown>>)
+      .route_to!;
+    route.inputs = Object.fromEntries(Array.from({ length: 64 }, (_, index) => [
+      `input_${index}`,
+      `artifact-${index}.txt`
+    ]));
+    const artifacts = Object.fromEntries(Array.from({ length: 64 }, (_, index) => [
+      `artifact-${index}.txt`,
+      "fixture"
+    ]));
+
+    expect(simulateAgentFlowWorkflow(countLimitedWorkflow, {
+      artifacts,
+      steps: { work: { outcome: "failed", recovery: "remediated" } }
+    })).toMatchObject({ status: "paused" });
+  });
+
+  test("does not apply recovery-session byte limits to nested workflows", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: large-nested-recovery-input
+version: 1
+style: recovery_pipeline
+maturity: experimental
+limits: { max_recovery_cycles: 1 }
+steps:
+  - id: work
+    type: command
+    command: echo work
+    on_failure:
+      route_to:
+        workflow: nested
+        inputs: { evidence: evidence.txt }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+  - { id: complete, type: result, status: completed }
+  - { id: pause, type: result, status: paused }
+`);
+
+    expect(simulateAgentFlowWorkflow(workflow, {
+      artifacts: { "evidence.txt": "x".repeat(11 * 1024 * 1024) },
+      steps: { work: { outcome: "failed", recovery: "remediated" } }
+    })).toMatchObject({ status: "completed" });
+  });
+
+  test("preflights sensitive nested-workflow recovery inputs", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: sensitive-nested-recovery-input
+version: 1
+style: recovery_pipeline
+maturity: experimental
+limits: { max_recovery_cycles: 1 }
+policies: { sensitive_inputs: deny }
+inputs: { credential: { required: true } }
+steps:
+  - id: work
+    type: command
+    command: echo work
+    on_failure:
+      route_to:
+        workflow: nested
+        inputs: { context: "{{ inputs.credential }}" }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+
+    const result = simulateAgentFlowWorkflow(workflow, {
+      inputs: { credential: "API_TOKEN=opaque-nested-secret" },
+      steps: { work: { outcome: "failed", recovery: "remediated" } }
+    });
+
+    expect(result.status).toBe("paused");
+    expect(result.unresolvedBranches).toEqual([]);
+    expect(result.terminalStates).toEqual([{ stepId: "work", status: "paused" }]);
+  });
+
+  test("preserves key-named workflow input provenance in recovery manifests", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: key-provenance-recovery-input
+version: 1
+style: recovery_pipeline
+maturity: experimental
+limits: { max_recovery_cycles: 1 }
+inputs: { key: { required: true } }
+sessions: { fixer: { provider: fixture } }
+steps:
+  - id: work
+    type: command
+    command: echo work
+    on_failure:
+      route_to:
+        session: fixer
+        prompt: fix.md
+        inputs: { opaque: "{{ inputs.key }}" }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+    const fixture = {
+      inputs: { key: "opaque-key-secret" },
+      steps: { work: { outcome: "failed" as const, recovery: "remediated" as const } }
+    };
+
+    expect(simulateAgentFlowWorkflow(workflow, fixture)).toMatchObject({ status: "completed" });
+    const deniedWorkflow = structuredClone(workflow);
+    deniedWorkflow.policies = { sensitive_inputs: "deny" };
+    expect(simulateAgentFlowWorkflow(deniedWorkflow, fixture)).toMatchObject({ status: "paused" });
+  });
+
+  test("preserves sensitive run-input provenance for opaque recovery artifacts during simulation", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: referenced-sensitive-recovery-session-input
+version: 1
+style: recovery_pipeline
+maturity: experimental
+limits: { max_recovery_cycles: 1 }
+inputs: { credential: { required: true } }
+sessions: { fixer: { provider: fixture } }
+steps:
+  - id: work
+    type: command
+    command: echo work
+    on_failure:
+      route_to:
+        session: fixer
+        prompt: fix.md
+        inputs: { evidence: "{{ inputs.credential }}" }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+  - { id: complete, type: result, status: completed }
+`);
+    const fixture = {
+      inputs: { credential: { certificate: "payload.txt" } },
+      artifacts: { "payload.txt": "hunter2abc" },
+      steps: { work: { outcome: "failed" as const, recovery: "remediated" as const } }
+    };
+
+    expect(simulateAgentFlowWorkflow(workflow, fixture)).toMatchObject({
+      status: "completed",
+      availableArtifacts: ["payload.txt"]
+    });
+
+    const deniedWorkflow = structuredClone(workflow);
+    deniedWorkflow.policies = { sensitive_inputs: "deny" };
+    expect(simulateAgentFlowWorkflow(deniedWorkflow, fixture)).toMatchObject({
+      status: "paused",
+      availableArtifacts: ["payload.txt"]
+    });
+
+    const unsafeRecoveryIdentity = structuredClone(deniedWorkflow);
+    unsafeRecoveryIdentity.sessions!["API_TOKEN=recovery-secret"] = unsafeRecoveryIdentity.sessions!.fixer!;
+    delete unsafeRecoveryIdentity.sessions!.fixer;
+    const route = unsafeRecoveryIdentity.steps[0]!.on_failure as Record<string, Record<string, unknown>>;
+    route.route_to!.session = "API_TOKEN=recovery-secret";
+    expect(simulateAgentFlowWorkflow(unsafeRecoveryIdentity, fixture)).toMatchObject({
+      status: "paused",
+      availableArtifacts: ["payload.txt"]
+    });
   });
 
   test("preserves paused result status", () => {

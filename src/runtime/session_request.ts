@@ -38,7 +38,14 @@ import {
   staleApprovalMessage,
   staleApprovalStepIdsAcrossLineage
 } from "./approval_state";
-import { redactAgentFlowSensitiveText } from "./failure_payload";
+import { agentFlowInputKeyLooksSensitive, redactAgentFlowSensitiveText } from "./failure_payload";
+import {
+  AgentFlowSensitiveInputError,
+  assertAgentFlowAdapterStringSafe,
+  preflightAgentFlowTextInputPath,
+  secureAgentFlowReferencedByteInput,
+  secureAgentFlowTextInput
+} from "./execution_security";
 
 export const MAX_AGENT_FLOW_SESSION_PROMPT_BYTES = 1024 * 1024;
 export const MAX_AGENT_FLOW_SESSION_INPUT_BYTES = 10 * 1024 * 1024;
@@ -398,6 +405,21 @@ async function executeAgentFlowSessionStep(
   const initialStaleApproval = staleMergeApprovalError();
   if (initialStaleApproval !== undefined) throw initialStaleApproval;
   const provider = requiredName(session.provider, `Session ${sessionId} provider`);
+  try {
+    for (const [label, value] of [
+      ["Session adapter run ID", runId],
+      ["Session adapter step ID", stepId],
+      ["Session adapter session ID", sessionId],
+      ["Session adapter provider", provider]
+    ] as const) {
+      assertAgentFlowAdapterStringSafe(workflow, label, value);
+    }
+  } catch (error) {
+    if (error instanceof AgentFlowSensitiveInputError) {
+      throw new AgentFlowSessionRequestError(errorMessage(error), error.code, { cause: sanitizedErrorCause(error) });
+    }
+    throw error;
+  }
   const adapter = registry.get(provider);
   if (adapter === undefined) {
     throw new AgentFlowSessionRequestError(
@@ -420,59 +442,126 @@ async function executeAgentFlowSessionStep(
     : kind === "disagreement" ? [options.disagreementOutput]
       : kind === "approval" ? [typeof step.output === "string" ? step.output : defaultAgentFlowApprovalOutputPath(stepId)] : step.outputs;
   const outputPaths = normalizedArtifactPaths(rawOutputs, `${label} ${stepId} outputs`);
-  const prompt = kind === "approval"
-    ? createAgentFlowApprovalPrompt(
-      stepId,
-      sessionId,
-      normalizedArtifactPaths(rawInputs, `Approval ${stepId} artifacts`),
-      outputPaths[0]!,
-      typeof step.message === "string" ? step.message.trim() : undefined
-    )
-    : kind === "review"
-    ? createAgentFlowReviewPrompt(
-      stepId,
-      sessionId,
-      requiredName(step.subject, `Review ${stepId} subject`),
-      normalizedArtifactPaths(rawInputs, `Review ${stepId} artifacts`),
-      outputPaths
-    )
-    : kind === "disagreement"
-      ? createAgentFlowDisagreementPrompt(
+  try {
+    if (priorExternalSessionId !== undefined) {
+      assertAgentFlowAdapterStringSafe(workflow, "Session adapter external session ID", priorExternalSessionId);
+    }
+    for (const outputPath of outputPaths) {
+      assertAgentFlowAdapterStringSafe(workflow, "Session adapter output path", outputPath);
+    }
+  } catch (error) {
+    if (error instanceof AgentFlowSensitiveInputError) {
+      throw new AgentFlowSessionRequestError(errorMessage(error), error.code, { cause: sanitizedErrorCause(error) });
+    }
+    throw error;
+  }
+  let rawPrompt: AgentFlowSessionProviderRequest["prompt"];
+  let prompt: AgentFlowSessionProviderRequest["prompt"];
+  let sourcePromptChecksum: string;
+  let promptWasRedacted = false;
+  try {
+    const secureGeneratedField = (value: string, field: string): string => {
+      const secured = secureAgentFlowTextInput(workflow, `${label} ${stepId} ${field}`, value);
+      if (secured.redacted) promptWasRedacted = true;
+      return secured.value;
+    };
+    const createGeneratedPrompt = (
+      transformField: (value: string, field: string) => string
+    ): AgentFlowSessionProviderRequest["prompt"] => {
+      if (kind === "approval") return createAgentFlowApprovalPrompt(
+        stepId,
+        sessionId,
+        normalizedArtifactPaths(rawInputs, `Approval ${stepId} artifacts`),
+        outputPaths[0]!,
+        typeof step.message === "string"
+          ? transformField(step.message.trim(), "message")
+          : undefined
+      );
+      if (kind === "review") return createAgentFlowReviewPrompt(
+        stepId,
+        sessionId,
+        transformField(requiredName(step.subject, `Review ${stepId} subject`), "subject"),
+        normalizedArtifactPaths(rawInputs, `Review ${stepId} artifacts`),
+        outputPaths
+      );
+      if (kind === "disagreement") return createAgentFlowDisagreementPrompt(
         stepId,
         sessionId,
         requiredName(step.reviewer, `Review ${stepId} reviewer`),
-        requiredName(step.subject, `Review ${stepId} subject`),
+        transformField(requiredName(step.subject, `Review ${stepId} subject`), "subject"),
         disagreementInputs!,
         outputPaths[0]!,
         Number.isSafeInteger(options.disagreementRound) && Number(options.disagreementRound) > 0
           ? Number(options.disagreementRound)
           : 1
-      )
-    : kind === "consult"
-      ? createAgentFlowConsultPrompt(
+      );
+      if (kind === "consult") return createAgentFlowConsultPrompt(
         stepId,
         requiredName(step.from, `Consult ${stepId} from`),
         sessionId,
-        requiredName(step.question, `Consult ${stepId} question`),
+        transformField(requiredName(step.question, `Consult ${stepId} question`), "question"),
         normalizedArtifactPaths(rawInputs, `Consult ${stepId} artifacts`),
         outputPaths[0]!,
         step.blocking === true
-      )
-      : kind === "challenge"
-        ? createAgentFlowChallengePrompt(
-          stepId,
-          requiredName(step.from, `Challenge ${stepId} from`),
-          sessionId,
-          requiredName(step.question, `Challenge ${stepId} question`),
-          normalizedArtifactPaths(rawInputs, `Challenge ${stepId} artifacts`),
-          outputPaths[0]!
-        )
-        : readAgentFlowSessionPrompt(store.repoRoot, requiredName(step.prompt, `Session request ${stepId} prompt`));
+      );
+      if (kind === "challenge") return createAgentFlowChallengePrompt(
+        stepId,
+        requiredName(step.from, `Challenge ${stepId} from`),
+        sessionId,
+        transformField(requiredName(step.question, `Challenge ${stepId} question`), "question"),
+        normalizedArtifactPaths(rawInputs, `Challenge ${stepId} artifacts`),
+        outputPaths[0]!
+      );
+      throw new AgentFlowSessionRequestError(
+        `Session request ${stepId} does not use a generated prompt.`,
+        "AGENT_FLOW_SESSION_PROMPT_PATH"
+      );
+    };
+    const sourcePrompt = kind === "session_request"
+      ? (() => {
+        const promptPath = requiredName(step.prompt, `Session request ${stepId} prompt`);
+        preflightAgentFlowTextInputPath(
+          workflow,
+          `${label} ${stepId} prompt`,
+          promptPath
+        );
+        return readAgentFlowSessionPrompt(store.repoRoot, promptPath);
+      })()
+      : createGeneratedPrompt((value) => value);
+    if (Buffer.byteLength(sourcePrompt.content, "utf8") > MAX_AGENT_FLOW_SESSION_PROMPT_BYTES) {
+      throw promptTooLarge(sourcePrompt.path);
+    }
+    sourcePromptChecksum = sourcePrompt.checksum;
+    rawPrompt = kind === "session_request" ? sourcePrompt : createGeneratedPrompt(secureGeneratedField);
+    const securedPrompt = secureAgentFlowTextInput(
+      workflow,
+      `${label} ${stepId} prompt`,
+      rawPrompt.content,
+      kind === "session_request" ? rawPrompt.path : undefined
+    );
+    promptWasRedacted ||= securedPrompt.redacted;
+    prompt = {
+      ...rawPrompt,
+      content: securedPrompt.value,
+      checksum: `sha256:${digest(securedPrompt.value)}`
+    };
+  } catch (error) {
+    if (error instanceof AgentFlowSensitiveInputError) {
+      throw new AgentFlowSessionRequestError(errorMessage(error), error.code, { cause: sanitizedErrorCause(error) });
+    }
+    if (error instanceof AgentFlowSessionRequestError) {
+      throw sanitizedSessionRequestError(error);
+    }
+    throw error;
+  }
   if (Buffer.byteLength(prompt.content, "utf8") > MAX_AGENT_FLOW_SESSION_PROMPT_BYTES) {
     throw promptTooLarge(prompt.path);
   }
+  const resolvedSessionInputs = kind === "session_request"
+    ? resolveSessionInputPaths(rawInputs, run.inputs, stepId)
+    : { value: rawInputs, sensitivePaths: new Set<string>() };
   const inputPaths = disagreementInputs ?? normalizedArtifactPaths(
-    kind === "session_request" ? resolveSessionInputPaths(rawInputs, run.inputs, stepId) : rawInputs,
+    resolvedSessionInputs.value,
     `${label} ${stepId} ${kind === "session_request" ? "inputs" : "artifacts"}`
   );
   if (kind === "approval") {
@@ -491,21 +580,91 @@ async function executeAgentFlowSessionStep(
     );
   }
   const inputs: AgentFlowSessionRequestArtifact[] = [];
-  let totalInputBytes = 0;
+  const sourceInputEvidence: Array<{ path: string; checksum: string }> = [];
+  const redactedInputPaths = new Set<string>();
+  let totalSourceInputBytes = 0;
+  let totalProviderInputBytes = 0;
   for (const inputPath of inputPaths) {
-    const input = readAgentFlowSessionInput(store, runId, stepId, inputPath);
-    totalInputBytes += input.content.byteLength;
-    if (totalInputBytes > MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES) {
+    try {
+      preflightAgentFlowTextInputPath(
+        workflow,
+        `${label} ${stepId} input`,
+        inputPath
+      );
+    } catch (error) {
+      if (error instanceof AgentFlowSensitiveInputError) {
+        throw new AgentFlowSessionRequestError(errorMessage(error), error.code, { cause: sanitizedErrorCause(error) });
+      }
+      throw error;
+    }
+    const sourceInput = readAgentFlowSessionInput(store, runId, stepId, inputPath);
+    totalSourceInputBytes += sourceInput.content.byteLength;
+    if (totalSourceInputBytes > MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES) {
       throw new AgentFlowSessionRequestError(
         `Session request ${stepId} inputs exceed the ${MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES}-byte aggregate limit.`,
         "AGENT_FLOW_SESSION_INPUT_LIMIT"
       );
     }
+    let securedInput: ReturnType<typeof secureAgentFlowReferencedByteInput>;
+    try {
+      securedInput = secureAgentFlowReferencedByteInput(
+        workflow,
+        `${label} ${stepId} input ${JSON.stringify(inputPath)}`,
+        sourceInput.content,
+        inputPath,
+        sourceInput.contentType,
+        resolvedSessionInputs.sensitivePaths.has(inputPath)
+      );
+    } catch (error) {
+      if (error instanceof AgentFlowSensitiveInputError) {
+        throw new AgentFlowSessionRequestError(errorMessage(error), error.code, { cause: sanitizedErrorCause(error) });
+      }
+      throw error;
+    }
+    const input = {
+      ...sourceInput,
+      content: securedInput.value,
+      checksum: `sha256:${digest(securedInput.value)}`
+    };
+    if (input.content.byteLength > MAX_AGENT_FLOW_SESSION_INPUT_BYTES) {
+      throw new AgentFlowSessionRequestError(
+        `Session request ${stepId} input ${inputPath} exceeds the ${MAX_AGENT_FLOW_SESSION_INPUT_BYTES}-byte input limit after sensitive-data handling.`,
+        "AGENT_FLOW_SESSION_INPUT_LIMIT"
+      );
+    }
+    totalProviderInputBytes += input.content.byteLength;
+    if (totalProviderInputBytes > MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES) {
+      throw new AgentFlowSessionRequestError(
+        `Session request ${stepId} provider inputs exceed the ${MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES}-byte aggregate limit after sensitive-data handling.`,
+        "AGENT_FLOW_SESSION_INPUT_LIMIT"
+      );
+    }
+    if (securedInput.redacted) redactedInputPaths.add(inputPath);
+    sourceInputEvidence.push({ path: inputPath, checksum: sourceInput.checksum });
     inputs.push(input);
   }
   const requestDirectory = kind === "session_request" ? "session-requests" : `${kind}-requests`;
   const requestPath = `${requestDirectory}/${safePathSegment(stepId).slice(0, 200)}-${digest(stepId).slice(0, 12)}.json`;
   preflightOutputCollisions(store, runId, step, sessionId, outputPaths, requestPath, requestKind, outputKind, requestIdPrefix);
+  try {
+    if (kind === "session_request") {
+      assertAgentFlowAdapterStringSafe(
+        workflow,
+        "Session adapter prompt path",
+        prompt.path,
+        { path: true }
+      );
+    }
+    for (const input of inputs) {
+      assertAgentFlowAdapterStringSafe(workflow, "Session adapter input path", input.path, { path: true });
+      assertAgentFlowAdapterStringSafe(workflow, "Session adapter input content type", input.contentType);
+    }
+  } catch (error) {
+    if (error instanceof AgentFlowSensitiveInputError) {
+      throw new AgentFlowSessionRequestError(errorMessage(error), error.code, { cause: sanitizedErrorCause(error) });
+    }
+    throw error;
+  }
   const request: AgentFlowSessionProviderRequest = {
     runId,
     stepId,
@@ -583,11 +742,16 @@ async function executeAgentFlowSessionStep(
       externalSessionId: priorExternalSessionId ?? null,
       state: { resume, lastStepId: stepId, error: persistedErrorMessage(error) }
     });
-    if (error instanceof AgentFlowSessionRequestError) throw error;
+    if (error instanceof AgentFlowSessionRequestError) {
+      throw sanitizedSessionRequestError(error);
+    }
+    if (error instanceof AgentFlowRunStateError) {
+      throw new AgentFlowSessionRequestError(errorMessage(error), error.code, { cause: sanitizedErrorCause(error) });
+    }
     throw new AgentFlowSessionRequestError(
       `Session provider ${provider} failed for step ${stepId}: ${errorMessage(error)}`,
       "AGENT_FLOW_SESSION_PROVIDER_FAILED",
-      { cause: error }
+      { cause: sanitizedErrorCause(error) }
     );
   }
 
@@ -596,6 +760,13 @@ async function executeAgentFlowSessionStep(
     response.externalSessionId,
     `Session provider external session ID for step ${stepId}`
   );
+  if (returnedExternalSessionId !== undefined) {
+    assertAgentFlowAdapterStringSafe(
+      workflow,
+      "Session provider external session ID",
+      returnedExternalSessionId
+    );
+  }
   const externalSessionId = returnedExternalSessionId ?? priorExternalSessionId;
   effectiveExternalSessionId = externalSessionId;
   store.upsertSession({
@@ -632,8 +803,17 @@ async function executeAgentFlowSessionStep(
     sessionId,
     provider,
     resume,
-    prompt: { path: prompt.path, checksum: prompt.checksum },
-    inputs: inputs.map((input) => ({ path: input.path, checksum: input.checksum, contentType: input.contentType })),
+    prompt: {
+      path: prompt.path,
+      checksum: sourcePromptChecksum,
+      ...(promptWasRedacted ? { providerChecksum: prompt.checksum, redacted: true } : {})
+    },
+    inputs: inputs.map((input) => ({
+      path: input.path,
+      checksum: sourceInputEvidence.find((evidence) => evidence.path === input.path)!.checksum,
+      contentType: input.contentType,
+      ...(redactedInputPaths.has(input.path) ? { providerChecksum: input.checksum, redacted: true } : {})
+    })),
     outputs: outputPaths,
     ...(externalSessionId === undefined ? {} : { externalSessionId }),
     ...(providerMetadata === undefined ? {} : { providerMetadata })
@@ -648,7 +828,7 @@ async function executeAgentFlowSessionStep(
     content: `${stableJson(requestMetadata)}\n`,
     overwrite: store.getArtifact(runId, requestPath) !== null,
     requiredRunStatus: "running",
-    requiredArtifacts: inputs.map((input) => ({ path: input.path, checksum: input.checksum })),
+    requiredArtifacts: sourceInputEvidence,
     metadata: {
       sessionId,
       provider,
@@ -679,15 +859,13 @@ async function executeAgentFlowSessionStep(
       ...(kind === "approval" && options.requiredApprovalId !== undefined
         ? { requiredApproval: { id: options.requiredApprovalId, status: "requested" as const } }
         : {}),
-      requiredArtifacts: inputs
-        .filter((input) => !overwrittenInputs.has(input.path))
-        .map((input) => ({ path: input.path, checksum: input.checksum })),
+      requiredArtifacts: sourceInputEvidence.filter((input) => !overwrittenInputs.has(input.path)),
       metadata: {
         sessionId,
         provider,
         requestArtifact: requestPath,
         ...(kind === "approval"
-          ? { evidence: inputs.map((input) => ({ path: input.path, checksum: input.checksum })) }
+          ? { evidence: sourceInputEvidence }
           : {}),
         ...(options.attempt === undefined ? {} : { attempt: options.attempt })
       }
@@ -720,7 +898,7 @@ async function executeAgentFlowSessionStep(
     provider,
     requestArtifact,
     outputArtifacts,
-    inputEvidence: inputs.map((input) => ({ path: input.path, checksum: input.checksum })),
+    inputEvidence: sourceInputEvidence,
     ...(consultResult === undefined ? {} : { consultResult }),
     ...(disagreementResult === undefined ? {} : { disagreementResult }),
     ...(approvalResult === undefined ? {} : { approvalResult }),
@@ -744,7 +922,21 @@ async function executeAgentFlowSessionStep(
     if (stopped !== undefined && !(error instanceof AgentFlowSessionRequestInterruptedError)) {
       throw new AgentFlowSessionRequestInterruptedError(stopped);
     }
-    throw error;
+    if (error instanceof AgentFlowSessionRequestError) {
+      throw sanitizedSessionRequestError(error);
+    }
+    if (error instanceof AgentFlowRunStateError) {
+      throw new AgentFlowSessionRequestError(
+        errorMessage(error),
+        error.code,
+        { cause: sanitizedErrorCause(error) }
+      );
+    }
+    throw new AgentFlowSessionRequestError(
+      `Session provider ${provider} response processing failed for step ${stepId}: ${errorMessage(error)}`,
+      "AGENT_FLOW_SESSION_RESPONSE_FAILED",
+      { cause: sanitizedErrorCause(error) }
+    );
   }
 }
 
@@ -860,7 +1052,17 @@ export function readAgentFlowSessionPrompt(
   } finally {
     fs.closeSync(descriptor);
   }
-  return { path: declaredPath, content: content.toString("utf8"), checksum: `sha256:${digest(content)}` };
+  let decoded: string;
+  try {
+    decoded = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(content);
+  } catch (error) {
+    throw new AgentFlowSessionRequestError(
+      `Prompt ${declaredPath} is not valid UTF-8 text.`,
+      "AGENT_FLOW_SESSION_PROMPT_ENCODING",
+      { cause: error }
+    );
+  }
+  return { path: declaredPath, content: decoded, checksum: `sha256:${digest(content)}` };
 }
 
 function promptTooLarge(declaredPath: string): AgentFlowSessionRequestError {
@@ -1034,17 +1236,24 @@ function resolveRepoFile(repoRoot: string, declaredPath: string): string {
       "AGENT_FLOW_SESSION_PROMPT_PATH"
     );
   }
-  const resolved = path.resolve(repoRoot, ...normalized.split("/"));
+  const resolvedRepoRoot = fs.realpathSync(repoRoot);
+  const resolved = path.resolve(resolvedRepoRoot, ...normalized.split("/"));
   let real: string;
   try {
     real = fs.realpathSync(resolved);
   } catch {
     real = resolved;
   }
-  const relative = path.relative(repoRoot, real);
+  const relative = path.relative(resolvedRepoRoot, real);
   if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
     throw new AgentFlowSessionRequestError(
       `Prompt path ${JSON.stringify(declaredPath)} must stay inside the repository.`,
+      "AGENT_FLOW_SESSION_PROMPT_PATH"
+    );
+  }
+  if (real !== resolved) {
+    throw new AgentFlowSessionRequestError(
+      `Prompt path ${JSON.stringify(declaredPath)} must not traverse symbolic links.`,
       "AGENT_FLOW_SESSION_PROMPT_PATH"
     );
   }
@@ -1087,9 +1296,10 @@ function resolveSessionInputPaths(
   value: unknown,
   runInputs: Record<string, AgentFlowRunStateValue>,
   stepId: string
-): unknown {
-  if (!Array.isArray(value)) return value;
-  return value.map((entry) => {
+): { value: unknown; sensitivePaths: Set<string> } {
+  const sensitivePaths = new Set<string>();
+  if (!Array.isArray(value)) return { value, sensitivePaths };
+  const resolvedValue = value.map((entry) => {
     if (typeof entry !== "string") return entry;
     const reference = /^\{\{\s*inputs\.([A-Za-z0-9_-]+)\s*}}$/.exec(entry.trim());
     if (reference === null) return entry;
@@ -1100,8 +1310,16 @@ function resolveSessionInputPaths(
         "AGENT_FLOW_SESSION_INPUT_UNRESOLVED"
       );
     }
+    if (agentFlowInputKeyLooksSensitive(reference[1]!)) {
+      try {
+        sensitivePaths.add(normalizeAgentFlowArtifactPath(resolved));
+      } catch {
+        // normalizedArtifactPaths reports the canonical validation error below.
+      }
+    }
     return resolved;
   });
+  return { value: resolvedValue, sensitivePaths };
 }
 
 function requiredName(value: unknown, label: string): string {
@@ -1206,9 +1424,22 @@ function sortJson(value: unknown): unknown {
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return redactAgentFlowSensitiveText(error instanceof Error ? error.message : String(error));
 }
 
 function persistedErrorMessage(error: unknown): string {
-  return redactAgentFlowSensitiveText(errorMessage(error));
+  return errorMessage(error);
+}
+
+function sanitizedSessionRequestError(error: AgentFlowSessionRequestError): AgentFlowSessionRequestError {
+  if (error instanceof AgentFlowSessionRequestInterruptedError) return error;
+  const message = errorMessage(error);
+  if (error instanceof AgentFlowSessionPolicyError) {
+    return new AgentFlowSessionPolicyError(message, error.code, error.status);
+  }
+  return new AgentFlowSessionRequestError(message, error.code, { cause: sanitizedErrorCause(error) });
+}
+
+function sanitizedErrorCause(error: unknown): Error {
+  return new Error(errorMessage(error));
 }

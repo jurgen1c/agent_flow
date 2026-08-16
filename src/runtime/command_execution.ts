@@ -32,7 +32,9 @@ import {
   AgentFlowSessionPolicyError,
   AgentFlowSessionRequestError,
   AgentFlowSessionRequestInterruptedError,
+  MAX_AGENT_FLOW_SESSION_INPUT_BYTES,
   MAX_AGENT_FLOW_SESSION_INPUTS,
+  MAX_AGENT_FLOW_SESSION_PROMPT_BYTES,
   MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES,
   createAgentFlowSessionProviderRegistry,
   executeAgentFlowApproval,
@@ -86,10 +88,21 @@ import {
 } from "./retention";
 import { withAgentFlowPipelineFinalization } from "./finalization";
 import {
+  agentFlowInputKeyLooksSensitive,
   persistAgentFlowFailurePayload,
   redactAgentFlowSensitiveText,
   type PersistAgentFlowFailurePayloadResult
 } from "./failure_payload";
+import {
+  AgentFlowSensitiveInputError,
+  assertAgentFlowAdapterStringSafe,
+  preflightAgentFlowTextInputPath,
+  secureAgentFlowByteInput,
+  secureAgentFlowJsonInput,
+  secureAgentFlowReferencedByteInput,
+  secureAgentFlowSensitiveJsonInputValue,
+  secureAgentFlowTextInput
+} from "./execution_security";
 import {
   AgentFlowWorkflowRegistry,
   createAgentFlowWorkflowRegistry,
@@ -2654,7 +2667,7 @@ async function routeAfterFailedStep(
   try {
     if (routeKind === "workflow") {
       const nested = await executeNestedRecoveryWorkflow(
-        store, runId, stepId, step, failure.id, failure.attempt ?? 1, route,
+        store, runId, workflow, stepId, step, failure.id, failure.attempt ?? 1, route,
         transforms, sessionProviders, mcpCalls, notifications, workflows
       );
       status = nested.status;
@@ -3203,6 +3216,7 @@ function resolveReturnedRecoveryFailures(
 async function executeNestedRecoveryWorkflow(
   store: AgentFlowRunStateStore,
   parentRunId: string,
+  parentWorkflow: AgentFlowWorkflow,
   stepId: string,
   parentStep: AgentFlowWorkflowStep,
   failureId: string,
@@ -3230,8 +3244,10 @@ async function executeNestedRecoveryWorkflow(
     store,
     parentRunId,
     failureId,
+    route.inputs,
     resolvedInputs,
     failure.payloadPath,
+    parentWorkflow,
     nestedWorkflow
   );
   const inputs = preparedInputs.inputs;
@@ -3529,19 +3545,87 @@ async function executeRecoverySession(
   const provider = normalizedTarget(session.provider)!;
   const adapter = providers.get(provider)!;
   const promptPath = normalizedTarget(route.prompt)!;
-  const prompt = readAgentFlowSessionPrompt(store.repoRoot, promptPath);
+  let prompt: ReturnType<typeof readAgentFlowSessionPrompt>;
+  try {
+    preflightAgentFlowTextInputPath(workflow, `Recovery session ${stepId} prompt`, promptPath);
+    const sourcePrompt = readAgentFlowSessionPrompt(store.repoRoot, promptPath);
+    const securedPrompt = secureAgentFlowTextInput(
+      workflow,
+      `Recovery session ${stepId} prompt`,
+      sourcePrompt.content,
+      sourcePrompt.path
+    );
+    prompt = {
+      ...sourcePrompt,
+      content: securedPrompt.value,
+      checksum: `sha256:${createHash("sha256").update(securedPrompt.value).digest("hex")}`
+    };
+    if (Buffer.byteLength(prompt.content, "utf8") > MAX_AGENT_FLOW_SESSION_PROMPT_BYTES) {
+      throw new AgentFlowSessionRequestError(
+        `Recovery prompt ${prompt.path} exceeds the ${MAX_AGENT_FLOW_SESSION_PROMPT_BYTES}-byte session prompt limit after sensitive-data handling.`,
+        "AGENT_FLOW_SESSION_PROMPT_TOO_LARGE"
+      );
+    }
+  } catch (error) {
+    if (error instanceof AgentFlowSensitiveInputError) {
+      throw new AgentFlowSessionRequestError(error.message, error.code, { cause: error });
+    }
+    throw error;
+  }
   const run = store.getRun(runId)!;
   const resolvedInputs = resolveRecoveryInputs(route.inputs, run.inputs, stepId, failurePath);
   const inputPaths = new Set<string>();
-  collectRecoveryArtifactPaths(store, runId, resolvedInputs, inputPaths);
+  const sensitiveInputPaths = new Set<string>();
+  collectRecoveryArtifactPaths(store, runId, resolvedInputs, inputPaths, sensitiveInputPaths);
+  collectRecoveryReferencedSensitiveArtifactPaths(
+    store,
+    runId,
+    route.inputs,
+    resolvedInputs,
+    sensitiveInputPaths
+  );
   const recoveryStepId = `${stepId}:recovery`;
   const hasInputManifest = Object.keys(resolvedInputs).length > 0;
+  let inputManifestPath: string | undefined;
+  let sourceInputManifestBytes = 0;
   if (failurePath !== null && recoveryValueReferencesPath(resolvedInputs, failurePath)) {
     const availableSlots = MAX_AGENT_FLOW_SESSION_INPUTS - inputPaths.size - (hasInputManifest ? 1 : 0);
     collectRecoveryFailureArtifactPaths(store, runId, failurePath, inputPaths, availableSlots);
   }
   if (hasInputManifest) {
-    inputPaths.add(persistRecoverySessionInputs(store, runId, recoveryStepId, failureId, resolvedInputs));
+    const sourceManifest = assertRecoverySessionInputManifestSize(
+      resolvedInputs,
+      recoveryStepId,
+      "before sensitive-data handling"
+    );
+    sourceInputManifestBytes = Buffer.byteLength(sourceManifest, "utf8");
+    let securedManifest: Record<string, AgentFlowRunStateValue>;
+    try {
+      const provenanceSecuredManifest = secureRecoveryReferencedInputValues(
+        workflow,
+        `Recovery session ${recoveryStepId} input manifest`,
+        route.inputs,
+        resolvedInputs
+      );
+      securedManifest = secureAgentFlowJsonInput(
+        workflow,
+        `Recovery session ${recoveryStepId} input manifest`,
+        provenanceSecuredManifest
+      ).value;
+    } catch (error) {
+      if (error instanceof AgentFlowSensitiveInputError) {
+        throw new AgentFlowSessionRequestError(error.message, error.code, { cause: error });
+      }
+      throw error;
+    }
+    inputManifestPath = persistRecoverySessionInputs(
+      store,
+      runId,
+      recoveryStepId,
+      failureId,
+      securedManifest
+    );
+    inputPaths.add(inputManifestPath);
   }
   if (inputPaths.size > MAX_AGENT_FLOW_SESSION_INPUTS) {
     throw new AgentFlowSessionRequestError(
@@ -3550,17 +3634,64 @@ async function executeRecoverySession(
     );
   }
   const inputs: Array<ReturnType<typeof readAgentFlowSessionInput>> = [];
-  let totalInputBytes = 0;
+  let totalSourceInputBytes = 0;
+  let totalProviderInputBytes = 0;
   for (const artifactPath of [...inputPaths].sort()) {
-    const input = readAgentFlowSessionInput(store, runId, recoveryStepId, artifactPath);
-    totalInputBytes += input.content.byteLength;
-    if (totalInputBytes > MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES) {
+    try {
+      preflightAgentFlowTextInputPath(
+        workflow,
+        `Recovery session ${recoveryStepId} input`,
+        artifactPath
+      );
+    } catch (error) {
+      if (error instanceof AgentFlowSensitiveInputError) {
+        throw new AgentFlowSessionRequestError(error.message, error.code, { cause: error });
+      }
+      throw error;
+    }
+    const sourceInput = readAgentFlowSessionInput(store, runId, recoveryStepId, artifactPath);
+    totalSourceInputBytes += artifactPath === inputManifestPath
+      ? sourceInputManifestBytes
+      : sourceInput.content.byteLength;
+    if (totalSourceInputBytes > MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES) {
       throw new AgentFlowSessionRequestError(
         `Recovery session ${recoveryStepId} inputs exceed the ${MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES}-byte aggregate limit.`,
         "AGENT_FLOW_SESSION_INPUT_LIMIT"
       );
     }
-    inputs.push(input);
+    try {
+      const securedInput = secureAgentFlowReferencedByteInput(
+        workflow,
+        `Recovery session ${recoveryStepId} input ${JSON.stringify(artifactPath)}`,
+        sourceInput.content,
+        artifactPath,
+        sourceInput.contentType,
+        sensitiveInputPaths.has(artifactPath)
+      );
+      if (securedInput.value.byteLength > MAX_AGENT_FLOW_SESSION_INPUT_BYTES) {
+        throw new AgentFlowSessionRequestError(
+          `Recovery session ${recoveryStepId} input ${artifactPath} exceeds the ${MAX_AGENT_FLOW_SESSION_INPUT_BYTES}-byte input limit after sensitive-data handling.`,
+          "AGENT_FLOW_SESSION_INPUT_LIMIT"
+        );
+      }
+      totalProviderInputBytes += securedInput.value.byteLength;
+      if (totalProviderInputBytes > MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES) {
+        throw new AgentFlowSessionRequestError(
+          `Recovery session ${recoveryStepId} provider inputs exceed the ${MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES}-byte aggregate limit after sensitive-data handling.`,
+          "AGENT_FLOW_SESSION_INPUT_LIMIT"
+        );
+      }
+      inputs.push({
+        ...sourceInput,
+        content: securedInput.value,
+        checksum: `sha256:${createHash("sha256").update(securedInput.value).digest("hex")}`
+      });
+    } catch (error) {
+      if (error instanceof AgentFlowSensitiveInputError) {
+        throw new AgentFlowSessionRequestError(error.message, error.code, { cause: error });
+      }
+      throw error;
+    }
   }
   if (inputs.some((input) => input.path === RECOVERY_CONTEXT_INPUT_PATH)) {
     throw new AgentFlowSessionRequestError(
@@ -3571,6 +3702,20 @@ async function executeRecoverySession(
   const resume = session.resume === true;
   const previous = store.getSession(runId, sessionId);
   const priorExternalSessionId = resume ? previous?.externalSessionId ?? undefined : undefined;
+  assertRecoveryAdapterStringsSafe(workflow, [
+    ["Recovery adapter run ID", runId],
+    ["Recovery adapter step ID", recoveryStepId],
+    ["Recovery adapter session ID", sessionId],
+    ["Recovery adapter provider", provider],
+    ["Recovery adapter prompt path", prompt.path, true],
+    ...inputs.flatMap((input): Array<[string, string, boolean?]> => [
+      ["Recovery adapter input path", input.path, true],
+      ["Recovery adapter input content type", input.contentType]
+    ]),
+    ...(priorExternalSessionId === undefined
+      ? []
+      : [["Recovery adapter external session ID", priorExternalSessionId] as [string, string]])
+  ]);
   store.claimSession({
     id: sessionId,
     runId,
@@ -3594,13 +3739,39 @@ async function executeRecoverySession(
       if (activeRevision > appliedContextRevision) {
         appliedContextRevision = activeRevision;
         rerunRevision = appliedContextRevision;
-        contextInput = recoveryContextInputArtifact(activeSession.state);
+        const sourceContextInput = recoveryContextInputArtifact(activeSession.state);
         if (inputs.length + 1 > MAX_AGENT_FLOW_SESSION_INPUTS
-            || totalInputBytes + contextInput.content.byteLength > MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES) {
+            || totalSourceInputBytes + sourceContextInput.content.byteLength > MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES) {
           throw new AgentFlowSessionRequestError(
             `Recovery session ${recoveryStepId} inputs exceed their configured limits after context injection.`,
             "AGENT_FLOW_SESSION_INPUT_LIMIT"
           );
+        }
+        try {
+          const securedContext = secureAgentFlowByteInput(
+            workflow,
+            `Recovery session ${recoveryStepId} injected context`,
+            sourceContextInput.content,
+            sourceContextInput.path,
+            sourceContextInput.contentType
+          );
+          if (securedContext.value.byteLength > MAX_AGENT_FLOW_SESSION_INPUT_BYTES
+              || totalProviderInputBytes + securedContext.value.byteLength > MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES) {
+            throw new AgentFlowSessionRequestError(
+              `Recovery session ${recoveryStepId} provider inputs exceed their configured limits after sensitive-data handling.`,
+              "AGENT_FLOW_SESSION_INPUT_LIMIT"
+            );
+          }
+          contextInput = {
+            ...sourceContextInput,
+            content: securedContext.value,
+            checksum: `sha256:${createHash("sha256").update(securedContext.value).digest("hex")}`
+          };
+        } catch (error) {
+          if (error instanceof AgentFlowSensitiveInputError) {
+            throw new AgentFlowSessionRequestError(error.message, error.code, { cause: error });
+          }
+          throw error;
         }
       }
       reserveAgentFlowSessionModelCallBudgets(
@@ -3613,6 +3784,17 @@ async function executeRecoverySession(
           payload: { sessionId, revision: rerunRevision }
         });
       }
+      assertRecoveryAdapterStringsSafe(workflow, [
+        ...(externalSessionId === undefined
+          ? []
+          : [["Recovery adapter external session ID", externalSessionId] as [string, string]]),
+        ...(contextInput === undefined
+          ? []
+          : [
+              ["Recovery adapter context path", contextInput.path, true] as [string, string, boolean],
+              ["Recovery adapter context content type", contextInput.contentType] as [string, string]
+            ])
+      ]);
       try {
         response = await invokeAgentFlowSessionProvider(adapter, {
           runId,
@@ -3638,6 +3820,12 @@ async function executeRecoverySession(
         && typeof response.externalSessionId === "string" && response.externalSessionId.trim().length > 0
         ? response.externalSessionId.trim()
         : undefined;
+      if (returnedSessionId !== undefined) {
+        assertRecoveryAdapterStringsSafe(workflow, [[
+          "Recovery provider external session ID",
+          returnedSessionId
+        ]]);
+      }
       if (stoppedAfterResponse !== undefined) {
         externalSessionId = returnedSessionId ?? externalSessionId;
         throw new AgentFlowSessionRequestInterruptedError(stoppedAfterResponse);
@@ -3708,7 +3896,19 @@ async function executeRecoverySession(
           : { interrupted: stopped })
       }
     });
-    throw error;
+    if (error instanceof AgentFlowSessionRequestInterruptedError) throw error;
+    const message = redactAgentFlowSensitiveText(error instanceof Error ? error.message : String(error));
+    if (error instanceof AgentFlowSessionPolicyError) {
+      throw new AgentFlowSessionPolicyError(message, error.code, error.status);
+    }
+    if (error instanceof AgentFlowSessionRequestError) {
+      throw new AgentFlowSessionRequestError(message, error.code, { cause: new Error(message) });
+    }
+    throw new AgentFlowSessionRequestError(
+      `Session provider ${provider} failed for step ${recoveryStepId}: ${message}`,
+      "AGENT_FLOW_SESSION_PROVIDER_FAILED",
+      { cause: new Error(message) }
+    );
   }
   return {
     status,
@@ -3766,6 +3966,52 @@ function resolveRecoveryInputs(
   ]));
 }
 
+function secureRecoveryReferencedInputValues(
+  workflow: AgentFlowWorkflow,
+  label: string,
+  declared: unknown,
+  resolved: Record<string, AgentFlowRunStateValue>
+): Record<string, AgentFlowRunStateValue> {
+  const declaredMapping = mapping(declared) ?? {};
+  return Object.fromEntries(Object.entries(resolved).map(([name, value]) => [
+    name,
+    secureRecoveryReferencedInputValue(workflow, `${label}.${name}`, declaredMapping[name], value)
+  ]));
+}
+
+function secureRecoveryReferencedInputValue(
+  workflow: AgentFlowWorkflow,
+  label: string,
+  declared: unknown,
+  resolved: AgentFlowRunStateValue
+): AgentFlowRunStateValue {
+  if (typeof declared === "string") {
+    const reference = /^\{\{\s*inputs\.([A-Za-z_][A-Za-z0-9_-]*)\s*}}$/.exec(declared);
+    if (reference !== null && agentFlowInputKeyLooksSensitive(reference[1]!)) {
+      return secureAgentFlowSensitiveJsonInputValue(workflow, label, resolved).value;
+    }
+  }
+  if (Array.isArray(declared) && Array.isArray(resolved)) {
+    return resolved.map((value, index) =>
+      secureRecoveryReferencedInputValue(workflow, `${label}[${index}]`, declared[index], value)
+    );
+  }
+  const declaredMapping = mapping(declared);
+  const resolvedMapping = mapping(resolved);
+  if (declaredMapping !== undefined && resolvedMapping !== undefined) {
+    return Object.fromEntries(Object.entries(resolvedMapping).map(([name, value]) => [
+      name,
+      secureRecoveryReferencedInputValue(
+        workflow,
+        `${label}.${name}`,
+        declaredMapping[name],
+        value as AgentFlowRunStateValue
+      )
+    ]));
+  }
+  return resolved;
+}
+
 function resolveRecoveryInputValue(
   value: unknown,
   runInputs: Record<string, AgentFlowRunStateValue>,
@@ -3815,13 +4061,7 @@ function persistRecoverySessionInputs(
   inputs: Record<string, AgentFlowRunStateValue>
 ): string {
   const artifactPath = `recoveries/${safeId(failureId)}/inputs.json`;
-  const content = `${JSON.stringify(inputs, null, 2)}\n`;
-  if (Buffer.byteLength(content) > MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES) {
-    throw new AgentFlowSessionRequestError(
-      `Recovery session ${stepId} inputs exceed the ${MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES}-byte aggregate limit.`,
-      "AGENT_FLOW_SESSION_INPUT_LIMIT"
-    );
-  }
+  const content = assertRecoverySessionInputManifestSize(inputs, stepId, "after sensitive-data handling");
   store.writeArtifact({
     id: `recovery:${createHash("sha256").update(failureId).digest("hex")}:inputs`,
     runId,
@@ -3835,22 +4075,72 @@ function persistRecoverySessionInputs(
   return artifactPath;
 }
 
+function assertRecoverySessionInputManifestSize(
+  inputs: Record<string, AgentFlowRunStateValue>,
+  stepId: string,
+  phase: string
+): string {
+  const content = `${JSON.stringify(inputs, null, 2)}\n`;
+  if (Buffer.byteLength(content) > MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES) {
+    throw new AgentFlowSessionRequestError(
+      `Recovery session ${stepId} inputs exceed the ${MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES}-byte aggregate limit ${phase}.`,
+      "AGENT_FLOW_SESSION_INPUT_LIMIT"
+    );
+  }
+  return content;
+}
+
+function assertRecoveryAdapterStringsSafe(
+  workflow: AgentFlowWorkflow,
+  values: Array<[label: string, value: string, path?: boolean]>
+): void {
+  try {
+    for (const [label, value, path] of values) {
+      assertAgentFlowAdapterStringSafe(workflow, label, value, { path: path === true });
+    }
+  } catch (error) {
+    if (error instanceof AgentFlowSensitiveInputError) {
+      throw new AgentFlowSessionRequestError(error.message, error.code, { cause: error });
+    }
+    throw error;
+  }
+}
+
 interface PreparedNestedRecoveryInputs {
   inputs: Record<string, AgentFlowRunStateValue>;
-  copies: Array<{ sourcePath: string; targetPath: string }>;
+  copies: Array<{ sourcePath: string; targetPath: string; sensitive: boolean }>;
   pathMap: Map<string, string>;
+  securityWorkflow: AgentFlowWorkflow;
 }
 
 function prepareNestedRecoveryInputs(
   store: AgentFlowRunStateStore,
   parentRunId: string,
   failureId: string,
+  declaredInputs: unknown,
   inputs: Record<string, AgentFlowRunStateValue>,
   failurePath: string | null,
+  securityWorkflow: AgentFlowWorkflow,
   workflow: AgentFlowWorkflow
 ): PreparedNestedRecoveryInputs {
   const paths = new Set<string>();
   collectRecoveryArtifactPaths(store, parentRunId, inputs, paths);
+  const sensitivePaths = new Set<string>();
+  collectRecoveryReferencedSensitiveArtifactPaths(
+    store,
+    parentRunId,
+    declaredInputs,
+    inputs,
+    sensitivePaths
+  );
+  const securedInputs = secureNestedRecoveryInputValues(
+    store,
+    parentRunId,
+    securityWorkflow,
+    "Nested recovery inputs",
+    declaredInputs,
+    inputs
+  );
   const failurePaths = new Set<string>();
   if (failurePath !== null && recoveryValueReferencesPath(inputs, failurePath)) {
     collectRecoveryFailureArtifactPaths(store, parentRunId, failurePath, failurePaths);
@@ -3876,10 +4166,100 @@ function prepareNestedRecoveryInputs(
     assignedTargets.add(targetPath);
   }
   return {
-    inputs: remapRecoveryArtifactPaths(inputs, pathMap),
-    copies: [...pathMap].map(([sourcePath, targetPath]) => ({ sourcePath, targetPath })),
-    pathMap
+    inputs: remapRecoveryArtifactPaths(securedInputs, pathMap),
+    copies: [...pathMap].map(([sourcePath, targetPath]) => ({
+      sourcePath,
+      targetPath,
+      sensitive: sensitivePaths.has(sourcePath)
+    })),
+    pathMap,
+    securityWorkflow
   };
+}
+
+function secureNestedRecoveryInputValues(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  workflow: AgentFlowWorkflow,
+  label: string,
+  declared: unknown,
+  resolved: Record<string, AgentFlowRunStateValue>
+): Record<string, AgentFlowRunStateValue> {
+  const declaredMapping = mapping(declared) ?? {};
+  return Object.fromEntries(Object.entries(resolved).map(([name, value]) => [
+    name,
+    secureNestedRecoveryInputValue(
+      store,
+      runId,
+      workflow,
+      `${label}.${name}`,
+      declaredMapping[name],
+      value,
+      agentFlowInputKeyLooksSensitive(name)
+    )
+  ]));
+}
+
+function secureNestedRecoveryInputValue(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  workflow: AgentFlowWorkflow,
+  label: string,
+  declared: unknown,
+  resolved: AgentFlowRunStateValue,
+  sensitive: boolean
+): AgentFlowRunStateValue {
+  const reference = typeof declared === "string"
+    ? /^\{\{\s*inputs\.([A-Za-z_][A-Za-z0-9_-]*)\s*}}$/.exec(declared)
+    : null;
+  const inheritedSensitive = sensitive
+    || (reference !== null && agentFlowInputKeyLooksSensitive(reference[1]!));
+  if (typeof resolved === "string") {
+    try {
+      if (store.getArtifact(runId, resolved) !== null) return resolved;
+    } catch {
+      // Literal nested-recovery inputs do not have to be artifact paths.
+    }
+    return secureNestedRecoveryScalarValue(workflow, label, resolved, inheritedSensitive);
+  }
+  if (Array.isArray(resolved)) {
+    const declaredValues = Array.isArray(declared) ? declared : [];
+    return resolved.map((value, index) => secureNestedRecoveryInputValue(
+      store,
+      runId,
+      workflow,
+      `${label}[${index}]`,
+      declaredValues[index],
+      value,
+      inheritedSensitive
+    ));
+  }
+  if (resolved !== null && typeof resolved === "object") {
+    const declaredMapping = mapping(declared) ?? {};
+    return Object.fromEntries(Object.entries(resolved).map(([name, value]) => [
+      name,
+      secureNestedRecoveryInputValue(
+        store,
+        runId,
+        workflow,
+        `${label}.${name}`,
+        declaredMapping[name],
+        value,
+        inheritedSensitive || agentFlowInputKeyLooksSensitive(name)
+      )
+    ]));
+  }
+  return secureNestedRecoveryScalarValue(workflow, label, resolved, inheritedSensitive);
+}
+
+function secureNestedRecoveryScalarValue(
+  workflow: AgentFlowWorkflow,
+  label: string,
+  value: AgentFlowRunStateValue,
+  sensitive: boolean
+): AgentFlowRunStateValue {
+  if (sensitive) return secureAgentFlowSensitiveJsonInputValue(workflow, label, value).value;
+  return secureAgentFlowJsonInput(workflow, label, { value }).value.value!;
 }
 
 function nestedWorkflowCommandLogPrefixes(steps: AgentFlowWorkflowStep[]): string[] {
@@ -3914,9 +4294,21 @@ function copyRecoveryInputArtifacts(
   recoveryRunId: string,
   prepared: PreparedNestedRecoveryInputs
 ): void {
-  for (const { sourcePath, targetPath } of prepared.copies) {
+  for (const { sourcePath, targetPath, sensitive } of prepared.copies) {
     const source = store.readArtifact(parentRunId, sourcePath);
-    const content = remapRecoveryArtifactContent(source.content, source.artifact.contentType, prepared.pathMap);
+    const secured = secureAgentFlowReferencedByteInput(
+      prepared.securityWorkflow,
+      `Nested recovery input ${sourcePath}`,
+      source.content,
+      sourcePath,
+      source.artifact.contentType,
+      sensitive
+    );
+    const content = remapRecoveryArtifactContent(
+      Buffer.from(secured.value),
+      source.artifact.contentType,
+      prepared.pathMap
+    );
     store.writeArtifact({
       id: `recovery-input:${createHash("sha256").update(targetPath).digest("hex")}`,
       runId: recoveryRunId,
@@ -4045,22 +4437,75 @@ function collectRecoveryArtifactPaths(
   store: AgentFlowRunStateStore,
   runId: string,
   value: AgentFlowRunStateValue,
-  paths: Set<string>
+  paths: Set<string>,
+  sensitivePaths?: Set<string>,
+  sensitive = false
 ): void {
   if (typeof value === "string") {
     try {
-      if (store.getArtifact(runId, value) !== null) paths.add(normalizeAgentFlowArtifactPath(value));
+      if (store.getArtifact(runId, value) !== null) {
+        const normalized = normalizeAgentFlowArtifactPath(value);
+        paths.add(normalized);
+        if (sensitive) sensitivePaths?.add(normalized);
+      }
     } catch {
       // Literal recovery inputs do not have to be artifact paths.
     }
     return;
   }
   if (Array.isArray(value)) {
-    value.forEach((entry) => collectRecoveryArtifactPaths(store, runId, entry, paths));
+    value.forEach((entry) => collectRecoveryArtifactPaths(store, runId, entry, paths, sensitivePaths, sensitive));
     return;
   }
   if (value !== null && typeof value === "object") {
-    Object.values(value).forEach((entry) => collectRecoveryArtifactPaths(store, runId, entry, paths));
+    Object.entries(value).forEach(([key, entry]) => collectRecoveryArtifactPaths(
+      store,
+      runId,
+      entry,
+      paths,
+      sensitivePaths,
+      sensitive || agentFlowInputKeyLooksSensitive(key)
+    ));
+  }
+}
+
+function collectRecoveryReferencedSensitiveArtifactPaths(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  declared: unknown,
+  resolved: AgentFlowRunStateValue,
+  sensitivePaths: Set<string>,
+  sensitive = false
+): void {
+  if (typeof declared === "string") {
+    const expression = /^\{\{\s*inputs\.([A-Za-z_][A-Za-z0-9_-]*)\s*}}$/.exec(declared);
+    const referencedSensitiveInput = expression !== null && agentFlowInputKeyLooksSensitive(expression[1]!);
+    if (sensitive || referencedSensitiveInput) {
+      collectRecoveryArtifactPaths(store, runId, resolved, new Set(), sensitivePaths, true);
+    }
+    return;
+  }
+  if (Array.isArray(declared) && Array.isArray(resolved)) {
+    declared.forEach((entry, index) => collectRecoveryReferencedSensitiveArtifactPaths(
+      store,
+      runId,
+      entry,
+      resolved[index] ?? null,
+      sensitivePaths,
+      sensitive
+    ));
+    return;
+  }
+  const declaredRecord = mapping(declared);
+  if (declaredRecord !== undefined && resolved !== null && typeof resolved === "object" && !Array.isArray(resolved)) {
+    Object.entries(declaredRecord).forEach(([key, entry]) => collectRecoveryReferencedSensitiveArtifactPaths(
+      store,
+      runId,
+      entry,
+      resolved[key] ?? null,
+      sensitivePaths,
+      sensitive || agentFlowInputKeyLooksSensitive(key)
+    ));
   }
 }
 

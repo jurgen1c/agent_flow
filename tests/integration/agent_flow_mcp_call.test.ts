@@ -7,6 +7,7 @@ import {
   createAgentFlowFixtureMcpAdapter,
   createAgentFlowLifecycleRun,
   createAgentFlowMcpCallRegistry,
+  AgentFlowMcpCallError,
   executeAgentFlowCommandPipeline,
   executeAgentFlowMcpCall,
   MAX_AGENT_FLOW_MCP_ARGUMENT_BYTES,
@@ -227,6 +228,442 @@ steps:
     ]));
   });
 
+  test("redacts secret-like MCP arguments before adapter invocation and audit persistence", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: redacted-mcp-arguments
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: fetch
+    type: mcp_call
+    server: fixture
+    tool: get_issue
+    arguments:
+      api_token: mcp-secret-value
+      key: AF-44
+      issue_key: AF-44
+      project_key: AF
+      sort_key: created_at
+    outputs: [ticket.json]
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "redacted-mcp", workflow });
+    let captured: AgentFlowMcpCallRequest | undefined;
+    const calls = createAgentFlowMcpCallRegistry().register("fixture", (request) => {
+      captured = request;
+      return { outputs: { "ticket.json": { key: "AF-44" } } };
+    });
+
+    expect((await executeAgentFlowCommandPipeline(
+      store,
+      "redacted-mcp",
+      workflow,
+      undefined,
+      undefined,
+      calls
+    )).status).toBe("completed");
+    expect(captured?.arguments).toEqual({
+      api_token: "[REDACTED]",
+      key: "AF-44",
+      issue_key: "AF-44",
+      project_key: "AF",
+      sort_key: "created_at"
+    });
+    const requestArtifact = store.listArtifacts("redacted-mcp")
+      .find((artifact) => artifact.kind === "mcp_request")!;
+    const persisted = store.readArtifact("redacted-mcp", requestArtifact.declaredPath).content.toString("utf8");
+    expect(persisted).toContain('\"redacted\":true');
+    expect(persisted).not.toContain("mcp-secret-value");
+    store.close();
+  });
+
+  test("preserves sensitive workflow-input provenance through MCP interpolation", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: interpolated-mcp-credential
+version: 1
+style: pipeline
+maturity: experimental
+inputs: { key: { required: true } }
+steps:
+  - id: fetch
+    type: mcp_call
+    server: fixture
+    tool: search
+    arguments: { query: "prefix {{ inputs.key }} suffix" }
+    outputs: [result.json]
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, {
+      id: "interpolated-mcp-credential",
+      workflow,
+      inputs: { key: "hunter2abc" }
+    });
+    let captured: AgentFlowMcpCallRequest | undefined;
+    const calls = createAgentFlowMcpCallRegistry().register("fixture", (request) => {
+      captured = request;
+      return { outputs: { "result.json": { ok: true } } };
+    });
+
+    expect((await executeAgentFlowCommandPipeline(
+      store,
+      "interpolated-mcp-credential",
+      workflow,
+      undefined,
+      undefined,
+      calls
+    )).status).toBe("completed");
+    expect(captured?.arguments).toEqual({ query: "prefix [REDACTED] suffix" });
+    const requestArtifact = store.listArtifacts("interpolated-mcp-credential")
+      .find((artifact) => artifact.kind === "mcp_request")!;
+    const persisted = store.readArtifact(
+      "interpolated-mcp-credential",
+      requestArtifact.declaredPath
+    ).content.toString("utf8");
+    expect(persisted).toContain('"redacted":true');
+    expect(persisted).not.toContain("hunter2abc");
+    store.close();
+  });
+
+  test("accepts ordinary structured-format names for MCP output artifacts", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: csv-mcp-output
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: fetch, type: mcp_call, server: fixture, tool: export, arguments: {}, outputs: [report.csv] }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "csv-mcp-output", workflow });
+    const calls = createAgentFlowMcpCallRegistry().register("fixture", () => ({
+      outputs: { "report.csv": "key,value\nAF-44,complete\n" }
+    }));
+
+    expect((await executeAgentFlowCommandPipeline(
+      store,
+      "csv-mcp-output",
+      workflow,
+      undefined,
+      undefined,
+      calls
+    )).status).toBe("completed");
+    expect(store.readArtifact("csv-mcp-output", "report.csv").content.toString("utf8"))
+      .toBe("key,value\nAF-44,complete\n");
+    store.close();
+  });
+
+  test("mirrors sensitive MCP argument rejection during simulation", () => {
+    const secretPathWorkflow = parseAgentFlowWorkflowOrThrow(`name: simulated-secret-path
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: fetch, type: mcp_call, server: fixture, tool: read_file, arguments: { path: 'C:\\repo\\.env' }, outputs: [ticket.json] }
+`);
+    expect(simulateAgentFlowWorkflow(secretPathWorkflow, {
+      steps: { fetch: { outputs: { "ticket.json": { ok: true } } } }
+    })).toMatchObject({ status: "paused", availableArtifacts: [] });
+
+    const denyWorkflow = parseAgentFlowWorkflowOrThrow(`name: simulated-denied-secret
+version: 1
+style: pipeline
+maturity: experimental
+policies:
+  sensitive_inputs: deny
+steps:
+  - { id: fetch, type: mcp_call, server: fixture, tool: get, arguments: { api_token: secret-value }, outputs: [ticket.json] }
+`);
+    expect(simulateAgentFlowWorkflow(denyWorkflow, {
+      steps: { fetch: { outputs: { "ticket.json": { ok: true } } } }
+    })).toMatchObject({ status: "paused", availableArtifacts: [] });
+
+    const interpolatedCredentialWorkflow = parseAgentFlowWorkflowOrThrow(`name: simulated-interpolated-credential
+version: 1
+style: pipeline
+maturity: experimental
+policies: { sensitive_inputs: deny }
+inputs: { key: { required: true } }
+steps:
+  - { id: fetch, type: mcp_call, server: fixture, tool: search, arguments: { query: "prefix {{ inputs.key }} suffix" }, outputs: [ticket.json] }
+`);
+    expect(simulateAgentFlowWorkflow(interpolatedCredentialWorkflow, {
+      inputs: { key: "hunter2abc" },
+      steps: { fetch: { outputs: { "ticket.json": { ok: true } } } }
+    })).toMatchObject({ status: "paused", availableArtifacts: [] });
+
+    for (const argumentsYaml of [
+      "{ filepath: .env }",
+      "{ access_key: opaque-value }",
+      "{ aws_access_key_id: opaque-value }",
+      "{ encryption_key: opaque-value }"
+    ]) {
+      const workflow = parseAgentFlowWorkflowOrThrow(`name: simulated-sensitive-arguments
+version: 1
+style: pipeline
+maturity: experimental
+policies:
+  sensitive_inputs: deny
+steps:
+  - { id: fetch, type: mcp_call, server: fixture, tool: get, arguments: ${argumentsYaml}, outputs: [ticket.json] }
+`);
+      expect(simulateAgentFlowWorkflow(workflow, {
+        steps: { fetch: { outputs: { "ticket.json": { ok: true } } } }
+      })).toMatchObject({ status: "paused", availableArtifacts: [] });
+    }
+  });
+
+  test("mirrors MCP adapter metadata checks during simulation without treating output names as inputs", () => {
+    const safeWorkflow = parseAgentFlowWorkflowOrThrow(`name: simulated-csv-mcp-output
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: fetch, type: mcp_call, server: fixture, tool: export, arguments: {}, outputs: [report.csv] }
+`);
+    expect(simulateAgentFlowWorkflow(safeWorkflow, {
+      steps: { fetch: { outputs: { "report.csv": "key,value\nAF-44,complete\n" } } }
+    })).toMatchObject({ status: "completed", availableArtifacts: ["report.csv"] });
+
+    const unsafeStepWorkflow = structuredClone(safeWorkflow);
+    unsafeStepWorkflow.steps[0]!.id = "api_token=opaque";
+    expect(simulateAgentFlowWorkflow(unsafeStepWorkflow, {
+      steps: { "api_token=opaque": { outputs: { "report.csv": "unsafe" } } }
+    })).toMatchObject({ status: "paused", availableArtifacts: [] });
+
+    const unsafeOutputWorkflow = structuredClone(safeWorkflow);
+    unsafeOutputWorkflow.steps[0]!.outputs = ["secrets/result.json"];
+    expect(simulateAgentFlowWorkflow(unsafeOutputWorkflow, {
+      steps: { fetch: { outputs: { "secrets/result.json": { unsafe: true } } } }
+    })).toMatchObject({ status: "paused", availableArtifacts: [] });
+  });
+
+  test("redacts adapter-native MCP errors before pipeline persistence", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: redacted-native-mcp-error
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: fetch, type: mcp_call, server: fixture, tool: get_issue, arguments: {}, outputs: [ticket.json] }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "redacted-native-mcp-error", workflow });
+    const calls = createAgentFlowMcpCallRegistry().register("fixture", () => {
+      throw new AgentFlowMcpCallError(
+        "server rejected Authorization: Bearer mcp-adapter-secret; passwords: plural-mcp-secret",
+        "FIXTURE_REJECTED"
+      );
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      "redacted-native-mcp-error",
+      workflow,
+      undefined,
+      undefined,
+      calls
+    );
+
+    expect(result.message).toContain("Authorization: Bearer [REDACTED]");
+    expect(JSON.stringify(result)).not.toContain("mcp-adapter-secret");
+    expect(JSON.stringify(store.listEvents("redacted-native-mcp-error"))).not.toContain("mcp-adapter-secret");
+    expect(JSON.stringify(result)).not.toContain("plural-mcp-secret");
+    expect(JSON.stringify(store.listEvents("redacted-native-mcp-error"))).not.toContain("plural-mcp-secret");
+    store.close();
+  });
+
+  test("sanitizes adapter error causes at the exported MCP boundary", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: sanitized-direct-mcp-error
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: fetch, type: mcp_call, server: fixture, tool: get_issue, arguments: {}, outputs: [ticket.json] }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    store.createRun({
+      id: "sanitized-direct-mcp-error",
+      status: "running",
+      workflow: { name: workflow.name, version: workflow.version, style: workflow.style, maturity: workflow.maturity },
+      context: { workflow }
+    });
+    const calls = createAgentFlowMcpCallRegistry().register("fixture", () => {
+      throw new AgentFlowMcpCallError("Authorization: Bearer direct-mcp-secret-value", "FIXTURE_REJECTED");
+    });
+
+    try {
+      await executeAgentFlowMcpCall(store, "sanitized-direct-mcp-error", workflow, workflow.steps[0]!, calls);
+      throw new Error("Expected direct MCP execution to fail.");
+    } catch (error) {
+      expect(error).toBeInstanceOf(AgentFlowMcpCallError);
+      expect((error as Error).message).toContain("Authorization: Bearer [REDACTED]");
+      expect(((error as Error).cause as Error | undefined)?.message).toContain("Authorization: Bearer [REDACTED]");
+      expect(JSON.stringify({
+        message: (error as Error).message,
+        cause: ((error as Error).cause as Error | undefined)?.message
+      })).not.toContain("direct-mcp-secret-value");
+    }
+    store.close();
+  });
+
+  test("sanitizes response-processing errors at the exported MCP boundary", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: sanitized-mcp-response-error
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: fetch, type: mcp_call, server: fixture, tool: get_issue, arguments: {}, outputs: [ticket.json] }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    store.createRun({
+      id: "sanitized-mcp-response-error",
+      status: "running",
+      workflow: { name: workflow.name, version: workflow.version, style: workflow.style, maturity: workflow.maturity },
+      context: { workflow }
+    });
+    const calls = createAgentFlowMcpCallRegistry().register("fixture", () =>
+      new Proxy({ outputs: { "ticket.json": { key: "AF-44" } } }, {
+        get(target, property, receiver) {
+          if (property === "outputs") throw new Error("Authorization: Bearer mcp-response-secret");
+          return Reflect.get(target, property, receiver);
+        }
+      })
+    );
+
+    try {
+      await executeAgentFlowMcpCall(store, "sanitized-mcp-response-error", workflow, workflow.steps[0]!, calls);
+      throw new Error("Expected MCP response processing to fail.");
+    } catch (error) {
+      expect(error).toBeInstanceOf(AgentFlowMcpCallError);
+      expect((error as Error).message).toContain("Authorization: Bearer [REDACTED]");
+      expect(((error as Error).cause as Error | undefined)?.message).toContain("Authorization: Bearer [REDACTED]");
+      expect(JSON.stringify({
+        message: (error as Error).message,
+        cause: ((error as Error).cause as Error | undefined)?.message
+      })).not.toContain("mcp-response-secret");
+    }
+    store.close();
+  });
+
+  test("blocks secret-like MCP path arguments before adapter invocation", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: blocked-mcp-path
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: fetch
+    type: mcp_call
+    server: fixture
+    tool: read_file
+    arguments: { source: .env, arbitrary: [README.md, credentials.json] }
+    outputs: [result.json]
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "blocked-mcp-path", workflow });
+    let calls = 0;
+    const adapters = createAgentFlowMcpCallRegistry().register("fixture", () => {
+      calls += 1;
+      return { outputs: { "result.json": {} } };
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      "blocked-mcp-path",
+      workflow,
+      undefined,
+      undefined,
+      adapters
+    );
+
+    expect(result).toMatchObject({ status: "paused", failedStep: "fetch" });
+    expect(result.message).toContain("secret-like path");
+    expect(calls).toBe(0);
+    store.close();
+  });
+
+  test("rejects secret-bearing MCP adapter identity metadata before invocation", async () => {
+    const root = temporaryRepo();
+    const secretStepId = "API_TOKEN=adapter-identity-secret";
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: blocked-mcp-adapter-identity
+version: 1
+style: pipeline
+maturity: experimental
+policies: { sensitive_inputs: deny }
+steps:
+  - id: ${JSON.stringify(secretStepId)}
+    type: mcp_call
+    server: fixture
+    tool: get_issue
+    arguments: {}
+    outputs: [ticket.json]
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    store.createRun({
+      id: "blocked-mcp-adapter-identity",
+      status: "running",
+      workflow: { name: workflow.name, version: workflow.version, style: workflow.style, maturity: workflow.maturity },
+      context: { workflow }
+    });
+    let calls = 0;
+    const adapters = createAgentFlowMcpCallRegistry().register("fixture", () => {
+      calls += 1;
+      return { outputs: { "ticket.json": {} } };
+    });
+
+    await expect(executeAgentFlowMcpCall(
+      store,
+      "blocked-mcp-adapter-identity",
+      workflow,
+      workflow.steps[0]!,
+      adapters
+    )).rejects.toMatchObject({ code: "AGENT_FLOW_SENSITIVE_INPUT" });
+    expect(calls).toBe(0);
+    store.close();
+  });
+
+  test("blocks host credential and process-introspection paths before MCP invocation", async () => {
+    for (const [index, hostPath] of ["/etc/shadow", "/proc/self/mem", "/proc/self/fd/3"].entries()) {
+      const root = temporaryRepo();
+      const workflow = parseAgentFlowWorkflowOrThrow(`name: blocked-host-path-${index}
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: fetch
+    type: mcp_call
+    server: fixture
+    tool: read_file
+    arguments: { path: ${JSON.stringify(hostPath)} }
+    outputs: [result.json]
+`);
+      const store = await openAgentFlowRunState({ cwd: root });
+      createAgentFlowLifecycleRun(store, { id: `blocked-host-path-${index}`, workflow });
+      let calls = 0;
+      const adapters = createAgentFlowMcpCallRegistry().register("fixture", () => {
+        calls += 1;
+        return { outputs: { "result.json": {} } };
+      });
+
+      const result = await executeAgentFlowCommandPipeline(
+        store,
+        `blocked-host-path-${index}`,
+        workflow,
+        undefined,
+        undefined,
+        adapters
+      );
+
+      expect(result).toMatchObject({ status: "paused", failedStep: "fetch" });
+      expect(result.message).toContain("secret-like path");
+      expect(calls).toBe(0);
+      store.close();
+    }
+  });
+
   test("rejects MCP argument expressions unsupported by the runtime resolver", () => {
     const workflow = parseAgentFlowWorkflowOrThrow(`name: unsupported-mcp-expression
 version: 1
@@ -293,6 +730,44 @@ steps:
     store.close();
   });
 
+  test("rejects malformed sensitive-input policy at the direct MCP executor boundary", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: direct-invalid-sensitive-policy
+version: 1
+style: pipeline
+maturity: experimental
+policies: { sensitive_inputs: deny_typo }
+steps:
+  - { id: fetch, type: mcp_call, server: fixture, tool: get_issue, arguments: { api_token: secret }, outputs: [ticket.json] }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    store.createRunWithEvent({
+      id: "direct-invalid-sensitive-policy",
+      workflow: { name: workflow.name, version: workflow.version, style: workflow.style, maturity: workflow.maturity },
+      context: { workflow: workflow as never }
+    }, { type: "run.created", payload: { status: "pending" } });
+    store.transitionRunWithEvent("direct-invalid-sensitive-policy", {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: {} }
+    });
+    let invoked = false;
+    const calls = createAgentFlowMcpCallRegistry().register("fixture", () => {
+      invoked = true;
+      return { outputs: { "ticket.json": {} } };
+    });
+
+    await expect(executeAgentFlowMcpCall(
+      store,
+      "direct-invalid-sensitive-policy",
+      workflow,
+      workflow.steps[0]!,
+      calls
+    )).rejects.toMatchObject({ code: "AGENT_FLOW_SENSITIVE_INPUT" });
+    expect(invoked).toBe(false);
+    store.close();
+  });
+
   test("validates and simulates jira-ticket-spec with fixture-only MCP output", () => {
     const workflow = parseAgentFlowWorkflowOrThrow(fs.readFileSync(examplePath, "utf8"));
     const fixtureResult = parseAgentFlowSimulationFixture(fs.readFileSync(fixturePath, "utf8"));
@@ -325,6 +800,33 @@ steps:
 
     const result = simulateAgentFlowWorkflow(workflow, {
       steps: { fetch: { outputs: { "ticket.json": { key: "AM-26" } } } }
+    });
+
+    expect(result.status).toBe("paused");
+    expect(result.visitedSteps).toEqual([{ id: "fetch", type: "mcp_call", outcome: "failed" }]);
+    expect(result.availableArtifacts).toEqual([]);
+  });
+
+  test("enforces runtime MCP argument size limits during simulation", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: oversized-simulated-mcp-arguments
+version: 1
+style: pipeline
+maturity: experimental
+inputs:
+  credential: { required: true }
+steps:
+  - id: fetch
+    type: mcp_call
+    server: fixture
+    tool: get_issue
+    arguments: { api_token: "{{ inputs.credential }}" }
+    outputs: [ticket.json]
+    on_failure: { then: pause }
+`);
+
+    const result = simulateAgentFlowWorkflow(workflow, {
+      inputs: { credential: "x".repeat(MAX_AGENT_FLOW_MCP_ARGUMENT_BYTES + 1) },
+      steps: { fetch: { outputs: { "ticket.json": { key: "AF-44" } } } }
     });
 
     expect(result.status).toBe("paused");
@@ -1211,7 +1713,49 @@ steps:
     store.close();
   });
 
-  test("retries adapter failures with the declared failure policy", async () => {
+  test("rejects oversized source arguments before sensitive-value redaction", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: oversized-secret-source-argument
+version: 1
+style: pipeline
+maturity: experimental
+inputs: { credential: { required: true } }
+steps:
+  - id: fetch
+    type: mcp_call
+    server: fixture
+    tool: get_issue
+    arguments: { api_token: "{{ inputs.credential }}" }
+    outputs: [ticket.json]
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, {
+      id: "oversized-secret-source-argument",
+      workflow,
+      inputs: { credential: "x".repeat(MAX_AGENT_FLOW_MCP_ARGUMENT_BYTES + 1) }
+    });
+    let invoked = false;
+    const calls = createAgentFlowMcpCallRegistry().register("fixture", () => {
+      invoked = true;
+      return { outputs: { "ticket.json": {} } };
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      "oversized-secret-source-argument",
+      workflow,
+      undefined,
+      undefined,
+      calls
+    );
+
+    expect(result).toMatchObject({ status: "paused", failedStep: "fetch" });
+    expect(result.message).toContain("source arguments exceed");
+    expect(invoked).toBe(false);
+    store.close();
+  });
+
+  test("retries adapter failures without trusting adapter-supplied Agent Flow codes", async () => {
     const root = temporaryRepo();
     const workflow = parseAgentFlowWorkflowOrThrow(`name: retry-mcp
 version: 1
@@ -1232,7 +1776,9 @@ steps:
     let attempts = 0;
     const calls = createAgentFlowMcpCallRegistry().register("fixture", () => {
       attempts += 1;
-      if (attempts === 1) throw new Error("temporary failure");
+      if (attempts === 1) {
+        throw Object.assign(new Error("temporary failure"), { code: "AGENT_FLOW_MCP_OUTPUT_INVALID" });
+      }
       return { outputs: { "ticket.json": { key: "AM-26" } } };
     });
 

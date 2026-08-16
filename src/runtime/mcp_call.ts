@@ -9,6 +9,13 @@ import {
   type WriteAgentFlowArtifactInput
 } from "./run_state";
 import type { AgentFlowWorkflow, AgentFlowWorkflowStep, AgentFlowYamlMapping } from "./workflow";
+import {
+  AgentFlowSensitiveInputError,
+  assertAgentFlowAdapterStringSafe,
+  secureAgentFlowJsonInput,
+  secureAgentFlowSensitiveJsonInputValue
+} from "./execution_security";
+import { agentFlowInputKeyLooksSensitive, redactAgentFlowSensitiveText } from "./failure_payload";
 
 export const MAX_AGENT_FLOW_MCP_OUTPUT_BYTES = 10 * 1024 * 1024;
 export const MAX_AGENT_FLOW_MCP_METADATA_BYTES = 1024 * 1024;
@@ -144,6 +151,23 @@ export async function executeAgentFlowMcpCall(
       "AGENT_FLOW_MCP_CALL_INVALID"
     );
   }
+  const outputs = validateAgentFlowMcpOutputPaths(step.outputs, stepId);
+  try {
+    for (const [label, value, path] of [
+      ["MCP adapter run ID", runId, false],
+      ["MCP adapter step ID", stepId, false],
+      ["MCP adapter server", server, false],
+      ["MCP adapter tool", tool, false],
+      ...outputs.map((output): [string, string, boolean] => ["MCP adapter output path", output, false])
+    ] as Array<[string, string, boolean]>) {
+      assertAgentFlowAdapterStringSafe(workflow, label, value, { path });
+    }
+  } catch (error) {
+    if (error instanceof AgentFlowSensitiveInputError) {
+      throw new AgentFlowMcpCallError(error.message, error.code, { cause: error });
+    }
+    throw error;
+  }
   const adapter = registry.get(server);
   if (adapter === undefined) {
     throw new AgentFlowMcpCallError(
@@ -158,15 +182,23 @@ export async function executeAgentFlowMcpCall(
       "AGENT_FLOW_MCP_CALL_INVALID"
     );
   }
-  const requestArguments = resolveAgentFlowMcpArguments(declaredArguments, run.inputs, stepId);
-  const auditArguments = normalizeJsonValue(requestArguments, new Set(), 0) as Record<string, AgentFlowRunStateValue>;
-  if (Buffer.byteLength(stableJson(auditArguments)) > MAX_AGENT_FLOW_MCP_ARGUMENT_BYTES) {
-    throw new AgentFlowMcpCallError(
-      `MCP call ${stepId} arguments exceed the ${MAX_AGENT_FLOW_MCP_ARGUMENT_BYTES}-byte limit.`,
-      "AGENT_FLOW_MCP_ARGUMENTS_TOO_LARGE"
+  let securedArguments: ReturnType<typeof prepareAgentFlowMcpArguments>;
+  try {
+    securedArguments = prepareAgentFlowMcpArguments(
+      workflow,
+      declaredArguments,
+      run.inputs,
+      stepId
     );
+  } catch (error) {
+    if (error instanceof AgentFlowSensitiveInputError) {
+      throw new AgentFlowMcpCallError(error.message, error.code, { cause: error });
+    }
+    throw error;
   }
-  const outputs = validateAgentFlowMcpOutputPaths(step.outputs, stepId);
+  const requestArguments = securedArguments.value;
+  const auditArguments = structuredClone(securedArguments.value);
+  assertAgentFlowMcpArgumentSize(auditArguments, stepId, "secured");
   const requestPath = `mcp-calls/${safePathSegment(stepId).slice(0, 200)}-${digest(stepId).slice(0, 12)}.json`;
   const artifactSnapshots = preflightCollisions(
     store,
@@ -193,28 +225,32 @@ export async function executeAgentFlowMcpCall(
     response = await invokeAdapter(adapter, request, options.stopStatus);
   } catch (error) {
     if (error instanceof AgentFlowMcpCallInterruptedError) throw error;
-    if (error instanceof AgentFlowMcpCallError) throw error;
+    if (error instanceof AgentFlowMcpCallError) {
+      throw new AgentFlowMcpCallError(errorMessage(error), error.code, { cause: sanitizedErrorCause(error) });
+    }
     throw new AgentFlowMcpCallError(
       `MCP server ${server} failed while invoking ${tool} for step ${stepId}: ${errorMessage(error)}`,
       "AGENT_FLOW_MCP_ADAPTER_FAILED",
-      { cause: error }
+      { cause: sanitizedErrorCause(error) }
     );
   }
 
-  const returned = validateResponse(stepId, outputs, response);
-  const responseMetadata = validateMetadata(stepId, response.metadata);
-  options.beforePublish?.();
-  const requestMetadata = {
+  try {
+    const returned = validateResponse(stepId, outputs, response);
+    const responseMetadata = validateMetadata(stepId, response.metadata);
+    options.beforePublish?.();
+    const requestMetadata = {
     stepId,
     server,
     tool,
     arguments: auditArguments,
     outputs,
+    ...(securedArguments.redacted ? { redacted: true } : {}),
     ...(responseMetadata === undefined ? {} : { responseMetadata })
   };
-  const requestArtifactId = `mcp-request:${digest(requestPath)}`;
-  const existingRequestArtifact = artifactSnapshots.request.artifact;
-  const publications = [
+    const requestArtifactId = `mcp-request:${digest(requestPath)}`;
+    const existingRequestArtifact = artifactSnapshots.request.artifact;
+    const publications = [
     {
       id: requestArtifactId,
       runId,
@@ -256,14 +292,29 @@ export async function executeAgentFlowMcpCall(
       };
     })
   ];
-  const published = store.writeArtifactsAtomically(publications);
-  const byPath = new Map(published.map((artifact) => [artifact.declaredPath, artifact]));
-  return {
-    server,
-    tool,
-    requestArtifact: byPath.get(requestPath)!,
-    outputArtifacts: outputs.map((output) => byPath.get(output)!)
-  };
+    const published = store.writeArtifactsAtomically(publications);
+    const byPath = new Map(published.map((artifact) => [artifact.declaredPath, artifact]));
+    return {
+      server,
+      tool,
+      requestArtifact: byPath.get(requestPath)!,
+      outputArtifacts: outputs.map((output) => byPath.get(output)!)
+    };
+  } catch (error) {
+    if (error instanceof AgentFlowMcpCallInterruptedError) throw error;
+    if (error instanceof AgentFlowMcpCallError) {
+      throw new AgentFlowMcpCallError(errorMessage(error), error.code, { cause: sanitizedErrorCause(error) });
+    }
+    const code = agentFlowErrorCode(error);
+    if (code !== undefined) {
+      throw new AgentFlowMcpCallError(errorMessage(error), code, { cause: sanitizedErrorCause(error) });
+    }
+    throw new AgentFlowMcpCallError(
+      `MCP server ${server} response processing failed for ${tool} at step ${stepId}: ${errorMessage(error)}`,
+      "AGENT_FLOW_MCP_RESPONSE_FAILED",
+      { cause: sanitizedErrorCause(error) }
+    );
+  }
 }
 
 function validateResponse(
@@ -596,6 +647,65 @@ export function resolveAgentFlowMcpArguments(
   return normalizeJsonValue(resolvedArguments, new Set(), 0) as Record<string, AgentFlowRunStateValue>;
 }
 
+export function prepareAgentFlowMcpArguments(
+  workflow: AgentFlowWorkflow,
+  value: unknown,
+  inputs: Record<string, AgentFlowRunStateValue>,
+  stepId: string
+): { value: Record<string, AgentFlowRunStateValue>; redacted: boolean } {
+  const sourceArguments = resolveAgentFlowMcpArguments(value, inputs, stepId);
+  assertAgentFlowMcpArgumentSize(sourceArguments, stepId, "source");
+
+  const referencedInputNames = collectAgentFlowMcpInputReferences(value);
+  const referencedInputs = Object.fromEntries([...referencedInputNames].sort().map((name) => [
+    name,
+    inputs[name]!
+  ]));
+  const securedInputs = secureAgentFlowJsonInput(
+    workflow,
+    `MCP call ${stepId} referenced inputs`,
+    referencedInputs
+  );
+  const securedInputValues = { ...securedInputs.value };
+  let referencedInputRedacted = securedInputs.redacted;
+  for (const name of referencedInputNames) {
+    if (!agentFlowInputKeyLooksSensitive(name)) continue;
+    const secured = secureAgentFlowSensitiveJsonInputValue(
+      workflow,
+      `MCP call ${stepId} referenced input ${JSON.stringify(name)}`,
+      inputs[name]!
+    );
+    securedInputValues[name] = secured.value;
+    referencedInputRedacted ||= secured.redacted;
+  }
+  const argumentsWithSecuredInputs = referencedInputRedacted
+    ? resolveAgentFlowMcpArguments(value, { ...inputs, ...securedInputValues }, stepId)
+    : sourceArguments;
+  const securedArguments = secureAgentFlowJsonInput(
+    workflow,
+    `MCP call ${stepId} arguments`,
+    argumentsWithSecuredInputs
+  );
+  assertAgentFlowMcpArgumentSize(securedArguments.value, stepId, "secured");
+  return {
+    value: securedArguments.value,
+    redacted: referencedInputRedacted || securedArguments.redacted
+  };
+}
+
+export function assertAgentFlowMcpArgumentSize(
+  value: AgentFlowRunStateValue,
+  stepId: string,
+  phase: "source" | "secured"
+): void {
+  if (Buffer.byteLength(stableJson(value)) <= MAX_AGENT_FLOW_MCP_ARGUMENT_BYTES) return;
+  const qualifier = phase === "source" ? "source " : "";
+  throw new AgentFlowMcpCallError(
+    `MCP call ${stepId} ${qualifier}arguments exceed the ${MAX_AGENT_FLOW_MCP_ARGUMENT_BYTES}-byte limit.`,
+    "AGENT_FLOW_MCP_ARGUMENTS_TOO_LARGE"
+  );
+}
+
 export function validateAgentFlowMcpArgumentExpressions(value: unknown, stepId: string): void {
   if (Array.isArray(value)) {
     for (const entry of value) validateAgentFlowMcpArgumentExpressions(entry, stepId);
@@ -614,6 +724,23 @@ export function validateAgentFlowMcpArgumentExpressions(value: unknown, stepId: 
       "AGENT_FLOW_MCP_ARGUMENT_UNRESOLVED"
     );
   }
+}
+
+function collectAgentFlowMcpInputReferences(value: unknown, names: Set<string> = new Set()): Set<string> {
+  if (Array.isArray(value)) {
+    for (const entry of value) collectAgentFlowMcpInputReferences(entry, names);
+    return names;
+  }
+  const record = runStateMapping(value);
+  if (record !== undefined) {
+    for (const entry of Object.values(record)) collectAgentFlowMcpInputReferences(entry, names);
+    return names;
+  }
+  if (typeof value !== "string") return names;
+  for (const match of value.matchAll(/(?<!\{)\{\{\s*inputs\.([A-Za-z_][A-Za-z0-9_-]*)\s*}}(?!})/g)) {
+    names.add(match[1]!);
+  }
+  return names;
 }
 
 function resolveValue(
@@ -752,5 +879,19 @@ function digest(value: string): string {
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return redactAgentFlowSensitiveText(error instanceof Error ? error.message : String(error));
+}
+
+function sanitizedErrorCause(error: unknown): Error {
+  return new Error(errorMessage(error));
+}
+
+function agentFlowErrorCode(error: unknown): string | undefined {
+  try {
+    if (typeof error !== "object" || error === null) return undefined;
+    const code = Reflect.get(error, "code");
+    return typeof code === "string" && code.startsWith("AGENT_FLOW_") ? code : undefined;
+  } catch {
+    return undefined;
+  }
 }

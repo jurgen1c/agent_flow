@@ -12,11 +12,20 @@ export const AGENT_FLOW_FAILURE_REDACTION_MARKER = "[REDACTED]";
 export const MAX_AGENT_FLOW_FAILURE_ATTACHMENT_SCAN_BYTES = 1024 * 1024;
 export const MAX_AGENT_FLOW_FAILURE_ATTACHMENT_COUNT = 64;
 export const MAX_AGENT_FLOW_FAILURE_TOTAL_ATTACHMENT_BYTES = 8 * 1024 * 1024;
-const SECRET_KEY_PATTERN = /^(?:auth|(?:proxy_?)?authorization|(?:set_?)?cookie|pgpassword|mysql_?pwd|(?:[a-z0-9]+_)*(?:api_?(?:key|token)|access_?token|auth_?token|client_?secret|credential(?:s)?|key|passphrase|private_?key|password|passwd|secret|token)(?:_[a-z0-9]+)*)$/;
+const SECRET_KEY_PATTERN = /^(?:auth|(?:proxy_?)?authorization|(?:set_?)?cookie|pgpassword|mysql_?pwd|(?:[a-z0-9]+_)*(?:api_?(?:keys?|tokens?)|access_?(?:keys?|tokens?)|auth_?tokens?|client_?secrets?|credentials?|encryption_?keys?|key|master_?keys?|pass|passphrases?|private_?keys?|passwords?|passwds?|pwd|secrets?|signing_?keys?|tokens?)(?:_[a-z0-9]+)*)$/;
+const INPUT_SECRET_KEY_PATTERN = /^(?:auth|(?:proxy_?)?authorization|(?:set_?)?cookie|pgpassword|mysql_?pwd|key|(?:ssh|deploy|service(?:_account)?)_keys?(?:_[a-z0-9]+)*|(?:[a-z0-9]+_)*(?:api_?(?:keys?|tokens?)|access_?(?:keys?|tokens?)|auth_?tokens?|client_?secrets?|credentials?|encryption_?keys?|master_?keys?|pass|passphrases?|private_?keys?|passwords?|passwds?|pwd|secrets?|signing_?keys?|tokens?)(?:_[a-z0-9]+)*)$/;
 const SHELL_WORD_PATTERN = String.raw`(?:(?:\\[^\r\n])|'[^'\r\n]*'|"(?:\\[^\r\n]|[^"\\\r\n])*"|[^\s"'\\;&|()<>])+`;
 
 export function redactAgentFlowSensitiveText(value: string): string {
   return redactSensitiveText(value).value;
+}
+
+export function redactAgentFlowSensitiveInputText(value: string): string {
+  return redactSensitiveText(value, "text", agentFlowInputKeyLooksSensitive, true).value;
+}
+
+export function agentFlowInputKeyLooksSensitive(value: string): boolean {
+  return INPUT_SECRET_KEY_PATTERN.test(normalizeSecretKey(value));
 }
 
 export interface AgentFlowFailurePayload {
@@ -399,6 +408,12 @@ function decodeText(content: Buffer): string | null {
 function structuredContentHasSecretKey(content: string, contentType: string): boolean {
   const normalized = contentType.toLowerCase();
   if (unsafeSecretStructure(content)) return true;
+  const tomlAssignment = /^[ \t]*((?:"[^"\r\n]+"|'[^'\r\n]+'|[A-Za-z0-9_-]+)(?:[ \t]*\.[ \t]*(?:"[^"\r\n]+"|'[^'\r\n]+'|[A-Za-z0-9_-]+))*)[ \t]*=/gm;
+  for (const match of content.matchAll(tomlAssignment)) {
+    for (const segment of match[1]!.matchAll(/"([^"\r\n]+)"|'([^'\r\n]+)'|([A-Za-z0-9_-]+)/g)) {
+      if (segment[1]?.includes("\\")) return true;
+    }
+  }
   if (/<\s*\/?[A-Za-z][^>]*>/.test(content)) {
     return true;
   }
@@ -496,7 +511,9 @@ function runStateMapping(
 
 function redactSensitiveText(
   value: string,
-  assignmentMode: "shell" | "text" = "text"
+  assignmentMode: "shell" | "text" = "text",
+  keyClassifier: (value: string) => boolean = secretKey,
+  preserveColonKey = false
 ): { value: string; markers: string[] } {
   const markers: string[] = [];
   let sanitized = value;
@@ -505,9 +522,28 @@ function redactSensitiveText(
     if (next !== sanitized) markers.push(marker);
     sanitized = next;
   };
+  let shellAssignmentRestorations: Array<{ placeholder: string; assignment: string }> = [];
+  if (assignmentMode === "shell") {
+    const delimitedAssignments = redactShellDelimitedSecretAssignments(sanitized, keyClassifier);
+    if (delimitedAssignments.value !== sanitized) markers.push("secret_assignment");
+    sanitized = delimitedAssignments.value;
+    shellAssignmentRestorations = delimitedAssignments.restorations;
+  }
+  const positionalAssignments = redactPositionalSecretAssignments(sanitized, keyClassifier);
+  if (positionalAssignments !== sanitized) markers.push("secret_assignment");
+  sanitized = positionalAssignments;
+
+  const multilineAssignment = redactMultilineSecretAssignmentRemainder(sanitized, keyClassifier);
+  if (multilineAssignment !== sanitized) markers.push("secret_assignment");
+  sanitized = multilineAssignment;
 
   replace(
     /-----BEGIN ([A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?)-----[\s\S]*?-----END \1-----/g,
+    "private_key",
+    AGENT_FLOW_FAILURE_REDACTION_MARKER
+  );
+  replace(
+    /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*$/g,
     "private_key",
     AGENT_FLOW_FAILURE_REDACTION_MARKER
   );
@@ -529,7 +565,7 @@ function redactSensitiveText(
       new RegExp(`(\\B--?)([A-Za-z][A-Za-z0-9_.-]*)(\\s+|=)(?!-)(${SHELL_WORD_PATTERN})`, "g"),
       "secret_cli_argument",
       (match: string, dashes: string, key: string, separator: string) =>
-        secretKey(key)
+        keyClassifier(key)
           ? `${dashes}${key}${separator}${AGENT_FLOW_FAILURE_REDACTION_MARKER}`
           : match
     );
@@ -537,7 +573,7 @@ function redactSensitiveText(
       new RegExp(`\\b([A-Za-z_][A-Za-z0-9_.-]*)(\\s*=\\s*)(${SHELL_WORD_PATTERN})`, "g"),
       "secret_assignment",
       (match: string, key: string, separator: string) =>
-        secretKey(key)
+        keyClassifier(key)
           ? `${key}${separator}${AGENT_FLOW_FAILURE_REDACTION_MARKER}`
           : match
     );
@@ -545,7 +581,7 @@ function redactSensitiveText(
       new RegExp(`(\\b(?:aws\\s+configure|(?:git|npm|pnpm|yarn)\\s+config)\\s+set\\s+)([A-Za-z0-9_.-]+)(\\s+)(${SHELL_WORD_PATTERN})`, "gi"),
       "positional_secret_argument",
       (match: string, prefix: string, key: string, separator: string) =>
-        secretKey(key)
+        keyClassifier(key)
           ? `${prefix}${key}${separator}${AGENT_FLOW_FAILURE_REDACTION_MARKER}`
           : match
     );
@@ -554,7 +590,7 @@ function redactSensitiveText(
       "secret_header_argument",
       (match: string, prefix: string, word: string) => {
         const header = word.match(/([A-Za-z][A-Za-z0-9_.-]*)\s*:/);
-        return header !== null && secretKey(header[1]!)
+        return header !== null && keyClassifier(header[1]!)
           ? `${prefix}${AGENT_FLOW_FAILURE_REDACTION_MARKER}`
           : match;
       }
@@ -577,10 +613,18 @@ function redactSensitiveText(
       `${delimiter}${prefix}${quote}${AGENT_FLOW_FAILURE_REDACTION_MARKER}${quote}`
   );
   replace(
-    /(^|\\[nrt]|[^A-Za-z0-9_-])((?:Proxy-)?Authorization\s*:\s*)([A-Za-z][A-Za-z0-9_-]*\s+)?([^\s"'\\\r\n]+)/gim,
+    /(^|\\[nrt]|[^A-Za-z0-9_-])((?:Proxy-)?Authorization\s*:\s*)(?![ \t]*["'])([A-Za-z][A-Za-z0-9_-]*\s+)?((?:\\(?![nrt])[\s\S]|[^\\\r\n])*)/gim,
     "authorization_header",
     (_match: string, delimiter: string, prefix: string, scheme = "") =>
       `${delimiter}${prefix}${scheme}${AGENT_FLOW_FAILURE_REDACTION_MARKER}`
+  );
+  replace(
+    /\b([A-Za-z_][A-Za-z0-9_.-]*)(\s*(?:::=|::=|[+?!:-]=)\s*)([^\r\n]*)/g,
+    "secret_assignment",
+    (match: string, key: string, separator: string) =>
+      keyClassifier(key)
+        ? `${key}${separator}${AGENT_FLOW_FAILURE_REDACTION_MARKER}`
+        : match
   );
   replace(
     /(^|\\[nrt]|[^A-Za-z0-9_-])((?:Set-)?Cookie\s*:\s*)([^\r\n\\]+)/gim,
@@ -646,38 +690,86 @@ function redactSensitiveText(
     AGENT_FLOW_FAILURE_REDACTION_MARKER
   );
   replace(
-    /((?:\/\/[^\s="'\\]+\/?:)?_?auth[_-]?token\s*[:=]\s*)(["'])((?:\\[\s\S]|(?!\2)[\s\S])*)\2/gi,
+    /((?:\/\/[^\s="'\\]+\/?:)?_?auth[_-]?token\s*(?:=(?!=)|:(?!=))\s*)(["'])((?:\\[\s\S]|(?!\2)[\s\S])*)\2/gi,
     "auth_token_assignment",
     (_match: string, prefix: string, quote: string) =>
       `${prefix}${quote}${AGENT_FLOW_FAILURE_REDACTION_MARKER}${quote}`
   );
   replace(
-    /((?:\/\/[^\s="'\\]+\/?:)?_?auth[_-]?token\s*[:=]\s*)((?:\\[^\r\n]|[^\s$"',;\\])+)/gi,
+    /((?:\/\/[^\s="'\\]+\/?:)?_?auth[_-]?token\s*(?:=(?!=)|:(?!=))\s*)((?:\\[^\r\n]|[^\s$"',;\\])+)/gi,
     "auth_token_assignment",
     (_match: string, prefix: string) =>
       `${prefix}${AGENT_FLOW_FAILURE_REDACTION_MARKER}`
   );
   replace(
-    /\b([A-Za-z_][A-Za-z0-9_.-]*)(\s*[:=]\s*)(\$?)(["'])((?:\\[\s\S]|(?!\4)[\s\S])*)\4/g,
+    /(^|[^A-Za-z0-9_.-])(["'])([A-Za-z_][A-Za-z0-9_.-]*)\2(\s*=(?!=)\s*)(\$?)(["'])((?:\\[\s\S]|(?!\6)[\s\S])*)\6/g,
+    "secret_assignment",
+    (match: string, delimiter: string, keyQuote: string, key: string, separator: string, shellPrefix: string, valueQuote: string) =>
+      assignmentSecretKey(key, separator, keyClassifier, preserveColonKey)
+        ? `${delimiter}${keyQuote}${key}${keyQuote}${separator}${shellPrefix}${valueQuote}${AGENT_FLOW_FAILURE_REDACTION_MARKER}${valueQuote}`
+        : match
+  );
+  replace(
+    /(^|[^A-Za-z0-9_.-])(["'])([A-Za-z_][A-Za-z0-9_.-]*)\2(\s*=(?!=)\s*)(\$?)(["'])(?:(?!\6)[^\r\n])*$/gm,
+    "secret_assignment",
+    (match: string, delimiter: string, keyQuote: string, key: string, separator: string, shellPrefix: string, valueQuote: string) =>
+      assignmentSecretKey(key, separator, keyClassifier, preserveColonKey)
+        ? `${delimiter}${keyQuote}${key}${keyQuote}${separator}${shellPrefix}${valueQuote}${AGENT_FLOW_FAILURE_REDACTION_MARKER}`
+        : match
+  );
+  replace(
+    /(^|[^A-Za-z0-9_.-])(["'])([A-Za-z_][A-Za-z0-9_.-]*)\2(\s*=(?!=)\s*)((?:\\[\s\S]|[^\s"',;])+)/gm,
+    "secret_assignment",
+    (match: string, delimiter: string, keyQuote: string, key: string, separator: string) =>
+      assignmentSecretKey(key, separator, keyClassifier, preserveColonKey)
+        ? `${delimiter}${keyQuote}${key}${keyQuote}${separator}${AGENT_FLOW_FAILURE_REDACTION_MARKER}`
+        : match
+  );
+  replace(
+    /(\$env:)([A-Za-z_][A-Za-z0-9_.-]*)(\s*=\s*)(["'])((?:\\[\s\S]|(?!\4)[\s\S])*)\4/gi,
+    "secret_assignment",
+    (match: string, prefix: string, key: string, separator: string, quote: string) =>
+      keyClassifier(key)
+        ? `${prefix}${key}${separator}${quote}${AGENT_FLOW_FAILURE_REDACTION_MARKER}${quote}`
+        : match
+  );
+  replace(
+    /(\$env:)([A-Za-z_][A-Za-z0-9_.-]*)(\s*=\s*)(["'])(?:(?!\4)[^\r\n])*$/gim,
+    "secret_assignment",
+    (match: string, prefix: string, key: string, separator: string, quote: string) =>
+      keyClassifier(key)
+        ? `${prefix}${key}${separator}${quote}${AGENT_FLOW_FAILURE_REDACTION_MARKER}`
+        : match
+  );
+  replace(
+    /(\$env:)([A-Za-z_][A-Za-z0-9_.-]*)(\s*=\s*)((?:\\[^\r\n]|[^\s"',;])+)/gi,
+    "secret_assignment",
+    (match: string, prefix: string, key: string, separator: string) =>
+      keyClassifier(key)
+        ? `${prefix}${key}${separator}${AGENT_FLOW_FAILURE_REDACTION_MARKER}`
+        : match
+  );
+  replace(
+    /\b([A-Za-z_][A-Za-z0-9_.-]*)(\s*(?:=(?!=)|:(?!=))\s*)(\$?)(["'])((?:\\[\s\S]|(?!\4)[\s\S])*)\4/g,
     "secret_assignment",
     (match: string, key: string, separator: string, shellPrefix: string, quote: string) =>
-      assignmentSecretKey(key, separator)
+      assignmentSecretKey(key, separator, keyClassifier, preserveColonKey)
         ? `${key}${separator}${shellPrefix}${quote}${AGENT_FLOW_FAILURE_REDACTION_MARKER}${quote}`
         : match
   );
   replace(
-    /\b([A-Za-z_][A-Za-z0-9_.-]*)(\s*[:=]\s*)(\$?)(["'])(?:(?!\4)[^\r\n])*$/gm,
+    /\b([A-Za-z_][A-Za-z0-9_.-]*)(\s*(?:=(?!=)|:(?!=))\s*)(\$?)(["'])(?:(?!\4)[^\r\n])*$/gm,
     "secret_assignment",
     (match: string, key: string, separator: string, shellPrefix: string, quote: string) =>
-      assignmentSecretKey(key, separator)
+      assignmentSecretKey(key, separator, keyClassifier, preserveColonKey)
         ? `${key}${separator}${shellPrefix}${quote}${AGENT_FLOW_FAILURE_REDACTION_MARKER}`
         : match
   );
   replace(
-    /\b([A-Za-z_][A-Za-z0-9_.-]*)(\s*[:=]\s*)((?:\\[\s\S]|[^\s"',;])+)/g,
+    /\b([A-Za-z_][A-Za-z0-9_.-]*)(\s*(?:=(?!=)|:(?!=))\s*)((?:\\[\s\S]|[^\s"',;])+)/g,
     "secret_assignment",
     (match: string, key: string, separator: string) =>
-      assignmentSecretKey(key, separator)
+      assignmentSecretKey(key, separator, keyClassifier, preserveColonKey)
         ? `${key}${separator}${AGENT_FLOW_FAILURE_REDACTION_MARKER}`
         : match
   );
@@ -685,7 +777,7 @@ function redactSensitiveText(
     /(\B--?)([A-Za-z][A-Za-z0-9_.-]*)(\s+|=)(\$?)(["'])((?:\\[\s\S]|(?!\5)[\s\S])*)\5/g,
     "secret_cli_argument",
     (match: string, dashes: string, key: string, separator: string, shellPrefix: string, quote: string) =>
-      secretKey(key)
+      keyClassifier(key)
         ? `${dashes}${key}${separator}${shellPrefix}${quote}${AGENT_FLOW_FAILURE_REDACTION_MARKER}${quote}`
         : match
   );
@@ -693,7 +785,7 @@ function redactSensitiveText(
     /(\B--?)([A-Za-z][A-Za-z0-9_.-]*)(\s+|=)(?!-)((?:\\[^\r\n]|[^\s$"',;\\])+)/g,
     "secret_cli_argument",
     (match: string, dashes: string, key: string, separator: string) =>
-      secretKey(key)
+      keyClassifier(key)
         ? `${dashes}${key}${separator}${AGENT_FLOW_FAILURE_REDACTION_MARKER}`
         : match
   );
@@ -735,75 +827,386 @@ function redactSensitiveText(
         `${key}${separator}${AGENT_FLOW_FAILURE_REDACTION_MARKER}`
     );
     replace(
-      /\b((?:[A-Za-z0-9]+[_-])*(?:api[_-]?(?:key|token)|access[_-]?token|auth[_-]?token|client[_-]?secret|private[_-]?key|password|passwd|secret|token)(?:[_-][A-Za-z0-9]+)*)(\s*[:=]\s*)(\$?)(["'])((?:\\[\s\S]|(?!\4)[\s\S])*)\4/gi,
+      /\b((?:[A-Za-z0-9]+[_-])*(?:api[_-]?(?:key|token)|access[_-]?token|auth[_-]?token|client[_-]?secret|private[_-]?key|password|passwd|secret|token)(?:[_-][A-Za-z0-9]+)*)(\s*(?:=(?!=)|:(?!=))\s*)(\$?)(["'])((?:\\[\s\S]|(?!\4)[\s\S])*)\4/gi,
       "secret_assignment",
       (_match: string, key: string, separator: string, shellPrefix: string, quote: string) =>
         `${key}${separator}${shellPrefix}${quote}${AGENT_FLOW_FAILURE_REDACTION_MARKER}${quote}`
     );
     replace(
-      /\b((?:[A-Za-z0-9]+[_-])*(?:api[_-]?(?:key|token)|access[_-]?token|auth[_-]?token|client[_-]?secret|private[_-]?key|password|passwd|secret|token)(?:[_-][A-Za-z0-9]+)*)(\s*[:=]\s*)(\$?)(["'])(?:(?!\4)[^\r\n])*$/gim,
+      /\b((?:[A-Za-z0-9]+[_-])*(?:api[_-]?(?:key|token)|access[_-]?token|auth[_-]?token|client[_-]?secret|private[_-]?key|password|passwd|secret|token)(?:[_-][A-Za-z0-9]+)*)(\s*(?:=(?!=)|:(?!=))\s*)(\$?)(["'])(?:(?!\4)[^\r\n])*$/gim,
       "secret_assignment",
       (_match: string, key: string, separator: string, shellPrefix: string, quote: string) =>
         `${key}${separator}${shellPrefix}${quote}${AGENT_FLOW_FAILURE_REDACTION_MARKER}`
     );
     replace(
-      /\b((?:[A-Za-z0-9]+[_-])*(?:api[_-]?(?:key|token)|access[_-]?token|auth[_-]?token|client[_-]?secret|private[_-]?key|password|passwd|secret|token)(?:[_-][A-Za-z0-9]+)*)(\s*[:=]\s*)((?:\\[\s\S]|[^\s"',;])+)/gi,
+      /\b((?:[A-Za-z0-9]+[_-])*(?:api[_-]?(?:key|token)|access[_-]?token|auth[_-]?token|client[_-]?secret|private[_-]?key|password|passwd|secret|token)(?:[_-][A-Za-z0-9]+)*)(\s*(?:=(?!=)|:(?!=))\s*)((?:\\[\s\S]|[^\s"',;])+)/gi,
       "secret_assignment",
       (_match: string, key: string, separator: string) =>
         `${key}${separator}${AGENT_FLOW_FAILURE_REDACTION_MARKER}`
     );
   } else {
     replace(
-      /\b((?:api\s+(?:key|token)|access\s+(?:key|token)|auth\s+token|client\s+secret|private\s+key))(\s+(?:is)\s+|\s*[:=]\s*)([^\r\n;]*)/gi,
+      /\b((?:api\s+(?:key|token)|access\s+(?:key|token)|auth\s+token|client\s+secret|private\s+key))(\s+(?:is)\s+|\s*(?:=(?!=)|:(?!=))\s*)([^\r\n]*)/gi,
       "secret_statement",
       (_match: string, key: string, separator: string) =>
         `${key}${separator}${AGENT_FLOW_FAILURE_REDACTION_MARKER}`
     );
     replace(
-      /(["'])([A-Za-z_][A-Za-z0-9_.-]*)\1(\s*:\s*)([^\r\n;]*)/g,
+      /(["'])([A-Za-z_][A-Za-z0-9_.-]*)\1(\s*:\s*)(?:(["'])((?:\\[^\r\n]|(?!\4)[^\\\r\n])*)\4|([^,}\r\n]*))/g,
       "secret_assignment",
-      (match: string, quote: string, key: string, separator: string) =>
-        secretKey(key)
-          ? `${quote}${key}${quote}${separator}${AGENT_FLOW_FAILURE_REDACTION_MARKER}`
+      (match: string, quote: string, key: string, separator: string, valueQuote?: string) =>
+        quotedSecretKey(key, keyClassifier, preserveColonKey)
+          ? `${quote}${key}${quote}${separator}${valueQuote ?? ""}${AGENT_FLOW_FAILURE_REDACTION_MARKER}${valueQuote ?? ""}`
           : match
     );
     replace(
-      /\b(PGPASSWORD|MYSQL_PWD)(\s*[:=]\s*)([^\r\n;]*)/gi,
+      /\b(PGPASSWORD|MYSQL_PWD)(\s*(?:=(?!=)|:(?!=))\s*)([^\r\n]*)/gi,
       "credential_environment",
       (_match: string, key: string, separator: string) =>
         `${key}${separator}${AGENT_FLOW_FAILURE_REDACTION_MARKER}`
     );
     replace(
-      /\b((?:[A-Za-z0-9]+[_-])*(?:api[_-]?(?:key|token)|access[_-]?token|auth[_-]?token|client[_-]?secret|private[_-]?key|password|passwd|secret|token)(?:[_-][A-Za-z0-9]+)*)(\s+is\s+)([^\r\n;]*)/gi,
+      /\b([A-Za-z_][A-Za-z0-9_.-]*)(\s+is\s+)([^\r\n]*)/gi,
       "secret_statement",
-      (_match: string, key: string, separator: string) =>
-        `${key}${separator}${AGENT_FLOW_FAILURE_REDACTION_MARKER}`
+      (match: string, key: string, separator: string) =>
+        keyClassifier(key)
+          ? `${key}${separator}${AGENT_FLOW_FAILURE_REDACTION_MARKER}`
+          : match
     );
     replace(
-      /\b((?:[A-Za-z0-9]+[_-])*(?:api[_-]?(?:key|token)|access[_-]?token|auth[_-]?token|client[_-]?secret|private[_-]?key|password|passwd|secret|token)(?:[_-][A-Za-z0-9]+)*)(\s*[:=]\s*)([^\r\n;]*)/gi,
+      /\b([A-Za-z_][A-Za-z0-9_.-]*)(\s*(?:=(?!=)|:(?!=))\s*)([^\r\n]*)/g,
       "secret_assignment",
-      (_match: string, key: string, separator: string) =>
-        `${key}${separator}${AGENT_FLOW_FAILURE_REDACTION_MARKER}`
+      (match: string, key: string, separator: string) =>
+        assignmentSecretKey(key, separator, keyClassifier, preserveColonKey)
+          ? `${key}${separator}${AGENT_FLOW_FAILURE_REDACTION_MARKER}`
+          : match
     );
   }
+  const nestedAssignments = redactNestedSecretAssignments(sanitized, keyClassifier, preserveColonKey);
+  if (nestedAssignments !== sanitized) markers.push("secret_assignment");
+  sanitized = nestedAssignments;
   replace(
-    /(\b[a-z][a-z0-9+.-]*:\/\/[^:\s/@]+:)([^@\s/]+)(@)/gi,
+    /(\b[a-z][a-z0-9+.-]*:\/\/[^:\s/@]*:)([^@\s/]+)(@)/gi,
     "url_password",
     `$1${AGENT_FLOW_FAILURE_REDACTION_MARKER}$3`
   );
+  replace(
+    /(\b[a-z][a-z0-9+.-]*:\/\/)([^:\s/@]+)(@)/gi,
+    "url_userinfo",
+    `$1${AGENT_FLOW_FAILURE_REDACTION_MARKER}$3`
+  );
+  for (const restoration of shellAssignmentRestorations) {
+    sanitized = sanitized.replaceAll(restoration.placeholder, restoration.assignment);
+  }
 
   return { value: sanitized, markers };
+}
+
+function redactPositionalSecretAssignments(
+  value: string,
+  keyClassifier: (value: string) => boolean
+): string {
+  const redact = (pattern: RegExp, source: string): string => source.replace(
+    pattern,
+    (match: string, boundary: string, indentation: string, command: string, key: string, separator: string) =>
+      keyClassifier(key)
+        ? `${boundary}${indentation}${command}${key}${separator}${AGENT_FLOW_FAILURE_REDACTION_MARKER}`
+        : match
+  );
+  const setenv = /(^|[\r\n;&|])([ \t]*)(setenv[ \t]+)([A-Za-z_][A-Za-z0-9_.-]*)([ \t]+)[^\r\n]*/gim;
+  const fishSet = /(^|[\r\n;&|])([ \t]*)(set(?:[ \t]+--?[A-Za-z][A-Za-z-]*)*[ \t]+)([A-Za-z_][A-Za-z0-9_.-]*)([ \t]+)[^\r\n]*/gim;
+  const printfVariable = /(^|[\r\n;&|])([ \t]*)(printf[ \t]+-v[ \t]+)([A-Za-z_][A-Za-z0-9_.-]*)([ \t]+)[^\r\n]*/gim;
+  const shellRedacted = redact(printfVariable, redact(fishSet, redact(setenv, value)));
+  const dockerfileRedacted = shellRedacted.replace(
+    /(^|[\r\n])([ \t]*)(ENV\b)([ \t]+(?:[^\r\n]*\\\r?\n)*[^\r\n]*)/gim,
+    (match: string, boundary: string, indentation: string, command: string, argumentsValue: string) => {
+      const key = positionalTokenValues(argumentsValue)[0];
+      if (key === undefined || key.includes("=") || !keyClassifier(key)) return match;
+      return `${boundary}${indentation}${command} ${key} ${AGENT_FLOW_FAILURE_REDACTION_MARKER}`;
+    }
+  );
+  const setxRedacted = dockerfileRedacted.replace(
+    /(^|[\r\n;&|])([ \t]*)(setx\b)((?:[^\r\n]*\^\r?\n)*[^\r\n]*)/gim,
+    (match: string, boundary: string, indentation: string, command: string, argumentsValue: string) => {
+      const key = positionalTokenValues(argumentsValue).find((candidate) => keyClassifier(candidate));
+      if (key === undefined) return match;
+      return `${boundary}${indentation}${command} ${key} ${AGENT_FLOW_FAILURE_REDACTION_MARKER}`;
+    }
+  );
+  const powerShellRedacted = setxRedacted.replace(
+    /(^|[\r\n;&|])([ \t]*)(Set-Variable\b)([^\r\n]*)/gim,
+    (match: string, boundary: string, indentation: string, command: string, argumentsValue: string) => {
+      const namedKey = /(?:^|[ \t])-Name(?:[ \t]+|=)(?:"([^"]+)"|'([^']+)'|([A-Za-z_][A-Za-z0-9_.-]*))/i
+        .exec(argumentsValue);
+      const positionalKey = /^[ \t]+(?:"([^"]+)"|'([^']+)'|([A-Za-z_][A-Za-z0-9_.-]*))(?:[ \t]|$)/
+        .exec(argumentsValue);
+      const key = namedKey?.slice(1).find((candidate) => candidate !== undefined)
+        ?? positionalKey?.slice(1).find((candidate) => candidate !== undefined);
+      if (key === undefined || !keyClassifier(key)) return match;
+      return `${boundary}${indentation}${command} -Name ${key} -Value ${AGENT_FLOW_FAILURE_REDACTION_MARKER}`;
+    }
+  );
+  return powerShellRedacted.replace(
+    /(^|[\r\n;&|])([ \t]*)(\[(?:System\.)?Environment][ \t]*::[ \t]*SetEnvironmentVariable[ \t]*\([ \t]*)(["'])([^"'\r\n]+)\4[^\r\n]*/gim,
+    (match: string, boundary: string, indentation: string, command: string, quote: string, key: string) =>
+      keyClassifier(key)
+        ? `${boundary}${indentation}${command}${quote}${key}${quote}, ${quote}${AGENT_FLOW_FAILURE_REDACTION_MARKER}${quote})`
+        : match
+  );
+}
+
+function positionalTokenValues(value: string): string[] {
+  return [...value.matchAll(/"([^"]+)"|'([^']+)'|([^ \t\r\n]+)/g)]
+    .map((match) => match[1] ?? match[2] ?? match[3]!);
+}
+
+function redactShellDelimitedSecretAssignments(
+  value: string,
+  keyClassifier: (value: string) => boolean
+): { value: string; restorations: Array<{ placeholder: string; assignment: string }> } {
+  const assignment = /\b([A-Za-z_][A-Za-z0-9_.-]*)(\s*=\s*)/g;
+  const quotedIndexes = shellQuotedIndexes(value);
+  const replacements: Array<{ start: number; end: number; assignment: string }> = [];
+  for (const match of value.matchAll(assignment)) {
+    if (!keyClassifier(match[1]!)) continue;
+    if (quotedIndexes[match.index] === 1) continue;
+    const valueStart = match.index + match[0].length;
+    if (shellStartingQuoteIsUnbalanced(value, valueStart)) continue;
+    const valueEnd = shellAssignmentValueEnd(value, valueStart);
+    if (valueEnd === valueStart) continue;
+    replacements.push({
+      start: match.index,
+      end: valueEnd,
+      assignment: `${match[1]}${match[2]}${AGENT_FLOW_FAILURE_REDACTION_MARKER}`
+    });
+  }
+  if (replacements.length === 0) return { value, restorations: [] };
+
+  let result = "";
+  let cursor = 0;
+  const restorations: Array<{ placeholder: string; assignment: string }> = [];
+  for (const replacement of replacements) {
+    if (replacement.start < cursor) continue;
+    const placeholder = shellAssignmentRedactionPlaceholder(value, restorations.length);
+    result += value.slice(cursor, replacement.start);
+    result += placeholder;
+    restorations.push({ placeholder, assignment: replacement.assignment });
+    cursor = replacement.end;
+  }
+  return { value: result + value.slice(cursor), restorations };
+}
+
+function shellQuotedIndexes(value: string): Uint8Array {
+  const quoted = new Uint8Array(value.length);
+  let quote: "\"" | "'" | "`" | undefined;
+  let escaped = false;
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index]!;
+    if (escaped) {
+      if (quote !== undefined) quoted[index] = 1;
+      escaped = false;
+      continue;
+    }
+    if (character === "\\" && quote !== "'") {
+      if (quote !== undefined) quoted[index] = 1;
+      escaped = true;
+      continue;
+    }
+    if (quote !== undefined) {
+      quoted[index] = 1;
+      if (character === quote) quote = undefined;
+      continue;
+    }
+    if (character === "\"" || character === "'" || character === "`") {
+      quote = character;
+      quoted[index] = 1;
+    }
+  }
+  return quoted;
+}
+
+function shellStartingQuoteIsUnbalanced(value: string, start: number): boolean {
+  const quote = value[start];
+  if (quote !== "\"" && quote !== "'") return false;
+  let escaped = false;
+  for (let index = start + 1; index < value.length; index += 1) {
+    const character = value[index]!;
+    if (character === "\r" || character === "\n") return true;
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (character === "\\" && quote !== "'") {
+      escaped = true;
+      continue;
+    }
+    if (character === quote) return false;
+  }
+  return true;
+}
+
+function shellAssignmentRedactionPlaceholder(value: string, index: number): string {
+  let suffix = index;
+  let placeholder = `\uE000agent-flow-redacted-shell-assignment-${suffix}\uE001`;
+  while (value.includes(placeholder)) {
+    suffix += 1;
+    placeholder = `\uE000agent-flow-redacted-shell-assignment-${suffix}\uE001`;
+  }
+  return placeholder;
+}
+
+function shellAssignmentValueEnd(value: string, start: number): number {
+  const closingDelimiters: string[] = [];
+  let quote: "\"" | "'" | "`" | undefined;
+  let escaped = false;
+  for (let index = start; index < value.length; index += 1) {
+    const character = value[index]!;
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (character === "\\" && quote !== "'") {
+      escaped = true;
+      continue;
+    }
+    if (quote !== undefined) {
+      if (character === quote) quote = undefined;
+      continue;
+    }
+    if (character === "\"" || character === "'" || character === "`") {
+      quote = character;
+      continue;
+    }
+    const expectedClose = closingDelimiters.at(-1);
+    if (expectedClose !== undefined && character === expectedClose) {
+      closingDelimiters.pop();
+      continue;
+    }
+    if (value.startsWith("$(", index) || value.startsWith("${", index)) {
+      closingDelimiters.push(value[index + 1] === "(" ? ")" : "}");
+      index += 1;
+      continue;
+    }
+    if (character === "(" || character === "{" || character === "[") {
+      closingDelimiters.push(character === "(" ? ")" : character === "{" ? "}" : "]");
+      continue;
+    }
+    if (closingDelimiters.length === 0 && /[\s;&|<>]/.test(character)) {
+      return index;
+    }
+  }
+  return value.length;
+}
+
+function redactNestedSecretAssignments(
+  value: string,
+  keyClassifier: (value: string) => boolean,
+  preserveColonKey: boolean
+): string {
+  if (!/\b[A-Za-z_][A-Za-z0-9_.-]*\s*(?:=(?!=)|:(?!=))\s*[A-Za-z_][A-Za-z0-9_.-]*\s*(?:=(?!=)|:(?!=))/.test(value)) {
+    return value;
+  }
+  const assignment = /\b([A-Za-z_][A-Za-z0-9_.-]*)(\s*(?:=(?!=)|:(?!=))\s*)/g;
+  return value.split(/(\r\n|[\r\n])/).map((line) => {
+    if (/^(?:\r\n|[\r\n])$/.test(line)) return line;
+    assignment.lastIndex = 0;
+    for (const match of line.matchAll(assignment)) {
+      const key = match[1]!;
+      const separator = match[2]!;
+      if (!assignmentSecretKey(key, separator, keyClassifier, preserveColonKey)) continue;
+      return `${line.slice(0, match.index)}${key}${separator}${AGENT_FLOW_FAILURE_REDACTION_MARKER}`;
+    }
+    return line;
+  }).join("");
+}
+
+function redactMultilineSecretAssignmentRemainder(
+  value: string,
+  keyClassifier: (value: string) => boolean
+): string {
+  const lines: Array<{ start: number; text: string }> = [];
+  let start = 0;
+  for (const match of value.matchAll(/\r\n|[\r\n]/g)) {
+    lines.push({ start, text: value.slice(start, match.index) });
+    start = match.index! + match[0].length;
+  }
+  lines.push({ start, text: value.slice(start) });
+
+  const assignment = /(?:^|(?<=[\s;&|]))(?:(?:export|readonly|declare|typeset|local|env)[ \t]+)*(?:\$env:)?([A-Za-z_][A-Za-z0-9_.-]*)[ \t]*(?:::=|::=|[+?!:-]=|[:=])[ \t]*/gi;
+  for (let index = 0; index < lines.length - 1; index += 1) {
+    const line = lines[index]!;
+    for (const match of line.text.matchAll(assignment)) {
+      if (!keyClassifier(match[1]!)) continue;
+      const valueOffset = match.index + match[0].length;
+      const assignedValue = line.text.slice(valueOffset);
+      if (!assignmentContinuesOnNextLine(assignedValue, lines[index + 1]!.text)) continue;
+      return `${value.slice(0, line.start + valueOffset)}${AGENT_FLOW_FAILURE_REDACTION_MARKER}`;
+    }
+  }
+  return value;
+}
+
+function assignmentContinuesOnNextLine(assignedValue: string, nextLine: string): boolean {
+  const trimmed = assignedValue.trim();
+  if (trimmed.length === 0 || /^[ \t]+/.test(nextLine) || /\\$/.test(assignedValue)) return true;
+  if (/^[|>](?:[1-9]|[+-]){0,2}(?:[ \t]+#.*)?$/.test(trimmed)) return true;
+  if (/^<<[-~]?[ \t]*(?:["'][^"'\r\n]+["']|[A-Za-z_][A-Za-z0-9_]*)$/.test(trimmed)) return true;
+  if (/^@["']/.test(trimmed) && !/["']@[ \t]*$/.test(trimmed)) return true;
+  for (const [open, close] of [["$(", ")"], ["${", "}"], ["[", "]"], ["{", "}"], ["(", ")"]] as const) {
+    if (trimmed.startsWith(open) && !trimmed.endsWith(close)) return true;
+  }
+  return hasUnclosedShellQuote(trimmed);
+}
+
+function hasUnclosedShellQuote(value: string): boolean {
+  let quote: "\"" | "'" | "`" | undefined;
+  let escaped = false;
+  for (const character of value) {
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (character === "\\" && quote !== "'") {
+      escaped = true;
+      continue;
+    }
+    if (quote !== undefined) {
+      if (character === quote) quote = undefined;
+      continue;
+    }
+    if (character === "\"" || character === "'" || character === "`") quote = character;
+  }
+  return quote !== undefined;
 }
 
 function secretKey(value: string): boolean {
   return SECRET_KEY_PATTERN.test(normalizeSecretKey(value));
 }
 
-function assignmentSecretKey(value: string, separator: string): boolean {
+function assignmentSecretKey(
+  value: string,
+  separator: string,
+  keyClassifier: (value: string) => boolean = secretKey,
+  preserveColonKey = false
+): boolean {
   const normalized = normalizeSecretKey(value);
-  return SECRET_KEY_PATTERN.test(normalized)
+  return keyClassifier(value)
+    && !(preserveColonKey && nonSecretIdentifierKey(normalized) && !separator.includes("="))
     && (separator.includes("=")
       || !/^(?:(?:proxy_?)?authorization|(?:set_?)?cookie)$/.test(normalized));
+}
+
+function quotedSecretKey(
+  value: string,
+  keyClassifier: (value: string) => boolean,
+  preserveColonKey: boolean
+): boolean {
+  return keyClassifier(value)
+    && !(preserveColonKey && nonSecretIdentifierKey(normalizeSecretKey(value)));
+}
+
+function nonSecretIdentifierKey(value: string): boolean {
+  return value === "key" || value === "ticket_key";
 }
 
 function normalizeSecretKey(value: string): string {
