@@ -166,6 +166,8 @@ The [documentation hub](docs/README.md) provides an end-to-end guide:
 - [Command reference](docs/command-reference.md) for every active CLI command.
 - [Concepts and safety](docs/concepts-and-safety.md) for workflow styles,
   policies, run state, artifacts, and the committed/generated file boundary.
+- [Execution security](docs/execution-security.md) for command and adapter
+  boundaries, sensitive-input handling, and deny-by-default unsafe channels.
 - [Packages and Memory integration](docs/packages-and-memory.md) for the roles of
   Agent Flow, Agent Memory, Agentic Development, and Agent Core.
 - [Operations and packaging](docs/operations-and-packaging.md) for validation,

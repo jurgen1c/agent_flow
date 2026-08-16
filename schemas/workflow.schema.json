@@ -83,6 +83,7 @@
           "additionalProperties": true
         },
         "recovery_limits": { "enum": ["pause", "fail"] },
+        "sensitive_inputs": { "enum": ["allow", "deny", "redact"] },
         "unsafe_operations": { "$ref": "#/$defs/policyMode" }
       },
       "additionalProperties": true

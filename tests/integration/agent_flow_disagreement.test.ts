@@ -651,6 +651,41 @@ steps:
     fs.rmSync(root, { recursive: true, force: true });
   });
 
+  test("enforces aggregate resolver input limits during simulation", async () => {
+    const policy = `
+    strategy: arbiter
+    arbiter: arbiter
+    max_rounds: 1`;
+    const { root, store, workflow } = await disagreementRun(
+      policy,
+      "arbiter-aggregate-simulation-limit",
+      true
+    );
+    const largeInput = "x".repeat(5.5 * 1024 * 1024);
+
+    const simulation = simulateAgentFlowWorkflow(workflow, {
+      artifacts: { "implementation.md": largeInput },
+      steps: {
+        review: {
+          outputs: {
+            "reviews/review.json": {
+              status: "changes_requested",
+              findings: [{ summary: largeInput }],
+              summary: "Change requested."
+            }
+          },
+          disagreement: "approved"
+        }
+      }
+    });
+
+    expect(simulation.status).toBe("failed");
+    expect(simulation.visitedSteps.filter((step) => step.type === "disagreement"))
+      .toEqual([expect.objectContaining({ outcome: "failed" })]);
+    store.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
   test("does not apply merge approval gating to a disagreement resolver", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-flow-disagreement-arbiter-"));
     fs.mkdirSync(path.join(root, ".git"));
@@ -1115,6 +1150,50 @@ steps:
       stepId: "review",
       reason: expect.stringContaining("already exists")
     }));
+  });
+
+  test("preflights automated disagreement inputs before selecting a fixture decision", () => {
+    const workflow = reviewLoopWorkflow(`
+    strategy: arbiter
+    arbiter: arbiter
+    max_rounds: 1`, true);
+    workflow.policies = { sensitive_inputs: "deny" };
+
+    const result = simulateAgentFlowWorkflow(workflow, {
+      artifacts: { "implementation.md": "Implementation" },
+      steps: {
+        review: {
+          outputs: {
+            "reviews/review.json": reviewResult("changes_requested", "API_TOKEN=resolver-input-secret")
+          },
+          disagreement: "approved"
+        }
+      }
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.visitedSteps).toContainEqual({
+      id: "review:disagreement:arbiter:episode-1:round-1",
+      type: "disagreement",
+      outcome: "failed"
+    });
+    expect(result.availableArtifacts).not.toContain(defaultAgentFlowDisagreementOutputPath("review", 1));
+
+    const unsafeResolver = structuredClone(workflow);
+    unsafeResolver.sessions!["API_TOKEN=resolver-secret"] = unsafeResolver.sessions!.arbiter!;
+    delete unsafeResolver.sessions!.arbiter;
+    (unsafeResolver.collaboration!.on_disagreement as Record<string, unknown>).arbiter = "API_TOKEN=resolver-secret";
+    expect(simulateAgentFlowWorkflow(unsafeResolver, {
+      artifacts: { "implementation.md": "Implementation" },
+      steps: {
+        review: {
+          outputs: {
+            "reviews/review.json": reviewResult("changes_requested", "Needs another revision.")
+          },
+          disagreement: "approved"
+        }
+      }
+    })).toMatchObject({ status: "failed" });
   });
 });
 

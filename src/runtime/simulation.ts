@@ -16,7 +16,22 @@ import {
   normalizeAgentFlowArtifactPath,
   type AgentFlowRunStateValue
 } from "./run_state";
-import { resolveAgentFlowMcpArguments } from "./mcp_call";
+import { prepareAgentFlowMcpArguments } from "./mcp_call";
+import {
+  assertAgentFlowAdapterStringSafe,
+  preflightAgentFlowTextInputPath,
+  secureAgentFlowReferencedByteInput,
+  secureAgentFlowJsonInput,
+  secureAgentFlowSensitiveJsonInputValue,
+  secureAgentFlowTextInput
+} from "./execution_security";
+import { agentFlowInputKeyLooksSensitive } from "./failure_payload";
+import {
+  MAX_AGENT_FLOW_SESSION_INPUT_BYTES,
+  MAX_AGENT_FLOW_SESSION_INPUTS,
+  MAX_AGENT_FLOW_SESSION_PROMPT_BYTES,
+  MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES
+} from "./session_request";
 import {
   AgentFlowConditionError,
   agentFlowConditionArtifactAlias,
@@ -25,10 +40,19 @@ import {
   selectAgentFlowConditionTargetFromValues
 } from "./condition";
 import { AgentFlowFailureClassificationError } from "./failure_classification";
-import { parseAgentFlowReviewResult } from "./review";
-import { defaultAgentFlowApprovalOutputPath, parseAgentFlowApprovalResult } from "./approval";
+import { createAgentFlowReviewPrompt, parseAgentFlowReviewResult } from "./review";
+import {
+  createAgentFlowApprovalPrompt,
+  defaultAgentFlowApprovalOutputPath,
+  parseAgentFlowApprovalResult
+} from "./approval";
 import { defaultAgentFlowDecisionRecordPath, resolveAgentFlowDecisionRecordContract } from "./decision_record";
-import { parseAgentFlowChallengeResult, parseAgentFlowConsultResult } from "./collaboration";
+import {
+  createAgentFlowChallengePrompt,
+  createAgentFlowConsultPrompt,
+  parseAgentFlowChallengeResult,
+  parseAgentFlowConsultResult
+} from "./collaboration";
 import {
   collectAgentFlowReviewCyclePathReviewIds,
   collectAgentFlowReviewCycleStepIds,
@@ -676,20 +700,27 @@ function simulateReviewDisagreement(
   while (round < maxRounds) {
     round += 1;
     state.disagreementRounds.set(stepId, round);
-    const fixturePosition = state.disagreementFixturePositions.get(stepId) ?? 0;
-    state.disagreementFixturePositions.set(stepId, fixturePosition + 1);
-    const decision = pickAt(fixture.disagreement, fixturePosition) ?? "unresolved";
     const disagreementStepId = `${stepId}:disagreement:${resolver}:episode-${episode}:round-${round}`;
     state.visitedSteps.push({
       id: disagreementStepId,
       type: "disagreement",
       outcome: "selected"
     });
+    try {
+      preflightSimulationSessionAdapterIdentity(state, disagreementStepId, resolver);
+      preflightSimulationDisagreementInputs(step, disagreementStepId, state);
+    } catch {
+      state.visitedSteps.at(-1)!.outcome = "failed";
+      continue;
+    }
     const budgetControl = simulationSessionBudgetControl(resolver, disagreementStepId, state);
     if (budgetControl !== undefined) {
       state.visitedSteps.at(-1)!.outcome = "failed";
       return budgetControl;
     }
+    const fixturePosition = state.disagreementFixturePositions.get(stepId) ?? 0;
+    state.disagreementFixturePositions.set(stepId, fixturePosition + 1);
+    const decision = pickAt(fixture.disagreement, fixturePosition) ?? "unresolved";
     if (decision === "failed") {
       state.visitedSteps.at(-1)!.outcome = "failed";
       continue;
@@ -730,6 +761,37 @@ function simulateReviewDisagreement(
   if (policy.strategy === "arbiter_then_user") return simulateUserDisagreement(step, fixture, stepId, state);
   state.terminalStates.push({ stepId, status: "failed" });
   return { kind: "terminal", status: "failed" };
+}
+
+function preflightSimulationDisagreementInputs(
+  step: AgentFlowWorkflowStep,
+  disagreementStepId: string,
+  state: SimulationState
+): void {
+  const inputs = new Set<string>();
+  const artifacts = Array.isArray(step.artifacts) ? step.artifacts : [];
+  const outputs = Array.isArray(step.outputs) ? step.outputs : [];
+  for (const value of [...artifacts, ...outputs]) {
+    const name = nonEmptyString(value);
+    if (name !== undefined) inputs.add(canonicalArtifactName(name));
+  }
+  let totalSourceInputBytes = 0;
+  let totalProviderInputBytes = 0;
+  for (const artifact of inputs) {
+    const sizes = preflightSimulationSessionInput(state, disagreementStepId, artifact);
+    totalSourceInputBytes += sizes.sourceBytes;
+    if (totalSourceInputBytes > MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES) {
+      throw new Error(
+        `Session request ${disagreementStepId} inputs exceed the ${MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES}-byte aggregate limit.`
+      );
+    }
+    totalProviderInputBytes += sizes.securedBytes;
+    if (totalProviderInputBytes > MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES) {
+      throw new Error(
+        `Session request ${disagreementStepId} provider inputs exceed the ${MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES}-byte aggregate limit after sensitive-data handling.`
+      );
+    }
+  }
 }
 
 function simulateUserDisagreement(
@@ -887,6 +949,20 @@ function simulationSessionBudgetControl(
   return undefined;
 }
 
+function preflightSimulationSessionAdapterIdentity(
+  state: SimulationState,
+  stepId: string,
+  sessionId: string
+): void {
+  const session = state.workflow.sessions?.[sessionId];
+  const provider = isRecord(session) ? nonEmptyString(session.provider) : undefined;
+  assertAgentFlowAdapterStringSafe(state.workflow, "Session adapter step ID", stepId);
+  assertAgentFlowAdapterStringSafe(state.workflow, "Session adapter session ID", sessionId);
+  if (provider !== undefined) {
+    assertAgentFlowAdapterStringSafe(state.workflow, "Session adapter provider", provider);
+  }
+}
+
 function simulationBudgetReference(state: SimulationState, segments: string[]): AgentFlowYamlValue | undefined {
   if (segments.length !== 1 || !segments[0]!.endsWith("_remaining")) return undefined;
   const kind = segments[0]!.slice(0, -"_remaining".length);
@@ -943,7 +1019,17 @@ function simulateMcpCallStep(
   state: SimulationState
 ): SequenceControl {
   try {
-    resolveAgentFlowMcpArguments(
+    const server = requiredSimulationPromptField(step.server, `MCP call ${stepId} server`);
+    const tool = requiredSimulationPromptField(step.tool, `MCP call ${stepId} tool`);
+    assertAgentFlowAdapterStringSafe(state.workflow, "MCP adapter step ID", stepId);
+    assertAgentFlowAdapterStringSafe(state.workflow, "MCP adapter server", server);
+    assertAgentFlowAdapterStringSafe(state.workflow, "MCP adapter tool", tool);
+    for (const output of Array.isArray(step.outputs) ? step.outputs : []) {
+      const outputPath = requiredSimulationPromptField(output, `MCP call ${stepId} output`);
+      assertAgentFlowAdapterStringSafe(state.workflow, "MCP adapter output path", outputPath);
+    }
+    prepareAgentFlowMcpArguments(
+      state.workflow,
       step.arguments,
       (state.fixture.inputs ?? {}) as Record<string, AgentFlowRunStateValue>,
       stepId
@@ -1030,6 +1116,24 @@ function simulateSessionRequestStep(
   const isApproval = step.type === "approval";
   const isExchange = step.type === "consult" || step.type === "challenge";
   let approvalApproved = false;
+  const sessionId = isReview || isApproval
+    ? nonEmptyString(step.reviewer)
+    : isExchange ? nonEmptyString(step.to) : nonEmptyString(step.session);
+  const session = sessionId === undefined || !isRecord(state.workflow.sessions?.[sessionId])
+    ? undefined
+    : state.workflow.sessions[sessionId];
+  const provider = isRecord(session) ? nonEmptyString(session.provider) : undefined;
+  try {
+    assertAgentFlowAdapterStringSafe(state.workflow, "Session adapter step ID", stepId);
+    if (sessionId !== undefined) {
+      assertAgentFlowAdapterStringSafe(state.workflow, "Session adapter session ID", sessionId);
+    }
+    if (provider !== undefined) {
+      assertAgentFlowAdapterStringSafe(state.workflow, "Session adapter provider", provider);
+    }
+  } catch (error) {
+    return simulatedSessionFailure(step, fixture, stepId, state, error instanceof Error ? error.message : String(error));
+  }
   if (isApproval) {
     const reviewer = nonEmptyString(step.reviewer);
     const session = reviewer === undefined ? undefined : state.workflow.sessions?.[reviewer];
@@ -1058,8 +1162,19 @@ function simulateSessionRequestStep(
       );
     }
   }
+  if (step.type === "session_request") {
+    const promptPath = nonEmptyString(step.prompt);
+    if (promptPath !== undefined) {
+      try {
+        preflightAgentFlowTextInputPath(state.workflow, `Session request ${stepId} prompt`, promptPath);
+      } catch (error) {
+        return simulatedSessionFailure(step, fixture, stepId, state, error instanceof Error ? error.message : String(error));
+      }
+    }
+  }
   const declaredInputs = isApproval || isReview || isExchange ? step.artifacts : step.inputs;
   const resolvedInputs: string[] = [];
+  const sensitiveInputPaths = new Set<string>();
   for (const value of Array.isArray(declaredInputs) ? declaredInputs as AgentFlowYamlValue[] : []) {
     const name = nonEmptyString(value);
     const reference = name === undefined ? null : /^\{\{\s*inputs\.([A-Za-z0-9_-]+)\s*}}$/.exec(name);
@@ -1079,6 +1194,7 @@ function simulateSessionRequestStep(
       );
     }
     resolvedInputs.push(normalized);
+    if (agentFlowInputKeyLooksSensitive(reference[1]!)) sensitiveInputPaths.add(normalized);
   }
   const missingInputs = resolvedInputs.filter((artifact) => !state.artifacts.has(artifact));
   if (missingInputs.length > 0) {
@@ -1093,6 +1209,32 @@ function simulateSessionRequestStep(
       `Fixture does not provide declared session input ${missingInputs[0]}.`
     );
   }
+  let totalSourceInputBytes = 0;
+  let totalProviderInputBytes = 0;
+  for (const artifact of resolvedInputs) {
+    try {
+      const sizes = preflightSimulationSessionInput(
+        state,
+        stepId,
+        artifact,
+        sensitiveInputPaths.has(artifact)
+      );
+      totalSourceInputBytes += sizes.sourceBytes;
+      if (totalSourceInputBytes > MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES) {
+        throw new Error(
+          `Session request ${stepId} inputs exceed the ${MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES}-byte aggregate limit.`
+        );
+      }
+      totalProviderInputBytes += sizes.securedBytes;
+      if (totalProviderInputBytes > MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES) {
+        throw new Error(
+          `Session request ${stepId} provider inputs exceed the ${MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES}-byte aggregate limit after sensitive-data handling.`
+        );
+      }
+    } catch (error) {
+      return simulatedSessionFailure(step, fixture, stepId, state, error instanceof Error ? error.message : String(error));
+    }
+  }
 
   const rawOutputs = isExchange ? [step.output]
     : isApproval ? [nonEmptyString(step.output) ?? defaultAgentFlowApprovalOutputPath(stepId)]
@@ -1102,6 +1244,13 @@ function simulateSessionRequestStep(
       .flatMap((output) => nonEmptyString(output) ?? [])
       .map(canonicalArtifactName)
   );
+  try {
+    for (const output of declaredOutputs) {
+      assertAgentFlowAdapterStringSafe(state.workflow, "Session adapter output path", output);
+    }
+  } catch (error) {
+    return simulatedSessionFailure(step, fixture, stepId, state, error instanceof Error ? error.message : String(error));
+  }
   if (isExchange && declaredOutputs.size !== 1) {
     return simulatedSessionFailure(
       step,
@@ -1124,6 +1273,11 @@ function simulateSessionRequestStep(
         `Artifact ${artifact} already exists; declare overwrite: true to replace it during simulation.`
       );
     }
+  }
+  try {
+    preflightSimulationGeneratedSessionPrompt(step, stepId, resolvedInputs, [...declaredOutputs], state);
+  } catch (error) {
+    return simulatedSessionFailure(step, fixture, stepId, state, error instanceof Error ? error.message : String(error));
   }
   const budgetControl = simulationModelBudgetControl(step, stepId, state);
   if (budgetControl !== undefined) {
@@ -1213,6 +1367,120 @@ function simulateSessionRequestStep(
     else state.approvalStatuses.delete(stepId);
   }
   return { kind: "done" };
+}
+
+function preflightSimulationGeneratedSessionPrompt(
+  step: AgentFlowWorkflowStep,
+  stepId: string,
+  inputs: string[],
+  outputs: string[],
+  state: SimulationState
+): void {
+  const type = nonEmptyString(step.type);
+  if (type === "session_request" || !["approval", "review", "consult", "challenge"].includes(type ?? "")) return;
+  const secureGeneratedField = (value: string, field: string): string =>
+    secureAgentFlowTextInput(state.workflow, `${type} ${stepId} ${field}`, value).value;
+  const createGeneratedPrompt = (transformField: (value: string, field: string) => string) => type === "approval"
+    ? createAgentFlowApprovalPrompt(
+      stepId,
+      requiredSimulationPromptField(step.reviewer, `Approval ${stepId} reviewer`),
+      inputs,
+      outputs[0]!,
+      typeof step.message === "string" ? transformField(step.message.trim(), "message") : undefined
+    )
+    : type === "review"
+      ? createAgentFlowReviewPrompt(
+        stepId,
+        requiredSimulationPromptField(step.reviewer, `Review ${stepId} reviewer`),
+        transformField(requiredSimulationPromptField(step.subject, `Review ${stepId} subject`), "subject"),
+        inputs,
+        outputs
+      )
+      : type === "consult"
+        ? createAgentFlowConsultPrompt(
+          stepId,
+          requiredSimulationPromptField(step.from, `Consult ${stepId} from`),
+          requiredSimulationPromptField(step.to, `Consult ${stepId} to`),
+          transformField(requiredSimulationPromptField(step.question, `Consult ${stepId} question`), "question"),
+          inputs,
+          outputs[0]!,
+          step.blocking === true
+        )
+        : createAgentFlowChallengePrompt(
+          stepId,
+          requiredSimulationPromptField(step.from, `Challenge ${stepId} from`),
+          requiredSimulationPromptField(step.to, `Challenge ${stepId} to`),
+          transformField(requiredSimulationPromptField(step.question, `Challenge ${stepId} question`), "question"),
+          inputs,
+          outputs[0]!
+        );
+  const sourcePrompt = createGeneratedPrompt((value) => value);
+  if (Buffer.byteLength(sourcePrompt.content, "utf8") > MAX_AGENT_FLOW_SESSION_PROMPT_BYTES) {
+    throw new Error(
+      `${type} ${stepId} prompt exceeds the ${MAX_AGENT_FLOW_SESSION_PROMPT_BYTES}-byte session prompt limit before sensitive-data handling.`
+    );
+  }
+  const prompt = createGeneratedPrompt(secureGeneratedField);
+  const securedPrompt = secureAgentFlowTextInput(state.workflow, `${type} ${stepId} prompt`, prompt.content);
+  if (Buffer.byteLength(securedPrompt.value, "utf8") > MAX_AGENT_FLOW_SESSION_PROMPT_BYTES) {
+    throw new Error(
+      `${type} ${stepId} prompt exceeds the ${MAX_AGENT_FLOW_SESSION_PROMPT_BYTES}-byte session prompt limit after sensitive-data handling.`
+    );
+  }
+}
+
+function requiredSimulationPromptField(value: AgentFlowYamlValue | undefined, label: string): string {
+  const normalized = nonEmptyString(value);
+  if (normalized === undefined) throw new Error(`${label} must be a non-empty string.`);
+  return normalized;
+}
+
+function preflightSimulationSessionInput(
+  state: SimulationState,
+  stepId: string,
+  artifact: string,
+  sensitiveProvenance = false,
+  enforceSizeLimits = true
+): { sourceBytes: number; securedBytes: number } {
+  const value = state.artifactValues.get(artifact);
+  const label = `Session request ${stepId} input ${artifact}`;
+  if (value === undefined) {
+    if (!sensitiveProvenance) {
+      preflightAgentFlowTextInputPath(state.workflow, label, artifact);
+      return { sourceBytes: 0, securedBytes: 0 };
+    }
+    const secured = secureAgentFlowReferencedByteInput(
+      state.workflow,
+      label,
+      new Uint8Array(),
+      artifact,
+      undefined,
+      sensitiveProvenance
+    );
+    return { sourceBytes: 0, securedBytes: secured.value.byteLength };
+  }
+  const source = typeof value === "string"
+    ? Buffer.from(value, "utf8")
+    : Buffer.from(`${JSON.stringify(value)}\n`, "utf8");
+  if (enforceSizeLimits && source.byteLength > MAX_AGENT_FLOW_SESSION_INPUT_BYTES) {
+    throw new Error(
+      `Session request ${stepId} input ${artifact} exceeds the ${MAX_AGENT_FLOW_SESSION_INPUT_BYTES}-byte input limit.`
+    );
+  }
+  const secured = secureAgentFlowReferencedByteInput(
+    state.workflow,
+    label,
+    source,
+    artifact,
+    typeof value === "string" ? undefined : "application/json",
+    sensitiveProvenance
+  );
+  if (enforceSizeLimits && secured.value.byteLength > MAX_AGENT_FLOW_SESSION_INPUT_BYTES) {
+    throw new Error(
+      `Session request ${stepId} input ${artifact} exceeds the ${MAX_AGENT_FLOW_SESSION_INPUT_BYTES}-byte input limit after sensitive-data handling.`
+    );
+  }
+  return { sourceBytes: source.byteLength, securedBytes: secured.value.byteLength };
 }
 
 function simulatedSessionFailure(
@@ -1522,6 +1790,23 @@ function failureControl(
     if (guardControl !== undefined) return guardControl;
     const route = isRecord(onFailure.route_to) ? onFailure.route_to : undefined;
     const routeSession = nonEmptyString(route?.session);
+    try {
+      preflightSimulationRecoveryInputs(state, id, route, routeSession !== undefined);
+      if (routeSession !== undefined) {
+        const promptPath = nonEmptyString(route?.prompt);
+        preflightSimulationSessionAdapterIdentity(state, `${id}:recovery`, routeSession);
+        if (promptPath !== undefined) {
+          preflightAgentFlowTextInputPath(state.workflow, `Recovery session ${id} prompt`, promptPath);
+        }
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const unresolved = isRecord(onFailure?.on_unresolved) ? onFailure.on_unresolved : undefined;
+      const target = nonEmptyString(unresolved?.then);
+      if (target !== undefined) return controlForTarget(target, id, state);
+      addUnresolved(state, id, message);
+      return { kind: "terminal", status: "unresolved" };
+    }
     if (routeSession !== undefined) {
       if (simulationSessionCanMerge(state, routeSession) && staleSimulationApprovalIds(state).length > 0) {
         state.terminalStates.push({ stepId: id, status: "failed" });
@@ -1553,6 +1838,229 @@ function failureControl(
     : "failed";
   state.terminalStates.push({ stepId: id, status: defaultStatus });
   return { kind: "terminal", status: defaultStatus };
+}
+
+function preflightSimulationRecoveryInputs(
+  state: SimulationState,
+  stepId: string,
+  route: AgentFlowYamlMapping | undefined,
+  sessionRoute: boolean
+): void {
+  const declared = isRecord(route?.inputs) ? route.inputs : undefined;
+  if (declared === undefined) return;
+  const resolved = Object.fromEntries(Object.entries(declared).map(([key, value]) => [
+    key,
+    resolveSimulationRecoveryInputValue(value, state, stepId)
+  ])) as Record<string, AgentFlowRunStateValue>;
+  const provenanceSecured = secureSimulationRecoveryReferencedInputValues(
+    state,
+    `Recovery ${stepId} inputs`,
+    declared,
+    resolved
+  );
+  const securedManifest = secureAgentFlowJsonInput(
+    state.workflow,
+    `Recovery ${stepId} inputs`,
+    provenanceSecured
+  ).value;
+
+  const artifactPaths = new Set<string>();
+  const sensitiveArtifactPaths = new Set<string>();
+  collectSimulationRecoveryArtifactPaths(resolved, state, artifactPaths, sensitiveArtifactPaths);
+  collectSimulationReferencedSensitiveArtifactPaths(
+    declared,
+    resolved,
+    state,
+    sensitiveArtifactPaths
+  );
+  const hasInputManifest = Object.keys(resolved).length > 0;
+  if (sessionRoute && artifactPaths.size + (hasInputManifest ? 1 : 0) > MAX_AGENT_FLOW_SESSION_INPUTS) {
+    throw new Error(
+      `Recovery session ${stepId}:recovery declares ${artifactPaths.size + (hasInputManifest ? 1 : 0)} inputs; at most ${MAX_AGENT_FLOW_SESSION_INPUTS} are allowed.`
+    );
+  }
+  let totalSourceInputBytes = hasInputManifest
+    ? Buffer.byteLength(`${JSON.stringify(resolved, null, 2)}\n`, "utf8")
+    : 0;
+  let totalProviderInputBytes = hasInputManifest
+    ? Buffer.byteLength(`${JSON.stringify(securedManifest, null, 2)}\n`, "utf8")
+    : 0;
+  if (sessionRoute && totalSourceInputBytes > MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES) {
+    throw new Error(
+      `Recovery session ${stepId}:recovery inputs exceed the ${MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES}-byte aggregate limit.`
+    );
+  }
+  if (sessionRoute && totalProviderInputBytes > MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES) {
+    throw new Error(
+      `Recovery session ${stepId}:recovery provider inputs exceed the ${MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES}-byte aggregate limit after sensitive-data handling.`
+    );
+  }
+  for (const artifact of artifactPaths) {
+    const sizes = preflightSimulationSessionInput(
+      state,
+      `${stepId}:recovery`,
+      artifact,
+      sensitiveArtifactPaths.has(artifact),
+      sessionRoute
+    );
+    if (!sessionRoute) continue;
+    totalSourceInputBytes += sizes.sourceBytes;
+    if (totalSourceInputBytes > MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES) {
+      throw new Error(
+        `Recovery session ${stepId}:recovery inputs exceed the ${MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES}-byte aggregate limit.`
+      );
+    }
+    totalProviderInputBytes += sizes.securedBytes;
+    if (totalProviderInputBytes > MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES) {
+      throw new Error(
+        `Recovery session ${stepId}:recovery provider inputs exceed the ${MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES}-byte aggregate limit after sensitive-data handling.`
+      );
+    }
+  }
+}
+
+function secureSimulationRecoveryReferencedInputValues(
+  state: SimulationState,
+  label: string,
+  declared: Record<string, AgentFlowYamlValue | undefined>,
+  resolved: Record<string, AgentFlowRunStateValue>
+): Record<string, AgentFlowRunStateValue> {
+  return Object.fromEntries(Object.entries(resolved).map(([name, value]) => [
+    name,
+    secureSimulationRecoveryReferencedInputValue(state, `${label}.${name}`, declared[name], value)
+  ]));
+}
+
+function secureSimulationRecoveryReferencedInputValue(
+  state: SimulationState,
+  label: string,
+  declared: AgentFlowYamlValue | undefined,
+  resolved: AgentFlowRunStateValue
+): AgentFlowRunStateValue {
+  if (typeof declared === "string") {
+    const reference = /^\{\{\s*inputs\.([A-Za-z_][A-Za-z0-9_-]*)\s*}}$/.exec(declared);
+    if (reference !== null && agentFlowInputKeyLooksSensitive(reference[1]!)) {
+      return secureAgentFlowSensitiveJsonInputValue(state.workflow, label, resolved).value;
+    }
+  }
+  if (Array.isArray(declared) && Array.isArray(resolved)) {
+    return resolved.map((value, index) =>
+      secureSimulationRecoveryReferencedInputValue(state, `${label}[${index}]`, declared[index], value)
+    );
+  }
+  if (isRecord(declared) && isRecord(resolved)) {
+    return Object.fromEntries(Object.entries(resolved).map(([name, value]) => [
+      name,
+      secureSimulationRecoveryReferencedInputValue(
+        state,
+        `${label}.${name}`,
+        declared[name],
+        simulationRunStateValue(value)
+      )
+    ]));
+  }
+  return resolved;
+}
+
+function resolveSimulationRecoveryInputValue(
+  value: AgentFlowYamlValue | undefined,
+  state: SimulationState,
+  stepId: string
+): AgentFlowRunStateValue {
+  if (typeof value === "string") {
+    const expression = /^\{\{\s*([^}]+?)\s*}}$/.exec(value);
+    if (expression?.[1] === "step.id") return stepId;
+    const input = /^inputs\.([A-Za-z_][A-Za-z0-9_-]*)$/.exec(expression?.[1] ?? "");
+    const resolved = input === null ? undefined : state.fixture.inputs?.[input[1]!];
+    return resolved === undefined ? value : simulationRunStateValue(resolved);
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) => resolveSimulationRecoveryInputValue(entry, state, stepId));
+  }
+  if (isRecord(value)) {
+    return Object.fromEntries(Object.entries(value).map(([key, entry]) => [
+      key,
+      resolveSimulationRecoveryInputValue(entry, state, stepId)
+    ]));
+  }
+  return value ?? null;
+}
+
+function simulationRunStateValue(value: AgentFlowYamlValue | undefined): AgentFlowRunStateValue {
+  if (Array.isArray(value)) return value.map(simulationRunStateValue);
+  if (isRecord(value)) {
+    return Object.fromEntries(Object.entries(value).map(([key, entry]) => [
+      key,
+      simulationRunStateValue(entry)
+    ]));
+  }
+  return value ?? null;
+}
+
+function collectSimulationRecoveryArtifactPaths(
+  value: AgentFlowRunStateValue,
+  state: SimulationState,
+  paths: Set<string>,
+  sensitivePaths?: Set<string>,
+  sensitive = false
+): void {
+  if (typeof value === "string") {
+    const normalized = tryNormalizeArtifactPath(value.trim());
+    if (normalized !== undefined && state.artifacts.has(normalized)) {
+      paths.add(normalized);
+      if (sensitive) sensitivePaths?.add(normalized);
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((entry) => collectSimulationRecoveryArtifactPaths(entry, state, paths, sensitivePaths, sensitive));
+    return;
+  }
+  if (value !== null && typeof value === "object") {
+    Object.entries(value).forEach(([key, entry]) => collectSimulationRecoveryArtifactPaths(
+      entry,
+      state,
+      paths,
+      sensitivePaths,
+      sensitive || agentFlowInputKeyLooksSensitive(key)
+    ));
+  }
+}
+
+function collectSimulationReferencedSensitiveArtifactPaths(
+  declared: AgentFlowYamlValue | undefined,
+  resolved: AgentFlowRunStateValue,
+  state: SimulationState,
+  sensitivePaths: Set<string>,
+  sensitive = false
+): void {
+  if (typeof declared === "string") {
+    const expression = /^\{\{\s*inputs\.([A-Za-z_][A-Za-z0-9_-]*)\s*}}$/.exec(declared);
+    const referencedSensitiveInput = expression !== null && agentFlowInputKeyLooksSensitive(expression[1]!);
+    if (sensitive || referencedSensitiveInput) {
+      collectSimulationRecoveryArtifactPaths(resolved, state, new Set(), sensitivePaths, true);
+    }
+    return;
+  }
+  if (Array.isArray(declared) && Array.isArray(resolved)) {
+    declared.forEach((entry, index) => collectSimulationReferencedSensitiveArtifactPaths(
+      entry,
+      resolved[index] ?? null,
+      state,
+      sensitivePaths,
+      sensitive
+    ));
+    return;
+  }
+  if (isRecord(declared) && resolved !== null && typeof resolved === "object" && !Array.isArray(resolved)) {
+    Object.entries(declared).forEach(([key, entry]) => collectSimulationReferencedSensitiveArtifactPaths(
+      entry,
+      resolved[key] ?? null,
+      state,
+      sensitivePaths,
+      sensitive || agentFlowInputKeyLooksSensitive(key)
+    ));
+  }
 }
 
 function checkInputs(step: AgentFlowWorkflowStep, stepId: string, state: SimulationState): void {

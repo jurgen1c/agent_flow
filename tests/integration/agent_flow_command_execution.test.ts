@@ -880,7 +880,7 @@ steps:
   - id: secret-check
     type: command
     command: |
-      AWS_SECRET_ACCESS_KEY=aws-secret-value MY_API_TOKEN=super-secret-value sh -c "printf 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz\\nProxy-Authorization: Basic dXNlcjpwYXNzd29yZA==\\nAuthorization: ApiKey opaque-api-key-value\\nMY_API_TOKEN=log-secret-value\\n-----BEGIN PGP PRIVATE KEY BLOCK-----\\ncHJpdmF0ZS1rZXk=\\n-----END PGP PRIVATE KEY BLOCK-----\\n' >&2; exit 12" --password cli-password-value --api-token "quoted-cli-token" --verbose
+      AWS_SECRET_ACCESS_KEY=aws-secret-value RAILS_MASTER_KEY=rails-master-value MY_API_TOKEN=super-secret-value sh -c "printf 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz\\nProxy-Authorization: Basic dXNlcjpwYXNzd29yZA==\\nAuthorization: ApiKey opaque-api-key-value\\nMY_API_TOKEN=log-secret-value\\nJWT_SIGNING_KEY=jwt-signing-value\\n-----BEGIN PGP PRIVATE KEY BLOCK-----\\ncHJpdmF0ZS1rZXk=\\n-----END PGP PRIVATE KEY BLOCK-----\\n' >&2; exit 12" --password cli-password-value --api-token "quoted-cli-token" --verbose
     on_failure: { then: pause }
 `);
     const store = await openAgentFlowRunState({ cwd: repoRoot });
@@ -893,6 +893,7 @@ steps:
     const serialized = store.readArtifact("redacted-failure", failure.payloadPath!).content.toString("utf8");
     expect(serialized).not.toContain("super-secret-value");
     expect(serialized).not.toContain("aws-secret-value");
+    expect(serialized).not.toContain("rails-master-value");
     expect(serialized).not.toContain("log-secret-value");
     expect(serialized).not.toContain("abcdefghijklmnopqrstuvwxyz");
     expect(serialized).not.toContain("dXNlcjpwYXNzd29yZA");
@@ -900,10 +901,12 @@ steps:
     expect(serialized).not.toContain("cHJpdmF0ZS1rZXk");
     expect(serialized).not.toContain("cli-password-value");
     expect(serialized).not.toContain("quoted-cli-token");
+    expect(serialized).not.toContain("jwt-signing-value");
     const payload = JSON.parse(serialized);
     const stderrPath = payload.logs.stderr as string;
     const redactedFields = payload.redactions.fields as string[];
     expect(payload.command).toContain("AWS_SECRET_ACCESS_KEY=[REDACTED]");
+    expect(payload.command).toContain("RAILS_MASTER_KEY=[REDACTED]");
     expect(payload.command).toContain("MY_API_TOKEN=[REDACTED]");
     expect(payload.command).toContain("--password [REDACTED]");
     expect(payload.command).toContain("--api-token [REDACTED]");
@@ -918,9 +921,45 @@ steps:
         "Proxy-Authorization: Basic [REDACTED]",
         "Authorization: ApiKey [REDACTED]",
         "MY_API_TOKEN=[REDACTED]",
+        "JWT_SIGNING_KEY=[REDACTED]",
         "[REDACTED]",
         ""
       ].join("\n"));
+    store.close();
+  });
+
+  test("redacts complete shell-substitution values in persisted failed commands", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: redacted-shell-substitution
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: secret-check
+    type: command
+    command: |
+      API_KEYS=$(printf first-secret-part)opaque-suffix BACKUP_TOKEN=\`printf second-secret-part\`tail PREFIX_TOKEN=prefix$(printf third-secret-part) false
+    on_failure: { then: pause }
+`);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: "redacted-shell-substitution", workflow });
+
+    expect((await executeAgentFlowCommandPipeline(
+      store,
+      "redacted-shell-substitution",
+      workflow
+    )).status).toBe("paused");
+    const failure = store.listFailures("redacted-shell-substitution")[0]!;
+    const payload = JSON.parse(
+      store.readArtifact("redacted-shell-substitution", failure.payloadPath!).content.toString("utf8")
+    );
+    expect(payload.command).toBe(
+      "API_KEYS=[REDACTED] BACKUP_TOKEN=[REDACTED] PREFIX_TOKEN=[REDACTED] false\n"
+    );
+    expect(JSON.stringify(payload)).not.toContain("first-secret-part");
+    expect(JSON.stringify(payload)).not.toContain("second-secret-part");
+    expect(JSON.stringify(payload)).not.toContain("third-secret-part");
+    expect(JSON.stringify(payload)).not.toContain("opaque-suffix");
     store.close();
   });
 
@@ -1112,13 +1151,19 @@ steps:
       outcome: "pause",
       indexPayload: {
         api_token: "plain-index-secret",
-        nested: { AWS_SECRET_ACCESS_KEY: "nested-index-secret" }
+        db_pass: "database-pass-index-secret",
+        nested: {
+          AWS_SECRET_ACCESS_KEY: "nested-index-secret",
+          pwd: "nested-pwd-index-secret"
+        }
       }
     });
 
     const serialized = store.readArtifact("attempt-scoped-failure", persisted.path!).content.toString("utf8");
     expect(serialized).not.toContain("plain-index-secret");
+    expect(serialized).not.toContain("database-pass-index-secret");
     expect(serialized).not.toContain("nested-index-secret");
+    expect(serialized).not.toContain("nested-pwd-index-secret");
     expect(serialized).not.toContain("yaml-block-secret");
     expect(serialized).not.toContain("opaque-private-key-secret");
     expect(serialized).not.toContain("plain-block-secret-value");
@@ -1163,7 +1208,11 @@ steps:
     expect(serialized).not.toContain("attachment-npm-secret");
     expect(persisted.indexPayload).toEqual({
       api_token: "[REDACTED]",
-      nested: { AWS_SECRET_ACCESS_KEY: "[REDACTED]" }
+      db_pass: "[REDACTED]",
+      nested: {
+        AWS_SECRET_ACCESS_KEY: "[REDACTED]",
+        pwd: "[REDACTED]"
+      }
     });
     const payload = JSON.parse(serialized);
     expect(payload.command).toBe(

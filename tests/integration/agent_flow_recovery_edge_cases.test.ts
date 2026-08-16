@@ -6,10 +6,13 @@ import { execFileSync } from "node:child_process";
 
 import {
   createAgentFlowLifecycleRun,
+  createAgentFlowMcpCallRegistry,
   createAgentFlowSessionProviderRegistry,
   createAgentFlowWorkflowRegistry,
   executeAgentFlowCommandPipeline,
   injectAgentFlowRecoveryContext,
+  MAX_AGENT_FLOW_SESSION_PROMPT_BYTES,
+  MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES,
   openAgentFlowRunState,
   parseAgentFlowWorkflowOrThrow,
   transitionAgentFlowLifecycleRun,
@@ -517,6 +520,407 @@ steps:
     store.close();
   });
 
+  test("applies sensitive-input redaction to recovery session prompts", async () => {
+    const root = temporaryRepo();
+    writePrompt(root);
+    fs.writeFileSync(
+      path.join(root, "prompts", "fix.md"),
+      "Investigate with Authorization: Bearer recovery-prompt-secret.\n"
+    );
+    const workflow = recoverySessionWorkflow(`
+sessions:
+  fixer: { provider: fixture }
+steps:
+  - id: check
+    type: command
+    command: "false"
+    on_failure:
+      route_to: { session: fixer, prompt: prompts/fix.md }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "redacted-recovery-prompt", workflow });
+    let prompt = "";
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => {
+      prompt = request.prompt.content;
+      return { outputs: {}, metadata: { recovery_status: "unresolved" } };
+    });
+
+    await executeAgentFlowCommandPipeline(store, "redacted-recovery-prompt", workflow, undefined, providers);
+
+    expect(prompt).toContain("Authorization: Bearer [REDACTED]");
+    expect(prompt).not.toContain("recovery-prompt-secret");
+    store.close();
+  });
+
+  test("redacts recovery input manifests before durable persistence", async () => {
+    const root = temporaryRepo();
+    writePrompt(root);
+    const workflow = recoverySessionWorkflow(`
+policies: { sensitive_inputs: redact }
+inputs: { key: { required: true } }
+sessions:
+  fixer: { provider: fixture }
+steps:
+  - id: check
+    type: command
+    command: "false"
+    on_failure:
+      route_to:
+        session: fixer
+        prompt: prompts/fix.md
+        inputs:
+          API_TOKEN: recovery-manifest-secret
+          opaque: "{{ inputs.key }}"
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, {
+      id: "redacted-recovery-manifest",
+      workflow,
+      inputs: { key: "opaque-key-secret" }
+    });
+    let providerManifest = "";
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => {
+      const manifest = request.inputs.find((input) => input.path.endsWith("/inputs.json"));
+      providerManifest = manifest === undefined ? "" : Buffer.from(manifest.content).toString("utf8");
+      return { outputs: {}, metadata: { recovery_status: "unresolved" } };
+    });
+
+    await executeAgentFlowCommandPipeline(
+      store,
+      "redacted-recovery-manifest",
+      workflow,
+      undefined,
+      providers
+    );
+
+    const manifestArtifact = store.listArtifacts("redacted-recovery-manifest")
+      .find((artifact) => artifact.kind === "recovery_input")!;
+    const persistedManifest = store.readArtifact(
+      "redacted-recovery-manifest",
+      manifestArtifact.declaredPath
+    ).content.toString("utf8");
+    expect(providerManifest).toContain("[REDACTED]");
+    expect(persistedManifest).toContain("[REDACTED]");
+    expect(`${providerManifest}\n${persistedManifest}`).not.toContain("recovery-manifest-secret");
+    expect(`${providerManifest}\n${persistedManifest}`).not.toContain("opaque-key-secret");
+    store.close();
+  });
+
+  test("enforces recovery manifest source limits before sensitive-data redaction", async () => {
+    const root = temporaryRepo();
+    writePrompt(root);
+    const workflow = recoverySessionWorkflow(`
+policies: { sensitive_inputs: redact }
+inputs: { credential: { required: true } }
+sessions:
+  fixer: { provider: fixture }
+steps:
+  - id: check
+    type: command
+    command: "false"
+    on_failure:
+      route_to:
+        session: fixer
+        prompt: prompts/fix.md
+        inputs: { API_TOKEN: "{{ inputs.credential }}" }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, {
+      id: "oversized-recovery-manifest-source",
+      workflow,
+      inputs: { credential: "x".repeat(MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES) }
+    });
+    let invoked = false;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+      invoked = true;
+      return { outputs: {}, metadata: { recovery_status: "unresolved" } };
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      "oversized-recovery-manifest-source",
+      workflow,
+      undefined,
+      providers
+    );
+
+    expect(result).toMatchObject({ status: "paused" });
+    expect(store.listEvents("oversized-recovery-manifest-source")).toContainEqual(expect.objectContaining({
+      type: "recovery.completed",
+      payload: expect.objectContaining({
+        message: expect.stringContaining("aggregate limit before sensitive-data handling")
+      })
+    }));
+    expect(store.listArtifacts("oversized-recovery-manifest-source")
+      .some((artifact) => artifact.kind === "recovery_input")).toBe(false);
+    expect(invoked).toBe(false);
+    store.close();
+  });
+
+  test("counts the pre-redaction recovery manifest toward the source aggregate limit", async () => {
+    const root = temporaryRepo();
+    writePrompt(root);
+    const workflow = recoverySessionWorkflow(`
+policies: { sensitive_inputs: redact }
+inputs:
+  credential: { required: true }
+  evidence: { required: true }
+sessions: { fixer: { provider: fixture } }
+steps:
+  - id: check
+    type: command
+    command: "false"
+    on_failure:
+      route_to:
+        session: fixer
+        prompt: prompts/fix.md
+        inputs:
+          API_TOKEN: "{{ inputs.credential }}"
+          evidence: "{{ inputs.evidence }}"
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, {
+      id: "aggregate-recovery-manifest-source",
+      workflow,
+      inputs: {
+        credential: "x".repeat(6 * 1024 * 1024),
+        evidence: "evidence.txt"
+      }
+    });
+    store.writeArtifact({
+      id: "aggregate-recovery-evidence",
+      runId: "aggregate-recovery-manifest-source",
+      stepId: "fixture",
+      path: "evidence.txt",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "y".repeat(6 * 1024 * 1024)
+    });
+    let invoked = false;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+      invoked = true;
+      return { outputs: {}, metadata: { recovery_status: "unresolved" } };
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      "aggregate-recovery-manifest-source",
+      workflow,
+      undefined,
+      providers
+    );
+
+    expect(result).toMatchObject({ status: "paused" });
+    expect(store.listEvents("aggregate-recovery-manifest-source")).toContainEqual(expect.objectContaining({
+      type: "recovery.completed",
+      payload: expect.objectContaining({ message: expect.stringContaining("aggregate limit") })
+    }));
+    expect(invoked).toBe(false);
+    store.close();
+  });
+
+  test("preserves sensitive provenance for opaque recovery artifacts referenced through run inputs", async () => {
+    const root = temporaryRepo();
+    writePrompt(root);
+    const workflow = recoverySessionWorkflow(`
+inputs: { credential: { required: true } }
+sessions: { fixer: { provider: fixture } }
+steps:
+  - id: check
+    type: command
+    command: "false"
+    on_failure:
+      route_to:
+        session: fixer
+        prompt: prompts/fix.md
+        inputs: { evidence: "{{ inputs.credential }}" }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, {
+      id: "referenced-recovery-credential",
+      workflow,
+      inputs: { credential: { certificate: "payload.txt" } }
+    });
+    store.writeArtifact({
+      id: "credential-payload",
+      runId: "referenced-recovery-credential",
+      stepId: "fixture",
+      path: "payload.txt",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "hunter2abc"
+    });
+    let providerInput = "";
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => {
+      const payload = request.inputs.find((input) => input.path === "payload.txt");
+      providerInput = payload === undefined ? "" : Buffer.from(payload.content).toString("utf8");
+      return { outputs: {}, metadata: { recovery_status: "unresolved" } };
+    });
+
+    expect((await executeAgentFlowCommandPipeline(
+      store,
+      "referenced-recovery-credential",
+      workflow,
+      undefined,
+      providers
+    )).status).toBe("paused");
+    expect(providerInput).toBe("[REDACTED]");
+    expect(providerInput).not.toContain("hunter2abc");
+    store.close();
+  });
+
+  test("preflights sensitive recovery prompt paths before filesystem reads", async () => {
+    const root = temporaryRepo();
+    const workflow = recoverySessionWorkflow(`
+sessions:
+  fixer: { provider: fixture }
+steps:
+  - id: check
+    type: command
+    command: "false"
+    on_failure:
+      route_to: { session: fixer, prompt: .env }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "preflight-recovery-prompt-path", workflow });
+    let invoked = false;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+      invoked = true;
+      return remediated();
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      "preflight-recovery-prompt-path",
+      workflow,
+      undefined,
+      providers
+    );
+
+    expect(result).toMatchObject({ status: "paused" });
+    expect(store.listEvents("preflight-recovery-prompt-path")).toContainEqual(expect.objectContaining({
+      type: "recovery.completed",
+      payload: expect.objectContaining({
+        message: expect.stringContaining("secret-like path")
+      })
+    }));
+    expect(JSON.stringify(store.listEvents("preflight-recovery-prompt-path"))).not.toContain("ENOENT");
+    expect(invoked).toBe(false);
+    store.close();
+  });
+
+  test("preflights sensitive recovery artifact paths before artifact reads", async () => {
+    const root = temporaryRepo();
+    writePrompt(root);
+    const workflow = recoverySessionWorkflow(`
+sessions:
+  fixer: { provider: fixture }
+steps:
+  - id: check
+    type: command
+    command: "false"
+    on_failure:
+      route_to:
+        session: fixer
+        prompt: prompts/fix.md
+        inputs: { evidence: .env }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "preflight-recovery-artifact-path", workflow });
+    store.writeArtifact({
+      id: "environment",
+      runId: "preflight-recovery-artifact-path",
+      stepId: "fixture",
+      path: ".env",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "API_TOKEN=recovery-artifact-secret\n"
+    });
+    const readArtifact = store.readArtifact.bind(store);
+    let sensitiveArtifactRead = false;
+    store.readArtifact = ((runId, artifactPath, options) => {
+      if (artifactPath === ".env") sensitiveArtifactRead = true;
+      return readArtifact(runId, artifactPath, options);
+    });
+    let invoked = false;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+      invoked = true;
+      return remediated();
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      "preflight-recovery-artifact-path",
+      workflow,
+      undefined,
+      providers
+    );
+
+    expect(result).toMatchObject({ status: "paused" });
+    expect(sensitiveArtifactRead).toBe(false);
+    expect(invoked).toBe(false);
+    store.close();
+  });
+
+  test("rejects recovery prompts that exceed the limit after redaction", async () => {
+    const root = temporaryRepo();
+    writePrompt(root);
+    const source = "token=x\n".repeat(100_000);
+    expect(Buffer.byteLength(source)).toBeLessThan(MAX_AGENT_FLOW_SESSION_PROMPT_BYTES);
+    fs.writeFileSync(path.join(root, "prompts", "fix.md"), source);
+    const workflow = recoverySessionWorkflow(`
+sessions:
+  fixer: { provider: fixture }
+steps:
+  - id: check
+    type: command
+    command: "false"
+    on_failure:
+      route_to: { session: fixer, prompt: prompts/fix.md }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "oversized-redacted-recovery-prompt", workflow });
+    let invoked = false;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+      invoked = true;
+      return { outputs: {}, metadata: { recovery_status: "unresolved" } };
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      "oversized-redacted-recovery-prompt",
+      workflow,
+      undefined,
+      providers
+    );
+
+    expect(result).toMatchObject({ status: "paused" });
+    expect(store.listEvents("oversized-redacted-recovery-prompt")).toContainEqual(expect.objectContaining({
+      type: "recovery.completed",
+      payload: expect.objectContaining({
+        message: expect.stringContaining("session prompt limit after sensitive-data handling")
+      })
+    }));
+    expect(invoked).toBe(false);
+    store.close();
+  });
+
   test("routes every failed or paused nested recovery outcome through on_unresolved", async () => {
     const root = temporaryRepo();
     const child = recoverySessionWorkflow(`
@@ -552,6 +956,141 @@ steps:
       type: "recovery.completed",
       payload: expect.objectContaining({ status: "unresolved", route: "workflow" })
     }));
+    store.close();
+  });
+
+  test("preserves sensitive provenance when a nested recovery renames a run input", async () => {
+    const root = temporaryRepo();
+    writePrompt(root);
+    const child = recoverySessionWorkflow(`
+inputs: { evidence: { required: true } }
+sessions: { inspector: { provider: fixture } }
+steps:
+  - id: inspect
+    type: session_request
+    session: inspector
+    prompt: prompts/fix.md
+    inputs: ["{{ inputs.evidence }}"]
+    outputs: [inspection.json]
+`);
+    const parent = recoverySessionWorkflow(`
+inputs: { credential: { required: true } }
+steps:
+  - id: check
+    type: command
+    command: "false"
+    on_failure:
+      route_to:
+        workflow: nested
+        inputs: { evidence: "{{ inputs.credential }}" }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, {
+      id: "nested-renamed-input",
+      workflow: parent,
+      inputs: { credential: "payload.txt" }
+    });
+    store.writeArtifact({
+      id: "nested-credential-payload",
+      runId: "nested-renamed-input",
+      stepId: "fixture",
+      path: "payload.txt",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "opaque-nested-credential"
+    });
+    let providerInput = "";
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => {
+      providerInput = Buffer.from(request.inputs[0]!.content).toString("utf8");
+      return { outputs: { "inspection.json": "{}\n" } };
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      "nested-renamed-input",
+      parent,
+      undefined,
+      providers,
+      undefined,
+      undefined,
+      createAgentFlowWorkflowRegistry().register("nested", child)
+    );
+
+    expect(result.status).toBe("paused");
+    expect(providerInput).toBe("[REDACTED]");
+    expect(providerInput).not.toContain("opaque-nested-credential");
+    const recoveryEvent = store.listEvents("nested-renamed-input")
+      .find((event) => event.type === "recovery.completed");
+    const nestedRunId = recoveryEvent?.payload.recoveryRunId;
+    expect(typeof nestedRunId).toBe("string");
+    const nestedRun = store.getRun(nestedRunId as string);
+    expect(nestedRun?.inputs).toEqual({ evidence: "payload.txt" });
+    expect(store.readArtifact(nestedRun!.id, "payload.txt").content.toString("utf8"))
+      .toBe("[REDACTED]");
+    store.close();
+  });
+
+  test("applies the parent sensitive-input policy to every nested recovery scalar", async () => {
+    const root = temporaryRepo();
+    const child = recoverySessionWorkflow(`
+policies: { sensitive_inputs: allow }
+inputs: { context: { required: true } }
+steps:
+  - id: inspect
+    type: mcp_call
+    server: fixture
+    tool: inspect
+    arguments: { body: "{{ inputs.context }}" }
+    outputs: [inspection.json]
+  - { id: done, type: result, status: remediated }
+`);
+    const parent = recoverySessionWorkflow(`
+inputs: { context: { required: true } }
+steps:
+  - id: check
+    type: command
+    command: "false"
+    on_failure:
+      route_to:
+        workflow: nested
+        inputs: { context: "{{ inputs.context }}" }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+  - { id: complete, type: result, status: completed }
+  - { id: pause, type: result, status: paused }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, {
+      id: "nested-scalar-policy",
+      workflow: parent,
+      inputs: { context: "API_TOKEN=opaquevalue" }
+    });
+    let adapterArguments: Record<string, unknown> | undefined;
+    const mcpCalls = createAgentFlowMcpCallRegistry().register("fixture", (request) => {
+      adapterArguments = request.arguments;
+      return { outputs: { "inspection.json": { safe: true } } };
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      "nested-scalar-policy",
+      parent,
+      undefined,
+      undefined,
+      mcpCalls,
+      undefined,
+      createAgentFlowWorkflowRegistry().register("nested", child)
+    );
+
+    expect(result.status).toBe("completed");
+    expect(adapterArguments).toEqual({ body: "API_TOKEN=[REDACTED]" });
+    expect(JSON.stringify(adapterArguments)).not.toContain("opaquevalue");
+    const nestedRunId = store.listEvents("nested-scalar-policy")
+      .find((event) => event.type === "recovery.completed")?.payload.recoveryRunId;
+    expect(store.getRun(nestedRunId as string)?.inputs)
+      .toEqual({ context: "API_TOKEN=[REDACTED]" });
     store.close();
   });
 

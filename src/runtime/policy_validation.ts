@@ -19,6 +19,7 @@ export interface AgentFlowPolicyIssue {
 
 const POLICY_MODES = new Set(["allow", "deny", "require_approval"]);
 const RECOVERY_LIMIT_MODES = new Set(["pause", "fail"]);
+const SENSITIVE_INPUT_MODES = new Set(["allow", "deny", "redact"]);
 
 export function validateAgentFlowPolicyPrimitives(workflow: AgentFlowWorkflow): AgentFlowPolicyIssue[] {
   const errors: AgentFlowPolicyIssue[] = [];
@@ -82,6 +83,13 @@ export function validateAgentFlowPolicyPrimitives(workflow: AgentFlowWorkflow): 
 
   validatePolicyMode(policies, "cleanup", errors);
   validatePolicyMode(policies, "unsafe_operations", errors);
+  if (policies?.sensitive_inputs !== undefined && !SENSITIVE_INPUT_MODES.has(policies.sensitive_inputs as string)) {
+    errors.push(issue(
+      "workflow.policy.sensitive_inputs.invalid",
+      "policies.sensitive_inputs",
+      "Sensitive-input policy must be allow, deny, or redact."
+    ));
+  }
   if (policies?.recovery_limits !== undefined && !RECOVERY_LIMIT_MODES.has(policies.recovery_limits as string)) {
     errors.push(issue(
       "workflow.policy.recovery_limits.invalid",

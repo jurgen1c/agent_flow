@@ -1,6 +1,17 @@
 import { spawnSync } from "node:child_process";
+import { isDeepStrictEqual } from "node:util";
 import type { AgentFlowRunStateStore, AgentFlowRunStateValue, AgentFlowRunStatus } from "./run_state";
 import type { AgentFlowWorkflow, AgentFlowYamlMapping, AgentFlowYamlValue } from "./workflow";
+import {
+  AGENT_FLOW_FAILURE_REDACTION_MARKER,
+  redactAgentFlowSensitiveInputText,
+  redactAgentFlowSensitiveText
+} from "./failure_payload";
+import {
+  agentFlowSensitiveInputMode,
+  secureAgentFlowJsonInput,
+  secureAgentFlowTextInput
+} from "./execution_security";
 
 export type AgentFlowNotificationEvent =
   | "workflow.completed"
@@ -139,6 +150,13 @@ export function validateAgentFlowNotifications(workflow: AgentFlowWorkflow): Age
         "Notification channels must not contain duplicates."
       ));
     }
+    if (channels.includes("command") && mapping(workflow.policies)?.unsafe_operations !== "allow") {
+      errors.push(issue(
+        "workflow.notification.command.unsafe",
+        `${path}.channels`,
+        "Command notification channels are denied by default; set policies.unsafe_operations to allow after reviewing the registered adapter."
+      ));
+    }
 
     if (rule.required !== undefined && typeof rule.required !== "boolean") {
       errors.push(issue(
@@ -189,7 +207,9 @@ function deliverAgentFlowNotificationEventUnlocked(
 ): AgentFlowNotificationDeliveryResult {
   let requiredFailure: AgentFlowNotificationDeliveryResult["requiredFailure"];
   const attempts: NonNullable<AgentFlowNotificationDeliveryResult["attempts"]> = [];
-  const initialStatus = store.getRun(runId)?.status;
+  const initialRun = store.getRun(runId);
+  if (initialRun === null) return {};
+  const initialStatus = initialRun?.status;
   if (context.requiredRunStatus !== undefined && initialStatus !== context.requiredRunStatus) return {};
 
   for (const value of workflow.notify ?? []) {
@@ -200,12 +220,51 @@ function deliverAgentFlowNotificationEventUnlocked(
       if (store.getRun(runId)?.status !== initialStatus) {
         return deliveryResult(requiredFailure, attempts, true);
       }
-      const notification = buildNotification(runId, workflow.name, event, channel, required, context);
+      const auditChannel = auditNotificationIdentifier(workflow, "Notification channel", channel);
+      const auditStepId = context.stepId === undefined
+        ? undefined
+        : auditNotificationIdentifier(workflow, "Notification step id", context.stepId);
       let failureMessage: string | undefined;
       try {
+        const currentRun = store.getRun(runId);
+        if (currentRun === null || !isDeepStrictEqual(currentRun.context.workflow, workflow)) {
+          throw new Error(
+            "Notification delivery is denied unless the supplied workflow matches the workflow persisted for the run."
+          );
+        }
+        agentFlowSensitiveInputMode(workflow);
+        if (channel === "command" && mapping(workflow.policies)?.unsafe_operations !== "allow") {
+          throw new Error(
+            "Command notification channels are denied by default unless the persisted workflow matches and explicitly sets policies.unsafe_operations to allow."
+          );
+        }
         const adapter = registry.get(channel);
         if (adapter === undefined) throw new Error(`No notification adapter is registered for channel "${channel}".`);
-        const result: unknown = adapter(notification);
+        const label = `Notification ${event} for channel ${channel}`;
+        const securedRunId = secureNotificationIdentifier(workflow, `${label} run id`, runId);
+        const securedWorkflowName = secureNotificationIdentifier(workflow, `${label} workflow name`, workflow.name);
+        const securedChannel = secureNotificationIdentifier(workflow, `${label} channel`, channel);
+        const securedStepId = context.stepId === undefined
+          ? undefined
+          : secureNotificationIdentifier(workflow, `${label} step id`, context.stepId);
+        const securedPayload = context.payload === undefined
+          ? undefined
+          : secureAgentFlowJsonInput(workflow, `${label} payload`, { payload: context.payload }).value.payload;
+        // Title and message are composed only after every dynamic source field has
+        // passed the sensitive-input boundary, so generated notification text
+        // cannot reintroduce unchecked workflow metadata.
+        const securedNotification = buildNotification(
+          securedRunId,
+          securedWorkflowName,
+          event,
+          securedChannel,
+          required,
+          {
+            ...(securedStepId === undefined ? {} : { stepId: securedStepId }),
+            ...(securedPayload === undefined ? {} : { payload: securedPayload })
+          }
+        );
+        const result: unknown = adapter(securedNotification);
         if (isPromiseLike(result)) {
           void Promise.resolve(result).catch(() => {});
           throw new Error(
@@ -213,18 +272,18 @@ function deliverAgentFlowNotificationEventUnlocked(
           );
         }
       } catch (error) {
-        failureMessage = error instanceof Error ? error.message : String(error);
+        failureMessage = redactAgentFlowSensitiveText(error instanceof Error ? error.message : String(error));
       }
 
       if (failureMessage === undefined) {
         const attempt = {
           type: "notification.delivered",
-          ...(context.stepId === undefined ? {} : { stepId: context.stepId }),
+          ...(auditStepId === undefined ? {} : { stepId: auditStepId }),
           payload: {
-            channel,
+            channel: auditChannel,
             event,
             required,
-            ...(context.stepId === undefined ? {} : { stepId: context.stepId })
+            ...(auditStepId === undefined ? {} : { stepId: auditStepId })
           }
         } as const;
         store.appendRunEvent(runId, attempt);
@@ -232,19 +291,19 @@ function deliverAgentFlowNotificationEventUnlocked(
       } else {
         const attempt = {
           type: "notification.failed",
-          ...(context.stepId === undefined ? {} : { stepId: context.stepId }),
+          ...(auditStepId === undefined ? {} : { stepId: auditStepId }),
           payload: {
-            channel,
+            channel: auditChannel,
             event,
             message: failureMessage,
             required,
-            ...(context.stepId === undefined ? {} : { stepId: context.stepId })
+            ...(auditStepId === undefined ? {} : { stepId: auditStepId })
           }
         } as const;
         store.appendRunEvent(runId, attempt);
         attempts.push(attempt);
         if (required && requiredFailure === undefined) {
-          requiredFailure = { channel, event, message: failureMessage };
+          requiredFailure = { channel: auditChannel, event, message: failureMessage };
         }
       }
     }
@@ -302,6 +361,27 @@ function buildNotification(
     ...(context.stepId === undefined ? {} : { stepId: context.stepId }),
     ...(context.payload === undefined ? {} : { payload: context.payload })
   };
+}
+
+function secureNotificationIdentifier(workflow: AgentFlowWorkflow, label: string, value: string): string {
+  const isPlainIdentifier = /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/.test(value)
+    && redactAgentFlowSensitiveInputText(value) === value;
+  if (isPlainIdentifier) return value;
+  return secureAgentFlowTextInput(workflow, label, value).value;
+}
+
+function auditNotificationIdentifier(workflow: AgentFlowWorkflow, label: string, value: string): string {
+  const auditWorkflow = structuredClone(workflow);
+  auditWorkflow.policies = {
+    ...(mapping(workflow.policies) ?? {}),
+    sensitive_inputs: "redact"
+  };
+  try {
+    return secureNotificationIdentifier(auditWorkflow, label, value);
+  } catch {
+    const redacted = redactAgentFlowSensitiveInputText(value);
+    return redacted === value ? AGENT_FLOW_FAILURE_REDACTION_MARKER : redacted;
+  }
 }
 
 function terminalNotificationAdapter(notification: AgentFlowNotification): undefined {

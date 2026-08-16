@@ -1,11 +1,15 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
   createAgentFlowFixtureSessionProvider,
+  createAgentFlowApprovalPrompt,
   createAgentFlowLifecycleRun,
   createAgentFlowSessionProviderRegistry,
+  AgentFlowRunStateError,
+  AgentFlowSessionRequestError,
   executeAgentFlowCommandPipeline,
   executeAgentFlowSessionRequest,
   MAX_AGENT_FLOW_SESSION_METADATA_BYTES,
@@ -19,7 +23,14 @@ import {
   validateAgentFlowWorkflow,
   type AgentFlowSessionProviderRequest
 } from "../../src/runtime";
-import { invokeAgentFlowSessionProvider } from "../../src/runtime/session_request";
+import { invokeAgentFlowSessionProvider, readAgentFlowSessionPrompt } from "../../src/runtime/session_request";
+import {
+  assertAgentFlowAdapterStringSafe,
+  secureAgentFlowByteInput,
+  secureAgentFlowJsonInput,
+  secureAgentFlowTextInput
+} from "../../src/runtime/execution_security";
+import { redactAgentFlowSensitiveText } from "../../src/runtime/failure_payload";
 
 describe("Agent Flow session request steps", () => {
   test("rejects and aborts when an in-flight interrupt check throws", async () => {
@@ -192,6 +203,1317 @@ steps:
     });
     expect(repeated).toMatchObject({ status: "completed", availableArtifacts: ["request.md", "response.md"] });
     expect(repeated.visitedSteps.filter((step) => step.id === "draft")).toHaveLength(2);
+  });
+
+  test("redacts secret-like prompt and artifact content before invoking a session provider", async () => {
+    const root = temporaryRepo();
+    fs.mkdirSync(path.join(root, "prompts"), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, "prompts", "draft.md"),
+      "Use Authorization: Bearer prompt-secret-value to investigate.\n"
+    );
+    const sourcePrompt = readAgentFlowSessionPrompt(root, "prompts/draft.md");
+    const workflow = sessionWorkflow();
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "redacted-session-input", workflow });
+    const source = store.writeArtifact({
+      id: "request",
+      runId: "redacted-session-input",
+      path: "request.md",
+      kind: "command_log",
+      contentType: "text/markdown",
+      content: "api_token: artifact-secret-value\n"
+    });
+    let captured: AgentFlowSessionProviderRequest | undefined;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => {
+      captured = request;
+      return { outputs: { "response.md": "Safe response" } };
+    });
+
+    expect((await executeAgentFlowCommandPipeline(
+      store,
+      "redacted-session-input",
+      workflow,
+      undefined,
+      providers
+    )).status).toBe("completed");
+    expect(captured?.prompt.content).toContain("Authorization: Bearer [REDACTED]");
+    expect(captured?.prompt.content).not.toContain("prompt-secret-value");
+    expect(Buffer.from(captured!.inputs[0]!.content).toString("utf8")).toBe("api_token: [REDACTED]\n");
+    expect(captured!.inputs[0]!.checksum).not.toBe(source.checksum);
+    const requestArtifact = store.listArtifacts("redacted-session-input")
+      .find((artifact) => artifact.kind === "session_request")!;
+    const requestMetadata = JSON.parse(
+      store.readArtifact("redacted-session-input", requestArtifact.declaredPath).content.toString("utf8")
+    );
+    expect(requestMetadata.prompt).toEqual({
+      path: "prompts/draft.md",
+      checksum: sourcePrompt.checksum,
+      providerChecksum: captured!.prompt.checksum,
+      redacted: true
+    });
+    expect(requestMetadata.inputs).toEqual([{
+      path: "request.md",
+      checksum: source.checksum,
+      contentType: "text/markdown",
+      providerChecksum: captured!.inputs[0]!.checksum,
+      redacted: true
+    }]);
+    store.close();
+  });
+
+  test("preserves sensitive input provenance for opaque referenced artifacts and accepts CSV output names", async () => {
+    const root = temporaryRepo();
+    fs.mkdirSync(path.join(root, "prompts"), { recursive: true });
+    fs.writeFileSync(path.join(root, "prompts", "draft.md"), "Draft a response.\n");
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: referenced-session-credential
+version: 1
+style: pipeline
+maturity: experimental
+inputs: { credential: { required: true } }
+sessions: { writer: { provider: fixture } }
+steps:
+  - { id: draft, type: session_request, session: writer, prompt: prompts/draft.md, inputs: ["{{ inputs.credential }}"], outputs: [response.csv] }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, {
+      id: "referenced-session-credential",
+      workflow,
+      inputs: { credential: "payload.txt" }
+    });
+    store.writeArtifact({
+      id: "credential-payload",
+      runId: "referenced-session-credential",
+      path: "payload.txt",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "hunter2abc"
+    });
+    let providerInput = "";
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => {
+      providerInput = Buffer.from(request.inputs[0]!.content).toString("utf8");
+      return { outputs: { "response.csv": "status\ncomplete\n" } };
+    });
+
+    expect((await executeAgentFlowCommandPipeline(
+      store,
+      "referenced-session-credential",
+      workflow,
+      undefined,
+      providers
+    )).status).toBe("completed");
+    expect(providerInput).toBe("[REDACTED]");
+    expect(providerInput).not.toContain("hunter2abc");
+    expect(store.readArtifact("referenced-session-credential", "response.csv").content.toString("utf8"))
+      .toBe("status\ncomplete\n");
+    store.close();
+  });
+
+  test("denies opaque artifacts referenced by sensitive workflow inputs", async () => {
+    const root = temporaryRepo();
+    fs.mkdirSync(path.join(root, "prompts"), { recursive: true });
+    fs.writeFileSync(path.join(root, "prompts", "draft.md"), "Draft a response.\n");
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: denied-referenced-session-credential
+version: 1
+style: pipeline
+maturity: experimental
+policies: { sensitive_inputs: deny }
+inputs: { credential: { required: true } }
+sessions: { writer: { provider: fixture } }
+steps:
+  - { id: draft, type: session_request, session: writer, prompt: prompts/draft.md, inputs: ["{{ inputs.credential }}"], outputs: [response.md] }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, {
+      id: "denied-referenced-session-credential",
+      workflow,
+      inputs: { credential: "payload.txt" }
+    });
+    store.writeArtifact({
+      id: "credential-payload",
+      runId: "denied-referenced-session-credential",
+      path: "payload.txt",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "hunter2abc"
+    });
+    let invoked = false;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+      invoked = true;
+      return { outputs: { "response.md": "unsafe" } };
+    });
+
+    expect((await executeAgentFlowCommandPipeline(
+      store,
+      "denied-referenced-session-credential",
+      workflow,
+      undefined,
+      providers
+    ))).toMatchObject({ status: "paused", failedStep: "draft" });
+    expect(invoked).toBe(false);
+    store.close();
+  });
+
+  test("preserves ordinary keys and safely handles structured or secret-path inputs", () => {
+    const workflow = sessionWorkflow();
+    const deniedWorkflow = parseAgentFlowWorkflowOrThrow(`name: denied-sensitive-input
+version: 1
+style: pipeline
+maturity: experimental
+policies:
+  sensitive_inputs: deny
+steps: []
+`);
+    expect(secureAgentFlowTextInput(workflow, "ticket", "key: AF-44\n").value).toBe("key: AF-44\n");
+    expect(secureAgentFlowTextInput(workflow, "ticket", "ticket_key: AF-44\n").value)
+      .toBe("ticket_key: AF-44\n");
+    expect(secureAgentFlowJsonInput(workflow, "ticket", { issue_key: "AF-44" }))
+      .toEqual({ value: { issue_key: "AF-44" }, redacted: false });
+    for (const credentialKey of [
+      "PASS",
+      "PWD",
+      "DB_PASS",
+      "DB_PWD",
+      "REDIS_PASS",
+      "SSH_KEY",
+      "SSH_KEY_B64",
+      "SSH_KEY_PATH",
+      "DEPLOY_KEY",
+      "DEPLOY_KEY_FILE",
+      "SERVICE_KEY",
+      "SERVICE_KEY_PATH",
+      "SERVICE_ACCOUNT_KEY",
+      "SERVICE_ACCOUNT_KEY_JSON"
+    ]) {
+      expect(secureAgentFlowTextInput(workflow, "credential", `${credentialKey}=opaque-value\n`).value)
+        .toBe(`${credentialKey}=[REDACTED]\n`);
+      expect(secureAgentFlowJsonInput(workflow, "credential", { [credentialKey]: "opaque-value" }))
+        .toEqual({ value: { [credentialKey]: "[REDACTED]" }, redacted: true });
+      expect(() => secureAgentFlowJsonInput(deniedWorkflow, "credential", { [credentialKey]: "opaque-value" }))
+        .toThrow("denied by policies.sensitive_inputs");
+    }
+    expect(secureAgentFlowTextInput(workflow, "credential", "KEY=secret-value\n").value)
+      .toBe("KEY=[REDACTED]\n");
+    expect(secureAgentFlowTextInput(workflow, "credential", "tool --key secret-value\n").value)
+      .toBe("tool --key [REDACTED]\n");
+    for (const [source, expected] of [
+      ['export "API_TOKEN"=hunter2-value\n', 'export "API_TOKEN"=[REDACTED]\n'],
+      ["export 'API_TOKEN'=hunter2-value\n", "export 'API_TOKEN'=[REDACTED]\n"]
+    ] as const) {
+      expect(secureAgentFlowTextInput(workflow, "quoted shell credential", source).value).toBe(expected);
+      expect(() => secureAgentFlowTextInput(deniedWorkflow, "quoted shell credential", source))
+        .toThrow("denied by policies.sensitive_inputs");
+    }
+    for (const [source, expected] of [
+      ["PASSWORD+=opaque-secret\n", "PASSWORD+=[REDACTED]\n"],
+      ["API_TOKEN ?= opaque-secret\n", "API_TOKEN ?= [REDACTED]\n"],
+      ["PASSWORD := opaque-secret\n", "PASSWORD := [REDACTED]\n"]
+    ] as const) {
+      expect(secureAgentFlowTextInput(workflow, "compound credential", source).value).toBe(expected);
+      expect(() => secureAgentFlowTextInput(deniedWorkflow, "compound credential", source))
+        .toThrow("denied by policies.sensitive_inputs");
+    }
+    expect(secureAgentFlowTextInput(workflow, "credential", "api_token: first;second;third\n").value)
+      .toBe("api_token: [REDACTED]\n");
+    expect(secureAgentFlowTextInput(
+      workflow,
+      "password-only connection URI",
+      "REDIS_URL=redis://:opaque-password@localhost/0\n"
+    ).value).toBe("REDIS_URL=redis://:[REDACTED]@localhost/0\n");
+    expect(secureAgentFlowTextInput(
+      workflow,
+      "username-only connection URI",
+      "https://opaque-credential@example.test/repo"
+    ).value).toBe("https://[REDACTED]@example.test/repo");
+    expect(() => secureAgentFlowTextInput(
+      deniedWorkflow,
+      "username-only connection URI",
+      "https://opaque-credential@example.test/repo"
+    )).toThrow("denied by policies.sensitive_inputs");
+    for (const [source, redactedFragment] of [
+      ["setenv API_TOKEN hunter2abc\n", "API_TOKEN [REDACTED]"],
+      ["set -gx API_TOKEN hunter2abc\n", "API_TOKEN [REDACTED]"],
+      ["set --global --export API_TOKEN hunter2abc\n", "API_TOKEN [REDACTED]"],
+      ["printf -v API_TOKEN %s hunter2abc\n", "API_TOKEN [REDACTED]"],
+      ["ENV API_TOKEN hunter2abc\n", "API_TOKEN [REDACTED]"],
+      ["ENV API_TOKEN first-part\\\n  hunter2abc\n", "API_TOKEN [REDACTED]"],
+      ["setx API_TOKEN hunter2abc\n", "API_TOKEN [REDACTED]"],
+      ["setx /M \"API_TOKEN\" \"hunter2abc\"\n", "API_TOKEN [REDACTED]"],
+      ["setx API_TOKEN first-part^\n  hunter2abc\n", "API_TOKEN [REDACTED]"],
+      ["Set-Variable -Name API_TOKEN -Value hunter2abc\n", "API_TOKEN -Value [REDACTED]"],
+      ["Set-Variable -Value hunter2abc -Name 'API_TOKEN'\n", "API_TOKEN -Value [REDACTED]"],
+      ["Set-Variable API_TOKEN hunter2abc\n", "API_TOKEN -Value [REDACTED]"],
+      [
+        "[Environment]::SetEnvironmentVariable('API_TOKEN', 'hunter2abc')\n",
+        "'API_TOKEN', '[REDACTED]')"
+      ]
+    ] as const) {
+      expect(secureAgentFlowTextInput(workflow, "positional credential", source).value)
+        .toContain(redactedFragment);
+      expect(() => secureAgentFlowTextInput(deniedWorkflow, "positional credential", source))
+        .toThrow("denied by policies.sensitive_inputs");
+      expect(redactAgentFlowSensitiveText(source)).not.toContain("hunter2abc");
+    }
+    for (const ordinaryPositionalAssignment of [
+      "ENV RELEASE_CHANNEL stable\n",
+      "setx RELEASE_CHANNEL stable\n"
+    ]) {
+      expect(secureAgentFlowTextInput(workflow, "ordinary positional value", ordinaryPositionalAssignment))
+        .toEqual({ value: ordinaryPositionalAssignment, redacted: false });
+    }
+    for (const ordinaryCredentialProse of [
+      "Never expose secrets in logs.",
+      "Review how credentials are stored."
+    ]) {
+      expect(secureAgentFlowTextInput(workflow, "ordinary security guidance", ordinaryCredentialProse))
+        .toEqual({ value: ordinaryCredentialProse, redacted: false });
+    }
+    expect(() => assertAgentFlowAdapterStringSafe(workflow, "adapter identifier", "credentials"))
+      .not.toThrow();
+    for (const [source, expected] of [
+      [
+        'Authorization: Digest username="Mufasa", realm="test", nonce="abc", response="opaque-response"',
+        "Authorization: Digest [REDACTED]"
+      ],
+      [
+        "Authorization: AWS4-HMAC-SHA256 Credential=AKID/20260814/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=opaque-signature",
+        "Authorization: AWS4-HMAC-SHA256 [REDACTED]"
+      ],
+      ["Proxy-Authorization: Negotiate first-token trailing-token", "Proxy-Authorization: Negotiate [REDACTED]"],
+      [
+        'Authorization: Digest username="foo\\\"bar", response="opaque-secret"',
+        "Authorization: Digest [REDACTED]"
+      ]
+    ] as const) {
+      expect(secureAgentFlowTextInput(workflow, "authorization header", source).value).toBe(expected);
+    }
+    for (const ambiguousHeader of [
+      'Authorization: "opaque-authorization-secret',
+      "Authorization: 'opaque-authorization-secret",
+      "Authorization:\\r\\n opaque-authorization-secret",
+      "Proxy-Authorization:\\n opaque-proxy-secret",
+      "Cookie:\\t session=opaque-cookie-secret",
+      'Authorization: "opaque-authorization-secret" trailing-secret'
+    ]) {
+      expect(() => secureAgentFlowTextInput(workflow, "ambiguous credential header", ambiguousHeader))
+        .toThrow("ambiguous credential header");
+      expect(() => secureAgentFlowTextInput(deniedWorkflow, "ambiguous credential header", ambiguousHeader))
+        .toThrow("ambiguous credential header");
+      expect(() => secureAgentFlowJsonInput(workflow, "nested ambiguous credential header", {
+        body: ambiguousHeader
+      })).toThrow("ambiguous credential header");
+    }
+    expect(secureAgentFlowTextInput(
+      workflow,
+      "inline JSON",
+      '{"api_token":"opaquevalue","query":"keep"}\n'
+    ).value).toBe('{"api_token":"[REDACTED]","query":"keep"}\n');
+    for (const key of ["RAILS_MASTER_KEY", "JWT_SIGNING_KEY"]) {
+      expect(secureAgentFlowTextInput(workflow, "credential", `${key}=opaquevalue\n`).value)
+        .toBe(`${key}=[REDACTED]\n`);
+      expect(secureAgentFlowJsonInput(workflow, "credential", { [key]: "opaquevalue" }))
+        .toEqual({ value: { [key]: "[REDACTED]" }, redacted: true });
+    }
+    expect(secureAgentFlowTextInput(
+      workflow,
+      "quoted credentials",
+      '{"authorization":"opaque-value","cookie":"session-value"}\n'
+    ).value).not.toContain("opaque-value");
+
+    const securedJson = secureAgentFlowByteInput(
+      workflow,
+      "ticket JSON",
+      Buffer.from('{"key":"AF-44","api_token":"secret-value"}\n'),
+      "ticket.json",
+      "application/json"
+    );
+    expect(JSON.parse(Buffer.from(securedJson.value).toString("utf8"))).toEqual({
+      key: "AF-44",
+      api_token: "[REDACTED]"
+    });
+    expect(() => secureAgentFlowByteInput(
+      workflow,
+      "ticket JSON",
+      Buffer.from('{"id":9007199254740993,"api_token":"secret-value"}\n'),
+      "ticket.json",
+      "application/json"
+    )).toThrow("outside the safe lossless redaction range");
+    for (const unsafeNumber of ["9007199254740993.0", "9.007199254740993e15"]) {
+      expect(() => secureAgentFlowByteInput(
+        workflow,
+        "ticket JSON",
+        Buffer.from(`{"id":${unsafeNumber},"api_token":"secret-value"}\n`),
+        "ticket.json",
+        "application/json"
+      )).toThrow("outside the safe lossless redaction range");
+    }
+    for (const lossyNumber of ["0.1234567890123456789", "1e-400", "-0"]) {
+      expect(() => secureAgentFlowByteInput(
+        workflow,
+        "ticket JSON",
+        Buffer.from(`{"amount":${lossyNumber},"api_token":"secret-value"}\n`),
+        "ticket.json",
+        "application/json"
+      )).toThrow("outside the safe lossless redaction range");
+    }
+    const losslessJson = '{"id":9007199254740993,"key":"AF-44"}\n';
+    expect(Buffer.from(secureAgentFlowByteInput(
+      workflow,
+      "ticket JSON",
+      Buffer.from(losslessJson),
+      "ticket.json",
+      "application/json"
+    ).value).toString("utf8")).toBe(losslessJson);
+    const sniffedJson = secureAgentFlowByteInput(
+      workflow,
+      "untyped JSON artifact",
+      Buffer.from('{"api\\u005ftoken":"opaque-secret-value","query":"keep"}\n'),
+      "request.txt",
+      "application/octet-stream"
+    );
+    expect(JSON.parse(Buffer.from(sniffedJson.value).toString("utf8"))).toEqual({
+      api_token: "[REDACTED]",
+      query: "keep"
+    });
+    for (const markdown of [
+      "[Review instructions]\nCheck the diff.\n",
+      "{project} should remain literal\n",
+      "[link](https://example.com)\n"
+    ]) {
+      expect(secureAgentFlowTextInput(workflow, "Markdown prompt", markdown, "prompt.md").value)
+        .toBe(markdown);
+    }
+    const sniffedJsonArray = secureAgentFlowTextInput(
+      workflow,
+      "untyped JSON array",
+      '[{"api_token":"opaque-array-secret"}]\n',
+      "request.txt",
+      "application/octet-stream"
+    );
+    expect(JSON.parse(sniffedJsonArray.value)).toEqual([{ api_token: "[REDACTED]" }]);
+    expect(() => secureAgentFlowByteInput(
+      workflow,
+      "malformed untyped JSON artifact",
+      Buffer.from('{"api\\u005ftoken":"opaque-secret-value"'),
+      "request.txt",
+      "application/octet-stream"
+    )).toThrow("could not be parsed and sanitized safely");
+    for (const malformedArray of [
+      '[,{"api\\u005ftoken":"opaque-secret-value"}]',
+      '[/*comment*/{"api\\u005ftoken":"opaque-secret-value"}]'
+    ]) {
+      expect(() => secureAgentFlowByteInput(
+        workflow,
+        "malformed untyped JSON array",
+        Buffer.from(malformedArray),
+        "request.txt",
+        "application/octet-stream"
+      )).toThrow("could not be parsed and sanitized safely");
+    }
+    for (const [path, contentType, content] of [
+      [
+        "duplicate.json",
+        "application/json",
+        '{"note":"Authorization: Bearer leaked-value","note":"safe"}'
+      ],
+      [
+        "comment.yaml",
+        "application/yaml",
+        "note: safe\n# Authorization: Bearer leaked-value\n"
+      ]
+    ] as const) {
+      expect(() => secureAgentFlowByteInput(
+        workflow,
+        "lossy structured artifact",
+        Buffer.from(content),
+        path,
+        contentType
+      )).toThrow("structured source text that cannot be sanitized safely");
+    }
+
+    expect(() => secureAgentFlowTextInput(deniedWorkflow, "credential", "KEY=secret-value\n"))
+      .toThrow("denied by policies.sensitive_inputs");
+    expect(() => secureAgentFlowByteInput(
+      deniedWorkflow,
+      "untyped JSON artifact",
+      Buffer.from('{"api\\u005ftoken":"opaque-secret-value"}\n'),
+      "request.txt",
+      "application/octet-stream"
+    )).toThrow("denied by policies.sensitive_inputs");
+    expect(() => secureAgentFlowByteInput(
+      deniedWorkflow,
+      "malformed untyped JSON artifact",
+      Buffer.from('{"api\\u005ftoken":"opaque-secret-value"'),
+      "request.txt",
+      "application/octet-stream"
+    )).toThrow("could not be parsed and sanitized safely");
+    for (const malformedJson of ['{"password', '{"api\\u005ftoken']) {
+      expect(() => secureAgentFlowTextInput(
+        workflow,
+        "malformed declared JSON",
+        malformedJson,
+        "request.json",
+        "application/json"
+      )).toThrow("could not be parsed and sanitized safely");
+    }
+    for (const [contentType, content] of [
+      ["text/plain", "<password>opaque-xml-secret</password>"],
+      ["application/octet-stream", '"password" = "opaque-toml-secret"'],
+      ["text/plain", '<input type="password" value="opaque-html-secret">'],
+      ["application/octet-stream", "<input type=password value=opaque-html-secret>"],
+      ["text/plain", "<input name=password value=opaque-html-secret>"],
+      [
+        "text/plain",
+        [
+          "--credential-boundary",
+          'Content-Disposition: form-data; name="api_token"',
+          "",
+          "opaque-multipart-secret",
+          "--credential-boundary--"
+        ].join("\r\n")
+      ],
+      [
+        "application/octet-stream",
+        [
+          "--credential-boundary",
+          "Content-Disposition: form-data; name=api_token",
+          "",
+          "opaque-multipart-secret",
+          "--credential-boundary--"
+        ].join("\r\n")
+      ]
+    ] as const) {
+      for (const sensitiveWorkflow of [workflow, deniedWorkflow]) {
+        expect(() => secureAgentFlowByteInput(
+          sensitiveWorkflow,
+          "disguised structured artifact",
+          Buffer.from(content),
+          "notes.txt",
+          contentType
+        )).toThrow("no supported safe sanitizer");
+      }
+    }
+    expect(() => secureAgentFlowTextInput(
+      deniedWorkflow,
+      "password-only connection URI",
+      "REDIS_URL=redis://:opaque-password@localhost/0\n"
+    )).toThrow("denied by policies.sensitive_inputs");
+    expect(() => secureAgentFlowByteInput(
+      workflow,
+      "duplicate-key JSON artifact",
+      Buffer.from('{"policy":"first","policy":"second","api_token":"opaque"}\n'),
+      "request.json",
+      "application/json"
+    )).toThrow("duplicate object keys");
+    const duplicateOrdinaryJson = '{"policy":"first","policy":"second"}\n';
+    expect(Buffer.from(secureAgentFlowByteInput(
+      workflow,
+      "ordinary duplicate-key JSON artifact",
+      Buffer.from(duplicateOrdinaryJson),
+      "request.json",
+      "application/json"
+    ).value).toString("utf8")).toBe(duplicateOrdinaryJson);
+    expect(() => secureAgentFlowTextInput(
+      workflow,
+      "bare carriage-return credential",
+      "password: first-secret-part\r  second-secret-part\r"
+    )).toThrow("multiline secret-like assignment");
+    for (const blockScalar of [
+      "password: |\n\n  leaked-value\n",
+      "password: >-\n# comment\n  leaked-value\n"
+    ]) {
+      expect(() => secureAgentFlowTextInput(workflow, "YAML block credential", blockScalar))
+        .toThrow("multiline secret-like assignment");
+      expect(() => secureAgentFlowJsonInput(workflow, "nested YAML block credential", { body: blockScalar }))
+        .toThrow("multiline secret-like assignment");
+    }
+    const structuredMultilineSecret = "password: first-secret-part\n  second-secret-part";
+    expect(() => secureAgentFlowJsonInput(workflow, "multiline structured credential", {
+      nested: { note: structuredMultilineSecret }
+    })).toThrow("multiline secret-like assignment");
+    expect(() => secureAgentFlowByteInput(
+      workflow,
+      "multiline JSON credential",
+      Buffer.from(JSON.stringify({ nested: { note: structuredMultilineSecret } })),
+      "request.json",
+      "application/json"
+    )).toThrow("multiline secret-like assignment");
+    for (const shellQuotedSecret of [
+      "PASSWORD=$'first-secret-part\nsecond-secret-part",
+      'API_TOKEN=$"first-secret-part\nsecond-secret-part',
+      '$env:API_TOKEN = @"\nfirst-secret-part\n"@'
+    ]) {
+      expect(() => secureAgentFlowTextInput(workflow, "shell-quoted multiline credential", shellQuotedSecret))
+        .toThrow("multiline secret-like assignment");
+      expect(() => secureAgentFlowTextInput(deniedWorkflow, "shell-quoted multiline credential", shellQuotedSecret))
+        .toThrow("multiline secret-like assignment");
+      expect(() => secureAgentFlowJsonInput(workflow, "nested shell-quoted multiline credential", {
+        body: shellQuotedSecret
+      })).toThrow("multiline secret-like assignment");
+    }
+    for (const [nestedJson, expected] of [
+      ['{"api\\u005ftoken":"hunter2-value"}', '{"api_token":"[REDACTED]"}'],
+      ['[{"client\\u005fsecret":"opaque-value"}]', '[{"client_secret":"[REDACTED]"}]']
+    ] as const) {
+      expect(secureAgentFlowJsonInput(workflow, "JSON-encoded structured value", { body: nestedJson }))
+        .toEqual({ value: { body: expected }, redacted: true });
+      expect(() => secureAgentFlowJsonInput(deniedWorkflow, "JSON-encoded structured value", { body: nestedJson }))
+        .toThrow("denied by policies.sensitive_inputs");
+    }
+    const ordinaryNestedJson = '{ "ticket_key": "AF-44" }';
+    expect(secureAgentFlowJsonInput(workflow, "ordinary JSON-encoded value", { body: ordinaryNestedJson }))
+      .toEqual({ value: { body: ordinaryNestedJson }, redacted: false });
+    expect(() => secureAgentFlowJsonInput(workflow, "malformed JSON-encoded value", {
+      body: '{"api\\u005ftoken":"hunter2-value"'
+    })).toThrow("could not be parsed and sanitized safely");
+    expect(() => secureAgentFlowJsonInput(workflow, "lossy JSON-encoded value", {
+      body: '{"id":9007199254740993,"api_token":"hunter2-value"}'
+    })).toThrow("outside the safe lossless redaction range");
+    expect(() => secureAgentFlowJsonInput(workflow, "duplicate-key JSON-encoded value", {
+      body: '{"api_token":"first","api_token":"second"}'
+    })).toThrow("duplicate object keys");
+    for (const hiddenSecret of [
+      '{"note":"Authorization: Bearer abcdefghijklmnop","note":"safe"}',
+      '{"note":"password: leaked-value","note":"safe"}'
+    ]) {
+      expect(() => secureAgentFlowJsonInput(workflow, "duplicate-key hidden JSON credential", {
+        body: hiddenSecret
+      })).toThrow("secret-like JSON source text");
+      expect(() => secureAgentFlowJsonInput(deniedWorkflow, "duplicate-key hidden JSON credential", {
+        body: hiddenSecret
+      })).toThrow("secret-like JSON source text");
+    }
+    for (const embeddedStructuredSecret of [
+      "<password>opaque-xml-secret</password>",
+      "<input type=password value=opaque-html-secret>",
+      "<input name=password value=opaque-html-secret>",
+      '"database"."password" = "opaque-toml-secret"',
+      'database."client_secret" = "opaque-toml-secret"',
+      '"api\\u005ftoken" = "opaque-toml-secret"',
+      'database."client\\u005fsecret" = "opaque-toml-secret"'
+    ]) {
+      expect(() => secureAgentFlowJsonInput(workflow, "nested structured credential", {
+        nested: { content: embeddedStructuredSecret }
+      })).toThrow("no supported safe sanitizer");
+      expect(() => secureAgentFlowJsonInput(deniedWorkflow, "nested structured credential", {
+        nested: { content: embeddedStructuredSecret }
+      })).toThrow("no supported safe sanitizer");
+    }
+    for (const pluralKey of ["api_tokens", "api_keys", "passwords", "client_secrets"]) {
+      expect(secureAgentFlowTextInput(workflow, "plural credential", `${pluralKey}: opaque-value\n`).value)
+        .toBe(`${pluralKey}: [REDACTED]\n`);
+      expect(secureAgentFlowJsonInput(workflow, "plural credential", { [pluralKey]: "opaque-value" }))
+        .toEqual({ value: { [pluralKey]: "[REDACTED]" }, redacted: true });
+      expect(() => secureAgentFlowJsonInput(deniedWorkflow, "plural credential", { [pluralKey]: "opaque-value" }))
+        .toThrow("denied by policies.sensitive_inputs");
+    }
+    for (const nestedAssignment of [
+      "Note: API_TOKEN=hunter2",
+      "prefix: password=opaque",
+      "env: API_TOKEN=hunter2",
+      "$env:API_TOKEN = hunter2"
+    ]) {
+      expect(secureAgentFlowTextInput(workflow, "nested credential assignment", nestedAssignment).value)
+        .not.toContain("hunter2");
+      expect(secureAgentFlowTextInput(workflow, "nested credential assignment", nestedAssignment).value)
+        .not.toContain("opaque");
+      expect(() => secureAgentFlowTextInput(deniedWorkflow, "nested credential assignment", nestedAssignment))
+        .toThrow("denied by policies.sensitive_inputs");
+    }
+    const longOrdinaryAssignmentChain = `${"A=".repeat(5_000)}safe`;
+    expect(secureAgentFlowTextInput(workflow, "bounded ordinary assignment chain", longOrdinaryAssignmentChain))
+      .toEqual({ value: longOrdinaryAssignmentChain, redacted: false });
+    const longSensitiveAssignmentChain = `${"A=".repeat(5_000)}API_TOKEN=hunter2`;
+    const securedLongChain = secureAgentFlowTextInput(workflow, "bounded sensitive assignment chain", longSensitiveAssignmentChain);
+    expect(securedLongChain.redacted).toBe(true);
+    expect(securedLongChain.value).not.toContain("hunter2");
+    expect(() => secureAgentFlowTextInput(deniedWorkflow, "bounded sensitive assignment chain", longSensitiveAssignmentChain))
+      .toThrow("denied by policies.sensitive_inputs");
+    for (const secretBearingKey of [
+      "api_token=opaque-secret",
+      "Authorization: Bearer abcdefghijklmnop",
+      "ghp_abcdefghijklmnopqrstuvwxyz",
+      "https://user:password@example.com"
+    ]) {
+      expect(() => secureAgentFlowJsonInput(workflow, "secret-bearing object key", {
+        nested: { [secretBearingKey]: true }
+      })).toThrow("secret material in an object key");
+      expect(() => secureAgentFlowJsonInput(deniedWorkflow, "secret-bearing object key", {
+        nested: { [secretBearingKey]: true }
+      })).toThrow("secret material in an object key");
+    }
+    for (const structuredPath of [
+      { files: { primary: "credentials.json" } },
+      { path: { value: ".env" } },
+      { url: "file:///repo/.env" },
+      { urls: { primary: "file:///repo/credentials.json" } },
+      { source: ".env" },
+      { source: ".netrc" },
+      { source: ".pgpass" },
+      { path: "C:.netrc" },
+      { path: "D:.pgpass" },
+      { path: "/home/user/.ssh/id_ecdsa" },
+      { path: "/home/user/.ssh/id_dsa" },
+      { path: "keys/id_ecdsa" },
+      { path: "keys/id_dsa" },
+      { path: "/home/user/.ssh/deploy_key" },
+      { path: "/home/user/.ssh/github" },
+      { files: { ".env": true } },
+      { urls: { "file:///repo/.netrc": true } },
+      { files: { primary: "inputs/ghp_abcdefghijklmnopqrstuvwxyz.txt" } },
+      { path: "inputs/api_token=opaque-secret.txt" },
+      { url: "https://example.test/%2Eenv" },
+      { url: "https://example.test/%252Eenv" },
+      { url: "https://example.test/%2Edocker/config.json" },
+      { url: "https://example.test/call?api%5Ftoken=hunter2" },
+      { url: "https://example.test/call?api%255Ftoken=hunter2" },
+      { arbitrary: ["credentials.json"] }
+    ]) {
+      expect(() => secureAgentFlowJsonInput(workflow, "nested path", structuredPath))
+        .toThrow("secret-like path");
+      expect(() => secureAgentFlowJsonInput(deniedWorkflow, "nested path", structuredPath))
+        .toThrow("secret-like path");
+    }
+    for (const embeddedPath of [
+      "cat .env && echo done",
+      "cat /repo/.env | grep TOKEN",
+      "cat credentials.json && true",
+      "Read file:///repo/.env now",
+      "Inspect config/master.key",
+      "Read /etc/shadow.",
+      "Inspect /proc/self/environ?",
+      "Open .env.",
+      "Read credentials.json.",
+      "https://example.test/?%70assword=hunter2",
+      "https://example.test/?api%5Ftoken=hunter2",
+      "filename=.netrc",
+      "filename=%2enetrc",
+      "Content-Disposition: form-data; name=file; filename=.netrc\r\n\r\nmachine example.test login bob password hunter2"
+    ]) {
+      expect(() => secureAgentFlowTextInput(workflow, "embedded sensitive path", embeddedPath))
+        .toThrow("secret-like path");
+      expect(() => secureAgentFlowTextInput(deniedWorkflow, "embedded sensitive path", embeddedPath))
+        .toThrow("secret-like path");
+      expect(() => secureAgentFlowJsonInput(workflow, "embedded sensitive path", { command: embeddedPath }))
+        .toThrow("secret-like path");
+      expect(() => secureAgentFlowJsonInput(deniedWorkflow, "embedded sensitive path", { command: embeddedPath }))
+        .toThrow("secret-like path");
+    }
+    for (const fileUrl of [
+      "file:///repo/%2Eenv",
+      "file:///repo/.env?raw=1",
+      "file:///home/user/.docker/config.json#auth",
+      "file:///repo/%252Eenv",
+      "file:///repo/%2525252Eenv",
+      "file:///repo/.netrc~",
+      "file:///repo/.docker/config.json.swp",
+      "file:///proc/self/environ",
+      "file:///proc/1/task/1/cmdline",
+      "https://callback.test/#api%5Ftoken=hunter2",
+      "file:///safe#/%2Eenv",
+      "https://example.test/call?file=.netrc",
+      "https://example.test/call?file=%252Epgpass",
+      "https://example.test/call#file=.npmrc",
+      "https://example.test/call#.pypirc"
+    ]) {
+      expect(() => secureAgentFlowJsonInput(workflow, "encoded file URL", { url: fileUrl }))
+        .toThrow("secret-like path");
+      expect(() => secureAgentFlowJsonInput(deniedWorkflow, "encoded file URL", { url: fileUrl }))
+        .toThrow("secret-like path");
+    }
+    for (const pseudoFile of [
+      "/proc/self/environ",
+      "/proc/thread-self/cmdline",
+      "/proc/1/environ",
+      "/proc/1/task/1/cmdline",
+      "/etc/./shadow",
+      "/etc//shadow",
+      "/dev/fd/3",
+      "/dev/stdin",
+      "/dev/stdout",
+      "/dev/stderr"
+    ]) {
+      expect(() => secureAgentFlowJsonInput(workflow, "process pseudo-file", { path: pseudoFile }))
+        .toThrow("secret-like path");
+      expect(() => secureAgentFlowJsonInput(deniedWorkflow, "process pseudo-file", { path: pseudoFile }))
+        .toThrow("secret-like path");
+    }
+
+    expect(() => secureAgentFlowTextInput(
+      workflow,
+      "environment",
+      "API_TOKEN=known\nCUSTOM_VALUE=still-secret\n",
+      ".env"
+    )).toThrow("complete redaction cannot be verified");
+    expect(() => secureAgentFlowTextInput(
+      workflow,
+      "Windows environment",
+      "ignored",
+      String.raw`C:\repo\.env`
+    )).toThrow("complete redaction cannot be verified");
+    for (const dotenvPath of ["production.env", "config/staging.env.local", ".envrc"]) {
+      expect(() => secureAgentFlowTextInput(
+        workflow,
+        "suffix-style environment",
+        "RAILS_MASTER_KEY=opaque-secret\n",
+        dotenvPath
+      )).toThrow("secret-like path");
+      expect(() => secureAgentFlowTextInput(
+        deniedWorkflow,
+        "suffix-style environment",
+        "RAILS_MASTER_KEY=opaque-secret\n",
+        dotenvPath
+      )).toThrow("secret-like path");
+    }
+    for (const credentialPath of [
+      ".env~",
+      ".htpasswd",
+      ".htpasswd.bak",
+      "config/.htpasswd",
+      ".netrc",
+      ".netrc~",
+      ".pgpass",
+      ".my.cnf",
+      ".npmrc",
+      ".pypirc",
+      ".docker/config.json",
+      ".docker/config.json.backup",
+      ".kube/config",
+      ".kube/config.old",
+      "/home/user/.gnupg/private-keys-v1.d/0123456789ABCDEF.key",
+      "/home/user/.aws/credentials",
+      "/home/user/.azure/accessTokens.json",
+      "/home/user/.config/containers/auth.json"
+    ]) {
+      expect(() => secureAgentFlowTextInput(workflow, "credential file", "opaque", credentialPath))
+        .toThrow("secret-like path");
+      expect(() => secureAgentFlowTextInput(deniedWorkflow, "credential file", "opaque", credentialPath))
+        .toThrow("secret-like path");
+    }
+    for (const railsKeyPath of ["config/master.key", "config/credentials/production.key"]) {
+      expect(() => secureAgentFlowTextInput(workflow, "Rails credential key", "opaque", railsKeyPath))
+        .toThrow("secret-like path");
+      expect(() => secureAgentFlowTextInput(deniedWorkflow, "Rails credential key", "opaque", railsKeyPath))
+        .toThrow("secret-like path");
+    }
+    expect(() => secureAgentFlowByteInput(
+      workflow,
+      "malformed text",
+      Buffer.from([0xff, ...Buffer.from("API_TOKEN=secret-value")]),
+      "notes.txt",
+      "text/plain"
+    )).toThrow("cannot be inspected or redacted safely");
+    expect(() => secureAgentFlowByteInput(
+      workflow,
+      "YAML artifact",
+      Buffer.from("api_token: |\n  still-secret\n"),
+      "config.yaml",
+      "application/yaml"
+    )).toThrow("cannot be reserialized safely");
+    for (const content of [
+      "api_token: |\n  still-secret\n",
+      "api_token: first-secret-part\n  second-secret-part\n",
+      "password:\n  still-secret\n",
+      "'client_secret': >-\n  still-secret\n",
+      "api_token=first-secret-part\n  second-secret-part\n",
+      "api_token = \"\"\"first-secret-part\nsecond-secret-part\"\"\"\n",
+      "client_secret = '''first-secret-part\nsecond-secret-part'''\n",
+      "password=first-secret-part\\\nsecond-secret-part\n",
+      "api_token = [\n\"array-secret\"\n]\n",
+      "api_token={\nvalue = \"object-secret\"\n}\n",
+      "password=<<EOF\nheredoc-secret\nEOF\n",
+      "client_secret=<<-'SECRET'\nheredoc-secret\nSECRET\n",
+      "password = <<~RUBY\nsquiggly-heredoc-secret\nRUBY\n",
+      "PASSWORD=$(cat <<EOF\nshell-substitution-secret\nEOF\n)\n",
+      "PASSWORD=$(cat <<EOF)\ninline-heredoc-secret\nEOF\n",
+      "PASSWORD=`cat <<EOF\nbacktick-substitution-secret\nEOF\n`\n",
+      "export PASSWORD=$(cat <<EOF\nprefixed-shell-secret\nEOF\n)\n",
+      "readonly PASSWORD=<<EOF\nprefixed-heredoc-secret\nEOF\n",
+      "env PASSWORD=`cat <<EOF\nprefixed-backtick-secret\nEOF\n`\n",
+      "API_TOKEN=${TOKEN:-\nparameter-expansion-secret\n}\n",
+      "CLIENT_SECRET=$((1 +\narithmetic-expansion-secret\n))\n",
+      "api_token=\"first-secret-part\nsecond-secret-part\"\n",
+      "api_token=\nsecret-on-next-line\n",
+      "PASSWORD+=first-secret-part\n  second-secret-part\n",
+      "API_TOKEN ?= first-secret-part\n  second-secret-part\n",
+      "API_TOKEN=prefix\"first-secret-part\nsecond-secret-part\"\n",
+      "CLIENT_SECRET=prefix'first-secret-part\nsecond-secret-part'\n",
+      "PASSWORD=prefix`first-secret-part\nsecond-secret-part`\n"
+    ]) {
+      expect(() => secureAgentFlowTextInput(workflow, "unstructured input", content, "notes.md"))
+        .toThrow("multiline secret-like assignment");
+    }
+    for (const prefixedMultilineSecret of [
+      'Note: API_TOKEN="first-secret-part\nsecond-secret-part',
+      'A=1 API_TOKEN="first-secret-part\nsecond-secret-part'
+    ]) {
+      expect(() => secureAgentFlowTextInput(workflow, "prefixed multiline credential", prefixedMultilineSecret))
+        .toThrow("multiline secret-like assignment");
+      expect(redactAgentFlowSensitiveText(prefixedMultilineSecret)).not.toContain("first-secret-part");
+      expect(redactAgentFlowSensitiveText(prefixedMultilineSecret)).not.toContain("second-secret-part");
+    }
+    for (const indexedAssignment of [
+      "PASSWORD[0]=indexed-secret",
+      "API_TOKENS[prod]=indexed-secret",
+      "export CLIENT_SECRET[primary]=indexed-secret",
+      'config["api_token"] = "indexed-secret"',
+      'os.environ["PASSWORD"] = "indexed-secret"',
+      "PASSWORD[0]=first-part\\\nsecond-part"
+    ]) {
+      expect(() => secureAgentFlowTextInput(workflow, "indexed credential", indexedAssignment, "notes.md"))
+        .toThrow("indexed secret-like assignment");
+      expect(() => secureAgentFlowJsonInput(deniedWorkflow, "indexed credential", { body: indexedAssignment }))
+        .toThrow("indexed secret-like assignment");
+    }
+    expect(secureAgentFlowTextInput(workflow, "ordinary indexed assignment", "VALUES[0]=ordinary", "notes.md"))
+      .toEqual({ value: "VALUES[0]=ordinary", redacted: false });
+    for (const [content, secured] of [
+      ["PASSWORD=$(printf ordinary)\nnext line\n", "PASSWORD=[REDACTED]\nnext line\n"],
+      ["PASSWORD=`printf ordinary`\nnext line\n", "PASSWORD=[REDACTED]\nnext line\n"],
+      ["API_TOKEN=${TOKEN:-ordinary}\nnext line\n", "API_TOKEN=[REDACTED]\nnext line\n"],
+      ["CLIENT_SECRET=$((1 + 1))\nnext line\n", "CLIENT_SECRET=[REDACTED]\nnext line\n"]
+    ] as const) {
+      expect(secureAgentFlowTextInput(workflow, "single-line shell assignment", content, "notes.md").value)
+        .toBe(secured);
+    }
+    for (const content of [
+      "-----BEGIN PRIVATE KEY-----\nopaque-private-key-material\n",
+      "-----BEGIN PGP PRIVATE KEY BLOCK-----\nopaque-private-key-material\n-----END PRIVATE KEY-----\n"
+    ]) {
+      expect(() => secureAgentFlowTextInput(workflow, "private key", content, "notes.md"))
+        .toThrow("private-key material");
+      expect(() => secureAgentFlowJsonInput(workflow, "private key", { source: content }))
+        .toThrow("private-key material");
+    }
+    for (const [path, contentType, content] of [
+      ["config.json", "application/json", '{"api_token" /*comment*/: "leaked-secret-value"}'],
+      ["config.yaml", "application/yaml", "api_token: [unterminated\n"]
+    ] as const) {
+      expect(() => secureAgentFlowByteInput(
+        workflow,
+        "malformed structured artifact",
+        Buffer.from(content),
+        path,
+        contentType
+      )).toThrow("could not be parsed and sanitized safely");
+    }
+    for (const [path, contentType, content] of [
+      ["credential.xml", "application/xml", "<password>opaquevalue</password>"],
+      ["credential.toml", "application/toml", '"password" = "opaquevalue"'],
+      [
+        "upload.bin",
+        "multipart/form-data; boundary=credential",
+        '--credential\r\nContent-Disposition: form-data; name="password"\r\n\r\nopaquevalue\r\n--credential--\r\n'
+      ],
+      ["credential.eml", "message/rfc822", "Password: opaquevalue\r\n"]
+    ] as const) {
+      expect(() => secureAgentFlowByteInput(
+        workflow,
+        "unsupported structured artifact",
+        Buffer.from(content),
+        path,
+        contentType
+      )).toThrow("no supported safe sanitizer");
+      expect(() => secureAgentFlowByteInput(
+        deniedWorkflow,
+        "unsupported structured artifact",
+        Buffer.from(content),
+        path,
+        contentType
+      )).toThrow("no supported safe sanitizer");
+    }
+  });
+
+  test("allows reviewed sensitive model inputs only through explicit policy", async () => {
+    const root = temporaryRepo();
+    fs.writeFileSync(path.join(root, ".env"), "API_TOKEN=prompt-secret-value\n");
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: explicitly-allowed-sensitive-input
+version: 1
+style: pipeline
+maturity: experimental
+policies:
+  sensitive_inputs: allow
+sessions:
+  writer: { provider: fixture }
+steps:
+  - { id: draft, type: session_request, session: writer, prompt: .env, inputs: [credentials.json], outputs: [response.md] }
+`);
+    expect(Buffer.from(secureAgentFlowByteInput(
+      workflow,
+      "reviewed XML artifact",
+      Buffer.from("<password>reviewed-value</password>"),
+      "credential.xml",
+      "application/xml"
+    ).value).toString("utf8")).toBe("<password>reviewed-value</password>");
+    expect(Buffer.from(secureAgentFlowByteInput(
+      workflow,
+      "reviewed untyped JSON artifact",
+      Buffer.from('{"api\\u005ftoken":"reviewed-value"}\n'),
+      "request.txt",
+      "application/octet-stream"
+    ).value).toString("utf8")).toBe('{"api\\u005ftoken":"reviewed-value"}\n');
+    expect(secureAgentFlowJsonInput(workflow, "reviewed file URL", { url: "file:///repo/%2Eenv" }))
+      .toEqual({ value: { url: "file:///repo/%2Eenv" }, redacted: false });
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "allowed-sensitive-input", workflow });
+    store.writeArtifact({
+      id: "credentials",
+      runId: "allowed-sensitive-input",
+      path: "credentials.json",
+      kind: "fixture",
+      contentType: "application/json",
+      content: '{"api_token":"artifact-secret-value"}\n'
+    });
+    let prompt = "";
+    let input = "";
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => {
+      prompt = request.prompt.content;
+      input = Buffer.from(request.inputs[0]!.content).toString("utf8");
+      return { outputs: { "response.md": "Reviewed response" } };
+    });
+
+    expect((await executeAgentFlowCommandPipeline(
+      store,
+      "allowed-sensitive-input",
+      workflow,
+      undefined,
+      providers
+    )).status).toBe("completed");
+    expect(prompt).toContain("prompt-secret-value");
+    expect(input).toContain("artifact-secret-value");
+    store.close();
+  });
+
+  test("does not scan synthetic generated-prompt paths as external input paths", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: generated-prompt-path
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  reviewer: { provider: fixture, authority: { can_approve: true } }
+steps:
+  - { id: approve-secrets, type: approval, reviewer: reviewer, artifacts: [spec.md], output: approvals/result.json }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "generated-prompt-path", workflow });
+    store.writeArtifact({
+      id: "spec",
+      runId: "generated-prompt-path",
+      path: "spec.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Review this ordinary specification."
+    });
+    let promptPath = "";
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => {
+      promptPath = request.prompt.path;
+      return {
+        outputs: {
+          "approvals/result.json": JSON.stringify({ status: "approved", decision: "The specification is safe." })
+        }
+      };
+    });
+
+    expect((await executeAgentFlowCommandPipeline(
+      store,
+      "generated-prompt-path",
+      workflow,
+      undefined,
+      providers
+    )).status).toBe("completed");
+    expect(promptPath).toContain("approve-secrets");
+    store.close();
+  });
+
+  test("preserves generated prompt source provenance when a field is redacted", async () => {
+    const root = temporaryRepo();
+    const message = "Approve with API_TOKEN=generated-prompt-secret";
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: generated-prompt-provenance
+version: 1
+style: pipeline
+maturity: experimental
+policies: { sensitive_inputs: redact }
+sessions:
+  reviewer: { provider: fixture, authority: { can_approve: true } }
+steps:
+  - { id: approve, type: approval, reviewer: reviewer, artifacts: [spec.md], output: approvals/result.json }
+`);
+    workflow.steps[0]!.message = message;
+    const sourcePrompt = createAgentFlowApprovalPrompt(
+      "approve",
+      "reviewer",
+      ["spec.md"],
+      "approvals/result.json",
+      message
+    );
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "generated-prompt-provenance", workflow });
+    store.writeArtifact({
+      id: "spec",
+      runId: "generated-prompt-provenance",
+      path: "spec.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Review this ordinary specification."
+    });
+    let captured: AgentFlowSessionProviderRequest | undefined;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => {
+      captured = request;
+      return {
+        outputs: {
+          "approvals/result.json": JSON.stringify({ status: "approved", decision: "Safe" })
+        }
+      };
+    });
+
+    expect((await executeAgentFlowCommandPipeline(
+      store,
+      "generated-prompt-provenance",
+      workflow,
+      undefined,
+      providers
+    )).status).toBe("completed");
+    expect(captured!.prompt.content).toContain("API_TOKEN=[REDACTED]");
+    expect(captured!.prompt.checksum).not.toBe(sourcePrompt.checksum);
+    const requestArtifact = store.listArtifacts("generated-prompt-provenance")
+      .find((artifact) => artifact.kind === "approval_request")!;
+    const requestMetadata = JSON.parse(
+      store.readArtifact("generated-prompt-provenance", requestArtifact.declaredPath).content.toString("utf8")
+    );
+    expect(requestMetadata.prompt).toEqual({
+      path: sourcePrompt.path,
+      checksum: sourcePrompt.checksum,
+      providerChecksum: captured!.prompt.checksum,
+      redacted: true
+    });
+    store.close();
+  });
+
+  test("enforces generated prompt source limits before sensitive-data redaction", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: generated-prompt-source-limit
+version: 1
+style: pipeline
+maturity: experimental
+policies: { sensitive_inputs: redact }
+sessions:
+  reviewer: { provider: fixture, authority: { can_approve: true } }
+steps:
+  - { id: approve, type: approval, reviewer: reviewer, artifacts: [spec.md], output: approvals/result.json }
+`);
+    workflow.steps[0]!.message = `API_TOKEN=${"x".repeat(MAX_AGENT_FLOW_SESSION_PROMPT_BYTES)}`;
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "generated-prompt-source-limit", workflow });
+    store.writeArtifact({
+      id: "spec",
+      runId: "generated-prompt-source-limit",
+      path: "spec.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Review this ordinary specification."
+    });
+    let invoked = false;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+      invoked = true;
+      return {
+        outputs: {
+          "approvals/result.json": JSON.stringify({ status: "approved", decision: "Safe" })
+        }
+      };
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      "generated-prompt-source-limit",
+      workflow,
+      undefined,
+      providers
+    );
+
+    expect(result).toMatchObject({ status: "paused" });
+    expect(result.message).toContain("session prompt limit");
+    expect(invoked).toBe(false);
+    store.close();
+  });
+
+  test("preflights generated prompt content during simulation", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: simulated-sensitive-generated-prompt
+version: 1
+style: pipeline
+maturity: experimental
+policies: { sensitive_inputs: deny }
+sessions:
+  reviewer: { provider: fixture, authority: { can_approve: true } }
+steps:
+  - id: approve
+    type: approval
+    reviewer: reviewer
+    message: "API_TOKEN=generated-prompt-secret"
+    artifacts: [spec.md]
+    output: approvals/result.json
+`);
+    const fixture = {
+      artifacts: { "spec.md": "Ordinary specification" },
+      steps: {
+        approve: {
+          outputs: {
+            "approvals/result.json": { status: "approved", decision: "Safe" }
+          }
+        }
+      }
+    };
+
+    expect(simulateAgentFlowWorkflow(workflow, fixture)).toMatchObject({
+      status: "paused",
+      availableArtifacts: ["spec.md"],
+      terminalStates: [{ stepId: "approve", status: "paused" }]
+    });
+
+    const allowedWorkflow = structuredClone(workflow);
+    allowedWorkflow.policies = { sensitive_inputs: "allow" };
+    expect(simulateAgentFlowWorkflow(allowedWorkflow, fixture)).toMatchObject({
+      status: "completed",
+      availableArtifacts: ["approvals/result.json", "spec.md"]
+    });
+
+    const oversizedWorkflow = structuredClone(allowedWorkflow);
+    oversizedWorkflow.policies = { sensitive_inputs: "redact" };
+    oversizedWorkflow.steps[0]!.message = "token=x\n".repeat(100_000);
+    expect(simulateAgentFlowWorkflow(oversizedWorkflow, fixture)).toMatchObject({
+      status: "paused",
+      availableArtifacts: ["spec.md"],
+      terminalStates: [{ stepId: "approve", status: "paused" }]
+    });
+
+    const oversizedSourceWorkflow = structuredClone(allowedWorkflow);
+    oversizedSourceWorkflow.policies = { sensitive_inputs: "redact" };
+    oversizedSourceWorkflow.steps[0]!.message =
+      `API_TOKEN=${"x".repeat(MAX_AGENT_FLOW_SESSION_PROMPT_BYTES)}`;
+    expect(simulateAgentFlowWorkflow(oversizedSourceWorkflow, fixture)).toMatchObject({
+      status: "paused",
+      availableArtifacts: ["spec.md"],
+      terminalStates: [{ stepId: "approve", status: "paused" }]
+    });
+  });
+
+  test("preflights sensitive session paths during simulation", () => {
+    const defaultWorkflow = parseAgentFlowWorkflowOrThrow(`name: simulated-sensitive-session
+version: 1
+style: pipeline
+maturity: experimental
+sessions: { writer: { provider: fixture } }
+steps:
+  - { id: draft, type: session_request, session: writer, prompt: .env, inputs: [request.md], outputs: [response.md] }
+`);
+    const fixture = {
+      artifacts: { "request.md": "Request" },
+      steps: { draft: { outputs: { "response.md": "Response" } } }
+    };
+
+    expect(simulateAgentFlowWorkflow(defaultWorkflow, fixture)).toMatchObject({
+      status: "paused",
+      availableArtifacts: ["request.md"],
+      terminalStates: [{ stepId: "draft", status: "paused" }]
+    });
+
+    const sensitiveInputWorkflow = parseAgentFlowWorkflowOrThrow(`name: simulated-sensitive-session-input
+version: 1
+style: pipeline
+maturity: experimental
+sessions: { writer: { provider: fixture } }
+steps:
+  - { id: draft, type: session_request, session: writer, prompt: prompt.md, inputs: [credentials.json], outputs: [response.md] }
+`);
+    expect(simulateAgentFlowWorkflow(sensitiveInputWorkflow, {
+      artifacts: { "credentials.json": { key: "ordinary-value" } },
+      steps: { draft: { outputs: { "response.md": "Response" } } }
+    })).toMatchObject({
+      status: "paused",
+      availableArtifacts: ["credentials.json"],
+      terminalStates: [{ stepId: "draft", status: "paused" }]
+    });
+
+    const allowedWorkflow = parseAgentFlowWorkflowOrThrow(`name: simulated-allowed-sensitive-session
+version: 1
+style: pipeline
+maturity: experimental
+policies: { sensitive_inputs: allow }
+sessions: { writer: { provider: fixture } }
+steps:
+  - { id: draft, type: session_request, session: writer, prompt: .env, inputs: [request.md], outputs: [response.md] }
+`);
+    expect(simulateAgentFlowWorkflow(allowedWorkflow, fixture)).toMatchObject({
+      status: "completed",
+      availableArtifacts: ["request.md", "response.md"]
+    });
+  });
+
+  test("mirrors referenced-input provenance and output-name checks during session simulation", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: simulated-referenced-session-credential
+version: 1
+style: pipeline
+maturity: experimental
+inputs: { credential: { required: true } }
+sessions: { writer: { provider: fixture } }
+steps:
+  - { id: draft, type: session_request, session: writer, prompt: prompt.md, inputs: ["{{ inputs.credential }}"], outputs: [response.csv] }
+`);
+    const fixture = {
+      inputs: { credential: "payload.txt" },
+      artifacts: { "payload.txt": "hunter2abc" },
+      steps: { draft: { outputs: { "response.csv": "status\ncomplete\n" } } }
+    };
+
+    expect(simulateAgentFlowWorkflow(workflow, fixture)).toMatchObject({
+      status: "completed",
+      availableArtifacts: ["payload.txt", "response.csv"]
+    });
+
+    const deniedWorkflow = structuredClone(workflow);
+    deniedWorkflow.policies = { sensitive_inputs: "deny" };
+    expect(simulateAgentFlowWorkflow(deniedWorkflow, fixture)).toMatchObject({
+      status: "paused",
+      availableArtifacts: ["payload.txt"]
+    });
+
+    const unsafeIdentityWorkflow = structuredClone(workflow);
+    unsafeIdentityWorkflow.steps[0]!.id = "api_token=opaque";
+    expect(simulateAgentFlowWorkflow(unsafeIdentityWorkflow, {
+      ...fixture,
+      steps: { "api_token=opaque": fixture.steps.draft }
+    })).toMatchObject({ status: "paused", availableArtifacts: ["payload.txt"] });
+  });
+
+  test("preflights unsupported availability-only session inputs during simulation", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: simulated-unsupported-session-input
+version: 1
+style: pipeline
+maturity: experimental
+sessions: { writer: { provider: fixture } }
+steps:
+  - { id: prepare, type: command, command: echo, outputs: [data.csv] }
+  - { id: draft, type: session_request, session: writer, prompt: prompt.md, inputs: [data.csv], outputs: [response.md] }
+`);
+    const fixture = {
+      steps: {
+        prepare: { outputs: ["data.csv"] },
+        draft: { outputs: { "response.md": "Response" } }
+      }
+    };
+
+    expect(simulateAgentFlowWorkflow(workflow, fixture)).toMatchObject({
+      status: "paused",
+      availableArtifacts: ["data.csv"],
+      terminalStates: [{ stepId: "draft", status: "paused" }]
+    });
+
+    const allowedWorkflow = structuredClone(workflow);
+    allowedWorkflow.policies = { sensitive_inputs: "allow" };
+    expect(simulateAgentFlowWorkflow(allowedWorkflow, fixture)).toMatchObject({
+      status: "completed",
+      availableArtifacts: ["data.csv", "response.md"]
+    });
   });
 
   test("simulates output collisions with runtime overwrite semantics", () => {
@@ -408,6 +1730,375 @@ steps:
     store.close();
   });
 
+  test("redacts adapter-native session errors before pipeline persistence", async () => {
+    const root = temporaryRepo();
+    fs.mkdirSync(path.join(root, "prompts"), { recursive: true });
+    fs.writeFileSync(path.join(root, "prompts", "draft.md"), "Draft.\n");
+    const workflow = sessionWorkflow();
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "redacted-native-session-error", workflow });
+    store.writeArtifact({
+      id: "request",
+      runId: "redacted-native-session-error",
+      path: "request.md",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "Request"
+    });
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+      throw new AgentFlowSessionRequestError(
+        "provider rejected Authorization: Bearer adapter-secret-value; api_tokens: plural-session-secret",
+        "FIXTURE_REJECTED"
+      );
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      "redacted-native-session-error",
+      workflow,
+      undefined,
+      providers
+    );
+
+    expect(result.message).toContain("Authorization: Bearer [REDACTED]");
+    expect(JSON.stringify(result)).not.toContain("adapter-secret-value");
+    expect(JSON.stringify(store.getSession("redacted-native-session-error", "writer"))).not.toContain("adapter-secret-value");
+    expect(JSON.stringify(store.listEvents("redacted-native-session-error"))).not.toContain("adapter-secret-value");
+    expect(JSON.stringify(result)).not.toContain("plural-session-secret");
+    expect(JSON.stringify(store.getSession("redacted-native-session-error", "writer"))).not.toContain("plural-session-secret");
+    expect(JSON.stringify(store.listEvents("redacted-native-session-error"))).not.toContain("plural-session-secret");
+    store.close();
+  });
+
+  test("sanitizes adapter error causes at the exported session boundary", async () => {
+    const root = temporaryRepo();
+    fs.mkdirSync(path.join(root, "prompts"), { recursive: true });
+    fs.writeFileSync(path.join(root, "prompts", "draft.md"), "Draft.\n");
+    const workflow = sessionWorkflow();
+    const store = await openAgentFlowRunState({ cwd: root });
+    store.createRun({
+      id: "sanitized-direct-session-error",
+      status: "running",
+      workflow: { name: workflow.name, version: workflow.version, style: workflow.style, maturity: workflow.maturity },
+      context: { workflow }
+    });
+    store.writeArtifact({
+      id: "request",
+      runId: "sanitized-direct-session-error",
+      path: "request.md",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "Request"
+    });
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+      throw new AgentFlowSessionRequestError(
+        "Authorization: Bearer direct-session-secret-value",
+        "FIXTURE_REJECTED"
+      );
+    });
+
+    try {
+      await executeAgentFlowSessionRequest(
+        store,
+        "sanitized-direct-session-error",
+        workflow,
+        workflow.steps[0]!,
+        providers
+      );
+      throw new Error("Expected direct session execution to fail.");
+    } catch (error) {
+      expect(error).toBeInstanceOf(AgentFlowSessionRequestError);
+      expect((error as Error).message).toContain("Authorization: Bearer [REDACTED]");
+      expect(((error as Error).cause as Error | undefined)?.message).toContain("Authorization: Bearer [REDACTED]");
+      expect(JSON.stringify({
+        message: (error as Error).message,
+        cause: ((error as Error).cause as Error | undefined)?.message
+      })).not.toContain("direct-session-secret-value");
+    }
+    store.close();
+  });
+
+  test("sanitizes response-processing errors at the exported session boundary", async () => {
+    const root = temporaryRepo();
+    fs.mkdirSync(path.join(root, "prompts"), { recursive: true });
+    fs.writeFileSync(path.join(root, "prompts", "draft.md"), "Draft.\n");
+    const workflow = sessionWorkflow();
+    const store = await openAgentFlowRunState({ cwd: root });
+    store.createRun({
+      id: "sanitized-session-response-error",
+      status: "running",
+      workflow: { name: workflow.name, version: workflow.version, style: workflow.style, maturity: workflow.maturity },
+      context: { workflow }
+    });
+    store.writeArtifact({
+      id: "request",
+      runId: "sanitized-session-response-error",
+      path: "request.md",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "Request"
+    });
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () =>
+      new Proxy({ outputs: { "response.md": "unused" } }, {
+        get(target, property, receiver) {
+          if (property === "outputs") throw new Error("Authorization: Bearer session-response-secret");
+          return Reflect.get(target, property, receiver);
+        }
+      })
+    );
+
+    try {
+      await executeAgentFlowSessionRequest(
+        store,
+        "sanitized-session-response-error",
+        workflow,
+        workflow.steps[0]!,
+        providers
+      );
+      throw new Error("Expected session response processing to fail.");
+    } catch (error) {
+      expect(error).toBeInstanceOf(AgentFlowSessionRequestError);
+      expect((error as Error).message).toContain("Authorization: Bearer [REDACTED]");
+      expect(((error as Error).cause as Error | undefined)?.message).toContain("Authorization: Bearer [REDACTED]");
+      expect(JSON.stringify(store.getSession("sanitized-session-response-error", "writer")))
+        .not.toContain("session-response-secret");
+    }
+    store.close();
+  });
+
+  test("preserves sanitized run-state codes from session response publication", async () => {
+    const root = temporaryRepo();
+    fs.mkdirSync(path.join(root, "prompts"), { recursive: true });
+    fs.writeFileSync(path.join(root, "prompts", "draft.md"), "Draft.\n");
+    const workflow = sessionWorkflow();
+    const store = await openAgentFlowRunState({ cwd: root });
+    store.createRun({
+      id: "session-publication-race",
+      status: "running",
+      workflow: { name: workflow.name, version: workflow.version, style: workflow.style, maturity: workflow.maturity },
+      context: { workflow }
+    });
+    store.writeArtifact({
+      id: "request",
+      runId: "session-publication-race",
+      path: "request.md",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "Request"
+    });
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => ({
+      outputs: { "response.md": "Response" }
+    }));
+    store.writeArtifactsAtomically = (() => {
+      throw new AgentFlowRunStateError(
+        "Artifact publication raced with run state; Authorization: Bearer publication-secret",
+        "AGENT_FLOW_ARTIFACT_RUN_STATUS"
+      );
+    }) as typeof store.writeArtifactsAtomically;
+
+    try {
+      await executeAgentFlowSessionRequest(
+        store,
+        "session-publication-race",
+        workflow,
+        workflow.steps[0]!,
+        providers
+      );
+      throw new Error("Expected session publication to fail.");
+    } catch (error) {
+      expect(error).toBeInstanceOf(AgentFlowSessionRequestError);
+      expect(error).toMatchObject({ code: "AGENT_FLOW_ARTIFACT_RUN_STATUS" });
+      expect((error as Error).message).toContain("Authorization: Bearer [REDACTED]");
+      expect(((error as Error).cause as Error | undefined)?.message)
+        .toContain("Authorization: Bearer [REDACTED]");
+      expect(JSON.stringify(error)).not.toContain("publication-secret");
+    }
+    store.close();
+  });
+
+  test("sanitizes credential-bearing artifact paths at the exported session boundary", async () => {
+    const root = temporaryRepo();
+    fs.writeFileSync(path.join(root, "prompt.md"), "Draft.\n");
+    const credentialPath = "inputs/api_token=direct-path-secret.txt";
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: sanitized-direct-session-path
+version: 1
+style: pipeline
+maturity: experimental
+sessions: { writer: { provider: fixture } }
+steps:
+  - { id: draft, type: session_request, session: writer, prompt: prompt.md, inputs: [${credentialPath}], outputs: [out.md] }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    store.createRun({
+      id: "sanitized-direct-session-path",
+      status: "running",
+      workflow: { name: workflow.name, version: workflow.version, style: workflow.style, maturity: workflow.maturity },
+      context: { workflow }
+    });
+    store.writeArtifact({
+      id: "credential-path-input",
+      runId: "sanitized-direct-session-path",
+      path: credentialPath,
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "ordinary content"
+    });
+    let calls = 0;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+      calls += 1;
+      return { outputs: { "out.md": "unexpected" } };
+    });
+
+    try {
+      await executeAgentFlowSessionRequest(
+        store,
+        "sanitized-direct-session-path",
+        workflow,
+        workflow.steps[0]!,
+        providers
+      );
+      throw new Error("Expected credential-bearing path preflight to fail.");
+    } catch (error) {
+      expect(error).toBeInstanceOf(AgentFlowSessionRequestError);
+      expect((error as Error).message).toContain("secret-like path");
+      expect(((error as Error).cause as Error | undefined)?.message).toContain("secret-like path");
+      expect(JSON.stringify({
+        message: (error as Error).message,
+        cause: ((error as Error).cause as Error | undefined)?.message
+      })).not.toContain("direct-path-secret");
+    }
+    expect(calls).toBe(0);
+    store.close();
+  });
+
+  test("rejects secret-bearing session adapter identity metadata before invocation", async () => {
+    const root = temporaryRepo();
+    fs.writeFileSync(path.join(root, "prompt.md"), "Draft.\n");
+    const secretStepId = "API_TOKEN=session-adapter-identity-secret";
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: blocked-session-adapter-identity
+version: 1
+style: pipeline
+maturity: experimental
+policies: { sensitive_inputs: deny }
+sessions: { writer: { provider: fixture } }
+steps:
+  - id: ${JSON.stringify(secretStepId)}
+    type: session_request
+    session: writer
+    prompt: prompt.md
+    inputs: []
+    outputs: [out.md]
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    store.createRun({
+      id: "blocked-session-adapter-identity",
+      status: "running",
+      workflow: { name: workflow.name, version: workflow.version, style: workflow.style, maturity: workflow.maturity },
+      context: { workflow }
+    });
+    let calls = 0;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+      calls += 1;
+      return { outputs: { "out.md": "unexpected" } };
+    });
+
+    await expect(executeAgentFlowSessionRequest(
+      store,
+      "blocked-session-adapter-identity",
+      workflow,
+      workflow.steps[0]!,
+      providers
+    )).rejects.toMatchObject({ code: "AGENT_FLOW_SENSITIVE_INPUT" });
+    expect(calls).toBe(0);
+    store.close();
+  });
+
+  test("sanitizes missing credential-bearing paths before session artifact reads", async () => {
+    const root = temporaryRepo();
+    fs.writeFileSync(path.join(root, "prompt.md"), "Draft.\n");
+    const credentialPath = "inputs/api_token=missing-path-secret.txt";
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: sanitized-missing-session-path
+version: 1
+style: pipeline
+maturity: experimental
+sessions: { writer: { provider: fixture } }
+steps:
+  - { id: draft, type: session_request, session: writer, prompt: prompt.md, inputs: [${credentialPath}], outputs: [out.md] }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    store.createRun({
+      id: "sanitized-missing-session-path",
+      status: "running",
+      workflow: { name: workflow.name, version: workflow.version, style: workflow.style, maturity: workflow.maturity },
+      context: { workflow }
+    });
+    let calls = 0;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+      calls += 1;
+      return { outputs: { "out.md": "unexpected" } };
+    });
+
+    try {
+      await executeAgentFlowSessionRequest(
+        store,
+        "sanitized-missing-session-path",
+        workflow,
+        workflow.steps[0]!,
+        providers
+      );
+      throw new Error("Expected credential-bearing path preflight to fail.");
+    } catch (error) {
+      expect(error).toBeInstanceOf(AgentFlowSessionRequestError);
+      expect((error as Error).message).not.toContain("missing-path-secret");
+      expect(((error as Error).cause as Error | undefined)?.message).not.toContain("missing-path-secret");
+    }
+    expect(calls).toBe(0);
+    store.close();
+  });
+
+  test("sanitizes credential-bearing prompt paths before session filesystem reads", async () => {
+    const root = temporaryRepo();
+    const credentialPath = "prompts/api_token=missing-prompt-secret.txt";
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: sanitized-missing-prompt-path
+version: 1
+style: pipeline
+maturity: experimental
+sessions: { writer: { provider: fixture } }
+steps:
+  - { id: draft, type: session_request, session: writer, prompt: ${credentialPath}, outputs: [out.md] }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    store.createRun({
+      id: "sanitized-missing-prompt-path",
+      status: "running",
+      workflow: { name: workflow.name, version: workflow.version, style: workflow.style, maturity: workflow.maturity },
+      context: { workflow }
+    });
+    let calls = 0;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+      calls += 1;
+      return { outputs: { "out.md": "unexpected" } };
+    });
+
+    try {
+      await executeAgentFlowSessionRequest(
+        store,
+        "sanitized-missing-prompt-path",
+        workflow,
+        workflow.steps[0]!,
+        providers
+      );
+      throw new Error("Expected credential-bearing prompt preflight to fail.");
+    } catch (error) {
+      expect(error).toBeInstanceOf(AgentFlowSessionRequestError);
+      expect((error as Error).message).toContain("secret-like path");
+      expect((error as Error).message).not.toContain("missing-prompt-secret");
+      expect(((error as Error).cause as Error | undefined)?.message).not.toContain("missing-prompt-secret");
+    }
+    expect(calls).toBe(0);
+    store.close();
+  });
+
   test("bounds request metadata filenames for long valid step IDs", async () => {
     const root = temporaryRepo();
     fs.mkdirSync(path.join(root, "prompts"), { recursive: true });
@@ -523,6 +2214,36 @@ steps:
     store.close();
   });
 
+  test("rejects malformed UTF-8 prompts before invoking a provider", async () => {
+    const root = temporaryRepo();
+    fs.mkdirSync(path.join(root, "prompts"), { recursive: true });
+    fs.writeFileSync(path.join(root, "prompts", "draft.md"), Buffer.from([0xff, ...Buffer.from("Draft")]));
+    const workflow = sessionWorkflow();
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "malformed-prompt", workflow });
+    store.writeArtifact({
+      id: "request",
+      runId: "malformed-prompt",
+      path: "request.md",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "Request"
+    });
+    let calls = 0;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+      calls += 1;
+      return { outputs: { "response.md": "Response" } };
+    });
+
+    const result = await executeAgentFlowCommandPipeline(store, "malformed-prompt", workflow, undefined, providers);
+
+    expect(result).toMatchObject({ status: "paused", failedStep: "draft" });
+    expect(result.message).toContain("not valid UTF-8 text");
+    expect(result.message).not.toContain("�");
+    expect(calls).toBe(0);
+    store.close();
+  });
+
   test("rejects oversized provider metadata before persisting request artifacts", async () => {
     const root = temporaryRepo();
     fs.mkdirSync(path.join(root, "prompts"), { recursive: true });
@@ -580,9 +2301,9 @@ steps:
 `);
     const store = await openAgentFlowRunState({ cwd: root });
     createAgentFlowLifecycleRun(store, { id: "aggregate-input-bound", workflow });
-    const half = Buffer.alloc(Math.floor(MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES / 2) + 1);
-    store.writeArtifact({ id: "first", runId: "aggregate-input-bound", path: "first.bin", kind: "fixture", contentType: "application/octet-stream", content: half });
-    store.writeArtifact({ id: "second", runId: "aggregate-input-bound", path: "second.bin", kind: "fixture", contentType: "application/octet-stream", content: half });
+    const half = `api_token: ${"x".repeat(Math.floor(MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES / 2))}`;
+    store.writeArtifact({ id: "first", runId: "aggregate-input-bound", path: "first.bin", kind: "fixture", contentType: "text/plain", content: half });
+    store.writeArtifact({ id: "second", runId: "aggregate-input-bound", path: "second.bin", kind: "fixture", contentType: "text/plain", content: half });
     let calls = 0;
     const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
       calls += 1;
@@ -596,6 +2317,64 @@ steps:
     expect(calls).toBe(0);
     store.close();
   });
+
+  test("rejects structured inputs that exceed provider limits after redaction", async () => {
+    const root = temporaryRepo();
+    fs.mkdirSync(path.join(root, "prompts"), { recursive: true });
+    fs.writeFileSync(path.join(root, "prompts", "draft.md"), "Draft.\n");
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: post-redaction-input-bound
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  writer: { provider: fixture }
+steps:
+  - { id: draft, type: session_request, session: writer, prompt: prompts/draft.md, inputs: [request.json], outputs: [response.md] }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "post-redaction-input-bound", workflow });
+    const repeated = '{"token":""},'.repeat(480_000);
+    const oversizedAfterRedaction = `[${repeated}{"token":""}]`;
+    expect(simulateAgentFlowWorkflow(workflow, {
+      artifacts: { "request.json": oversizedAfterRedaction },
+      steps: { draft: { outputs: { "response.md": "Response" } } }
+    })).toMatchObject({ status: "paused" });
+
+    const aggregateWorkflow = structuredClone(workflow);
+    aggregateWorkflow.steps[0]!.inputs = ["first.json", "second.json"];
+    const halfRepeated = '{"token":""},'.repeat(240_000);
+    const aggregatePart = `[${halfRepeated}{"token":""}]`;
+    expect(simulateAgentFlowWorkflow(aggregateWorkflow, {
+      artifacts: { "first.json": aggregatePart, "second.json": aggregatePart },
+      steps: { draft: { outputs: { "response.md": "Response" } } }
+    })).toMatchObject({ status: "paused" });
+    store.writeArtifact({
+      id: "request",
+      runId: "post-redaction-input-bound",
+      path: "request.json",
+      kind: "fixture",
+      contentType: "application/json",
+      content: oversizedAfterRedaction
+    });
+    let calls = 0;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+      calls += 1;
+      return { outputs: { "response.md": "Response" } };
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      "post-redaction-input-bound",
+      workflow,
+      undefined,
+      providers
+    );
+
+    expect(result).toMatchObject({ status: "paused", failedStep: "draft" });
+    expect(result.message).toContain("after sensitive-data handling");
+    expect(calls).toBe(0);
+    store.close();
+  }, 30_000);
 
   test("fails malformed direct-API session steps before persisting running state", async () => {
     const root = temporaryRepo();
@@ -682,6 +2461,40 @@ steps:
     expect(calls).toBe(0);
     expect(store.getSession("windows-absolute-prompt", "writer")).toBeNull();
     store.close();
+  });
+
+  test("rejects prompt paths that traverse in-repository symbolic links", () => {
+    const root = temporaryRepo();
+    fs.mkdirSync(path.join(root, "config"), { recursive: true });
+    fs.mkdirSync(path.join(root, "prompts"), { recursive: true });
+    fs.writeFileSync(path.join(root, "config", "master.key"), "0123456789abcdef0123456789abcdef\n");
+    fs.symlinkSync(path.join("..", "config", "master.key"), path.join(root, "prompts", "draft.md"));
+
+    expect(() => readAgentFlowSessionPrompt(root, "prompts/draft.md"))
+      .toThrow("must not traverse symbolic links");
+  });
+
+  test("preserves a UTF-8 BOM so prompt content matches its checksum", () => {
+    const root = temporaryRepo();
+    fs.mkdirSync(path.join(root, "prompts"), { recursive: true });
+    const bytes = Buffer.from("\uFEFFDraft.\n", "utf8");
+    fs.writeFileSync(path.join(root, "prompts", "draft.md"), bytes);
+
+    const prompt = readAgentFlowSessionPrompt(root, "prompts/draft.md");
+
+    expect(prompt.content).toBe("\uFEFFDraft.\n");
+    expect(prompt.checksum).toBe(`sha256:${createHash("sha256").update(Buffer.from(prompt.content, "utf8")).digest("hex")}`);
+
+    const workflow = sessionWorkflow();
+    const safeJson = "\uFEFF{\"safe\":true}";
+    expect(secureAgentFlowTextInput(workflow, "BOM-prefixed JSON prompt", safeJson, "prompt.json"))
+      .toEqual({ value: safeJson, redacted: false });
+    expect(secureAgentFlowTextInput(
+      workflow,
+      "BOM-prefixed JSON prompt",
+      "\uFEFF{\"api_token\":\"opaque-value\"}",
+      "prompt.json"
+    )).toEqual({ value: '{"api_token":"[REDACTED]"}\n', redacted: true });
   });
 
   test("rejects canonical output collisions before reserving budget or invoking a direct provider", async () => {

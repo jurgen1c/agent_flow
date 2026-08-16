@@ -666,6 +666,19 @@ steps:
     })).toMatchObject({ status: "fail", code: "policy.unsafe.denied" });
   });
 
+  test("validates sensitive-input policy modes", () => {
+    const invalid = parseAgentFlowWorkflowOrThrow(POLICY_WORKFLOW.replace(
+      "unsafe_operations: require_approval",
+      "unsafe_operations: require_approval\n  sensitive_inputs: prompt"
+    ));
+
+    expect(validateAgentFlowWorkflow(invalid).errors).toContainEqual({
+      code: "workflow.policy.sensitive_inputs.invalid",
+      message: "Sensitive-input policy must be allow, deny, or redact.",
+      path: "policies.sensitive_inputs"
+    });
+  });
+
   test("validation rejects unbounded model use and unscoped file writers", () => {
     const unbounded = parseAgentFlowWorkflowOrThrow(POLICY_WORKFLOW.replace("  max_frontier_calls: 2\n", ""));
     const unscoped = parseAgentFlowWorkflowOrThrow(POLICY_WORKFLOW.replace(

@@ -17,15 +17,19 @@ does not replace Agent Memory or depend on it.
 2. Use the [command reference](command-reference.md) for exact command syntax.
 3. Read [concepts and safety](concepts-and-safety.md) before enabling file
    writes, model sessions, approvals, recovery loops, or cleanup.
-4. Read [packages and Memory integration](packages-and-memory.md) when a
+4. Read [execution security](execution-security.md) for command policy,
+   adapter capabilities, sensitive-input redaction, and unsafe-channel defaults.
+5. Read [packages and Memory integration](packages-and-memory.md) when a
    repository also uses Agent Memory.
-5. Use [operations and packaging](operations-and-packaging.md) to promote a
+6. Use [operations and packaging](operations-and-packaging.md) to promote a
    workflow from draft to execution and to validate a package or release.
 
 ## Deeper references
 
 - [Architecture](architecture.md) defines source, dependency, persistence, and
   publication boundaries.
+- [Execution security](execution-security.md) defines command, adapter,
+  sensitive-input, and unsafe-channel enforcement.
 - [Example workflows](../examples/README.md) cover pipeline, recovery, and
   collaborative flows with offline fixtures.
 - [Workflow specifications](specifications/) define the supported workflow

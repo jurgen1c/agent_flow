@@ -8,11 +8,13 @@ import {
   createAgentFlowLifecycleRun,
   createAgentFlowNotificationRegistry,
   createAgentFlowSessionProviderRegistry,
+  deliverAgentFlowNotificationEvent,
   executeAgentFlowCommandPipeline,
   openAgentFlowRunState,
   parseAgentFlowWorkflowOrThrow,
   resumeAgentFlowCommandPipeline,
   transitionAgentFlowLifecycleRun,
+  type AgentFlowNotification,
   type AgentFlowNotificationAdapter,
   type AgentFlowRunStateValue,
   validateAgentFlowWorkflow,
@@ -186,6 +188,8 @@ name: external-notification-adapters
 version: 1
 style: pipeline
 maturity: experimental
+policies:
+  unsafe_operations: allow
 steps: []
 notify:
   - on: workflow.completed
@@ -220,6 +224,508 @@ notify:
       ["webhook", "workflow.completed"],
       ["command", "workflow.completed"]
     ]);
+    store.close();
+  });
+
+  test("applies sensitive-input policy before notification adapter invocation", async () => {
+    for (const mode of ["redact", "deny"] as const) {
+      const runId = `${mode}-notification-payload`;
+      const repoRoot = temporaryRepo();
+      const workflow = parseAgentFlowWorkflowOrThrow(`name: ${runId}
+version: 1
+style: pipeline
+maturity: experimental
+policies:
+  sensitive_inputs: ${mode}
+steps: []
+notify:
+  - on: approval.waiting
+    channels: [webhook]
+`);
+      const delivered: AgentFlowRunStateValue[] = [];
+      const notifications = createAgentFlowNotificationRegistry({
+        webhook: (notification) => {
+          delivered.push(notification as unknown as AgentFlowRunStateValue);
+          return undefined;
+        }
+      });
+      const store = await openAgentFlowRunState({ cwd: repoRoot });
+      createAgentFlowLifecycleRun(store, { id: runId, workflow });
+
+      const result = deliverAgentFlowNotificationEvent(
+        store,
+        runId,
+        workflow,
+        "approval.waiting",
+        notifications,
+        { stepId: "approve", payload: { prompt: "api_token=notification-opaque-value" } }
+      );
+
+      if (mode === "redact") {
+        expect(delivered).toHaveLength(1);
+        expect(delivered[0]).toMatchObject({
+          payload: { prompt: "api_token=[REDACTED]" }
+        });
+        expect(result.requiredFailure).toBeUndefined();
+      } else {
+        expect(delivered).toEqual([]);
+        expect(store.listEvents(runId)).toContainEqual(expect.objectContaining({
+          type: "notification.failed",
+          payload: expect.objectContaining({
+            message: expect.stringContaining("denied by policies.sensitive_inputs")
+          })
+        }));
+      }
+      expect(JSON.stringify(delivered)).not.toContain("notification-opaque-value");
+      expect(JSON.stringify(store.listEvents(runId))).not.toContain("notification-opaque-value");
+      store.close();
+    }
+  });
+
+  test("applies sensitive-input policy to every adapter-visible notification field", async () => {
+    for (const mode of ["redact", "deny"] as const) {
+      const secret = `notification-${mode}-secret`;
+      const runId = `API_TOKEN=${secret}`;
+      const repoRoot = temporaryRepo();
+      const workflow = parseAgentFlowWorkflowOrThrow(`name: "API_TOKEN=${secret}"
+version: 1
+style: pipeline
+maturity: experimental
+policies: { sensitive_inputs: ${mode} }
+steps: []
+notify:
+  - on: approval.waiting
+    channels: [webhook]
+`);
+      const delivered: AgentFlowNotification[] = [];
+      const notifications = createAgentFlowNotificationRegistry({
+        webhook: (notification) => {
+          delivered.push(notification);
+          return undefined;
+        }
+      });
+      const store = await openAgentFlowRunState({ cwd: repoRoot });
+      createAgentFlowLifecycleRun(store, { id: runId, workflow });
+
+      const result = deliverAgentFlowNotificationEvent(
+        store,
+        runId,
+        workflow,
+        "approval.waiting",
+        notifications,
+        { stepId: `PASSWORD=${secret}`, payload: { status: "waiting" } }
+      );
+
+      if (mode === "redact") {
+        expect(delivered).toHaveLength(1);
+        expect(JSON.stringify(delivered)).toContain("[REDACTED]");
+        expect(result.requiredFailure).toBeUndefined();
+      } else {
+        expect(delivered).toEqual([]);
+        expect(store.listEvents(runId)).toContainEqual(expect.objectContaining({
+          type: "notification.failed",
+          payload: expect.objectContaining({
+            message: expect.stringContaining("denied by policies.sensitive_inputs")
+          })
+        }));
+      }
+      expect(JSON.stringify(delivered)).not.toContain(secret);
+      expect(JSON.stringify(store.listEvents(runId).map((event) => ({
+        stepId: event.stepId,
+        payload: event.payload
+      })))).not.toContain(secret);
+      store.close();
+    }
+  });
+
+  test("does not classify notification identifiers as credential paths", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: secrets
+version: 1
+style: pipeline
+maturity: experimental
+steps: []
+notify:
+  - on: approval.waiting
+    channels: [webhook]
+`);
+    const delivered: AgentFlowNotification[] = [];
+    const notifications = createAgentFlowNotificationRegistry({
+      webhook: (notification) => {
+        delivered.push(notification);
+        return undefined;
+      }
+    });
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: "secret-run", workflow });
+
+    const result = deliverAgentFlowNotificationEvent(
+      store,
+      "secret-run",
+      workflow,
+      "approval.waiting",
+      notifications,
+      { stepId: "private-key", payload: { status: "waiting" } }
+    );
+
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]).toMatchObject({
+      runId: "secret-run",
+      workflowName: "secrets",
+      stepId: "private-key",
+      payload: { status: "waiting" }
+    });
+    expect(result.requiredFailure).toBeUndefined();
+    store.close();
+  });
+
+  test("rejects multiline notification identifiers without retaining continuation content", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: multiline-notification-redaction
+version: 1
+style: pipeline
+maturity: experimental
+steps: []
+notify:
+  - on: approval.waiting
+    channels: [webhook]
+`);
+    const delivered: AgentFlowNotification[] = [];
+    const notifications = createAgentFlowNotificationRegistry({
+      webhook: (notification) => {
+        delivered.push(notification);
+        return undefined;
+      }
+    });
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: "multiline-notification-redaction", workflow });
+
+    deliverAgentFlowNotificationEvent(
+      store,
+      "multiline-notification-redaction",
+      workflow,
+      "approval.waiting",
+      notifications,
+      { stepId: "PASSWORD=prefix\"first-secret-part\nsecond-secret-part\"" }
+    );
+
+    expect(delivered).toEqual([]);
+    expect(JSON.stringify(delivered)).not.toContain("first-secret-part");
+    expect(JSON.stringify(delivered)).not.toContain("second-secret-part");
+    expect(store.listEvents("multiline-notification-redaction")).toContainEqual(expect.objectContaining({
+      type: "notification.failed",
+      payload: expect.objectContaining({
+        message: expect.stringContaining("multiline secret-like assignment")
+      })
+    }));
+    expect(JSON.stringify(store.listEvents("multiline-notification-redaction"))).not.toContain("second-secret-part");
+    store.close();
+  });
+
+  test("fails closed for structured content and credential paths in notification identifiers", async () => {
+    for (const [mode, stepId] of [
+      ["redact", "<password>opaque-secret</password>"],
+      ["deny", "/etc/shadow"]
+    ] as const) {
+      const runId = `${mode}-unsafe-notification-identifier`;
+      const repoRoot = temporaryRepo();
+      const workflow = parseAgentFlowWorkflowOrThrow(`name: ${runId}
+version: 1
+style: pipeline
+maturity: experimental
+policies: { sensitive_inputs: ${mode} }
+steps: []
+notify:
+  - on: approval.waiting
+    channels: [webhook]
+`);
+      const delivered: AgentFlowNotification[] = [];
+      const notifications = createAgentFlowNotificationRegistry({
+        webhook: (notification) => {
+          delivered.push(notification);
+          return undefined;
+        }
+      });
+      const store = await openAgentFlowRunState({ cwd: repoRoot });
+      createAgentFlowLifecycleRun(store, { id: runId, workflow });
+
+      deliverAgentFlowNotificationEvent(
+        store,
+        runId,
+        workflow,
+        "approval.waiting",
+        notifications,
+        { stepId }
+      );
+
+      expect(delivered).toEqual([]);
+      expect(store.listEvents(runId)).toContainEqual(expect.objectContaining({
+        type: "notification.failed",
+        payload: expect.objectContaining({
+          message: expect.stringContaining(mode === "redact" ? "supported safe sanitizer" : "cannot be sent")
+        })
+      }));
+      expect(JSON.stringify(store.listEvents(runId))).not.toContain("opaque-secret");
+      store.close();
+    }
+  });
+
+  test("returns only the redacted channel when required notification delivery fails", async () => {
+    const repoRoot = temporaryRepo();
+    const secret = "required-channel-secret";
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: required-channel-redaction
+version: 1
+style: pipeline
+maturity: experimental
+steps: []
+notify:
+  - on: approval.waiting
+    channels: ["API_TOKEN=${secret}"]
+    required: true
+`);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: "required-channel-redaction", workflow });
+
+    const result = deliverAgentFlowNotificationEvent(
+      store,
+      "required-channel-redaction",
+      workflow,
+      "approval.waiting",
+      createAgentFlowNotificationRegistry()
+    );
+
+    expect(result.requiredFailure?.channel).toBe("API_TOKEN=[REDACTED]");
+    expect(JSON.stringify(result)).not.toContain(secret);
+    expect(JSON.stringify(store.listEvents("required-channel-redaction"))).not.toContain(secret);
+    store.close();
+  });
+
+  test("denies command notification channels without explicit unsafe-operation policy", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: denied-command-notification
+version: 1
+style: pipeline
+maturity: experimental
+steps: []
+notify:
+  - on: workflow.completed
+    channels: [command]
+`);
+
+    expect(validateAgentFlowWorkflow(workflow).errors).toContainEqual({
+      code: "workflow.notification.command.unsafe",
+      message: "Command notification channels are denied by default; set policies.unsafe_operations to allow after reviewing the registered adapter.",
+      path: "notify[0].channels"
+    });
+  });
+
+  test("denies direct command notification delivery without explicit unsafe-operation policy", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: direct-denied-command-notification
+version: 1
+style: pipeline
+maturity: experimental
+steps: []
+notify:
+  - on: workflow.completed
+    channels: [command]
+`);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    store.createRunWithEvent({
+      id: "direct-denied-command-notification",
+      workflow: {
+        name: workflow.name,
+        version: workflow.version,
+        style: workflow.style,
+        maturity: workflow.maturity
+      },
+      context: { workflow: workflow as unknown as AgentFlowRunStateValue }
+    }, { type: "run.created", payload: { status: "pending" } });
+    let calls = 0;
+    const notifications = createAgentFlowNotificationRegistry({
+      command: () => {
+        calls += 1;
+        return undefined;
+      }
+    });
+
+    deliverAgentFlowNotificationEvent(
+      store,
+      "direct-denied-command-notification",
+      workflow,
+      "workflow.completed",
+      notifications
+    );
+    const forgedAllowedWorkflow = structuredClone(workflow);
+    forgedAllowedWorkflow.policies = { unsafe_operations: "allow" };
+    deliverAgentFlowNotificationEvent(
+      store,
+      "direct-denied-command-notification",
+      forgedAllowedWorkflow,
+      "workflow.completed",
+      notifications
+    );
+
+    expect(calls).toBe(0);
+    expect(store.listEvents("direct-denied-command-notification").filter((event) =>
+      event.type === "notification.failed"
+    )).toHaveLength(2);
+    expect(store.listEvents("direct-denied-command-notification")).toContainEqual(expect.objectContaining({
+      type: "notification.failed",
+      payload: expect.objectContaining({
+        channel: "command",
+        message: expect.stringContaining("denied by default")
+      })
+    }));
+    store.close();
+  });
+
+  test("rechecks persisted command authorization after every notification adapter", async () => {
+    const repoRoot = temporaryRepo();
+    const runId = "revoked-command-notification";
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: ${runId}
+version: 1
+style: pipeline
+maturity: experimental
+policies: { unsafe_operations: allow }
+steps: []
+notify:
+  - on: workflow.completed
+    channels: [webhook, command]
+`);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: runId, workflow });
+    let commandCalls = 0;
+    const notifications = createAgentFlowNotificationRegistry({
+      webhook: () => {
+        const revokedWorkflow = structuredClone(workflow);
+        revokedWorkflow.policies = { unsafe_operations: "deny" };
+        store.updateRun(runId, {
+          context: { workflow: revokedWorkflow as unknown as AgentFlowRunStateValue }
+        });
+        return undefined;
+      },
+      command: () => {
+        commandCalls += 1;
+        return undefined;
+      }
+    });
+
+    deliverAgentFlowNotificationEvent(
+      store,
+      runId,
+      workflow,
+      "workflow.completed",
+      notifications
+    );
+
+    expect(commandCalls).toBe(0);
+    expect(store.listEvents(runId)).toContainEqual(expect.objectContaining({
+      type: "notification.failed",
+      payload: expect.objectContaining({
+        channel: "command",
+        message: expect.stringContaining("matches the workflow persisted for the run")
+      })
+    }));
+    store.close();
+  });
+
+  test("denies every direct notification adapter for a missing or mismatched persisted workflow", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: persisted-notification-workflow
+version: 1
+style: pipeline
+maturity: experimental
+steps: []
+notify:
+  - on: workflow.completed
+    channels: [webhook]
+`);
+    const forgedWorkflow = structuredClone(workflow);
+    forgedWorkflow.name = "forged-notification-workflow";
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: "persisted-notification-workflow", workflow });
+    let calls = 0;
+    const notifications = createAgentFlowNotificationRegistry({
+      webhook: () => {
+        calls += 1;
+        return undefined;
+      }
+    });
+
+    expect(deliverAgentFlowNotificationEvent(
+      store,
+      "missing-notification-run",
+      workflow,
+      "workflow.completed",
+      notifications
+    )).toEqual({});
+    deliverAgentFlowNotificationEvent(
+      store,
+      "persisted-notification-workflow",
+      forgedWorkflow,
+      "workflow.completed",
+      notifications
+    );
+
+    expect(calls).toBe(0);
+    expect(store.listEvents("persisted-notification-workflow")).toContainEqual(expect.objectContaining({
+      type: "notification.failed",
+      payload: expect.objectContaining({
+        channel: "webhook",
+        message: expect.stringContaining("matches the workflow persisted for the run")
+      })
+    }));
+    store.close();
+  });
+
+  test("denies direct notification adapters for malformed persisted sensitive-input policy", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: malformed-notification-policy
+version: 1
+style: pipeline
+maturity: experimental
+policies: { sensitive_inputs: typo }
+steps: []
+notify:
+  - on: workflow.completed
+    channels: [webhook]
+`);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    store.createRun({
+      id: "malformed-notification-policy",
+      status: "running",
+      workflow: {
+        name: workflow.name,
+        version: workflow.version,
+        style: workflow.style,
+        maturity: workflow.maturity
+      },
+      context: { workflow }
+    });
+    let calls = 0;
+    const notifications = createAgentFlowNotificationRegistry({
+      webhook: () => {
+        calls += 1;
+        return undefined;
+      }
+    });
+
+    deliverAgentFlowNotificationEvent(
+      store,
+      "malformed-notification-policy",
+      workflow,
+      "workflow.completed",
+      notifications
+    );
+
+    expect(calls).toBe(0);
+    expect(store.listEvents("malformed-notification-policy")).toContainEqual(expect.objectContaining({
+      type: "notification.failed",
+      payload: expect.objectContaining({
+        channel: "webhook",
+        message: expect.stringContaining("policies.sensitive_inputs")
+      })
+    }));
     store.close();
   });
 

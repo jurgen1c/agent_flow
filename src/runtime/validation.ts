@@ -20,6 +20,7 @@ import {
   agentFlowStepHasAmbiguousSuccessTarget
 } from "./success_routing";
 import { validateAgentFlowNotifications } from "./notifications";
+import { agentFlowPathLooksSensitive } from "./execution_security";
 import { AGENT_FLOW_FINAL_SUMMARY_PATH } from "./retention";
 import { MAX_AGENT_FLOW_COLLABORATION_QUESTION_BYTES } from "./collaboration";
 import { defaultAgentFlowApprovalOutputPath } from "./approval";
@@ -87,7 +88,6 @@ const STEP_TYPES = new Set([
 const TERMINAL_TARGETS = new Set(["cancel", "complete", "completed", "continue", "fail", "ignore", "pause"]);
 const TARGET_FIELDS = new Set(["else", "goto", "on_approve", "on_cancel", "on_reject", "return_to", "then"]);
 const RECOVERY_ROUTE_STEP_TYPES = new Set(["artifact_transform", "command", "mcp_call", "session_request"]);
-const SECRET_PATH = /(^|[/._-])(\.env|credentials|id_rsa|id_ed25519|private[_-]?key|secrets?)([/._-]|$)/i;
 const SHELL_EXECUTABLES = new Set(["bash", "dash", "ksh", "sh", "zsh"]);
 const SHELL_ANALYSIS_BUDGET = 65_536;
 export const AGENT_FLOW_COLLABORATION_AUTHORITY_CAPABILITIES = [
@@ -2721,7 +2721,7 @@ function lintCommands(contexts: StepContext[], warnings: AgentFlowWorkflowIssue[
     ];
 
     for (const { value: input, field } of secretCandidates) {
-      if (SECRET_PATH.test(input)) {
+      if (agentFlowPathLooksSensitive(input)) {
         addStepIssue(
           warnings,
           context,
