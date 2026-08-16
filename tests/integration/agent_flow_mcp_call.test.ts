@@ -527,7 +527,11 @@ steps:
     const calls = createAgentFlowMcpCallRegistry().register("fixture", () =>
       new Proxy({ outputs: { "ticket.json": { key: "AF-44" } } }, {
         get(target, property, receiver) {
-          if (property === "outputs") throw new Error("Authorization: Bearer mcp-response-secret");
+          if (property === "outputs") {
+            throw Object.assign(new Error("Authorization: Bearer mcp-response-secret"), {
+              code: "AGENT_FLOW_RUN_COLLISION"
+            });
+          }
           return Reflect.get(target, property, receiver);
         }
       })
@@ -538,6 +542,7 @@ steps:
       throw new Error("Expected MCP response processing to fail.");
     } catch (error) {
       expect(error).toBeInstanceOf(AgentFlowMcpCallError);
+      expect((error as AgentFlowMcpCallError).code).toBe("AGENT_FLOW_MCP_RESPONSE_FAILED");
       expect((error as Error).message).toContain("Authorization: Bearer [REDACTED]");
       expect(((error as Error).cause as Error | undefined)?.message).toContain("Authorization: Bearer [REDACTED]");
       expect(JSON.stringify({

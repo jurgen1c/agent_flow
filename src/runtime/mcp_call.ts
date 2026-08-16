@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import {
+  AgentFlowRunStateError,
   normalizeAgentFlowArtifactPath,
   type AgentFlowArtifactRecord,
   type AgentFlowRunStateStore,
@@ -305,9 +306,8 @@ export async function executeAgentFlowMcpCall(
     if (error instanceof AgentFlowMcpCallError) {
       throw new AgentFlowMcpCallError(errorMessage(error), error.code, { cause: sanitizedErrorCause(error) });
     }
-    const code = agentFlowErrorCode(error);
-    if (code !== undefined) {
-      throw new AgentFlowMcpCallError(errorMessage(error), code, { cause: sanitizedErrorCause(error) });
+    if (error instanceof AgentFlowRunStateError) {
+      throw new AgentFlowMcpCallError(errorMessage(error), error.code, { cause: sanitizedErrorCause(error) });
     }
     throw new AgentFlowMcpCallError(
       `MCP server ${server} response processing failed for ${tool} at step ${stepId}: ${errorMessage(error)}`,
@@ -884,14 +884,4 @@ function errorMessage(error: unknown): string {
 
 function sanitizedErrorCause(error: unknown): Error {
   return new Error(errorMessage(error));
-}
-
-function agentFlowErrorCode(error: unknown): string | undefined {
-  try {
-    if (typeof error !== "object" || error === null) return undefined;
-    const code = Reflect.get(error, "code");
-    return typeof code === "string" && code.startsWith("AGENT_FLOW_") ? code : undefined;
-  } catch {
-    return undefined;
-  }
 }
