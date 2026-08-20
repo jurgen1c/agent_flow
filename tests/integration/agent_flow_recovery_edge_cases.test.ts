@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 
 import {
   createAgentFlowLifecycleRun,
@@ -542,8 +543,10 @@ steps:
     const store = await openAgentFlowRunState({ cwd: root });
     createAgentFlowLifecycleRun(store, { id: "redacted-recovery-prompt", workflow });
     let prompt = "";
+    let providerChecksum = "";
     const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => {
       prompt = request.prompt.content;
+      providerChecksum = request.prompt.checksum;
       return { outputs: {}, metadata: { recovery_status: "unresolved" } };
     });
 
@@ -551,6 +554,18 @@ steps:
 
     expect(prompt).toContain("Authorization: Bearer [REDACTED]");
     expect(prompt).not.toContain("recovery-prompt-secret");
+    const requestPath = store.getSession("redacted-recovery-prompt", "fixer")!.state.requestArtifact as string;
+    const evidence = JSON.parse(store.readArtifact(
+      "redacted-recovery-prompt", requestPath
+    ).content.toString("utf8"));
+    expect(evidence.prompt).toEqual({
+      path: "prompts/fix.md",
+      checksum: `sha256:${createHash("sha256").update(
+        "Investigate with Authorization: Bearer recovery-prompt-secret.\n"
+      ).digest("hex")}`,
+      providerChecksum,
+      redacted: true
+    });
     store.close();
   });
 
@@ -761,9 +776,11 @@ steps:
       content: "hunter2abc"
     });
     let providerInput = "";
+    let providerChecksum = "";
     const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => {
       const payload = request.inputs.find((input) => input.path === "payload.txt");
       providerInput = payload === undefined ? "" : Buffer.from(payload.content).toString("utf8");
+      providerChecksum = payload?.checksum ?? "";
       return { outputs: {}, metadata: { recovery_status: "unresolved" } };
     });
 
@@ -776,6 +793,21 @@ steps:
     )).status).toBe("paused");
     expect(providerInput).toBe("[REDACTED]");
     expect(providerInput).not.toContain("hunter2abc");
+    const sourceArtifact = store.getArtifact("referenced-recovery-credential", "payload.txt")!;
+    const requestPath = store.getSession(
+      "referenced-recovery-credential", "fixer"
+    )!.state.requestArtifact as string;
+    const inputEvidence = (JSON.parse(store.readArtifact(
+      "referenced-recovery-credential", requestPath
+    ).content.toString("utf8")).inputs as Array<Record<string, unknown>>)
+      .find((input) => input.path === "payload.txt");
+    expect(inputEvidence).toEqual({
+      path: "payload.txt",
+      checksum: sourceArtifact.checksum,
+      contentType: "text/plain",
+      providerChecksum,
+      redacted: true
+    });
     store.close();
   });
 
@@ -1120,7 +1152,7 @@ steps:
     const providers = createAgentFlowSessionProviderRegistry().register("frontier", async (request) => {
       requests.push(request);
       return requests.length === 1 ? firstResponse : remediated();
-    });
+    }, { enabled: true });
     const execution = executeAgentFlowCommandPipeline(
       store, "injected-context", workflow, undefined, providers
     );
@@ -1153,6 +1185,16 @@ steps:
     });
     expect(store.listEvents("injected-context").map((event) => event.type))
       .toEqual(expect.arrayContaining(["recovery.context.injected", "recovery.context.rerun"]));
+    const requestPath = store.getSession("injected-context", "fixer")!.state.requestArtifact as string;
+    const requestEvidence = JSON.parse(store.readArtifact(
+      "injected-context", requestPath
+    ).content.toString("utf8"));
+    expect(requestEvidence.inputs).toContainEqual(expect.objectContaining({
+      path: "recovery-context/injected.md",
+      checksum: `sha256:${createHash("sha256").update(
+        `## Injected context 1\n\n${injectedText}\n`
+      ).digest("hex")}`
+    }));
     store.close();
   });
 
@@ -1178,7 +1220,7 @@ steps:
     const providers = createAgentFlowSessionProviderRegistry().register("frontier", (request) => {
       requests.push(request);
       return remediated();
-    });
+    }, { enabled: true });
     const settle = store.settleRecoverySessionForRunAtContextRevision.bind(store);
     let injected = false;
     store.settleRecoverySessionForRunAtContextRevision = (input, revision) => {
@@ -1210,6 +1252,121 @@ steps:
     store.close();
   });
 
+  test("does not persist stale recovery evidence when the required rerun fails", async () => {
+    const root = temporaryRepo();
+    writePrompt(root);
+    const workflow = recoverySessionWorkflow(`
+limits: { max_frontier_calls: 3 }
+sessions:
+  fixer: { provider: frontier, resume: true }
+steps:
+  - id: check
+    type: command
+    command: "false"
+    on_failure:
+      route_to: { session: fixer, prompt: prompts/fix.md }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "failed-settlement-rerun", workflow });
+    let calls = 0;
+    const providers = createAgentFlowSessionProviderRegistry().register("frontier", () => {
+      calls += 1;
+      if (calls === 1) {
+        return { ...remediated(), metadata: { recovery_status: "remediated", phase: "stale" } };
+      }
+      throw new Error("required rerun failed");
+    }, { enabled: true });
+    const settle = store.settleRecoverySessionForRunAtContextRevision.bind(store);
+    let injected = false;
+    store.settleRecoverySessionForRunAtContextRevision = (input, revision) => {
+      if (!injected) {
+        injected = true;
+        injectAgentFlowRecoveryContext(
+          store,
+          "failed-settlement-rerun",
+          "fixer",
+          "Context accepted immediately before settlement."
+        );
+      }
+      return settle(input, revision);
+    };
+
+    const result = await executeAgentFlowCommandPipeline(
+      store, "failed-settlement-rerun", workflow, undefined, providers
+    );
+
+    expect(result.status).toBe("paused");
+    expect(calls).toBe(2);
+    expect(store.listArtifacts("failed-settlement-rerun").filter((artifact) => artifact.kind === "session_request"))
+      .toEqual([]);
+    expect(store.getSession("failed-settlement-rerun", "fixer")?.state.requestArtifact).toBeUndefined();
+    store.close();
+  });
+
+  test("snapshots recovery evidence before invoking a mutating provider", async () => {
+    const root = temporaryRepo();
+    writePrompt(root);
+    const workflow = recoverySessionWorkflow(`
+inputs: { evidence: { required: true } }
+sessions: { fixer: { provider: fixture } }
+steps:
+  - id: check
+    type: command
+    command: "false"
+    on_failure:
+      route_to:
+        session: fixer
+        prompt: prompts/fix.md
+        inputs: { evidence: "{{ inputs.evidence }}" }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, {
+      id: "mutating-recovery-provider",
+      workflow,
+      inputs: { evidence: "evidence.txt" }
+    });
+    store.writeArtifact({
+      id: "recovery-evidence",
+      runId: "mutating-recovery-provider",
+      stepId: "fixture",
+      path: "evidence.txt",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "Original evidence."
+    });
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => {
+      request.prompt.path = "mutated-secret.env";
+      request.prompt.checksum = "sha256:mutated";
+      request.inputs[0]!.path = "mutated-input.env";
+      request.inputs[0]!.contentType = "application/mutated";
+      request.inputs.splice(0, request.inputs.length);
+      return remediated();
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store, "mutating-recovery-provider", workflow, undefined, providers
+    );
+
+    expect(result.status).toBe("completed");
+    const requestPath = store.getSession("mutating-recovery-provider", "fixer")!
+      .state.requestArtifact as string;
+    const evidence = JSON.parse(store.readArtifact(
+      "mutating-recovery-provider", requestPath
+    ).content.toString("utf8"));
+    expect(evidence.prompt).toMatchObject({ path: "prompts/fix.md" });
+    expect(evidence.inputs).toContainEqual(expect.objectContaining({
+      path: "evidence.txt",
+      contentType: "text/plain",
+      checksum: `sha256:${createHash("sha256").update("Original evidence.").digest("hex")}`
+    }));
+    expect(JSON.stringify(evidence)).not.toContain("mutated");
+    store.close();
+  });
+
   test("reruns injected context before rejecting an invalid stale provider response", async () => {
     const root = temporaryRepo();
     writePrompt(root);
@@ -1236,7 +1393,7 @@ steps:
     const providers = createAgentFlowSessionProviderRegistry().register("frontier", async (request) => {
       requests.push(request);
       return requests.length === 1 ? firstResponse : remediated();
-    });
+    }, { enabled: true });
     const execution = executeAgentFlowCommandPipeline(
       store, "invalid-stale-response", workflow, undefined, providers
     );
@@ -1279,7 +1436,7 @@ steps:
     const providers = createAgentFlowSessionProviderRegistry().register("frontier", async (request) => {
       requests.push(request);
       return requests.length === 1 ? firstResponse : remediated();
-    });
+    }, { enabled: true });
     const execution = executeAgentFlowCommandPipeline(
       store, "rejected-stale-response", workflow, undefined, providers
     );
@@ -1322,7 +1479,7 @@ steps:
     const providers = createAgentFlowSessionProviderRegistry().register("frontier", async (request) => {
       requests.push(request);
       return requests.length === 1 ? firstResponse : remediated();
-    });
+    }, { enabled: true });
     const execution = executeAgentFlowCommandPipeline(
       store, "non-resumable-rerun", workflow, undefined, providers
     );
@@ -1441,7 +1598,7 @@ steps:
     const providers = createAgentFlowSessionProviderRegistry().register("frontier", () => {
       calls += 1;
       return calls === 1 ? firstResponse : remediated();
-    });
+    }, { enabled: true });
     const execution = executeAgentFlowCommandPipeline(
       store, "bounded-context", workflow, undefined, providers
     );
@@ -1486,7 +1643,7 @@ steps:
     const providers = createAgentFlowSessionProviderRegistry().register("frontier", () => {
       fs.writeFileSync(path.join(root, "README.md"), "unauthorized\n");
       return firstResponse;
-    });
+    }, { enabled: true });
     const execution = executeAgentFlowCommandPipeline(
       store, "budgeted-rerun-audit", workflow, undefined, providers
     );

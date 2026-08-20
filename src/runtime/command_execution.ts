@@ -44,6 +44,8 @@ import {
   executeAgentFlowReview,
   executeAgentFlowSessionRequest,
   invokeAgentFlowSessionProvider,
+  persistAgentFlowSessionProviderEvidence,
+  preflightAgentFlowSessionProviderEvidence,
   readAgentFlowSessionInput,
   readAgentFlowSessionPrompt,
   reserveAgentFlowSessionModelCallBudgets,
@@ -3544,8 +3546,11 @@ async function executeRecoverySession(
   const session = mapping(workflow.sessions?.[sessionId])!;
   const provider = normalizedTarget(session.provider)!;
   const adapter = providers.get(provider)!;
+  const providerDescriptor = providers.describe(provider)!;
   const promptPath = normalizedTarget(route.prompt)!;
   let prompt: ReturnType<typeof readAgentFlowSessionPrompt>;
+  let sourcePromptChecksum: string;
+  let promptWasRedacted = false;
   try {
     preflightAgentFlowTextInputPath(workflow, `Recovery session ${stepId} prompt`, promptPath);
     const sourcePrompt = readAgentFlowSessionPrompt(store.repoRoot, promptPath);
@@ -3555,6 +3560,8 @@ async function executeRecoverySession(
       sourcePrompt.content,
       sourcePrompt.path
     );
+    sourcePromptChecksum = sourcePrompt.checksum;
+    promptWasRedacted = securedPrompt.redacted;
     prompt = {
       ...sourcePrompt,
       content: securedPrompt.value,
@@ -3634,6 +3641,8 @@ async function executeRecoverySession(
     );
   }
   const inputs: Array<ReturnType<typeof readAgentFlowSessionInput>> = [];
+  const sourceInputChecksums = new Map<string, string>();
+  const redactedInputPaths = new Set<string>();
   let totalSourceInputBytes = 0;
   let totalProviderInputBytes = 0;
   for (const artifactPath of [...inputPaths].sort()) {
@@ -3650,6 +3659,7 @@ async function executeRecoverySession(
       throw error;
     }
     const sourceInput = readAgentFlowSessionInput(store, runId, recoveryStepId, artifactPath);
+    sourceInputChecksums.set(artifactPath, sourceInput.checksum);
     totalSourceInputBytes += artifactPath === inputManifestPath
       ? sourceInputManifestBytes
       : sourceInput.content.byteLength;
@@ -3686,6 +3696,7 @@ async function executeRecoverySession(
         content: securedInput.value,
         checksum: `sha256:${createHash("sha256").update(securedInput.value).digest("hex")}`
       });
+      if (securedInput.redacted) redactedInputPaths.add(artifactPath);
     } catch (error) {
       if (error instanceof AgentFlowSensitiveInputError) {
         throw new AgentFlowSessionRequestError(error.message, error.code, { cause: error });
@@ -3707,6 +3718,9 @@ async function executeRecoverySession(
     ["Recovery adapter step ID", recoveryStepId],
     ["Recovery adapter session ID", sessionId],
     ["Recovery adapter provider", provider],
+    ...(providerDescriptor.profile === undefined
+      ? []
+      : [["Recovery adapter provider profile", providerDescriptor.profile] as [string, string]]),
     ["Recovery adapter prompt path", prompt.path, true],
     ...inputs.flatMap((input): Array<[string, string, boolean?]> => [
       ["Recovery adapter input path", input.path, true],
@@ -3731,6 +3745,8 @@ async function executeRecoverySession(
   let externalSessionId = priorExternalSessionId;
   let appliedContextRevision = 0;
   let contextInput: AgentFlowSessionRequestArtifact | undefined;
+  let contextInputSourceChecksum: string | undefined;
+  let contextInputWasRedacted = false;
   try {
     while (true) {
       const activeSession = store.getSession(runId, sessionId)!;
@@ -3767,6 +3783,8 @@ async function executeRecoverySession(
             content: securedContext.value,
             checksum: `sha256:${createHash("sha256").update(securedContext.value).digest("hex")}`
           };
+          contextInputSourceChecksum = sourceContextInput.checksum;
+          contextInputWasRedacted = securedContext.redacted;
         } catch (error) {
           if (error instanceof AgentFlowSensitiveInputError) {
             throw new AgentFlowSessionRequestError(error.message, error.code, { cause: error });
@@ -3774,6 +3792,13 @@ async function executeRecoverySession(
           throw error;
         }
       }
+      preflightAgentFlowSessionProviderEvidence(
+        store,
+        runId,
+        recoveryStepId,
+        failureId,
+        appliedContextRevision
+      );
       reserveAgentFlowSessionModelCallBudgets(
         store, runId, workflow, recoveryStepId, sessionId, provider
       );
@@ -3795,16 +3820,43 @@ async function executeRecoverySession(
               ["Recovery adapter context content type", contextInput.contentType] as [string, string]
             ])
       ]);
+      const providerInputs = contextInput === undefined ? inputs : [...inputs, contextInput];
+      const evidencePrompt = {
+        path: prompt.path,
+        checksum: sourcePromptChecksum,
+        ...(promptWasRedacted ? { providerChecksum: prompt.checksum, redacted: true as const } : {})
+      };
+      const evidenceInputs = providerInputs.map((input) => ({
+        path: input.path,
+        checksum: input.path === RECOVERY_CONTEXT_INPUT_PATH
+          ? contextInputSourceChecksum!
+          : sourceInputChecksums.get(input.path)!,
+        contentType: input.contentType,
+        ...(input.path === RECOVERY_CONTEXT_INPUT_PATH
+          ? contextInputWasRedacted
+            ? { providerChecksum: input.checksum, redacted: true as const }
+            : {}
+          : redactedInputPaths.has(input.path)
+            ? { providerChecksum: input.checksum, redacted: true as const }
+            : {})
+      }));
       try {
         response = await invokeAgentFlowSessionProvider(adapter, {
           runId,
           stepId: recoveryStepId,
           sessionId,
           provider,
+          providerKind: providerDescriptor.kind,
+          ...(providerDescriptor.profile === undefined
+            ? {}
+            : { providerProfile: providerDescriptor.profile }),
           resume,
           ...(externalSessionId === undefined ? {} : { externalSessionId }),
-          prompt,
-          inputs: contextInput === undefined ? inputs : [...inputs, contextInput],
+          prompt: { ...prompt },
+          inputs: providerInputs.map((input) => ({
+            ...input,
+            content: Uint8Array.from(input.content)
+          })),
           outputs: [],
           signal: new AbortController().signal
         }, () => activeStopStatus(store, runId));
@@ -3872,6 +3924,37 @@ async function executeRecoverySession(
       if (settled.stopped !== undefined) {
         throw new AgentFlowSessionRequestInterruptedError(settled.stopped);
       }
+      const requestArtifact = persistAgentFlowSessionProviderEvidence({
+        store,
+        runId,
+        stepId: recoveryStepId,
+        sessionId,
+        provider,
+        providerKind: providerDescriptor.kind,
+        ...(providerDescriptor.profile === undefined
+          ? {}
+          : { providerProfile: providerDescriptor.profile }),
+        resume,
+        prompt: evidencePrompt,
+        inputs: evidenceInputs,
+        outputs: [],
+        ...(externalSessionId === undefined ? {} : { externalSessionId }),
+        ...(metadata === undefined
+          ? {}
+          : { providerMetadata: metadata as Record<string, AgentFlowRunStateValue> }),
+        recoveryFailureId: failureId,
+        recoveryContextRevision: appliedContextRevision
+      });
+      const settledSession = store.getSession(runId, sessionId)!;
+      store.upsertSession({
+        id: sessionId,
+        runId,
+        stepId: recoveryStepId,
+        provider,
+        externalSessionId: externalSessionId ?? null,
+        status: "waiting",
+        state: { ...settledSession.state, requestArtifact: requestArtifact.declaredPath }
+      });
       break;
     }
   } catch (error) {
@@ -3949,7 +4032,7 @@ function recoveryContextInputArtifact(
     path: RECOVERY_CONTEXT_INPUT_PATH,
     content,
     contentType: "text/markdown; charset=utf-8",
-    checksum: createHash("sha256").update(content).digest("hex")
+    checksum: `sha256:${createHash("sha256").update(content).digest("hex")}`
   };
 }
 

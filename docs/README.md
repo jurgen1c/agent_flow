@@ -19,9 +19,11 @@ does not replace Agent Memory or depend on it.
    writes, model sessions, approvals, recovery loops, or cleanup.
 4. Read [execution security](execution-security.md) for command policy,
    adapter capabilities, sensitive-input redaction, and unsafe-channel defaults.
-5. Read [packages and Memory integration](packages-and-memory.md) when a
+5. Read [session provider boundaries](session-providers.md) before configuring
+   local, frontier, named Codex-profile, or custom adapters.
+6. Read [packages and Memory integration](packages-and-memory.md) when a
    repository also uses Agent Memory.
-6. Use [operations and packaging](operations-and-packaging.md) to promote a
+7. Use [operations and packaging](operations-and-packaging.md) to promote a
    workflow from draft to execution and to validate a package or release.
 
 ## Deeper references
@@ -30,6 +32,8 @@ does not replace Agent Memory or depend on it.
   publication boundaries.
 - [Execution security](execution-security.md) defines command, adapter,
   sensitive-input, and unsafe-channel enforcement.
+- [Session provider boundaries](session-providers.md) defines typed provider
+  registration, live opt-in, request/response evidence, and failure behavior.
 - [Example workflows](../examples/README.md) cover pipeline, recovery, and
   collaborative flows with offline fixtures.
 - [Workflow specifications](specifications/) define the supported workflow

@@ -246,8 +246,16 @@ export type {
   AgentFlowArtifactTransformOutput
 } from "./artifact_transform";
 export type {
+  AgentFlowCodexProfileSessionProviderRegistration,
+  AgentFlowCustomSessionProviderRegistration,
+  AgentFlowFixtureSessionProviderRegistration,
+  AgentFlowFrontierSessionProviderRegistration,
+  AgentFlowLocalSessionProviderRegistration,
   AgentFlowSessionProviderAdapter,
+  AgentFlowSessionProviderDescriptor,
+  AgentFlowSessionProviderKind,
   AgentFlowSessionProviderOutput,
+  AgentFlowSessionProviderRegistration,
   AgentFlowSessionProviderRequest,
   AgentFlowSessionProviderResponse,
   AgentFlowSessionRequestArtifact,

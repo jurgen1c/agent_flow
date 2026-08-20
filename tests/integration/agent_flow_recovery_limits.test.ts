@@ -99,7 +99,7 @@ steps:
     store.close();
   });
 
-  test("does not invoke frontier remediation after its model budget is exhausted", async () => {
+  test("charges named Codex profiles as frontier remediation", async () => {
     const root = temporaryRepo();
     fs.writeFileSync(path.join(root, "work.md"), "work\n");
     fs.writeFileSync(path.join(root, "fix.md"), "fix\n");
@@ -112,7 +112,7 @@ limits:
   max_recovery_cycles: 1
 policies: { recovery_limits: fail }
 sessions:
-  fixer: { provider: frontier }
+  fixer: { provider: codex:reviewer }
 steps:
   - { id: seed, type: command, command: "printf work > work.md", outputs: [work.md] }
   - { id: consume, type: session_request, session: fixer, prompt: work.md, inputs: [work.md], outputs: [result.md] }
@@ -127,9 +127,14 @@ steps:
     const store = await openAgentFlowRunState({ cwd: root });
     createAgentFlowLifecycleRun(store, { id: "frontier-recovery-budget", workflow });
     let calls = 0;
-    const providers = createAgentFlowSessionProviderRegistry().register("frontier", () => {
-      calls += 1;
-      return { outputs: { "result.md": "done\n" }, metadata: { recovery_status: "remediated" } };
+    const providers = createAgentFlowSessionProviderRegistry().registerProvider({
+      kind: "codex_profile",
+      profile: "reviewer",
+      enabled: true,
+      adapter: () => {
+        calls += 1;
+        return { outputs: { "result.md": "done\n" }, metadata: { recovery_status: "remediated" } };
+      }
     });
 
     const result = await executeAgentFlowCommandPipeline(
@@ -176,7 +181,7 @@ steps:
     const providers = createAgentFlowSessionProviderRegistry().register("local", () => {
       calls += 1;
       return { outputs: { "result.json": "{}" } };
-    });
+    }, { enabled: true });
 
     expect(await executeAgentFlowCommandPipeline(
       store, "ordinary-model-budget-fail", workflow, undefined, providers
@@ -273,7 +278,7 @@ steps:
     const providers = createAgentFlowSessionProviderRegistry().register("frontier", () => {
       calls += 1;
       return { outputs: {}, metadata: { recovery_status: "remediated" } };
-    });
+    }, { enabled: true });
 
     const result = await executeAgentFlowCommandPipeline(
       store, "pre-remediation-guard", workflow, undefined, providers
@@ -342,7 +347,7 @@ style: recovery_pipeline
 maturity: experimental
 limits: { max_frontier_calls: 1 }
 short_circuit_if: ["budget.frontier_calls_remaining == 0"]
-sessions: { fixer: { provider: frontier } }
+sessions: { fixer: { provider: codex:reviewer } }
 steps:
   - { id: fix, type: session_request, session: fixer, prompt: fix.md, inputs: [input.md], outputs: [result.md] }
   - { id: automate, type: command, command: automate }
@@ -357,7 +362,7 @@ version: 1
 style: recovery_pipeline
 maturity: experimental
 limits: { max_frontier_calls: 1, max_recovery_cycles: 1 }
-sessions: { fixer: { provider: frontier } }
+sessions: { fixer: { provider: codex:reviewer } }
 steps:
   - { id: use-budget, type: session_request, session: fixer, prompt: fix.md, outputs: [used.md] }
   - id: check
