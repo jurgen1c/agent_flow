@@ -1,5 +1,6 @@
 import type { AgentFlowWorkflow, AgentFlowYamlMapping, AgentFlowYamlValue } from "./workflow";
 import {
+  isAgentFlowFrontierProvider,
   isSupportedPolicyGlob,
   mapping,
   nonEmptyStringList,
@@ -30,7 +31,7 @@ export function validateAgentFlowPolicyPrimitives(workflow: AgentFlowWorkflow): 
   const frontierSessions = Object.entries(workflow.sessions ?? {})
     .filter(([, session]) => {
       const provider = mapping(session)?.provider;
-      return typeof provider === "string" && provider.trim() === "frontier";
+      return isAgentFlowFrontierProvider(provider);
     })
     .map(([name]) => name);
 

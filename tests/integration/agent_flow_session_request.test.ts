@@ -33,6 +33,83 @@ import {
 import { redactAgentFlowSensitiveText } from "../../src/runtime/failure_payload";
 
 describe("Agent Flow session request steps", () => {
+  test("registers typed provider boundaries while live providers require explicit opt in", () => {
+    const adapter = () => ({ outputs: {} });
+    const registry = createAgentFlowSessionProviderRegistry([
+      { kind: "fixture", adapter },
+      { kind: "local", enabled: true, adapter },
+      { kind: "frontier", enabled: true, adapter },
+      { kind: "codex_profile", profile: "reviewer", enabled: true, adapter },
+      { kind: "custom", name: "paseo", adapter }
+    ]);
+
+    expect(registry.names()).toEqual(["codex:reviewer", "fixture", "frontier", "local", "paseo"]);
+    expect(registry.describe("codex:reviewer")).toEqual({
+      name: "codex:reviewer",
+      kind: "codex_profile",
+      profile: "reviewer"
+    });
+    expect(() => createAgentFlowSessionProviderRegistry([
+      { kind: "frontier", enabled: false, adapter }
+    ])).toThrow("disabled unless enabled: true");
+    expect(() => createAgentFlowSessionProviderRegistry().register("local", adapter))
+      .toThrow("disabled unless enabled: true");
+    expect(createAgentFlowSessionProviderRegistry().register("local", adapter, { enabled: true }).describe("local"))
+      .toEqual({ name: "local", kind: "local" });
+    expect(() => createAgentFlowSessionProviderRegistry([
+      { kind: "custom", name: "codex:reviewer", adapter }
+    ])).toThrow("is reserved");
+    expect(() => createAgentFlowSessionProviderRegistry([
+      { kind: "custom", name: "fixture", adapter }
+    ])).toThrow("is reserved");
+    expect(() => createAgentFlowSessionProviderRegistry().register(
+      "codex: reviewer", adapter, { enabled: true }
+    )).toThrow("must not have leading or trailing whitespace");
+    expect(() => createAgentFlowSessionProviderRegistry([
+      { kind: "codex_profile", profile: "reviewer ", enabled: true, adapter }
+    ])).toThrow("must not have leading or trailing whitespace");
+    expect(() => createAgentFlowSessionProviderRegistry([
+      { kind: "custom", name: "codex:", adapter }
+    ])).toThrow("is reserved");
+  });
+
+  test("fails unsupported providers with registration guidance before invocation", async () => {
+    const root = temporaryRepo();
+    fs.mkdirSync(path.join(root, "prompts"), { recursive: true });
+    fs.writeFileSync(path.join(root, "prompts", "draft.md"), "Draft.\n");
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: unsupported-provider
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  writer: { provider: unavailable }
+steps:
+  - { id: draft, type: session_request, session: writer, prompt: prompts/draft.md, inputs: [request.md], outputs: [response.md] }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "unsupported-provider", workflow });
+    store.writeArtifact({
+      id: "request",
+      runId: "unsupported-provider",
+      path: "request.md",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "Request"
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      "unsupported-provider",
+      workflow,
+      undefined,
+      createAgentFlowSessionProviderRegistry()
+    );
+
+    expect(result).toMatchObject({ status: "paused", failedStep: "draft" });
+    expect(result.message).toContain("Register a fixture or named custom adapter explicitly.");
+    store.close();
+  });
+
   test("rejects and aborts when an in-flight interrupt check throws", async () => {
     let interruptChecks = 0;
     let aborted = false;
@@ -1632,6 +1709,7 @@ steps:
       stepId: "draft",
       sessionId: "writer",
       provider: "fixture",
+      providerKind: "fixture",
       resume: true,
       outputs: ["response.md"]
     });
@@ -1645,6 +1723,7 @@ steps:
       stepId: "draft",
       sessionId: "writer",
       provider: "fixture",
+      providerKind: "fixture",
       resume: true,
       outputs: ["response.md"],
       providerMetadata: { fixture: true }

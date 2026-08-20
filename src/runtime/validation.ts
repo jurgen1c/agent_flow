@@ -6,7 +6,7 @@ import type {
   AgentFlowYamlValue
 } from "./workflow";
 import { validateAgentFlowPolicyPrimitives } from "./policy";
-import { policyGlobLayersHaveWritablePath } from "./policy_utils";
+import { isAgentFlowFrontierProvider, policyGlobLayersHaveWritablePath } from "./policy_utils";
 import { normalizeAgentFlowArtifactPath } from "./run_state";
 import { MAX_AGENT_FLOW_SESSION_INPUTS } from "./session_request";
 import {
@@ -514,6 +514,21 @@ function validateSessionDefinitions(workflow: AgentFlowWorkflow, errors: AgentFl
           message: `Session "${name}" must declare a static provider so its adapter can be selected before execution.`,
           path: `sessions.${name}.provider`
         });
+      }
+
+      if (typeof value.provider === "string") {
+        const provider = value.provider.trim();
+        const codexProfile = provider.startsWith("codex:")
+          ? provider.slice("codex:".length)
+          : undefined;
+        if (codexProfile !== undefined
+            && (codexProfile.length === 0 || codexProfile !== codexProfile.trim())) {
+          errors.push({
+            code: "workflow.session.provider.codex_profile.invalid",
+            message: `Session "${name}" Codex provider must use codex:<profile> with a non-empty profile and no surrounding profile whitespace.`,
+            path: `sessions.${name}.provider`
+          });
+        }
       }
 
       if (value.resume !== undefined && typeof value.resume !== "boolean") {
@@ -2659,7 +2674,7 @@ function validateCollaborativeReviewBounds(
 
 function lintFrontierBudgets(workflow: AgentFlowWorkflow, warnings: AgentFlowWorkflowIssue[]): void {
   const frontierSessions = Object.entries(workflow.sessions ?? {})
-    .filter(([, session]) => isRecord(session) && session.provider === "frontier")
+    .filter(([, session]) => isRecord(session) && isAgentFlowFrontierProvider(session.provider))
     .map(([name]) => name);
   const limits = isRecord(workflow.limits) ? workflow.limits : undefined;
 

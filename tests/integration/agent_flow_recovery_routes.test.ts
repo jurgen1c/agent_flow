@@ -16,6 +16,7 @@ import {
   transitionAgentFlowLifecycleRun,
   validateAgentFlowWorkflow
 } from "../../src/runtime";
+import { preflightAgentFlowSessionProviderEvidence } from "../../src/runtime/session_request";
 
 describe("Agent Flow recovery routes", () => {
   test("validates recovery targets, outcome handlers, and result statuses", () => {
@@ -1398,6 +1399,7 @@ steps:
     });
     const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => {
       expect(request.stepId).toBe("check:recovery");
+      expect(request.providerKind).toBe("fixture");
       expect(request.externalSessionId).toBe("existing-session");
       expect(request.inputs.map((input) => input.path)).toEqual(expect.arrayContaining([
         expect.stringMatching(/^failures\/.+\.json$/),
@@ -1427,9 +1429,181 @@ steps:
     expect(store.getSession("session-recovery", "fixer")).toMatchObject({
       status: "waiting",
       externalSessionId: "continued-session",
-      state: { recoveryStatus: "remediated", failureId: expect.any(String) }
+      state: {
+        recoveryStatus: "remediated",
+        failureId: expect.any(String),
+        requestArtifact: expect.stringMatching(/^session-requests\//)
+      }
+    });
+    const requestPath = store.getSession("session-recovery", "fixer")!.state.requestArtifact as string;
+    expect(JSON.parse(store.readArtifact("session-recovery", requestPath).content.toString("utf8"))).toMatchObject({
+      stepId: "check:recovery",
+      sessionId: "fixer",
+      provider: "fixture",
+      providerKind: "fixture",
+      resume: true,
+      externalSessionId: "continued-session",
+      outputs: [],
+      providerMetadata: { recovery_status: "remediated", message: "fixed" }
     });
     expect(store.listFailures("session-recovery")[0]?.resolvedAt).not.toBeNull();
+    store.close();
+  });
+
+  test("keeps ordinary and recovery request evidence separate when their step IDs overlap", async () => {
+    const root = temporaryRepo();
+    fs.writeFileSync(path.join(root, "fix.md"), "Fix the failure.\n");
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: separate-recovery-evidence
+version: 1
+style: recovery_pipeline
+maturity: experimental
+sessions: { fixer: { provider: fixture } }
+steps:
+  - { id: "check:recovery", type: session_request, session: fixer, prompt: fix.md, inputs: [request.md], outputs: [first.md], then: check }
+  - id: check
+    type: command
+    command: exit 1
+    on_failure:
+      route_to: { session: fixer, prompt: fix.md }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "separate-recovery-evidence", workflow });
+    store.writeArtifact({
+      id: "request",
+      runId: "separate-recovery-evidence",
+      path: "request.md",
+      kind: "input",
+      contentType: "text/plain",
+      content: "Request.\n"
+    });
+    let calls = 0;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+      calls += 1;
+      return calls === 1
+        ? { outputs: { "first.md": "First response.\n" }, metadata: { phase: "ordinary" } }
+        : { outputs: {}, metadata: { recovery_status: "remediated", phase: "recovery" } };
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store, "separate-recovery-evidence", workflow, undefined, providers
+    );
+
+    expect(result.status).toBe("completed");
+    const ordinaryRequestPath = store.getArtifact("separate-recovery-evidence", "first.md")!
+      .metadata.requestArtifact as string;
+    const recoveryRequestPath = store.getSession("separate-recovery-evidence", "fixer")!
+      .state.requestArtifact as string;
+    expect(recoveryRequestPath).toMatch(/^session-requests\/recovery\//);
+    expect(recoveryRequestPath).not.toBe(ordinaryRequestPath);
+    expect(JSON.parse(store.readArtifact(
+      "separate-recovery-evidence", ordinaryRequestPath
+    ).content.toString("utf8"))).toMatchObject({ providerMetadata: { phase: "ordinary" } });
+    expect(JSON.parse(store.readArtifact(
+      "separate-recovery-evidence", recoveryRequestPath
+    ).content.toString("utf8"))).toMatchObject({
+      providerMetadata: { recovery_status: "remediated", phase: "recovery" },
+      recoveryContextRevision: 0
+    });
+    store.close();
+  });
+
+  test("preflights recovery request evidence ownership before provider invocation", async () => {
+    const root = temporaryRepo();
+    fs.writeFileSync(path.join(root, "fix.md"), "Fix the failure.\n");
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: recovery-evidence-collision
+version: 1
+style: recovery_pipeline
+maturity: experimental
+limits: { max_model_calls: 1 }
+sessions: { fixer: { provider: fixture } }
+steps:
+  - id: check
+    type: command
+    command: exit 1
+    on_failure:
+      route_to: { session: fixer, prompt: fix.md }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+    const runId = "recovery-evidence-collision";
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: runId, workflow });
+    const failureId = `command:check-${createHash("sha256").update("check").digest("hex").slice(0, 8)}:attempt-1`;
+    const requestPath = preflightAgentFlowSessionProviderEvidence(
+      store, runId, "check:recovery", failureId, 0
+    );
+    store.writeArtifact({
+      id: "foreign-artifact",
+      runId,
+      stepId: "fixture",
+      path: requestPath,
+      kind: "fixture",
+      contentType: "application/json; charset=utf-8",
+      content: "{}\n"
+    });
+    let calls = 0;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+      calls += 1;
+      return { outputs: {}, metadata: { recovery_status: "remediated" } };
+    });
+
+    const result = await executeAgentFlowCommandPipeline(store, runId, workflow, undefined, providers);
+
+    expect(result.status).toBe("paused");
+    expect(calls).toBe(0);
+    expect(store.getBudget(runId, "model:model_calls")?.used ?? 0).toBe(0);
+    expect(store.getSession(runId, "fixer")?.state.error).toContain("already owned by another artifact");
+    store.close();
+  });
+
+  test("preflights recovery request evidence ID ownership before provider invocation", async () => {
+    const root = temporaryRepo();
+    fs.writeFileSync(path.join(root, "fix.md"), "Fix the failure.\n");
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: recovery-evidence-id-collision
+version: 1
+style: recovery_pipeline
+maturity: experimental
+limits: { max_model_calls: 1 }
+sessions: { fixer: { provider: fixture } }
+steps:
+  - id: check
+    type: command
+    command: exit 1
+    on_failure:
+      route_to: { session: fixer, prompt: fix.md }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+    const runId = "recovery-evidence-id-collision";
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: runId, workflow });
+    const failureId = `command:check-${createHash("sha256").update("check").digest("hex").slice(0, 8)}:attempt-1`;
+    const requestPath = preflightAgentFlowSessionProviderEvidence(
+      store, runId, "check:recovery", failureId, 0
+    );
+    store.writeArtifact({
+      id: `session-request:${createHash("sha256").update(requestPath).digest("hex")}`,
+      runId,
+      stepId: "fixture",
+      path: "foreign-request-evidence.json",
+      kind: "fixture",
+      contentType: "application/json; charset=utf-8",
+      content: "{}\n"
+    });
+    let calls = 0;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+      calls += 1;
+      return { outputs: {}, metadata: { recovery_status: "remediated" } };
+    });
+
+    const result = await executeAgentFlowCommandPipeline(store, runId, workflow, undefined, providers);
+
+    expect(result.status).toBe("paused");
+    expect(calls).toBe(0);
+    expect(store.getBudget(runId, "model:model_calls")?.used ?? 0).toBe(0);
+    expect(store.getSession(runId, "fixer")?.state.error).toContain("already registered at");
     store.close();
   });
 
@@ -1493,6 +1667,21 @@ steps:
       status: "waiting",
       externalSessionId: "recovery-session-2"
     });
+    const requestArtifacts = store.listArtifacts("repeated-session-recovery")
+      .filter((artifact) => artifact.kind === "session_request");
+    expect(requestArtifacts).toHaveLength(2);
+    const requestEvidence = requestArtifacts.map((artifact) => JSON.parse(store.readArtifact(
+      "repeated-session-recovery", artifact.declaredPath
+    ).content.toString("utf8")) as {
+      externalSessionId: string;
+      recoveryFailureId: string;
+    });
+    expect(requestEvidence.map((evidence) => evidence.externalSessionId).sort())
+      .toEqual(["recovery-session-1", "recovery-session-2"]);
+    expect(new Set(requestEvidence.map((evidence) => evidence.recoveryFailureId)).size).toBe(2);
+    expect(requestArtifacts.map((artifact) => artifact.declaredPath)).toContain(
+      store.getSession("repeated-session-recovery", "fixer")!.state.requestArtifact
+    );
     expect(store.listFailures("repeated-session-recovery").every((failure) => failure.resolvedAt !== null)).toBe(true);
     expect(store.listEvents("repeated-session-recovery")
       .filter((event) => event.type === "step.started" && event.stepId === "check")

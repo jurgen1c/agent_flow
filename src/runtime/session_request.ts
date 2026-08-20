@@ -46,6 +46,7 @@ import {
   secureAgentFlowReferencedByteInput,
   secureAgentFlowTextInput
 } from "./execution_security";
+import { isAgentFlowFrontierProvider } from "./policy_utils";
 
 export const MAX_AGENT_FLOW_SESSION_PROMPT_BYTES = 1024 * 1024;
 export const MAX_AGENT_FLOW_SESSION_INPUT_BYTES = 10 * 1024 * 1024;
@@ -66,6 +67,8 @@ export interface AgentFlowSessionProviderRequest {
   stepId: string;
   sessionId: string;
   provider: string;
+  providerKind?: AgentFlowSessionProviderKind;
+  providerProfile?: string;
   kind?: "review" | "consult" | "challenge" | "approval" | "disagreement" | "session_request";
   resume: boolean;
   externalSessionId?: string;
@@ -89,6 +92,84 @@ export interface AgentFlowSessionProviderResponse {
 export type AgentFlowSessionProviderAdapter = (
   request: AgentFlowSessionProviderRequest
 ) => AgentFlowSessionProviderResponse | Promise<AgentFlowSessionProviderResponse>;
+
+export type AgentFlowSessionProviderKind =
+  | "fixture"
+  | "local"
+  | "frontier"
+  | "codex_profile"
+  | "custom";
+
+interface AgentFlowSessionProviderRegistrationBase {
+  adapter: AgentFlowSessionProviderAdapter;
+}
+
+export interface AgentFlowFixtureSessionProviderRegistration
+  extends AgentFlowSessionProviderRegistrationBase {
+  kind: "fixture";
+}
+
+export interface AgentFlowLocalSessionProviderRegistration
+  extends AgentFlowSessionProviderRegistrationBase {
+  kind: "local";
+  enabled: boolean;
+}
+
+export interface AgentFlowFrontierSessionProviderRegistration
+  extends AgentFlowSessionProviderRegistrationBase {
+  kind: "frontier";
+  enabled: boolean;
+}
+
+export interface AgentFlowCodexProfileSessionProviderRegistration
+  extends AgentFlowSessionProviderRegistrationBase {
+  kind: "codex_profile";
+  enabled: boolean;
+  profile: string;
+}
+
+export interface AgentFlowCustomSessionProviderRegistration
+  extends AgentFlowSessionProviderRegistrationBase {
+  kind: "custom";
+  name: string;
+}
+
+export type AgentFlowSessionProviderRegistration =
+  | AgentFlowFixtureSessionProviderRegistration
+  | AgentFlowLocalSessionProviderRegistration
+  | AgentFlowFrontierSessionProviderRegistration
+  | AgentFlowCodexProfileSessionProviderRegistration
+  | AgentFlowCustomSessionProviderRegistration;
+
+export interface AgentFlowSessionProviderDescriptor {
+  name: string;
+  kind: AgentFlowSessionProviderKind;
+  profile?: string;
+}
+
+export interface PersistAgentFlowSessionProviderEvidenceInput {
+  store: AgentFlowRunStateStore;
+  runId: string;
+  stepId: string;
+  sessionId: string;
+  provider: string;
+  providerKind: AgentFlowSessionProviderKind;
+  providerProfile?: string;
+  resume: boolean;
+  prompt: { path: string; checksum: string; providerChecksum?: string; redacted?: true };
+  inputs: Array<{
+    path: string;
+    checksum: string;
+    contentType: string;
+    providerChecksum?: string;
+    redacted?: true;
+  }>;
+  outputs: string[];
+  externalSessionId?: string;
+  providerMetadata?: Record<string, AgentFlowRunStateValue>;
+  recoveryFailureId: string;
+  recoveryContextRevision: number;
+}
 
 export interface AgentFlowSessionRequestExecutionResult {
   sessionId: string;
@@ -144,31 +225,190 @@ export class AgentFlowSessionPolicyError extends AgentFlowSessionRequestError {
 }
 
 export class AgentFlowSessionProviderRegistry {
-  private readonly providers = new Map<string, AgentFlowSessionProviderAdapter>();
+  private readonly providers = new Map<string, {
+    adapter: AgentFlowSessionProviderAdapter;
+    descriptor: AgentFlowSessionProviderDescriptor;
+  }>();
 
-  register(name: string, adapter: AgentFlowSessionProviderAdapter): this {
+  register(
+    name: string,
+    adapter: AgentFlowSessionProviderAdapter,
+    options: { enabled?: boolean } = {}
+  ): this {
     const normalized = requiredName(name, "Session provider name");
-    if (this.providers.has(normalized)) {
-      throw new AgentFlowSessionRequestError(
-        `Session provider ${normalized} is already registered.`,
-        "AGENT_FLOW_SESSION_PROVIDER_COLLISION"
+    if (normalized === "local" || normalized === "frontier") {
+      return this.registerProvider({
+        kind: normalized,
+        enabled: options.enabled === true,
+        adapter
+      });
+    }
+    if (normalized.startsWith("codex:")) {
+      const profile = requiredCodexProfile(normalized.slice("codex:".length));
+      return this.registerProvider({
+        kind: "codex_profile",
+        profile,
+        enabled: options.enabled === true,
+        adapter
+      });
+    }
+    const descriptor = descriptorForExplicitProviderName(normalized);
+    return this.add(normalized, adapter, descriptor);
+  }
+
+  registerProvider(registration: AgentFlowSessionProviderRegistration): this {
+    if (registration === null || typeof registration !== "object") {
+      throw invalidProviderRegistration("Session provider registration must be an object.");
+    }
+    if (typeof registration.adapter !== "function") {
+      throw invalidProviderRegistration("Session provider registration must include an adapter function.");
+    }
+    if (registration.kind === "fixture") {
+      return this.add("fixture", registration.adapter, { name: "fixture", kind: "fixture" });
+    }
+    if (registration.kind === "custom") {
+      const name = requiredName(registration.name, "Custom session provider name");
+      if (isReservedSessionProviderName(name)) {
+        throw invalidProviderRegistration(
+          `Custom session provider name ${name} is reserved; use a fixture registration or an enabled local, frontier, or Codex profile registration.`
+        );
+      }
+      return this.add(name, registration.adapter, { name, kind: "custom" });
+    }
+    if (registration.kind !== "local" && registration.kind !== "frontier"
+        && registration.kind !== "codex_profile") {
+      throw invalidProviderRegistration(
+        `Unsupported session provider kind ${JSON.stringify((registration as { kind?: unknown }).kind)}; `
+          + "use fixture, local, frontier, codex_profile, or custom."
       );
     }
-    this.providers.set(normalized, adapter);
-    return this;
+    if (registration.enabled !== true) {
+      throw new AgentFlowSessionRequestError(
+        `${providerKindLabel(registration.kind)} session providers are disabled unless enabled: true is explicitly configured.`,
+        "AGENT_FLOW_SESSION_PROVIDER_DISABLED"
+      );
+    }
+    if (registration.kind === "codex_profile") {
+      const profile = requiredCodexProfile(registration.profile);
+      const name = `codex:${profile}`;
+      return this.add(name, registration.adapter, { name, kind: registration.kind, profile });
+    }
+    return this.add(registration.kind, registration.adapter, {
+      name: registration.kind,
+      kind: registration.kind
+    });
   }
 
   get(name: string): AgentFlowSessionProviderAdapter | undefined {
-    return this.providers.get(requiredName(name, "Session provider name"));
+    return this.providers.get(requiredName(name, "Session provider name"))?.adapter;
+  }
+
+  describe(name: string): AgentFlowSessionProviderDescriptor | undefined {
+    const descriptor = this.providers.get(requiredName(name, "Session provider name"))?.descriptor;
+    return descriptor === undefined ? undefined : { ...descriptor };
   }
 
   names(): string[] {
     return [...this.providers.keys()].sort();
   }
+
+  private add(
+    name: string,
+    adapter: AgentFlowSessionProviderAdapter,
+    descriptor: AgentFlowSessionProviderDescriptor
+  ): this {
+    if (typeof adapter !== "function") {
+      throw invalidProviderRegistration(`Session provider ${name} adapter must be a function.`);
+    }
+    if (this.providers.has(name)) {
+      throw new AgentFlowSessionRequestError(
+        `Session provider ${name} is already registered.`,
+        "AGENT_FLOW_SESSION_PROVIDER_COLLISION"
+      );
+    }
+    this.providers.set(name, { adapter, descriptor: Object.freeze({ ...descriptor }) });
+    return this;
+  }
 }
 
-export function createAgentFlowSessionProviderRegistry(): AgentFlowSessionProviderRegistry {
-  return new AgentFlowSessionProviderRegistry();
+export function createAgentFlowSessionProviderRegistry(
+  registrations: readonly AgentFlowSessionProviderRegistration[] = []
+): AgentFlowSessionProviderRegistry {
+  const registry = new AgentFlowSessionProviderRegistry();
+  for (const registration of registrations) registry.registerProvider(registration);
+  return registry;
+}
+
+export function persistAgentFlowSessionProviderEvidence(
+  input: PersistAgentFlowSessionProviderEvidenceInput
+): AgentFlowArtifactRecord {
+  const requestPath = preflightAgentFlowSessionProviderEvidence(
+    input.store,
+    input.runId,
+    input.stepId,
+    input.recoveryFailureId,
+    input.recoveryContextRevision
+  );
+  const artifactId = `session-request:${digest(requestPath)}`;
+  const existing = input.store.getArtifact(input.runId, requestPath);
+  const requestMetadata = {
+    stepId: input.stepId,
+    sessionId: input.sessionId,
+    provider: input.provider,
+    providerKind: input.providerKind,
+    ...(input.providerProfile === undefined ? {} : { providerProfile: input.providerProfile }),
+    resume: input.resume,
+    recoveryFailureId: input.recoveryFailureId,
+    recoveryContextRevision: input.recoveryContextRevision,
+    prompt: { ...input.prompt },
+    inputs: input.inputs.map((artifact) => ({ ...artifact })),
+    outputs: [...input.outputs],
+    ...(input.externalSessionId === undefined ? {} : { externalSessionId: input.externalSessionId }),
+    ...(input.providerMetadata === undefined ? {} : { providerMetadata: input.providerMetadata })
+  };
+  return input.store.writeArtifact({
+    id: artifactId,
+    runId: input.runId,
+    stepId: input.stepId,
+    path: requestPath,
+    kind: "session_request",
+    contentType: "application/json; charset=utf-8",
+    content: `${stableJson(requestMetadata)}\n`,
+    overwrite: existing !== null,
+    requiredRunStatus: "running",
+    metadata: {
+      sessionId: input.sessionId,
+      provider: input.provider,
+      resume: input.resume
+    }
+  });
+}
+
+export function preflightAgentFlowSessionProviderEvidence(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  stepId: string,
+  recoveryFailureId: string,
+  recoveryContextRevision: number
+): string {
+  const evidenceKey = `${stepId}\0${recoveryFailureId}\0${recoveryContextRevision}`;
+  const requestPath = `session-requests/recovery/${safePathSegment(stepId).slice(0, 180)}-${digest(evidenceKey).slice(0, 12)}.json`;
+  const artifactId = `session-request:${digest(requestPath)}`;
+  const idOwner = store.getArtifactById(runId, artifactId);
+  if (idOwner !== null && idOwner.declaredPath !== requestPath) {
+    throw new AgentFlowSessionRequestError(
+      `Session request metadata ID ${artifactId} is already registered at ${idOwner.declaredPath}.`,
+      "AGENT_FLOW_SESSION_REQUEST_COLLISION"
+    );
+  }
+  const existing = store.getArtifact(runId, requestPath);
+  if (existing !== null && (existing.kind !== "session_request" || existing.id !== artifactId)) {
+    throw new AgentFlowSessionRequestError(
+      `Session request metadata path ${requestPath} is already owned by another artifact.`,
+      "AGENT_FLOW_SESSION_REQUEST_COLLISION"
+    );
+  }
+  return requestPath;
 }
 
 export function createAgentFlowFixtureSessionProvider(
@@ -405,12 +645,16 @@ async function executeAgentFlowSessionStep(
   const initialStaleApproval = staleMergeApprovalError();
   if (initialStaleApproval !== undefined) throw initialStaleApproval;
   const provider = requiredName(session.provider, `Session ${sessionId} provider`);
+  const providerDescriptor = registry.describe(provider);
   try {
     for (const [label, value] of [
       ["Session adapter run ID", runId],
       ["Session adapter step ID", stepId],
       ["Session adapter session ID", sessionId],
-      ["Session adapter provider", provider]
+      ["Session adapter provider", provider],
+      ...(providerDescriptor?.profile === undefined
+        ? []
+        : [["Session adapter provider profile", providerDescriptor.profile]])
     ] as const) {
       assertAgentFlowAdapterStringSafe(workflow, label, value);
     }
@@ -421,9 +665,9 @@ async function executeAgentFlowSessionStep(
     throw error;
   }
   const adapter = registry.get(provider);
-  if (adapter === undefined) {
+  if (providerDescriptor === undefined || adapter === undefined) {
     throw new AgentFlowSessionRequestError(
-      `No adapter is registered for session provider ${provider}; register it explicitly before running step ${stepId}.`,
+      missingProviderAdapterMessage(provider, stepId),
       "AGENT_FLOW_SESSION_PROVIDER_UNKNOWN"
     );
   }
@@ -670,6 +914,8 @@ async function executeAgentFlowSessionStep(
     stepId,
     sessionId,
     provider,
+    providerKind: providerDescriptor.kind,
+    ...(providerDescriptor.profile === undefined ? {} : { providerProfile: providerDescriptor.profile }),
     kind,
     resume,
     ...(priorExternalSessionId === undefined
@@ -802,6 +1048,8 @@ async function executeAgentFlowSessionStep(
     stepId,
     sessionId,
     provider,
+    providerKind: providerDescriptor.kind,
+    ...(providerDescriptor.profile === undefined ? {} : { providerProfile: providerDescriptor.profile }),
     resume,
     prompt: {
       path: prompt.path,
@@ -984,7 +1232,7 @@ export function reserveAgentFlowSessionModelCallBudgets(
   sessionId: string,
   provider: string
 ): void {
-  const kinds = ["model_calls", ...(provider === "frontier" ? ["frontier_calls"] : [])];
+  const kinds = ["model_calls", ...(isAgentFlowFrontierProvider(provider) ? ["frontier_calls"] : [])];
   const usage = Object.fromEntries(kinds.map((kind) => [kind, store.getBudget(runId, `model:${kind}`)?.used ?? 0]));
   const decision = evaluateAgentFlowPolicy(workflow, { kind: "model_usage", session: sessionId, usage });
   if (decision.status !== "allow") {
@@ -1327,6 +1575,44 @@ function requiredName(value: unknown, label: string): string {
     throw new AgentFlowSessionRequestError(`${label} must be a non-empty string.`, "AGENT_FLOW_SESSION_REQUEST_INVALID");
   }
   return value.trim();
+}
+
+function invalidProviderRegistration(message: string): AgentFlowSessionRequestError {
+  return new AgentFlowSessionRequestError(message, "AGENT_FLOW_SESSION_PROVIDER_REGISTRATION_INVALID");
+}
+
+function requiredCodexProfile(value: unknown): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw invalidProviderRegistration("Codex session provider profile must be a non-empty string.");
+  }
+  if (value !== value.trim()) {
+    throw invalidProviderRegistration(
+      "Codex session provider profile must not have leading or trailing whitespace."
+    );
+  }
+  return value;
+}
+
+function descriptorForExplicitProviderName(name: string): AgentFlowSessionProviderDescriptor {
+  if (name === "fixture") return { name, kind: "fixture" };
+  return { name, kind: "custom" };
+}
+
+function isReservedSessionProviderName(name: string): boolean {
+  return name === "fixture" || name === "local" || name === "frontier"
+    || name.startsWith("codex:");
+}
+
+function providerKindLabel(kind: "local" | "frontier" | "codex_profile"): string {
+  return kind === "codex_profile" ? "Codex profile" : `${kind[0]!.toUpperCase()}${kind.slice(1)}`;
+}
+
+function missingProviderAdapterMessage(provider: string, stepId: string): string {
+  const liveGuidance = provider === "local" || provider === "frontier" || provider.startsWith("codex:")
+    ? " Live providers are disabled by default; register an enabled provider configuration"
+      + " with createAgentFlowSessionProviderRegistry or registerProvider."
+    : " Register a fixture or named custom adapter explicitly.";
+  return `No adapter is registered for session provider ${provider}; cannot run step ${stepId}.${liveGuidance}`;
 }
 
 function optionalName(value: unknown, label: string): string | undefined {

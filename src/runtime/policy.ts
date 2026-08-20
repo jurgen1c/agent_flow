@@ -2,6 +2,7 @@ import type { AgentFlowApprovalStatus, AgentFlowRunStatus } from "./run_state";
 import type { AgentFlowWorkflow, AgentFlowYamlValue } from "./workflow";
 import { validateAgentFlowPolicyPrimitives } from "./policy_validation";
 import {
+  isAgentFlowFrontierProvider,
   isSupportedPolicyGlob,
   isPolicyRootDirectory,
   mapping,
@@ -165,7 +166,7 @@ function checkModelUsage(
     return fail("policy.model.provider.denied", `Provider "${provider}" is not allowed for session "${sessionName}".`);
   }
 
-  const budgets = ["model_calls", ...(provider === "frontier" ? ["frontier_calls"] : [])];
+  const budgets = ["model_calls", ...(isAgentFlowFrontierProvider(provider) ? ["frontier_calls"] : [])];
   for (const budget of budgets) {
     const limit = mapping(workflow.limits)?.[`max_${budget}`];
     if (limit === undefined && budget !== "frontier_calls") continue;

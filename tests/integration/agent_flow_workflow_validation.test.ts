@@ -1898,6 +1898,39 @@ steps:
     }]);
   });
 
+  test("rejects noncanonical Codex session provider profiles", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: invalid-codex-profiles
+version: 1
+style: pipeline
+maturity: experimental
+limits: { max_frontier_calls: 3 }
+sessions:
+  empty: { provider: "codex:" }
+  blank: { provider: "codex:   " }
+  spaced: { provider: "codex: reviewer" }
+steps:
+  - { id: noop, type: command, command: "true" }
+`);
+
+    expect(validateAgentFlowWorkflow(workflow).errors).toEqual([
+      {
+        code: "workflow.session.provider.codex_profile.invalid",
+        message: 'Session "empty" Codex provider must use codex:<profile> with a non-empty profile and no surrounding profile whitespace.',
+        path: "sessions.empty.provider"
+      },
+      {
+        code: "workflow.session.provider.codex_profile.invalid",
+        message: 'Session "blank" Codex provider must use codex:<profile> with a non-empty profile and no surrounding profile whitespace.',
+        path: "sessions.blank.provider"
+      },
+      {
+        code: "workflow.session.provider.codex_profile.invalid",
+        message: 'Session "spaced" Codex provider must use codex:<profile> with a non-empty profile and no surrounding profile whitespace.',
+        path: "sessions.spaced.provider"
+      }
+    ]);
+  });
+
   test("rejects malformed session authority mappings and capability flags", () => {
     const workflow = parseAgentFlowWorkflowOrThrow(`name: malformed-session-authority
 version: 1

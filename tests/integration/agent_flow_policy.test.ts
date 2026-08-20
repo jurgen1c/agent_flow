@@ -705,6 +705,14 @@ steps:
       "workflow.policy.budget.frontier.required"
     );
 
+    const codexProfile = parseAgentFlowWorkflowOrThrow(unboundedSource().replace(
+      "provider: frontier",
+      "provider: codex:reviewer"
+    ));
+    expect(validateAgentFlowWorkflow(codexProfile).errors.map((issue) => issue.code)).toContain(
+      "workflow.policy.budget.frontier.required"
+    );
+
     const dynamicProvider = parseAgentFlowWorkflowOrThrow(POLICY_WORKFLOW
       .replace("provider: frontier", 'provider: "{{ inputs.provider }}"')
       .replace("  max_frontier_calls: 2\n", ""));

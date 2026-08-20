@@ -94,6 +94,11 @@ const recoveryWorkflows = createAgentFlowWorkflowRegistry()
 // injectAgentFlowRecoveryContext(store, runId, "fixer", "New user context");
 ```
 
+Session providers are registered through typed fixture, local, frontier,
+named Codex-profile, or custom boundaries. Live providers are disabled by
+default and require explicit enabled configuration; see
+[Session provider boundaries](docs/session-providers.md).
+
 Pass the workflow registry as the final `executeAgentFlowCommandPipeline`
 argument when a workflow uses `route_to.workflow`. Recovery session providers
 report `metadata.recovery_status` as `remediated` or `unresolved`.

@@ -2,6 +2,13 @@ import fs from "node:fs";
 import path from "node:path";
 import type { AgentFlowYamlMapping, AgentFlowYamlValue } from "./workflow";
 
+export function isAgentFlowFrontierProvider(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  const provider = value.trim();
+  return provider === "frontier"
+    || (provider.startsWith("codex:") && provider.slice("codex:".length).trim().length > 0);
+}
+
 export function matchesPolicyGlob(candidate: string, sourcePattern: string): boolean {
   const expanded = normalizedPolicyPatterns(sourcePattern);
   if (expanded === undefined) return false;
