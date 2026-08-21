@@ -451,18 +451,25 @@ steps:
 version: 1
 style: recovery_pipeline
 maturity: experimental
+inputs: { enabled: { required: true } }
 short_circuit_if:
   - failures.never.attempts == 0
   - "!failures.never.attempts"
   - "!(artifacts.risk.high == true)"
+  - "!(failures.never.attempts >= 1 && inputs.enabled == false)"
 steps:
   - { id: check, type: command, command: "true" }
 `);
-    expect(simulateAgentFlowWorkflow(workflow, {})).toMatchObject({ status: "completed" });
+    expect(simulateAgentFlowWorkflow(workflow, { inputs: { enabled: true } }))
+      .toMatchObject({ status: "completed" });
 
     const root = temporaryRepo();
     const store = await openAgentFlowRunState({ cwd: root });
-    createAgentFlowLifecycleRun(store, { id: "absent-failure-reference", workflow });
+    createAgentFlowLifecycleRun(store, {
+      id: "absent-failure-reference",
+      workflow,
+      inputs: { enabled: true }
+    });
     expect(await executeAgentFlowCommandPipeline(store, "absent-failure-reference", workflow))
       .toMatchObject({ status: "completed", completedSteps: ["check"] });
     store.close();

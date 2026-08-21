@@ -551,10 +551,8 @@ function evaluateParsedCondition(
   }
   if (expression.operator === "&&") {
     const left = evaluateParsedCondition(expression.left, resolve, source, missingReferencesAreFalse);
-    if (left === false) return false;
-    const right = evaluateParsedCondition(expression.right, resolve, source, missingReferencesAreFalse);
-    if (right === false) return false;
-    return left === undefined || right === undefined ? undefined : true;
+    if (left !== true) return left;
+    return evaluateParsedCondition(expression.right, resolve, source, missingReferencesAreFalse);
   }
   const left = evaluateParsedCondition(expression.left, resolve, source, missingReferencesAreFalse);
   if (left === true) return true;
