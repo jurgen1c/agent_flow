@@ -6,6 +6,7 @@ import {
   AGENT_FLOW_FAILURE_CLASSIFICATION_KINDS,
   AgentFlowFailureClassificationError,
   createAgentFlowLifecycleRun,
+  evaluateAgentFlowCondition,
   executeAgentFlowCommandPipeline,
   openAgentFlowRunState,
   parseAgentFlowFailureClassification,
@@ -163,6 +164,59 @@ steps:
     store.close();
   });
 
+  test("preflights every canonical classification reference before short-circuit routing", async () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: inline-classification-preflight
+version: 1
+style: recovery_pipeline
+maturity: experimental
+inputs: { ready: { required: true } }
+steps:
+  - id: route
+    type: condition
+    if: inputs.ready || artifacts.failure_classification.extra == null
+    then: complete
+    else: pause
+`);
+    const value = classification("unknown");
+
+    const simulation = simulateAgentFlowWorkflow(workflow, {
+      inputs: { ready: true },
+      artifacts: { "failure-classification.json": value }
+    });
+    expect(simulation.status).toBe("paused");
+    expect(simulation.visitedSteps).toEqual([{ id: "route", type: "condition", outcome: "failed" }]);
+
+    const root = temporaryRepo();
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, {
+      id: "inline-classification-preflight",
+      workflow,
+      inputs: { ready: true }
+    });
+    store.writeArtifact({
+      id: "classification",
+      runId: "inline-classification-preflight",
+      stepId: "classifier",
+      path: "failure-classification.json",
+      kind: "session_output",
+      contentType: "application/json",
+      content: JSON.stringify(value)
+    });
+
+    expect(() => evaluateAgentFlowCondition(
+      store,
+      "inline-classification-preflight",
+      'inputs.ready || artifacts.failure_classification.extra == null'
+    )).toThrow(AgentFlowFailureClassificationError);
+
+    const result = await executeAgentFlowCommandPipeline(store, "inline-classification-preflight", workflow);
+
+    expect(result).toMatchObject({ status: "paused", failedStep: "route", failureOutcome: "pause" });
+    expect(store.listFailures("inline-classification-preflight")[0]?.classification)
+      .toBe("failure_classification_unknown");
+    store.close();
+  });
+
   test("pauses when a classification branch has no canonical artifact", async () => {
     const root = temporaryRepo();
     const workflow = parseAgentFlowWorkflowOrThrow(`name: missing-classification
@@ -200,6 +254,86 @@ steps:
     expect(store.listFailures("missing-classification")[0]?.classification)
       .toBe("failure_classification_invalid");
     store.close();
+  });
+
+  test("pauses before routing past a reserved nested classification artifact", async () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: reserved-nested-classification
+version: 1
+style: recovery_pipeline
+maturity: experimental
+inputs: { ready: { required: true } }
+steps:
+  - id: route
+    type: condition
+    branches:
+      - { if: inputs.ready, then: complete }
+      - { if: artifacts.ci.failure_classification.kind == "flake", then: pause }
+    else: fail
+  - { id: classifier, type: command, command: "true", outputs: [ci/failure-classification.json] }
+`);
+
+    expect(simulateAgentFlowWorkflow(workflow, { inputs: { ready: true } })).toMatchObject({
+      status: "paused",
+      visitedSteps: [{ id: "route", type: "condition", outcome: "failed" }]
+    });
+
+    const root = temporaryRepo();
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, {
+      id: "reserved-nested-classification",
+      workflow,
+      inputs: { ready: true }
+    });
+    const result = await executeAgentFlowCommandPipeline(store, "reserved-nested-classification", workflow);
+
+    expect(result).toMatchObject({ status: "paused", failedStep: "route", failureOutcome: "pause" });
+    expect(store.listFailures("reserved-nested-classification")[0]?.classification)
+      .toBe("failure_classification_invalid");
+    store.close();
+  });
+
+  test("inventories save_as and normalized parallel classification declarations in simulation", () => {
+    const inputRequest = parseAgentFlowWorkflowOrThrow(`name: save-as-classification
+version: 1
+style: recovery_pipeline
+maturity: experimental
+inputs: { ready: { required: true } }
+steps:
+  - id: route
+    type: condition
+    branches:
+      - { if: inputs.ready, then: complete }
+      - { if: artifacts.ci.failure_classification.kind == "flake", then: pause }
+    else: fail
+  - { id: classifier, type: input_request, question: "Classify failure", save_as: ci/failure-classification.json }
+`);
+
+    const paddedParallel = parseAgentFlowWorkflowOrThrow(`name: padded-parallel-classification
+version: 1
+style: recovery_pipeline
+maturity: experimental
+inputs: { ready: { required: true } }
+sessions: { worker: { provider: local } }
+steps:
+  - id: route
+    type: condition
+    branches:
+      - { if: inputs.ready, then: complete }
+      - { if: artifacts.ci.failure_classification.kind == "flake", then: pause }
+    else: fail
+  - id: classifier
+    type: " parallel "
+    strategy: fail_fast
+    branches:
+      - { id: worker, session: worker, outputs: [ci/failure-classification.json] }
+`);
+
+    for (const workflow of [inputRequest, paddedParallel]) {
+      expect(simulateAgentFlowWorkflow(workflow, { inputs: { ready: true } })).toMatchObject({
+        status: "paused",
+        visitedSteps: [{ id: "route", type: "condition", outcome: "failed" }]
+      });
+    }
   });
 
   test("does not reserve ordinary JSON properties named failure_classification", async () => {
@@ -240,6 +374,36 @@ steps:
     const result = await executeAgentFlowCommandPipeline(store, "ordinary-property", workflow);
 
     expect(result.status).toBe("completed");
+    store.close();
+  });
+
+  test("does not preflight an absent ordinary nested failure_classification property", async () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: absent-ordinary-property
+version: 1
+style: pipeline
+maturity: experimental
+inputs: { ready: { required: true } }
+steps:
+  - id: route
+    type: condition
+    if: inputs.ready || artifacts.report.failure_classification.kind == "flake"
+    then: complete
+    else: fail
+`);
+
+    expect(simulateAgentFlowWorkflow(workflow, { inputs: { ready: true } }).status).toBe("completed");
+
+    const root = temporaryRepo();
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, {
+      id: "absent-ordinary-property",
+      workflow,
+      inputs: { ready: true }
+    });
+
+    const result = await executeAgentFlowCommandPipeline(store, "absent-ordinary-property", workflow);
+
+    expect(result).toMatchObject({ status: "completed", completedSteps: ["route"] });
     store.close();
   });
 
@@ -445,6 +609,57 @@ steps:
       expect(store.listFailures(`short-circuit-${kind}`)[0]?.classification).toBe(expected);
       store.close();
     }
+  });
+
+  test("preflights compound recovery guards before logical short circuiting", async () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: compound-recovery-classification-preflight
+version: 1
+style: recovery_pipeline
+maturity: experimental
+inputs: { enabled: { required: true } }
+short_circuit_if:
+  - inputs.enabled && artifacts.failure_classification.kind == "flake"
+steps:
+  - { id: work, type: command, command: "true" }
+`);
+    const value = classification("unknown");
+
+    const simulation = simulateAgentFlowWorkflow(workflow, {
+      inputs: { enabled: false },
+      artifacts: { "failure-classification.json": value }
+    });
+    expect(simulation).toMatchObject({
+      status: "paused",
+      visitedSteps: [],
+      terminalStates: [{ stepId: "work", status: "paused" }]
+    });
+
+    const store = await openAgentFlowRunState({ cwd: temporaryRepo() });
+    createAgentFlowLifecycleRun(store, {
+      id: "compound-recovery-classification-preflight",
+      workflow,
+      inputs: { enabled: false }
+    });
+    store.writeArtifact({
+      id: "classification",
+      runId: "compound-recovery-classification-preflight",
+      stepId: "classifier",
+      path: "failure-classification.json",
+      kind: "session_output",
+      contentType: "application/json",
+      content: JSON.stringify(value)
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      "compound-recovery-classification-preflight",
+      workflow
+    );
+
+    expect(result).toMatchObject({ status: "paused", failedStep: "work", failureOutcome: "pause" });
+    expect(store.listFailures("compound-recovery-classification-preflight")[0]?.classification)
+      .toBe("failure_classification_unknown");
+    store.close();
   });
 
   test("pauses simulation before selecting a route for invalid and unknown classifications", () => {

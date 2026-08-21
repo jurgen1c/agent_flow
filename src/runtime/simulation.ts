@@ -36,9 +36,12 @@ import {
 import {
   AgentFlowConditionError,
   agentFlowConditionArtifactAlias,
+  agentFlowConditionDeclaredArtifactPaths,
   evaluateAgentFlowConditionWithResolver,
+  preflightAgentFlowFailureClassificationReferences,
   resolveAgentFlowConditionReferenceFromValues,
-  selectAgentFlowConditionTargetFromValues
+  selectAgentFlowConditionTargetFromValues,
+  type AgentFlowConditionReferenceResolver
 } from "./condition";
 import { AgentFlowFailureClassificationError } from "./failure_classification";
 import { createAgentFlowReviewPrompt, parseAgentFlowReviewResult } from "./review";
@@ -135,6 +138,7 @@ interface SimulationState {
   workflowStyle: AgentFlowWorkflow["style"];
   fixture: AgentFlowSimulationFixture;
   artifacts: Set<string>;
+  declaredArtifacts: Set<string>;
   artifactValues: Map<string, AgentFlowYamlValue>;
   producedArtifacts: Map<string, number>;
   artifactProducers: Map<string, string>;
@@ -260,6 +264,7 @@ export function simulateAgentFlowWorkflow(
     workflowStyle: workflow.style,
     fixture,
     artifacts: new Set([...fixtureArtifacts.values.keys(), ...fixtureArtifacts.collisions]),
+    declaredArtifacts: new Set(agentFlowConditionDeclaredArtifactPaths(workflow.steps)),
     artifactValues: fixtureArtifacts.values,
     producedArtifacts: new Map(),
     artifactProducers: new Map(),
@@ -881,7 +886,8 @@ function simulationRecoveryGuard(
   for (const expression of expressions) {
     let matched: boolean;
     try {
-      matched = evaluateAgentFlowConditionWithResolver(expression, (scope, segments) => {
+      const artifactCache = new Map<string, AgentFlowYamlValue>();
+      const resolve: AgentFlowConditionReferenceResolver = (scope, segments) => {
         if (scope === "artifacts" && segments[0] === "budget") {
           return simulationBudgetReference(state, segments.slice(1));
         }
@@ -892,9 +898,15 @@ function simulationRecoveryGuard(
         }
         assertSimulationArtifactValueAvailable(state, scope, segments);
         return resolveAgentFlowConditionReferenceFromValues(
-          state.fixture.inputs ?? {}, state.artifactValues, scope, segments
+          state.fixture.inputs ?? {}, state.artifactValues, scope, segments, artifactCache
         );
-      });
+      };
+      preflightAgentFlowFailureClassificationReferences(
+        [expression],
+        resolve,
+        new Set([...state.artifacts, ...state.declaredArtifacts])
+      );
+      matched = evaluateAgentFlowConditionWithResolver(expression, resolve, { missingReferences: "false" });
     } catch (error) {
       if (error instanceof AgentFlowConditionError &&
           (error.message.includes("does not match a published JSON artifact") ||
@@ -1515,7 +1527,8 @@ function conditionControl(
     target = selectAgentFlowConditionTargetFromValues(
       step,
       state.fixture.inputs ?? {},
-      state.artifactValues
+      state.artifactValues,
+      new Set([...state.artifacts, ...state.declaredArtifacts])
     ).target;
   } catch (error) {
     markConditionVisitFailed(state, id);

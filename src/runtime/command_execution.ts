@@ -14,7 +14,7 @@ import {
   type AgentFlowFailureOutcome,
   type WriteAgentFlowArtifactInput
 } from "./run_state";
-import type { AgentFlowWorkflow, AgentFlowWorkflowStep, AgentFlowYamlMapping } from "./workflow";
+import type { AgentFlowWorkflow, AgentFlowWorkflowStep, AgentFlowYamlMapping, AgentFlowYamlValue } from "./workflow";
 import { evaluateAgentFlowPolicy } from "./policy";
 import { validateAgentFlowRetentionPolicy } from "./policy_validation";
 import {
@@ -66,11 +66,14 @@ import {
 import {
   AgentFlowConditionError,
   agentFlowConditionArtifactAlias,
-  agentFlowConditionExpressionIsSimple,
-  agentFlowConditionReference,
+  agentFlowConditionDeclaredArtifactPaths,
+  agentFlowConditionExpressionError,
+  agentFlowConditionReferences,
   evaluateAgentFlowConditionWithResolver,
+  preflightAgentFlowFailureClassificationReferences,
   resolveAgentFlowConditionReference,
-  selectAgentFlowConditionTarget
+  selectAgentFlowConditionTarget,
+  type AgentFlowConditionReferenceResolver
 } from "./condition";
 import { assertAgentFlowSuccessTargetsAreUnambiguous } from "./success_routing";
 import {
@@ -2882,15 +2885,22 @@ function recoveryGuardFailure(
   for (const expression of declarations) {
     let matched = false;
     try {
-      matched = evaluateAgentFlowConditionWithResolver(expression, (scope, segments) => {
+      const artifactCache = new Map<string, AgentFlowYamlValue>();
+      const resolve: AgentFlowConditionReferenceResolver = (scope, segments) => {
         if (scope === "artifacts" && segments[0] === "budget") {
           return recoveryBudgetReference(store, runId, workflow, segments.slice(1));
         }
         if (scope === "artifacts" && segments[0] === "failures") {
           return recoveryFailureReference(store, runId, segments.slice(1));
         }
-        return resolveAgentFlowConditionReference(store, runId, scope, segments);
-      });
+        return resolveAgentFlowConditionReference(store, runId, scope, segments, artifactCache);
+      };
+      const artifactPaths = new Set([
+        ...store.listArtifactMetadata(runId).map((artifact) => artifact.declaredPath),
+        ...agentFlowConditionDeclaredArtifactPaths(workflow.steps)
+      ]);
+      preflightAgentFlowFailureClassificationReferences([expression], resolve, artifactPaths);
+      matched = evaluateAgentFlowConditionWithResolver(expression, resolve, { missingReferences: "false" });
     } catch (error) {
       if (error instanceof AgentFlowConditionError &&
           (error.message.includes("does not match a published JSON artifact") ||
@@ -3009,21 +3019,24 @@ function runtimeRecoveryLimitConfigurationIssue(
       };
     }
     const unsupportedIndex = declaration.value.findIndex((entry) =>
-      !agentFlowConditionExpressionIsSimple(entry as string)
+      agentFlowConditionExpressionError(entry as string) !== undefined
     );
     if (unsupportedIndex >= 0) {
       return {
         code: "workflow.recovery.short_circuit.expression.unsupported",
         path: `${declaration.path}[${unsupportedIndex}]`,
-        message: "Recovery short circuits support one input, artifact, budget, or failure reference with an optional scalar comparison."
+        message: agentFlowConditionExpressionError(declaration.value[unsupportedIndex] as string)!
       };
     }
-    const undeclaredInputIndex = declaration.value.findIndex((entry) => {
-      const reference = agentFlowConditionReference(entry as string);
-      return reference?.scope === "inputs" && !Object.hasOwn(workflow.inputs ?? {}, reference.segments[0]!);
-    });
+    const undeclaredInputIndex = declaration.value.findIndex((entry) =>
+      agentFlowConditionReferences(entry as string).some((reference) =>
+        reference.scope === "inputs" && !Object.hasOwn(workflow.inputs ?? {}, reference.segments[0]!)
+      )
+    );
     if (undeclaredInputIndex >= 0) {
-      const reference = agentFlowConditionReference(declaration.value[undeclaredInputIndex] as string)!;
+      const reference = agentFlowConditionReferences(declaration.value[undeclaredInputIndex] as string)
+        .find((candidate) => candidate.scope === "inputs" &&
+          !Object.hasOwn(workflow.inputs ?? {}, candidate.segments[0]!))!;
       return {
         code: "workflow.input.undeclared",
         path: `${declaration.path}[${undeclaredInputIndex}]`,

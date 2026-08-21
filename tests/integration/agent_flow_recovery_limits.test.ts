@@ -99,6 +99,42 @@ steps:
     store.close();
   });
 
+  test("evaluates later recovery OR operands when an earlier reference is missing", async () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: missing-short-circuit-operand
+version: 1
+style: recovery_pipeline
+maturity: experimental
+inputs: { high_risk: { required: true } }
+short_circuit_if:
+  - failures.never.attempts >= 1 || inputs.high_risk == true
+steps:
+  - { id: automate, type: command, command: "touch should-not-run" }
+`);
+
+    const simulation = simulateAgentFlowWorkflow(workflow, { inputs: { high_risk: true } });
+    expect(simulation.status).toBe("paused");
+    expect(simulation.visitedSteps).toEqual([]);
+
+    const root = temporaryRepo();
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, {
+      id: "missing-short-circuit-operand",
+      workflow,
+      inputs: { high_risk: true }
+    });
+
+    const result = await executeAgentFlowCommandPipeline(store, "missing-short-circuit-operand", workflow);
+
+    expect(result).toMatchObject({
+      status: "paused",
+      completedSteps: [],
+      failedStep: "automate",
+      message: 'Recovery short circuit matched "failures.never.attempts >= 1 || inputs.high_risk == true".'
+    });
+    expect(fs.existsSync(path.join(root, "should-not-run"))).toBe(false);
+    store.close();
+  });
+
   test("charges named Codex profiles as frontier remediation", async () => {
     const root = temporaryRepo();
     fs.writeFileSync(path.join(root, "work.md"), "work\n");
@@ -410,12 +446,15 @@ steps:
     store.close();
   });
 
-  test("leaves absent failure counters nonmatching in runtime and simulation", async () => {
+  test("leaves absent references nonmatching through comparisons and negation", async () => {
     const workflow = parseAgentFlowWorkflowOrThrow(`name: absent-failure-reference
 version: 1
 style: recovery_pipeline
 maturity: experimental
-short_circuit_if: ["failures.never.attempts == 0"]
+short_circuit_if:
+  - failures.never.attempts == 0
+  - "!failures.never.attempts"
+  - "!(artifacts.risk.high == true)"
 steps:
   - { id: check, type: command, command: "true" }
 `);
@@ -819,21 +858,49 @@ steps:
     store.close();
   });
 
+  test("parses direct parallel branch short circuits before scanning input references", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: direct-branch-input-references
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - id: parallel
+    type: parallel
+    strategy: fail_fast
+    branches:
+      - id: worker
+        session: worker
+        short_circuit_if:
+          - artifacts.note.value == "inputs.missing" || inputs.high_risk.active == true || inputs.high_risk.score > 5
+`);
+
+    expect(validateAgentFlowWorkflow(workflow).errors.filter((error) =>
+      error.code === "workflow.input.undeclared"
+    )).toEqual([{
+      code: "workflow.input.undeclared",
+      message: 'Input "high_risk" is referenced but not declared in workflow inputs.',
+      path: "steps[0].branches[0].short_circuit_if[0]",
+      stepId: "worker"
+    }]);
+  });
+
   test("rejects undeclared input references in recovery short circuits", async () => {
     const workflow = parseAgentFlowWorkflowOrThrow(`name: undeclared-short-circuit-input
 version: 1
 style: recovery_pipeline
 maturity: experimental
-short_circuit_if: ["high_risk == true"]
+short_circuit_if: ["inputs.high_risk.active == true || inputs.high_risk.score > 5"]
 steps:
   - { id: automate, type: command, command: automate }
 `);
 
-    expect(validateAgentFlowWorkflow(workflow).errors).toContainEqual({
+    expect(validateAgentFlowWorkflow(workflow).errors.filter((error) =>
+      error.code === "workflow.input.undeclared"
+    )).toEqual([{
       code: "workflow.input.undeclared",
       message: 'Input "high_risk" is referenced but not declared in workflow inputs.',
       path: "short_circuit_if[0]"
-    });
+    }]);
 
     const store = await openAgentFlowRunState({ cwd: temporaryRepo() });
     store.createRun({

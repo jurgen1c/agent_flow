@@ -192,6 +192,18 @@ Conditions are allowed but should remain simple.
   else: finish
 ```
 
+Condition expressions use a bounded declarative grammar. References start with
+`inputs.` or `artifacts.` (a bare input name remains supported), comparisons use
+`==`, `!=`, `>`, `>=`, `<`, or `<=` with JSON scalar literals, and boolean
+expressions may combine them with `!`, `&&`, `||`, and parentheses. `&&` binds
+more tightly than `||`, and evaluation short-circuits from left to right.
+
+The grammar does not execute JavaScript. Function calls, bracket access,
+template or shell interpolation, ternaries, arbitrary operators, and unsafe
+property segments such as `__proto__`, `prototype`, and `constructor` are
+validation errors. Runtime execution and offline simulation use the same parser
+and evaluator as workflow validation.
+
 Validation should warn when a pipeline contains many branches, because it may be better represented as a recovery or collaborative workflow.
 
 ## 9. Manual Gates
