@@ -5,10 +5,12 @@ import path from "node:path";
 import {
   AgentFlowArtifactTransformRegistry,
   type AgentFlowRunStateValue,
+  agentFlowConditionExpressionIsSimple,
   createAgentFlowLifecycleRun,
   executeAgentFlowCommandPipeline,
   openAgentFlowRunState,
   parseAgentFlowWorkflowOrThrow,
+  simulateAgentFlowWorkflow,
   validateAgentFlowWorkflow
 } from "../../src/runtime";
 
@@ -322,6 +324,105 @@ steps:
     store.close();
   });
 
+  test("evaluates logical expressions identically in validation, simulation, and runtime", async () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: logical-condition
+version: 1
+style: pipeline
+maturity: experimental
+inputs:
+  ready: { required: true }
+  strict: { required: true }
+steps:
+  - id: route
+    type: condition
+    if: inputs.ready && (artifacts.metrics.score >= 90 || !inputs.strict)
+    then: complete
+    else: fail
+`);
+
+    expect(validateAgentFlowWorkflow(workflow)).toEqual({ valid: true, errors: [] });
+    expect(simulateAgentFlowWorkflow(workflow, {
+      inputs: { ready: true, strict: true },
+      artifacts: { "metrics.json": { score: 95 } }
+    }).status).toBe("completed");
+    expect(simulateAgentFlowWorkflow(workflow, {
+      inputs: { ready: false, strict: false },
+      artifacts: { "metrics.json": { score: 95 } }
+    }).status).toBe("failed");
+
+    const root = temporaryRepo();
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, {
+      id: "logical-condition",
+      workflow,
+      inputs: { ready: true, strict: false }
+    });
+    store.writeArtifact({
+      id: "metrics",
+      runId: "logical-condition",
+      stepId: "fixture",
+      path: "metrics.json",
+      kind: "fixture",
+      contentType: "application/json",
+      content: JSON.stringify({ score: 20 })
+    });
+
+    expect(await executeAgentFlowCommandPipeline(store, "logical-condition", workflow))
+      .toMatchObject({ status: "completed", completedSteps: ["route"] });
+    store.close();
+  });
+
+  test("evaluates compound artifact references from one immutable snapshot", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: compound-artifact-snapshot
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: route
+    type: condition
+    if: artifacts.state.a == true && artifacts.state.b == true
+    then: complete
+    else: fail
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "compound-artifact-snapshot", workflow });
+    store.writeArtifact({
+      id: "state",
+      runId: "compound-artifact-snapshot",
+      stepId: "fixture",
+      path: "state.json",
+      kind: "fixture",
+      contentType: "application/json",
+      content: JSON.stringify({ a: true, b: false })
+    });
+    const readArtifact = store.readArtifact.bind(store);
+    let reads = 0;
+    store.readArtifact = ((...args) => {
+      const artifact = readArtifact(...args);
+      reads += 1;
+      if (reads === 1) {
+        store.writeArtifact({
+          id: "state",
+          runId: "compound-artifact-snapshot",
+          stepId: "fixture",
+          path: "state.json",
+          kind: "fixture",
+          contentType: "application/json",
+          content: JSON.stringify({ a: false, b: true }),
+          overwrite: true
+        });
+      }
+      return artifact;
+    }) as typeof store.readArtifact;
+
+    const result = await executeAgentFlowCommandPipeline(store, "compound-artifact-snapshot", workflow);
+
+    expect(result).toMatchObject({ status: "failed", completedSteps: ["route"] });
+    expect(reads).toBe(1);
+    store.close();
+  });
+
   test("preserves cancellation when artifact condition evaluation fails", async () => {
     const root = temporaryRepo();
     const workflow = parseAgentFlowWorkflowOrThrow(`name: cancelled-condition
@@ -597,7 +698,7 @@ steps:
     store.close();
   });
 
-  test("rejects condition expressions that would require code evaluation", () => {
+  test("validates compound conditions and rejects unsafe expression syntax", () => {
     const workflow = parseAgentFlowWorkflowOrThrow(`name: complex-condition
 version: 1
 style: pipeline
@@ -607,11 +708,41 @@ steps:
   - { id: route, type: condition, if: inputs.ready && inputs.approved, then: complete, else: fail }
 `);
 
-    expect(validateAgentFlowWorkflow(workflow).errors).toContainEqual({
+    expect(validateAgentFlowWorkflow(workflow)).toEqual({ valid: true, errors: [] });
+
+    const scopeNamedInputs = parseAgentFlowWorkflowOrThrow(`name: scope-named-inputs
+version: 1
+style: pipeline
+maturity: experimental
+inputs: { inputs: {}, artifacts: {} }
+steps:
+  - { id: route, type: condition, if: inputs || artifacts, then: complete, else: fail }
+`);
+    expect(validateAgentFlowWorkflow(scopeNamedInputs)).toEqual({ valid: true, errors: [] });
+    expect(simulateAgentFlowWorkflow(scopeNamedInputs, {
+      inputs: { inputs: false, artifacts: true }
+    }).status).toBe("completed");
+
+    const paddedExpression = `${" ".repeat(16 * 1024)}ready`;
+    expect(agentFlowConditionExpressionIsSimple(paddedExpression)).toBe(false);
+    const paddedWorkflow = parseAgentFlowWorkflowOrThrow(`name: padded-condition
+version: 1
+style: pipeline
+maturity: experimental
+inputs: { ready: {} }
+steps:
+  - { id: route, type: condition, if: ready, then: complete, else: fail }
+`);
+    paddedWorkflow.steps[0]!.if = paddedExpression;
+    expect(validateAgentFlowWorkflow(paddedWorkflow).errors).toContainEqual(expect.objectContaining({
       code: "workflow.condition.expression.unsupported",
-      message: "Condition expressions support one input or artifact reference with an optional scalar comparison.",
+      message: expect.stringContaining("exceeds the 16384-byte limit"),
       path: "steps[0].if",
       stepId: "route"
+    }));
+    expect(simulateAgentFlowWorkflow(paddedWorkflow, { inputs: { ready: true } })).toMatchObject({
+      status: "unresolved",
+      unresolvedBranches: [expect.objectContaining({ reason: expect.stringContaining("exceeds the 16384-byte limit") })]
     });
 
     for (const expression of ["inputs.ready > true", "inputs.ready < null"]) {
@@ -623,13 +754,73 @@ inputs: { ready: {} }
 steps:
   - { id: route, type: condition, if: ${expression}, then: complete, else: fail }
 `);
-      expect(validateAgentFlowWorkflow(invalidOrderedComparison).errors).toContainEqual({
+      expect(validateAgentFlowWorkflow(invalidOrderedComparison).errors).toContainEqual(expect.objectContaining({
         code: "workflow.condition.expression.unsupported",
-        message: "Condition expressions support one input or artifact reference with an optional scalar comparison.",
+        message: expect.stringContaining("ordered comparisons require a string or number literal"),
         path: "steps[0].if",
         stepId: "route"
-      });
+      }));
     }
+
+    for (const [expression, message] of [
+      ["inputs.ready()", "unsupported syntax"],
+      ['artifacts.payload["ready"] == true', "unsupported syntax"],
+      ["artifacts.payload.__proto__ == null", "unsafe property segment"],
+      ["inputs.ready ? inputs.approved : false", "unsupported syntax"],
+      ["inputs.ready && $(touch /tmp/unsafe)", "expected an input or artifact reference"],
+      ["inputs.ready || `touch /tmp/unsafe`", "expected an input or artifact reference"]
+    ] as const) {
+      const unsafe = parseAgentFlowWorkflowOrThrow(`name: unsafe-condition
+version: 1
+style: pipeline
+maturity: experimental
+inputs: { ready: {}, approved: {} }
+steps:
+  - id: route
+    type: condition
+    if: >-
+      ${expression}
+    then: complete
+    else: fail
+`);
+      expect(validateAgentFlowWorkflow(unsafe).errors).toContainEqual(expect.objectContaining({
+        code: "workflow.condition.expression.unsupported",
+        message: expect.stringContaining(message),
+        path: "steps[0].if",
+        stepId: "route"
+      }));
+    }
+
+    const undeclaredCompoundInput = parseAgentFlowWorkflowOrThrow(`name: undeclared-compound-input
+version: 1
+style: pipeline
+maturity: experimental
+inputs: { ready: {} }
+steps:
+  - { id: route, type: condition, if: inputs.ready && inputs.approved, then: complete, else: fail }
+`);
+    expect(validateAgentFlowWorkflow(undeclaredCompoundInput).errors).toContainEqual({
+      code: "workflow.input.undeclared",
+      message: 'Input "approved" is referenced but not declared in workflow inputs.',
+      path: "steps[0].if",
+      stepId: "route"
+    });
+
+    const repeatedUndeclaredInput = parseAgentFlowWorkflowOrThrow(`name: repeated-undeclared-input
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: route, type: condition, if: inputs.profile.name && inputs.profile.active, then: complete, else: fail }
+`);
+    expect(validateAgentFlowWorkflow(repeatedUndeclaredInput).errors.filter((error) =>
+      error.code === "workflow.input.undeclared"
+    )).toEqual([{
+      code: "workflow.input.undeclared",
+      message: 'Input "profile" is referenced but not declared in workflow inputs.',
+      path: "steps[0].if",
+      stepId: "route"
+    }]);
 
     const dynamicTarget = parseAgentFlowWorkflowOrThrow(`name: dynamic-condition-target
 version: 1

@@ -11,8 +11,8 @@ import { normalizeAgentFlowArtifactPath } from "./run_state";
 import { MAX_AGENT_FLOW_SESSION_INPUTS } from "./session_request";
 import {
   agentFlowConditionArtifactAlias,
-  agentFlowConditionExpressionIsSimple,
-  agentFlowConditionReference
+  agentFlowConditionExpressionError,
+  agentFlowConditionReferences
 } from "./condition";
 import {
   AGENT_FLOW_AMBIGUOUS_SUCCESS_TARGET_CODE,
@@ -147,7 +147,7 @@ export function validateAgentFlowWorkflow(workflow: AgentFlowWorkflow): AgentFlo
   validateConditionExpressions(workflow, executableContexts, errors);
   validateLoopBounds(executableContexts, errors);
   validateControlFlowCycles(workflow, executableContexts, errors);
-  validateInputReferences(workflow, contexts, errors);
+  validateInputReferences(workflow, runtimeContexts, errors);
   validateArtifactPaths(executableContexts, errors);
   validateReviewArtifactPaths(workflow, executableContexts, errors);
   validateDisagreementArtifactOutputs(workflow, executableContexts, errors);
@@ -214,18 +214,21 @@ function validateRecoveryLimits(
     }
     declaration.value.forEach((entry, index) => {
       const expression = entry as string;
-      if (!agentFlowConditionExpressionIsSimple(expression)) {
+      const expressionError = agentFlowConditionExpressionError(expression);
+      if (expressionError !== undefined) {
         errors.push({
           code: "workflow.recovery.short_circuit.expression.unsupported",
-          message: "Recovery short circuits support one input, artifact, budget, or failure reference with an optional scalar comparison.",
+          message: expressionError,
           path: `${declaration.path}[${index}]`,
           ...(declaration.stepId === undefined ? {} : { stepId: declaration.stepId })
         });
         return;
       }
-      const reference = agentFlowConditionReference(expression);
-      const inputName = reference?.scope === "inputs" ? reference.segments[0] : undefined;
-      if (inputName !== undefined && !Object.hasOwn(workflow.inputs ?? {}, inputName)) {
+      const undeclaredInputs = new Set(agentFlowConditionReferences(expression)
+        .filter((reference) => reference.scope === "inputs")
+        .map((reference) => reference.segments[0]!)
+        .filter((inputName) => !Object.hasOwn(workflow.inputs ?? {}, inputName)));
+      for (const inputName of undeclaredInputs) {
         errors.push({
           code: "workflow.input.undeclared",
           message: `Input ${JSON.stringify(inputName)} is referenced but not declared in workflow inputs.`,
@@ -275,18 +278,25 @@ function validateConditionExpressions(
       });
     }
     for (const expression of expressions) {
-      const value = nonEmptyString(expression.value);
-      if (value !== undefined && !agentFlowConditionExpressionIsSimple(value)) {
+      const value = typeof expression.value === "string" && expression.value.trim().length > 0
+        ? expression.value
+        : undefined;
+      const expressionError = value === undefined ? undefined : agentFlowConditionExpressionError(value);
+      if (expressionError !== undefined) {
         errors.push({
           code: "workflow.condition.expression.unsupported",
-          message: "Condition expressions support one input or artifact reference with an optional scalar comparison.",
+          message: expressionError,
           path: expression.path,
           ...(context.id === undefined ? {} : { stepId: context.id })
         });
         continue;
       }
-      const inputName = value === undefined ? undefined : conditionInputName(value);
-      if (inputName !== undefined && !Object.hasOwn(workflow.inputs ?? {}, inputName)) {
+      const references = value === undefined ? [] : agentFlowConditionReferences(value);
+      const undeclaredInputs = new Set(references
+        .filter((reference) => reference.scope === "inputs")
+        .map((reference) => reference.segments[0]!)
+        .filter((inputName) => !Object.hasOwn(workflow.inputs ?? {}, inputName)));
+      for (const inputName of undeclaredInputs) {
         errors.push({
           code: "workflow.input.undeclared",
           message: `Input "${inputName}" is referenced but not declared in workflow inputs.`,
@@ -294,8 +304,8 @@ function validateConditionExpressions(
           ...(context.id === undefined ? {} : { stepId: context.id })
         });
       }
-      const reference = value === undefined ? undefined : agentFlowConditionReference(value);
-      if (reference?.scope === "artifacts") {
+      for (const reference of references) {
+        if (reference.scope !== "artifacts") continue;
         const aliases = contexts.flatMap((candidate) => stepOutputContexts(candidate))
           .map(({ output }) => ({ output, alias: agentFlowConditionArtifactAlias(normalizeArtifactPath(output)) }))
           .filter(({ alias }) => reference.segments.slice(0, alias.length).join(".") === alias.join("."));
@@ -361,13 +371,6 @@ function validateConditionExpressions(
       });
     }
   }
-}
-
-function conditionInputName(expression: string): string | undefined {
-  const match = /^(?:(inputs|artifacts)\.)?([A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)*)\s*(?:(?:==|!=|>=|<=|>|<)|$)/.exec(expression.trim());
-  if (match === null) return undefined;
-  const scope = match[1] ?? (match[2]!.includes(".") ? "artifacts" : "inputs");
-  return scope === "inputs" ? match[2]!.split(".")[0] : undefined;
 }
 
 export function lintAgentFlowWorkflow(workflow: AgentFlowWorkflow): AgentFlowWorkflowLintResult {
@@ -1605,7 +1608,7 @@ function validateInputReferences(
 ): void {
   const inputs = new Set(Object.keys(workflow.inputs ?? {}));
   const seen = new Set<string>();
-  const conditionPaths = new Set(contexts.flatMap((context) => {
+  const parsedConditionPaths = new Set(contexts.flatMap((context) => {
     if (context.type !== "condition") return [];
     const paths = [`${context.path}.if`];
     if (Array.isArray(context.step.branches)) {
@@ -1615,9 +1618,18 @@ function validateInputReferences(
     }
     return paths;
   }));
+  if (Array.isArray(workflow.short_circuit_if)) {
+    workflow.short_circuit_if.forEach((_, index) => parsedConditionPaths.add(`short_circuit_if[${index}]`));
+  }
+  for (const context of contexts) {
+    if (!Array.isArray(context.step.short_circuit_if)) continue;
+    context.step.short_circuit_if.forEach((_, index) =>
+      parsedConditionPaths.add(`${context.path}.short_circuit_if[${index}]`)
+    );
+  }
 
   visitValue(workflow, "", (value, path) => {
-    if (typeof value !== "string" || conditionPaths.has(path)) {
+    if (typeof value !== "string" || parsedConditionPaths.has(path)) {
       return;
     }
 
@@ -2847,24 +2859,26 @@ function lintConditionArtifactInputs(
 
   for (const expression of expressions) {
     const source = nonEmptyString(expression.value);
-    const reference = source === undefined ? undefined : agentFlowConditionReference(source);
-    if (reference?.scope !== "artifacts") continue;
-    const candidates = [...producers.keys()]
-      .map((key) => ({ key, alias: agentFlowConditionArtifactAlias(key) }))
-      .filter(({ alias }) => reference.segments.slice(0, alias.length).join(".") === alias.join("."));
-    const longest = candidates.reduce((length, candidate) => Math.max(length, candidate.alias.length), 0);
-    const available = candidates
-      .filter((candidate) => candidate.alias.length === longest)
-      .some((candidate) => (producers.get(candidate.key) ?? []).some((producer) =>
-        producer.path !== context.path && artifactProducerAvailable(producer, context, contexts, dominators)
-      ));
-    if (!available) {
-      warnings.push({
-        code: "workflow.lint.artifact.read_before_write",
-        message: `Artifact reference "artifacts.${reference.segments.join(".")}" is read before any step produces it.`,
-        path: expression.path,
-        ...(context.id === undefined ? {} : { stepId: context.id })
-      });
+    if (source === undefined || agentFlowConditionExpressionError(source) !== undefined) continue;
+    for (const reference of agentFlowConditionReferences(source)) {
+      if (reference.scope !== "artifacts") continue;
+      const candidates = [...producers.keys()]
+        .map((key) => ({ key, alias: agentFlowConditionArtifactAlias(key) }))
+        .filter(({ alias }) => reference.segments.slice(0, alias.length).join(".") === alias.join("."));
+      const longest = candidates.reduce((length, candidate) => Math.max(length, candidate.alias.length), 0);
+      const available = candidates
+        .filter((candidate) => candidate.alias.length === longest)
+        .some((candidate) => (producers.get(candidate.key) ?? []).some((producer) =>
+          producer.path !== context.path && artifactProducerAvailable(producer, context, contexts, dominators)
+        ));
+      if (!available) {
+        warnings.push({
+          code: "workflow.lint.artifact.read_before_write",
+          message: `Artifact reference "artifacts.${reference.segments.join(".")}" is read before any step produces it.`,
+          path: expression.path,
+          ...(context.id === undefined ? {} : { stepId: context.id })
+        });
+      }
     }
   }
 }
