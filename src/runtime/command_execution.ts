@@ -7,6 +7,7 @@ import {
   AgentFlowRunStateError,
   isNormalizedStaticAgentFlowArtifactPath,
   normalizeAgentFlowArtifactPath,
+  type AgentFlowRunLockRecord,
   type AgentFlowRunStateValue,
   type AgentFlowRunStateStore,
   type AgentFlowRunStopStatus,
@@ -115,7 +116,8 @@ import {
 } from "./recovery";
 import {
   captureAgentFlowWorkspaceSnapshot,
-  changedAgentFlowWorkspacePaths
+  changedAgentFlowWorkspacePaths,
+  type AgentFlowWorkspaceSnapshot
 } from "./workspace";
 import { AgentFlowFailureClassificationError } from "./failure_classification";
 import { createAgentFlowLifecycleRun, transitionAgentFlowLifecycleRun } from "./lifecycle";
@@ -132,11 +134,15 @@ import {
   collectAgentFlowReviewCycleStepIds,
   defaultAgentFlowDisagreementOutputPath,
   parseAgentFlowDisagreementPolicy,
+  parseAgentFlowDisagreementResult,
   type AgentFlowDisagreementDecision,
-  type AgentFlowDisagreementPolicy
+  type AgentFlowDisagreementPolicy,
+  type AgentFlowDisagreementResult
 } from "./disagreement";
 
 const MAX_CAPTURE_BYTES = 10 * 1024 * 1024;
+const MAX_RECOVERY_WORKSPACE_SNAPSHOT_BYTES = 64 * 1024 * 1024;
+const MAX_RECOVERY_WORKSPACE_SNAPSHOT_PATHS = 200_000;
 const RECOVERY_CONTEXT_INPUT_PATH = "recovery-context/injected.md";
 
 export interface AgentFlowCommandPipelineResult {
@@ -196,19 +202,18 @@ export async function executeAgentFlowCommandPipeline(
   sessionProviders: AgentFlowSessionProviderRegistry = createAgentFlowSessionProviderRegistry(),
   mcpCalls: AgentFlowMcpCallRegistry = createAgentFlowMcpCallRegistry(),
   notifications: AgentFlowNotificationRegistry = createAgentFlowNotificationRegistry(),
-  workflows: AgentFlowWorkflowRegistry = createAgentFlowWorkflowRegistry()
+  workflows: AgentFlowWorkflowRegistry = createAgentFlowWorkflowRegistry(),
+  prepareExecution?: () => void
 ): Promise<AgentFlowCommandPipelineResult> {
-  return runAgentFlowCommandPipeline(
-    store,
-    runId,
-    workflow,
-    undefined,
-    transforms,
-    sessionProviders,
-    mcpCalls,
-    notifications,
-    workflows
-  );
+  return store.withRunLock(runId, "run", (lock) => {
+    assertPersistedWorkflowIdentity(store, runId, workflow);
+    const recoveredExecution = recoverInterruptedExecution(store, lock);
+    prepareExecution?.();
+    return runAgentFlowCommandPipeline(
+      store, runId, workflow, undefined, transforms, sessionProviders, mcpCalls, notifications, workflows,
+      undefined, recoveredExecution
+    );
+  });
 }
 
 export async function resumeAgentFlowCommandPipeline(
@@ -222,17 +227,127 @@ export async function resumeAgentFlowCommandPipeline(
   notifications: AgentFlowNotificationRegistry = createAgentFlowNotificationRegistry(),
   workflows: AgentFlowWorkflowRegistry = createAgentFlowWorkflowRegistry()
 ): Promise<AgentFlowCommandPipelineResult> {
-  return runAgentFlowCommandPipeline(
-    store,
-    runId,
-    workflow,
-    response,
-    transforms,
-    sessionProviders,
-    mcpCalls,
-    notifications,
-    workflows
+  return store.withRunLock(runId, "resume", (lock) => {
+    assertPersistedWorkflowIdentity(store, runId, workflow);
+    const recoveredExecution = recoverInterruptedExecution(store, lock);
+    const effectiveResponse = recoveredExecution === undefined ? response : undefined;
+    return runAgentFlowCommandPipeline(
+      store, runId, workflow, effectiveResponse, transforms, sessionProviders, mcpCalls, notifications, workflows,
+      undefined, recoveredExecution
+    );
+  });
+}
+
+function assertPersistedWorkflowIdentity(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  workflow: AgentFlowWorkflow
+): void {
+  const run = store.getRun(runId);
+  if (run === null) throw new Error(`Agent Flow run ${runId} was not found.`);
+  if (!isDeepStrictEqual(run.context.workflow, workflow)) {
+    throw new AgentFlowRunStateError(
+      `Agent Flow run ${runId} cannot execute a workflow that differs from its persisted definition.`,
+      "AGENT_FLOW_RUN_COLLISION"
+    );
+  }
+}
+
+function recoverInterruptedExecution(
+  store: AgentFlowRunStateStore,
+  lock: AgentFlowRunLockRecord
+): RecoveredAgentFlowExecution | undefined {
+  if (!lock.recoveredStaleLock) return undefined;
+  const run = store.getRun(lock.runId);
+  if (run === null) return undefined;
+  const routing = persistedExecutionRouting(run.context);
+  const cursorStepId = run.currentStepId ?? undefined;
+  if (run.status !== "running"
+      && !(run.status === "pending" && cursorStepId !== undefined && routing !== undefined)) {
+    return undefined;
+  }
+  const latestCursorEvent = cursorStepId === undefined
+    ? undefined
+    : [...store.listEvents(lock.runId)].reverse().find((event) =>
+        event.stepId === cursorStepId && event.type.startsWith("step.")
+      );
+  const latestCursorStep = cursorStepId === undefined
+    ? null
+    : store.latestStepRecoveryState(lock.runId, cursorStepId);
+  const latestCursorFailure = cursorStepId === undefined || latestCursorStep === null
+    ? undefined
+    : [...store.listFailures(lock.runId)].reverse().find((entry) =>
+      entry.stepId === cursorStepId && entry.attempt === latestCursorStep.attempt
+    );
+  const pendingCursorCheckpoint = cursorStepId !== undefined
+    && isPendingExecutionCheckpoint(
+      run.context.executionCheckpoint,
+      cursorStepId,
+      latestCursorStep?.attempt ?? 0
+    );
+  const checkpointCompletedAttempts = cursorStepId === undefined
+    ? undefined
+    : executionCheckpointCompletedAttempts(run.context.executionCheckpoint, cursorStepId);
+  const checkpointedVisit = cursorStepId === undefined
+    ? undefined
+    : executionCheckpointVisit(run.context.executionCheckpoint, cursorStepId);
+  const cursorHasPersistedFailure = cursorStepId !== undefined
+    && (latestCursorStep?.status === "failed" || latestCursorStep?.status === "running")
+    && latestCursorFailure !== undefined
+    && hasUnroutedFailureOrRecoveryDecision(store, lock.runId, cursorStepId, latestCursorStep.attempt);
+  const pendingRetryAttemptIndex = cursorHasPersistedFailure
+      && latestCursorFailure?.retryable === true
+      && mapping(latestCursorFailure.payload)?.outcome === "retry"
+      && checkpointCompletedAttempts !== undefined
+      && latestCursorStep!.attempt > checkpointCompletedAttempts
+    ? latestCursorStep!.attempt - checkpointCompletedAttempts
+    : undefined;
+  const interruptedRecoveryCursor = cursorStepId !== undefined
+    && cursorHasPersistedFailure
+    && !pendingCursorCheckpoint
+    && pendingRetryAttemptIndex === undefined;
+  const pendingRecoveredCursor = cursorStepId !== undefined && (
+    (run.status === "running"
+      && latestCursorStep?.status === "running"
+      && !cursorHasPersistedFailure
+      && checkpointedVisit !== undefined
+      && checkpointedVisit === routing?.visits[cursorStepId])
+    || (run.status === "pending"
+      && latestCursorStep?.status === "cancelled"
+      && [...store.listEvents(lock.runId)].reverse().some((event) =>
+        event.type === "run.execution_recovered"
+          && mapping(event.payload)?.interruptedStepId === cursorStepId
+      ))
   );
+  const completedCursorPayload = latestCursorStep === null
+    ? latestCursorEvent?.type === "step.completed" ? latestCursorEvent.payload : undefined
+    : latestCursorStep.status === "completed" && !pendingCursorCheckpoint ? latestCursorStep.output : undefined;
+  const latestCompletionEventAttempt = latestCursorEvent?.type === "step.completed"
+    ? mapping(latestCursorEvent.payload)?.attempt
+    : undefined;
+  if (cursorStepId !== undefined
+      && latestCursorStep?.status === "completed"
+      && !pendingCursorCheckpoint
+      && latestCompletionEventAttempt !== latestCursorStep.attempt) {
+    store.appendRunEvent(lock.runId, {
+      type: "step.completed",
+      stepId: cursorStepId,
+      payload: latestCursorStep.output
+    });
+  }
+  const completedSteps = completedStepsFromExecutionEvents(store, lock.runId);
+  return {
+    attempts: store.recoverInterruptedRun(lock),
+    routing,
+    completedSteps,
+    ...(cursorStepId === undefined ? {} : { cursorStepId }),
+    ...(completedCursorPayload === undefined ? {} : { completedCursorPayload }),
+    ...(interruptedRecoveryCursor ? { interruptedRecoveryCursor: true } : {}),
+    ...(pendingCursorCheckpoint || pendingRecoveredCursor || pendingRetryAttemptIndex !== undefined
+      ? { pendingExecutionCursor: true }
+      : {}),
+    ...(pendingRetryAttemptIndex === undefined ? {} : { pendingRetryAttemptIndex })
+  };
 }
 
 async function runAgentFlowCommandPipeline(
@@ -245,7 +360,8 @@ async function runAgentFlowCommandPipeline(
   mcpCalls: AgentFlowMcpCallRegistry,
   notifications: AgentFlowNotificationRegistry,
   workflows: AgentFlowWorkflowRegistry,
-  beforeRemediatedResult?: () => void
+  beforeRemediatedResult?: () => void,
+  recoveredExecution?: RecoveredAgentFlowExecution
 ): Promise<AgentFlowCommandPipelineResult> {
   const existing = store.getRun(runId);
   if (existing === null) throw new Error(`Agent Flow run ${runId} was not found.`);
@@ -296,19 +412,46 @@ async function runAgentFlowCommandPipeline(
     );
   }
   assertAgentFlowSuccessTargetsAreUnambiguous(workflow.steps);
-  let completedSteps: string[];
-  let routingBudget: SuccessfulRoutingBudget;
+  let completedSteps!: string[];
+  let routingBudget!: SuccessfulRoutingBudget;
   let currentSteps = workflow.steps;
   let stepIndex = 0;
+  let recoveredCompletedCursorPayload: AgentFlowRunStateValue | undefined;
+  let pendingExecutionCursor = recoveredExecution?.pendingExecutionCursor === true;
+  let pendingRetryAttemptIndex = recoveredExecution?.pendingRetryAttemptIndex;
 
   if (resumeInput === undefined) {
-    store.transitionRunWithEvent(runId, {
-      status: "running",
-      allowedFrom: ["pending"],
-      event: { type: "run.started", payload: { status: "running" } }
+    store.withRunStateTransaction(runId, () => {
+      store.transitionRunWithEvent(runId, {
+        status: "running",
+        allowedFrom: ["pending"],
+        event: { type: "run.started", payload: { status: "running" } }
+      });
+      const persistedRouting = recoveredExecution?.routing ?? persistedExecutionRouting(existing.context);
+      const cursorStepId = recoveredExecution?.cursorStepId
+        ?? (persistedRouting === undefined ? undefined : existing.currentStepId ?? undefined);
+      completedSteps = recoveredExecution?.completedSteps
+        ?? (cursorStepId === undefined ? [] : completedStepsFromExecutionEvents(store, runId));
+      if (cursorStepId !== undefined) {
+        const cursor = stepLocations.get(cursorStepId);
+        if (cursor === undefined) {
+          throw new AgentFlowRunStateError(
+            `Agent Flow run ${runId} cannot recover because interrupted step ${cursorStepId} is not in its workflow.`,
+            "AGENT_FLOW_RUN_LOCK_RECOVERY"
+          );
+        }
+        currentSteps = cursor.steps;
+        stepIndex = cursor.index;
+        recoveredCompletedCursorPayload = recoveredExecution?.completedCursorPayload;
+      }
+      routingBudget = persistedRouting === undefined
+        ? createSuccessfulRoutingBudget(workflow, notifications, recoveredExecution?.attempts)
+        : deserializeRoutingBudget(persistedRouting, workflow, notifications);
+      for (const [stepId, attempt] of Object.entries(recoveredExecution?.attempts ?? {})) {
+        routingBudget.attempts.set(stepId, Math.max(routingBudget.attempts.get(stepId) ?? 0, attempt));
+      }
+      checkpointExecutionRouting(store, runId, routingBudget);
     });
-    completedSteps = [];
-    routingBudget = createSuccessfulRoutingBudget(workflow, notifications);
   } else {
     const resumed = resumeWaitingStep(
       store,
@@ -326,11 +469,98 @@ async function runAgentFlowCommandPipeline(
     stepIndex = resumed.nextIndex;
   }
 
+  if (recoveredCompletedCursorPayload !== undefined) {
+    const step = currentSteps[stepIndex]!;
+    const stepId = requiredStepId(step);
+    let routed: SuccessfulRoute;
+    if (normalizedTarget(step.type) === "review"
+        && (routingBudget.disagreementRounds.get(stepId) ?? 0) > 0
+        && !isPersistedDisagreementResolution(recoveredCompletedCursorPayload)) {
+      const disagreement = await resolveReviewDisagreement(
+        store,
+        runId,
+        workflow,
+        step,
+        completedSteps,
+        routingBudget,
+        sessionProviders,
+        true
+      );
+      if ("result" in disagreement) return disagreement.result;
+      completedSteps.push(stepId);
+      routed = routeAfterSuccessfulStep(
+        store, runId, completedSteps, stepId, step, currentSteps, stepIndex, stepLocations, routingBudget
+      );
+    } else {
+      if (isPersistedDisagreementResolution(recoveredCompletedCursorPayload)) {
+        const output = mapping(recoveredCompletedCursorPayload)!;
+        routingBudget.disagreementRounds.set(stepId, 0);
+        routingBudget.attempts.set(stepId, Math.max(
+          routingBudget.attempts.get(stepId) ?? 0,
+          output.attempt as number
+        ));
+        checkpointExecutionRouting(store, runId, routingBudget);
+      }
+      routed = routeRecoveredCompletedStep(
+        store,
+        runId,
+        completedSteps,
+        stepId,
+        step,
+        currentSteps,
+        stepIndex,
+        stepLocations,
+        routingBudget,
+        recoveredCompletedCursorPayload,
+        beforeRemediatedResult
+      );
+    }
+    if ("result" in routed) return routed.result;
+    currentSteps = routed.steps;
+    stepIndex = routed.nextIndex;
+  }
+
+  if (recoveredExecution?.interruptedRecoveryCursor === true) {
+    const step = currentSteps[stepIndex]!;
+    const stepId = requiredStepId(step);
+    const recoveryRoute = await routeAfterFailedStep(
+      store, runId, workflow, completedSteps, stepId, step, currentSteps, stepIndex,
+      stepLocations, routingBudget, transforms, sessionProviders, mcpCalls, notifications, workflows
+    );
+    if (recoveryRoute === undefined) {
+      if (failureContinues(step)) {
+        const routed = fallthroughAfterStep(store, runId, completedSteps, stepId, currentSteps, stepIndex, routingBudget);
+        if ("result" in routed) return routed.result;
+        currentSteps = routed.steps;
+        stepIndex = routed.nextIndex;
+      } else {
+        const failure = latestPersistedStepFailure(store, runId, stepId);
+        return finishFailure(
+          store,
+          runId,
+          completedSteps,
+          stepId,
+          failure,
+          failureStatus(step),
+          routingBudget.terminalEffects
+        );
+      }
+    } else {
+      if ("result" in recoveryRoute) return recoveryRoute.result;
+      currentSteps = recoveryRoute.steps;
+      stepIndex = recoveryRoute.nextIndex;
+    }
+  }
+
   while (stepIndex < currentSteps.length) {
     const step = currentSteps[stepIndex]!;
     const stoppedBeforeStep = stoppedPipelineResult(store, runId, completedSteps);
     if (stoppedBeforeStep !== undefined) return stoppedBeforeStep;
     const stepId = requiredStepId(step);
+    const recoveredRetryAttemptIndex = stepId === recoveredExecution?.cursorStepId
+      ? pendingRetryAttemptIndex
+      : undefined;
+    pendingRetryAttemptIndex = undefined;
     const stepType = normalizedTarget(step.type);
     const staleApprovalIds = mergeContinuationStaleApprovals(store, runId, workflow, step);
     if (staleApprovalIds.length > 0) {
@@ -342,7 +572,8 @@ async function runAgentFlowCommandPipeline(
     }
     const recoveryGuard = recoveryGuardFailure(store, runId, workflow, completedSteps, stepId, step, routingBudget);
     if (recoveryGuard !== undefined) return recoveryGuard;
-    if (stepType === "review" && routingBudget.reviewCycleStepIds.has(stepId)
+    if (recoveredRetryAttemptIndex === undefined
+        && stepType === "review" && routingBudget.reviewCycleStepIds.has(stepId)
         && routingBudget.maxReviewCycles !== undefined
         && (routingBudget.attempts.get(stepId) ?? 0) >= routingBudget.maxReviewCycles) {
       const disagreement = await resolveReviewDisagreement(
@@ -364,7 +595,12 @@ async function runAgentFlowCommandPipeline(
       stepIndex = routed.nextIndex;
       continue;
     }
-    routingBudget.visits.set(stepId, (routingBudget.visits.get(stepId) ?? 0) + 1);
+    if (pendingExecutionCursor && stepId === recoveredExecution?.cursorStepId) {
+      pendingExecutionCursor = false;
+    } else {
+      routingBudget.visits.set(stepId, (routingBudget.visits.get(stepId) ?? 0) + 1);
+      checkpointExecutionRouting(store, runId, routingBudget, stepId);
+    }
     if (stepType === "approval" && normalizedTarget(step.reviewer) === "human") {
       const attempt = allocateStepAttempt(routingBudget, stepId);
       if (attempt === undefined) return stepAttemptLimitResult(store, runId, completedSteps, stepId, routingBudget);
@@ -450,8 +686,9 @@ async function runAgentFlowCommandPipeline(
       }
       const retries = failureRetries(step);
       let failure: string | undefined;
-      for (let attemptIndex = 1; attemptIndex <= retries + 1; attemptIndex += 1) {
-        const attempt = attemptIndex === 1 ? firstAttempt : allocateStepAttempt(routingBudget, stepId);
+      const firstAttemptIndex = nextRetryAttemptIndex(recoveredRetryAttemptIndex, retries, stepId);
+      for (let attemptIndex = firstAttemptIndex; attemptIndex <= retries + 1; attemptIndex += 1) {
+        const attempt = attemptIndex === firstAttemptIndex ? firstAttempt : allocateStepAttempt(routingBudget, stepId);
         if (attempt === undefined) return stepAttemptLimitResult(store, runId, completedSteps, stepId, routingBudget);
         const stopped = activeStopStatus(store, runId);
         if (stopped !== undefined) return stoppedPipelineResult(store, runId, completedSteps)!;
@@ -468,32 +705,36 @@ async function runAgentFlowCommandPipeline(
         store.upsertStep({ runId, stepId, attempt, status: "running", input });
         store.appendRunEvent(runId, { type: "step.started", stepId, payload: input });
         try {
-          const result = await executeAgentFlowMcpCall(store, runId, workflow, step, mcpCalls, {
+          await executeAgentFlowMcpCall(store, runId, workflow, step, mcpCalls, {
             attempt,
             stopStatus: () => activeStopStatus(store, runId),
+            interruptError: () => store.runLockInterruption(),
             beforePublish: () => {
+              const lockError = store.runLockInterruption();
+              if (lockError !== undefined) throw lockError;
               const status = activeStopStatus(store, runId);
               if (status !== undefined) throw new AgentFlowMcpCallInterruptedError(status);
+            },
+            finalize: (result) => {
+              const output = {
+                attempt,
+                server: result.server,
+                tool: result.tool,
+                requestArtifact: result.requestArtifact.declaredPath,
+                outputs: result.outputArtifacts.map((artifact) => artifact.declaredPath)
+              };
+              store.upsertStep({ runId, stepId, attempt, status: "completed", output });
+              store.appendRunEvent(runId, { type: "step.completed", stepId, payload: output });
             }
           });
-          const stoppedAfterPublish = activeStopStatus(store, runId);
-          if (stoppedAfterPublish !== undefined) {
-            persistMcpCallInterruption(store, runId, stepId, attempt, stoppedAfterPublish);
-            return interruptedPipelineResult(store, runId, completedSteps, stoppedAfterPublish);
-          }
-          const output = {
-            attempt,
-            server: result.server,
-            tool: result.tool,
-            requestArtifact: result.requestArtifact.declaredPath,
-            outputs: result.outputArtifacts.map((artifact) => artifact.declaredPath)
-          };
-          store.upsertStep({ runId, stepId, attempt, status: "completed", output });
-          store.appendRunEvent(runId, { type: "step.completed", stepId, payload: output });
+          const lockError = store.runLockInterruption();
+          if (lockError !== undefined) throw lockError;
           completedSteps.push(stepId);
           failure = undefined;
           break;
         } catch (error) {
+          const lockError = store.runLockInterruption();
+          if (lockError !== undefined) throw lockError;
           if (error instanceof AgentFlowMcpCallInterruptedError) {
             persistMcpCallInterruption(store, runId, stepId, attempt, error.status);
             return interruptedPipelineResult(store, runId, completedSteps, error.status);
@@ -557,8 +798,9 @@ async function runAgentFlowCommandPipeline(
       }
       const retries = failureRetries(step);
       let failure: string | undefined;
-      for (let attemptIndex = 1; attemptIndex <= retries + 1; attemptIndex += 1) {
-        const attempt = attemptIndex === 1 ? firstAttempt : allocateStepAttempt(routingBudget, stepId);
+      const firstAttemptIndex = nextRetryAttemptIndex(recoveredRetryAttemptIndex, retries, stepId);
+      for (let attemptIndex = firstAttemptIndex; attemptIndex <= retries + 1; attemptIndex += 1) {
+        const attempt = attemptIndex === firstAttemptIndex ? firstAttempt : allocateStepAttempt(routingBudget, stepId);
         if (attempt === undefined) return stepAttemptLimitResult(store, runId, completedSteps, stepId, routingBudget);
         const outcome = executeTransformStep(store, runId, stepId, step, transforms, attempt, attemptIndex <= retries);
         if (outcome.stopped !== undefined) {
@@ -628,8 +870,9 @@ async function runAgentFlowCommandPipeline(
       const retries = failureRetries(step);
       let failure: string | undefined;
       let sessionSelectedTarget: string | undefined;
-      for (let attemptIndex = 1; attemptIndex <= retries + 1; attemptIndex += 1) {
-        const attempt = attemptIndex === 1 ? firstAttempt : allocateStepAttempt(routingBudget, stepId);
+      const firstAttemptIndex = nextRetryAttemptIndex(recoveredRetryAttemptIndex, retries, stepId);
+      for (let attemptIndex = firstAttemptIndex; attemptIndex <= retries + 1; attemptIndex += 1) {
+        const attempt = attemptIndex === firstAttemptIndex ? firstAttempt : allocateStepAttempt(routingBudget, stepId);
         if (attempt === undefined) return stepAttemptLimitResult(store, runId, completedSteps, stepId, routingBudget);
         const stopped = activeStopStatus(store, runId);
         if (stopped !== undefined) return stoppedPipelineResult(store, runId, completedSteps)!;
@@ -679,36 +922,45 @@ async function runAgentFlowCommandPipeline(
             attempt,
             ...(approvalId === undefined ? {} : { requiredApprovalId: approvalId }),
             stopStatus: () => activeStopStatus(store, runId),
+            interruptError: () => store.runLockInterruption(),
             beforePublish: () => {
+              const lockError = store.runLockInterruption();
+              if (lockError !== undefined) throw lockError;
               const status = activeStopStatus(store, runId);
               if (status !== undefined) throw new AgentFlowSessionRequestInterruptedError(status);
+            },
+            finalize: (result) => {
+              const output = {
+                attempt,
+                session: result.sessionId,
+                provider: result.provider,
+                requestArtifact: result.requestArtifact.declaredPath,
+                outputs: result.outputArtifacts.map((artifact) => artifact.declaredPath),
+                externalSessionId: result.externalSessionId ?? null,
+                ...(result.approvalResult === undefined ? {} : { approvalStatus: result.approvalResult.status }),
+                ...(result.consultResult === undefined ? {} : { consultStatus: result.consultResult.status })
+              };
+              store.upsertStep({ runId, stepId, attempt, sessionId, status: "completed", output });
+              store.appendRunEvent(runId, { type: "step.completed", stepId, payload: output });
+              if (isApproval && result.approvalResult !== undefined) {
+                store.upsertApproval({
+                  id: approvalId!,
+                  runId,
+                  stepId,
+                  status: result.approvalResult.status,
+                  decidedBy: sessionId,
+                  decision: result.approvalResult.decision,
+                  context: {
+                    artifacts: step.artifacts as AgentFlowRunStateValue,
+                    evidence: result.inputEvidence as unknown as AgentFlowRunStateValue,
+                    output: result.outputArtifacts[0]!.declaredPath
+                  }
+                });
+              }
             }
           });
-          const output = {
-            attempt,
-            session: result.sessionId,
-            provider: result.provider,
-            requestArtifact: result.requestArtifact.declaredPath,
-            outputs: result.outputArtifacts.map((artifact) => artifact.declaredPath),
-            externalSessionId: result.externalSessionId ?? null
-          };
-          store.upsertStep({ runId, stepId, attempt, sessionId, status: "completed", output });
-          store.appendRunEvent(runId, { type: "step.completed", stepId, payload: output });
           completedSteps.push(stepId);
-          if (isApproval && result.approvalResult !== undefined) {
-            store.upsertApproval({
-              id: approvalId!,
-              runId,
-              stepId,
-              status: result.approvalResult.status,
-              decidedBy: sessionId,
-              decision: result.approvalResult.decision,
-              context: {
-                artifacts: step.artifacts as AgentFlowRunStateValue,
-                evidence: result.inputEvidence as unknown as AgentFlowRunStateValue,
-                output: result.outputArtifacts[0]!.declaredPath
-              }
-            });
+          if (result.approvalResult !== undefined) {
             sessionSelectedTarget = result.approvalResult.status === "approved"
               ? normalizedTarget(step.on_approve)
               : normalizedTarget(step.on_reject) ?? "cancel";
@@ -719,6 +971,8 @@ async function runAgentFlowCommandPipeline(
           failure = undefined;
           break;
         } catch (error) {
+          const lockError = store.runLockInterruption();
+          if (lockError !== undefined) throw lockError;
           if (isApproval) {
             store.upsertApproval({
               id: approvalId!,
@@ -998,8 +1252,9 @@ async function runAgentFlowCommandPipeline(
 
     const retries = failureRetries(step);
     let lastResult: CommandAttemptResult | undefined;
-    for (let attemptIndex = 1; attemptIndex <= retries + 1; attemptIndex += 1) {
-      const attempt = attemptIndex === 1 ? firstAttempt : allocateStepAttempt(routingBudget, stepId);
+    const firstAttemptIndex = nextRetryAttemptIndex(recoveredRetryAttemptIndex, retries, stepId);
+    for (let attemptIndex = firstAttemptIndex; attemptIndex <= retries + 1; attemptIndex += 1) {
+      const attempt = attemptIndex === firstAttemptIndex ? firstAttempt : allocateStepAttempt(routingBudget, stepId);
       if (attempt === undefined) return stepAttemptLimitResult(store, runId, completedSteps, stepId, routingBudget);
       store.updateRun(runId, { currentStepId: stepId, error: null });
       store.upsertStep({ runId, stepId, attempt, status: "running", input: { command: step.command as string } });
@@ -1009,7 +1264,8 @@ async function runAgentFlowCommandPipeline(
         store.repoRoot,
         step.command as string,
         timeoutMilliseconds(step),
-        () => activeStopStatus(store, runId)
+        () => activeStopStatus(store, runId),
+        () => store.runLockInterruption()
       );
       const stoppedAfterCommand = activeStopStatus(store, runId);
       if (stoppedAfterCommand !== undefined) {
@@ -1164,6 +1420,17 @@ interface SerializedSuccessfulRoutingBudget {
   attempts: Record<string, number>;
 }
 
+interface RecoveredAgentFlowExecution {
+  attempts: Record<string, number>;
+  routing?: SerializedSuccessfulRoutingBudget;
+  cursorStepId?: string;
+  completedCursorPayload?: AgentFlowRunStateValue;
+  interruptedRecoveryCursor?: true;
+  pendingExecutionCursor?: true;
+  pendingRetryAttemptIndex?: number;
+  completedSteps: string[];
+}
+
 type ResumedWaitingStep =
   | { steps: AgentFlowWorkflowStep[]; nextIndex: number; completedSteps: string[]; routingBudget: SuccessfulRoutingBudget }
   | { result: AgentFlowCommandPipelineResult };
@@ -1172,6 +1439,14 @@ type ReviewDisagreementControl =
   | { resolved: true }
   | { result: AgentFlowCommandPipelineResult };
 
+type PersistedDisagreementRoundOutcome =
+  | { status: "failed" | "unresolved" }
+  | {
+      status: "resolved";
+      result: AgentFlowDisagreementResult;
+      evidence: AgentFlowWaitingEvidence[];
+    };
+
 async function resolveReviewDisagreement(
   store: AgentFlowRunStateStore,
   runId: string,
@@ -1179,7 +1454,8 @@ async function resolveReviewDisagreement(
   reviewStep: AgentFlowWorkflowStep,
   completedSteps: string[],
   routingBudget: SuccessfulRoutingBudget,
-  sessionProviders: AgentFlowSessionProviderRegistry
+  sessionProviders: AgentFlowSessionProviderRegistry,
+  resumePersistedRound = false
 ): Promise<ReviewDisagreementControl> {
   const stepId = requiredStepId(reviewStep);
   const reviewer = requiredStaticString(reviewStep.reviewer, `Review ${stepId} reviewer`);
@@ -1187,6 +1463,9 @@ async function resolveReviewDisagreement(
   const collaboration = mapping(workflow.collaboration);
   const policy = parseAgentFlowDisagreementPolicy(collaboration?.on_disagreement);
   const completedReviewCycles = routingBudget.attempts.get(stepId) ?? 0;
+  const persistedRound = routingBudget.disagreementRounds.get(stepId) ?? 0;
+  const resumingRound = resumePersistedRound || persistedRound > 0;
+  if (!resumingRound) {
   const stoppedBeforeDisagreement = store.withRunFinalizationTransaction(runId, () => {
     const stopped = stoppedPipelineResult(store, runId, completedSteps);
     if (stopped !== undefined) return stopped;
@@ -1273,17 +1552,72 @@ async function resolveReviewDisagreement(
       )
     };
   }
+  }
 
   const resolver = policy.strategy === "owner_decides" ? subject : policy.arbiter!;
   const maxRounds = policy.strategy === "owner_decides" ? 1 : policy.maxRounds!;
-  const episode = (routingBudget.disagreementEpisodes.get(stepId) ?? 0) + 1;
-  routingBudget.disagreementEpisodes.set(stepId, episode);
-  let round = routingBudget.disagreementRounds.get(stepId) ?? 0;
-  while (round < maxRounds) {
-    round += 1;
-    routingBudget.disagreementRounds.set(stepId, round);
-    const outputPath = defaultAgentFlowDisagreementOutputPath(stepId, round, episode);
+  const persistedEpisode = routingBudget.disagreementEpisodes.get(stepId) ?? 0;
+  if (resumingRound && (persistedEpisode < 1 || persistedRound < 1 || persistedRound > maxRounds)) {
+    throw new AgentFlowRunStateError(
+      `Review ${stepId} cannot recover an invalid persisted disagreement round.`,
+      "AGENT_FLOW_RUN_LOCK_RECOVERY"
+    );
+  }
+  const episode = resumingRound ? persistedEpisode : persistedEpisode + 1;
+  if (!resumingRound) {
+    routingBudget.disagreementEpisodes.set(stepId, episode);
+  }
+  const persistedOutcome = resumingRound
+    ? persistedDisagreementRoundOutcome(store, runId, stepId, policy.strategy, resolver, episode, persistedRound)
+    : undefined;
+  if (persistedOutcome?.status === "resolved") {
+    const priorAttempt = routingBudget.attempts.get(stepId);
     try {
+      completeReviewDisagreementResolution(
+        store,
+        runId,
+        reviewStep,
+        routingBudget,
+        completedReviewCycles,
+        persistedOutcome.result,
+        persistedOutcome.evidence,
+        resolver,
+        policy.strategy,
+        episode,
+        persistedRound
+      );
+      return { resolved: true };
+    } catch (error) {
+      routingBudget.disagreementRounds.set(stepId, persistedRound);
+      if (priorAttempt === undefined) routingBudget.attempts.delete(stepId);
+      else routingBudget.attempts.set(stepId, priorAttempt);
+      const lockError = store.runLockInterruption();
+      if (lockError !== undefined) throw lockError;
+      const message = redactAgentFlowSensitiveText(error instanceof Error ? error.message : String(error));
+      store.appendRunEvent(runId, {
+        type: "collaboration.disagreement.round_failed",
+        stepId,
+        payload: { strategy: policy.strategy, resolver, episode, round: persistedRound, message }
+      });
+      if (activeStopStatus(store, runId) !== undefined) {
+        return { result: stoppedPipelineResult(store, runId, completedSteps)! };
+      }
+    }
+  }
+  let round = persistedRound;
+  let resumeCurrentRound = resumingRound && persistedOutcome === undefined;
+  while (resumeCurrentRound || round < maxRounds) {
+    if (resumeCurrentRound) {
+      resumeCurrentRound = false;
+    } else {
+      round += 1;
+      routingBudget.disagreementRounds.set(stepId, round);
+      checkpointExecutionRouting(store, runId, routingBudget, stepId);
+    }
+    const outputPath = defaultAgentFlowDisagreementOutputPath(stepId, round, episode);
+    const priorAttempt = routingBudget.attempts.get(stepId);
+    try {
+      let evidence: AgentFlowWaitingEvidence[] | undefined;
       const resolved = await executeAgentFlowDisagreementResolution(
         store,
         runId,
@@ -1293,73 +1627,64 @@ async function resolveReviewDisagreement(
         round,
         outputPath,
         sessionProviders,
-        { stopStatus: () => activeStopStatus(store, runId) }
+        {
+          stopStatus: () => activeStopStatus(store, runId),
+          interruptError: () => store.runLockInterruption(),
+          finalize: (finalized) => {
+            const resolutionEvidence = finalized.outputArtifacts.map((artifact) => {
+              if (artifact.checksum === null) {
+                throw new AgentFlowRunStateError(
+                  `Disagreement resolution artifact ${artifact.declaredPath} must have a persisted checksum.`,
+                  "AGENT_FLOW_DISAGREEMENT_INVALID"
+                );
+              }
+              return { path: artifact.declaredPath, checksum: artifact.checksum };
+            });
+            evidence = [...finalized.inputEvidence, ...resolutionEvidence];
+            store.appendRunEvent(runId, {
+              type: "collaboration.disagreement.round_completed",
+              stepId,
+              payload: {
+                strategy: policy.strategy,
+                resolver,
+                episode,
+                round,
+                output: outputPath,
+                status: finalized.disagreementResult!.status,
+                evidence: evidence as unknown as AgentFlowRunStateValue
+              }
+            });
+          }
+        }
       );
       const result = resolved.disagreementResult!;
-      store.appendRunEvent(runId, {
-        type: "collaboration.disagreement.round_completed",
-        stepId,
-        payload: { strategy: policy.strategy, resolver, episode, round, output: outputPath, status: result.status }
-      });
-      if (result.status === "unresolved") continue;
-      const resolutionEvidence = resolved.outputArtifacts.map((artifact) => {
-        if (artifact.checksum === null) {
-          throw new AgentFlowRunStateError(
-            `Disagreement resolution artifact ${artifact.declaredPath} must have a persisted checksum.`,
-            "AGENT_FLOW_DISAGREEMENT_INVALID"
-          );
-        }
-        return { path: artifact.declaredPath, checksum: artifact.checksum };
-      });
-      const attempt = completedReviewCycles + round;
-      store.withRunFinalizationTransaction(runId, () => {
-        publishReviewDisagreementDecision(
-          store,
-          runId,
-          reviewStep,
-          result.decision!,
-          result.rationale,
-          resolver,
-          policy.strategy,
-          round,
-          [...resolved.inputEvidence, ...resolutionEvidence]
+      if (evidence === undefined) {
+        throw new AgentFlowRunStateError(
+          `Disagreement resolution for ${stepId} did not persist its settlement evidence.`,
+          "AGENT_FLOW_DISAGREEMENT_INVALID"
         );
-        const output = {
-          attempt,
-          resolution: result.decision!,
-          resolutionArtifact: outputPath,
-          resolver,
-          strategy: policy.strategy,
-          episode,
-          round
-        };
-        store.upsertStep({
-          runId,
-          stepId,
-          attempt,
-          sessionId: resolver,
-          status: "completed",
-          output
-        });
-        store.appendRunEvent(runId, { type: "step.completed", stepId, payload: output });
-        store.appendRunEvent(runId, {
-          type: "collaboration.disagreement.resolved",
-          stepId,
-          payload: {
-            strategy: policy.strategy,
-            path: policy.strategy === "owner_decides" ? "owner" : "arbiter",
-            resolver,
-            episode,
-            round,
-            decision: result.decision!,
-            output: outputPath
-          }
-        });
-      });
-      routingBudget.disagreementRounds.set(stepId, 0);
-      routingBudget.attempts.set(stepId, attempt);
+      }
+      if (result.status === "unresolved") continue;
+      completeReviewDisagreementResolution(
+        store,
+        runId,
+        reviewStep,
+        routingBudget,
+        completedReviewCycles,
+        result,
+        evidence,
+        resolver,
+        policy.strategy,
+        episode,
+        round
+      );
       return { resolved: true };
     } catch (error) {
+      routingBudget.disagreementRounds.set(stepId, round);
+      if (priorAttempt === undefined) routingBudget.attempts.delete(stepId);
+      else routingBudget.attempts.set(stepId, priorAttempt);
+      const lockError = store.runLockInterruption();
+      if (lockError !== undefined) throw lockError;
       const message = redactAgentFlowSensitiveText(error instanceof Error ? error.message : String(error));
       if (error instanceof AgentFlowSessionPolicyError) {
         const attempt = completedReviewCycles + round;
@@ -1402,6 +1727,130 @@ async function resolveReviewDisagreement(
       policy
     )
   };
+}
+
+function persistedDisagreementRoundOutcome(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  stepId: string,
+  strategy: AgentFlowDisagreementPolicy["strategy"],
+  resolver: string,
+  episode: number,
+  round: number
+): PersistedDisagreementRoundOutcome | undefined {
+  const event = [...store.listEvents(runId)].reverse().find((candidate) => {
+    if (candidate.stepId !== stepId || ![
+      "collaboration.disagreement.round_completed",
+      "collaboration.disagreement.round_failed"
+    ].includes(candidate.type)) return false;
+    const payload = mapping(candidate.payload);
+    return payload?.strategy === strategy
+      && payload.resolver === resolver
+      && payload.episode === episode
+      && payload.round === round;
+  });
+  if (event === undefined) return undefined;
+  if (event.type === "collaboration.disagreement.round_failed") return { status: "failed" };
+  const payload = mapping(event.payload);
+  if (payload?.status === "unresolved") return { status: "unresolved" };
+  const outputPath = defaultAgentFlowDisagreementOutputPath(stepId, round, episode);
+  if (payload?.status !== "resolved" || payload.output !== outputPath) {
+    throw invalidPersistedDisagreementRound(stepId);
+  }
+  const evidence = persistedDisagreementEvidence(payload.evidence, stepId);
+  let result: AgentFlowDisagreementResult;
+  try {
+    result = parseAgentFlowDisagreementResult(store.readArtifact(runId, outputPath), outputPath);
+  } catch (error) {
+    throw new AgentFlowRunStateError(
+      `Review ${stepId} cannot recover its settled disagreement round because the resolution evidence is unavailable: ${error instanceof Error ? error.message : String(error)}.`,
+      "AGENT_FLOW_RUN_LOCK_RECOVERY",
+      { cause: error }
+    );
+  }
+  if (result.status !== "resolved") throw invalidPersistedDisagreementRound(stepId);
+  return { status: "resolved", result, evidence };
+}
+
+function persistedDisagreementEvidence(value: unknown, stepId: string): AgentFlowWaitingEvidence[] {
+  if (!Array.isArray(value) || value.length === 0) throw invalidPersistedDisagreementRound(stepId);
+  const evidence = value.map((entry) => {
+    const item = mapping(entry);
+    if (typeof item?.path !== "string" || item.path.length === 0
+        || typeof item.checksum !== "string" || item.checksum.length === 0) {
+      throw invalidPersistedDisagreementRound(stepId);
+    }
+    return { path: item.path, checksum: item.checksum };
+  });
+  if (new Set(evidence.map(({ path }) => path)).size !== evidence.length) {
+    throw invalidPersistedDisagreementRound(stepId);
+  }
+  return evidence;
+}
+
+function invalidPersistedDisagreementRound(stepId: string): AgentFlowRunStateError {
+  return new AgentFlowRunStateError(
+    `Review ${stepId} cannot recover an invalid persisted disagreement round outcome.`,
+    "AGENT_FLOW_RUN_LOCK_RECOVERY"
+  );
+}
+
+function completeReviewDisagreementResolution(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  reviewStep: AgentFlowWorkflowStep,
+  routingBudget: SuccessfulRoutingBudget,
+  completedReviewCycles: number,
+  result: AgentFlowDisagreementResult,
+  evidence: AgentFlowWaitingEvidence[],
+  resolver: string,
+  strategy: AgentFlowDisagreementPolicy["strategy"],
+  episode: number,
+  round: number
+): void {
+  const stepId = requiredStepId(reviewStep);
+  const attempt = completedReviewCycles + round;
+  const outputPath = defaultAgentFlowDisagreementOutputPath(stepId, round, episode);
+  store.withRunFinalizationTransaction(runId, () => {
+    publishReviewDisagreementDecision(
+      store,
+      runId,
+      reviewStep,
+      result.decision!,
+      result.rationale,
+      resolver,
+      strategy,
+      round,
+      evidence
+    );
+    const output = {
+      attempt,
+      resolution: result.decision!,
+      resolutionArtifact: outputPath,
+      resolver,
+      strategy,
+      episode,
+      round
+    };
+    store.upsertStep({ runId, stepId, attempt, sessionId: resolver, status: "completed", output });
+    store.appendRunEvent(runId, { type: "step.completed", stepId, payload: output });
+    store.appendRunEvent(runId, {
+      type: "collaboration.disagreement.resolved",
+      stepId,
+      payload: {
+        strategy,
+        path: strategy === "owner_decides" ? "owner" : "arbiter",
+        resolver,
+        episode,
+        round,
+        decision: result.decision!,
+        output: outputPath
+      }
+    });
+    routingBudget.disagreementRounds.set(stepId, 0);
+    routingBudget.attempts.set(stepId, attempt);
+    checkpointExecutionRouting(store, runId, routingBudget);
+  });
 }
 
 function publishReviewDisagreementDecision(
@@ -1757,6 +2206,18 @@ function pauseForInteraction(
     : persistWaiting();
 }
 
+interface PersistedResumeDecision {
+  persisted: true;
+  location: RuntimeStepLocation;
+  selectedTarget?: string;
+  completedSteps: string[];
+  routingBudget: SuccessfulRoutingBudget;
+}
+
+interface FailedResumeDecision {
+  resumeError: unknown;
+}
+
 function resumeWaitingStep(
   store: AgentFlowRunStateStore,
   runId: string,
@@ -1766,6 +2227,46 @@ function resumeWaitingStep(
   stepLocations: Map<string, RuntimeStepLocation>,
   notifications: AgentFlowNotificationRegistry
 ): ResumedWaitingStep {
+  const decision = store.withRunStateTransaction(runId, () => {
+    const persisted = persistWaitingStepResume(
+      store, runId, workflow, context, response, stepLocations, notifications
+    );
+    if (!("result" in persisted) && !("resumeError" in persisted)) {
+      checkpointExecutionRouting(store, runId, persisted.routingBudget);
+    }
+    return persisted;
+  });
+  if ("resumeError" in decision) throw decision.resumeError;
+  if (!("persisted" in decision)) return decision;
+
+  const completedSteps = [...decision.completedSteps, requiredStepId(
+    decision.location.steps[decision.location.index]!
+  )];
+  const routed = routeAfterSuccessfulStep(
+    store,
+    runId,
+    completedSteps,
+    completedSteps.at(-1)!,
+    decision.location.steps[decision.location.index]!,
+    decision.location.steps,
+    decision.location.index,
+    stepLocations,
+    decision.routingBudget,
+    decision.selectedTarget
+  );
+  if ("result" in routed) return routed;
+  return { ...routed, completedSteps, routingBudget: decision.routingBudget };
+}
+
+function persistWaitingStepResume(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  workflow: AgentFlowWorkflow,
+  context: Record<string, AgentFlowRunStateValue>,
+  response: AgentFlowPipelineResumeInput,
+  stepLocations: Map<string, RuntimeStepLocation>,
+  notifications: AgentFlowNotificationRegistry
+): ResumedWaitingStep | PersistedResumeDecision | FailedResumeDecision {
   const waiting = parseWaitingState(context.waiting);
   const location = stepLocations.get(waiting.stepId);
   if (location === undefined) {
@@ -2112,7 +2613,7 @@ function resumeWaitingStep(
         eventStepId: waiting.stepId,
         failureContext
       });
-      throw error;
+      return { resumeError: error };
     }
   }
 
@@ -2130,22 +2631,13 @@ function resumeWaitingStep(
     stepId: waiting.stepId,
     payload: output
   });
-  completedSteps.push(waiting.stepId);
-
-  const routed = routeAfterSuccessfulStep(
-    store,
-    runId,
+  return {
+    persisted: true,
+    location,
+    ...(selectedTarget === undefined ? {} : { selectedTarget }),
     completedSteps,
-    waiting.stepId,
-    step,
-    location.steps,
-    location.index,
-    stepLocations,
-    routingBudget,
-    selectedTarget
-  );
-  if ("result" in routed) return routed;
-  return { ...routed, completedSteps, routingBudget };
+    routingBudget
+  };
 }
 
 function manualGateOutcomeTarget(step: AgentFlowWorkflowStep, outcome: string): string | undefined {
@@ -2169,6 +2661,262 @@ function serializeRoutingBudget(budget: SuccessfulRoutingBudget): SerializedSucc
     disagreementRounds: Object.fromEntries([...budget.disagreementRounds].sort(([left], [right]) => left.localeCompare(right))),
     attempts: Object.fromEntries([...budget.attempts].sort(([left], [right]) => left.localeCompare(right)))
   };
+}
+
+function persistedExecutionRouting(
+  context: Record<string, AgentFlowRunStateValue>
+): SerializedSuccessfulRoutingBudget | undefined {
+  const persisted = mapping(context.executionRouting);
+  return persisted === undefined ? undefined : parseSerializedRoutingBudget(persisted);
+}
+
+function completedStepsFromExecutionEvents(store: AgentFlowRunStateStore, runId: string): string[] {
+  return store.listEvents(runId).flatMap((event) =>
+    event.type === "step.completed" && event.stepId !== null ? [event.stepId] : []
+  );
+}
+
+function incompleteRecoveryRoutePayload(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  stepId: string,
+  failureId?: string
+): AgentFlowYamlMapping | undefined {
+  const latestRecoveryEvent = [...store.listEvents(runId)].reverse().find((event) =>
+    event.stepId === stepId
+      && (event.type === "recovery.routed" || event.type === "recovery.completed")
+      && (failureId === undefined || mapping(event.payload)?.failureId === failureId)
+  );
+  return latestRecoveryEvent?.type === "recovery.routed"
+    ? mapping(latestRecoveryEvent.payload)
+    : undefined;
+}
+
+function recoveryWorkspaceSnapshotCoordinates(
+  stepId: string,
+  failureId: string
+): { id: string; path: string } {
+  const stepSegment = safeId(stepId);
+  const failureSegment = safeId(failureId);
+  return {
+    id: `recovery-workspace:${stepSegment}:${failureSegment}`,
+    path: `recovery-workspace/${stepSegment}/${failureSegment}.json`
+  };
+}
+
+function serializeRecoveryWorkspaceSnapshot(snapshot: AgentFlowWorkspaceSnapshot): string {
+  const serialized = `${JSON.stringify({
+    version: 1,
+    entries: [...snapshot.entries()].sort(([left], [right]) => left.localeCompare(right))
+  })}\n`;
+  if (Buffer.byteLength(serialized) > MAX_RECOVERY_WORKSPACE_SNAPSHOT_BYTES) {
+    throw new AgentFlowRunStateError(
+      `Recovery workspace snapshot exceeds the ${MAX_RECOVERY_WORKSPACE_SNAPSHOT_BYTES}-byte persistence limit.`,
+      "AGENT_FLOW_RECOVERY_WORKSPACE_SNAPSHOT"
+    );
+  }
+  return serialized;
+}
+
+function readRecoveryWorkspaceSnapshot(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  stepId: string,
+  failureId: string,
+  routeKind: "session" | "workflow",
+  target: string,
+  routePayload: AgentFlowYamlMapping
+): AgentFlowWorkspaceSnapshot {
+  const snapshotPath = normalizedTarget(routePayload.workspaceSnapshotPath);
+  const snapshotChecksum = normalizedTarget(routePayload.workspaceSnapshotChecksum);
+  const coordinates = recoveryWorkspaceSnapshotCoordinates(stepId, failureId);
+  if (snapshotPath !== coordinates.path || snapshotChecksum === undefined
+      || normalizedTarget(routePayload.route) !== routeKind
+      || normalizedTarget(routePayload.target) !== target) {
+    throw new AgentFlowRunStateError(
+      `Interrupted recovery route for step ${stepId} has no persisted pre-route workspace snapshot.`,
+      "AGENT_FLOW_RECOVERY_WORKSPACE_SNAPSHOT"
+    );
+  }
+  const snapshot = store.readArtifact(runId, snapshotPath, { maxBytes: MAX_RECOVERY_WORKSPACE_SNAPSHOT_BYTES });
+  if (snapshot.artifact.id !== coordinates.id
+      || snapshot.artifact.kind !== "recovery_workspace_snapshot"
+      || snapshot.artifact.checksum !== snapshotChecksum
+      || snapshot.artifact.metadata.failureId !== failureId
+      || snapshot.artifact.metadata.route !== routeKind
+      || snapshot.artifact.metadata.target !== target) {
+    throw new AgentFlowRunStateError(
+      `Interrupted recovery route for step ${stepId} has an invalid pre-route workspace snapshot.`,
+      "AGENT_FLOW_RECOVERY_WORKSPACE_SNAPSHOT"
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(snapshot.content.toString("utf8"));
+  } catch (error) {
+    throw new AgentFlowRunStateError(
+      `Interrupted recovery route for step ${stepId} has a malformed pre-route workspace snapshot.`,
+      "AGENT_FLOW_RECOVERY_WORKSPACE_SNAPSHOT",
+      { cause: error }
+    );
+  }
+  const payload = mapping(parsed);
+  const entries = payload?.entries;
+  if (payload?.version !== 1 || !Array.isArray(entries) || entries.length > MAX_RECOVERY_WORKSPACE_SNAPSHOT_PATHS) {
+    throw new AgentFlowRunStateError(
+      `Interrupted recovery route for step ${stepId} has a malformed pre-route workspace snapshot.`,
+      "AGENT_FLOW_RECOVERY_WORKSPACE_SNAPSHOT"
+    );
+  }
+  const result: AgentFlowWorkspaceSnapshot = new Map();
+  for (const entry of entries) {
+    if (!Array.isArray(entry) || entry.length !== 2
+        || typeof entry[0] !== "string" || entry[0].length === 0
+        || typeof entry[1] !== "string" || entry[1].length === 0
+        || result.has(entry[0])) {
+      throw new AgentFlowRunStateError(
+        `Interrupted recovery route for step ${stepId} has a malformed pre-route workspace snapshot.`,
+        "AGENT_FLOW_RECOVERY_WORKSPACE_SNAPSHOT"
+      );
+    }
+    result.set(entry[0], entry[1]);
+  }
+  return result;
+}
+
+function hasUnroutedFailureOrRecoveryDecision(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  stepId: string,
+  attempt: number
+): boolean {
+  const failure = [...store.listFailures(runId)].reverse().find((entry) =>
+    entry.stepId === stepId && entry.attempt === attempt
+  );
+  if (failure === undefined) return false;
+  if (failure.resolvedAt === null) return true;
+  return [...store.listEvents(runId)].reverse().some((event) => {
+    if (event.stepId !== stepId || event.type !== "recovery.completed") return false;
+    return mapping(event.payload)?.failureId === failure.id;
+  });
+}
+
+function isPendingExecutionCheckpoint(
+  value: AgentFlowRunStateValue | undefined,
+  stepId: string,
+  latestAttempt: number
+): boolean {
+  const checkpoint = mapping(value);
+  return checkpoint?.stepId === stepId
+    && typeof checkpoint.completedAttempts === "number"
+    && Number.isSafeInteger(checkpoint.completedAttempts)
+    && checkpoint.completedAttempts >= latestAttempt;
+}
+
+function executionCheckpointCompletedAttempts(
+  value: AgentFlowRunStateValue | undefined,
+  stepId: string
+): number | undefined {
+  const checkpoint = mapping(value);
+  return checkpoint?.stepId === stepId
+      && typeof checkpoint.completedAttempts === "number"
+      && Number.isSafeInteger(checkpoint.completedAttempts)
+      && checkpoint.completedAttempts >= 0
+    ? checkpoint.completedAttempts
+    : undefined;
+}
+
+function executionCheckpointVisit(
+  value: AgentFlowRunStateValue | undefined,
+  stepId: string
+): number | undefined {
+  const checkpoint = mapping(value);
+  return checkpoint?.stepId === stepId
+      && typeof checkpoint.visit === "number"
+      && Number.isSafeInteger(checkpoint.visit)
+      && checkpoint.visit > 0
+    ? checkpoint.visit
+    : undefined;
+}
+
+function nextRetryAttemptIndex(
+  recoveredAttemptIndex: number | undefined,
+  retries: number,
+  stepId: string
+): number {
+  if (recoveredAttemptIndex === undefined) return 1;
+  const next = recoveredAttemptIndex + 1;
+  if (next <= retries + 1) return next;
+  throw new AgentFlowRunStateError(
+    `Agent Flow run cannot recover retryable step ${stepId} because its persisted retry index exceeds the configured retry bound.`,
+    "AGENT_FLOW_RUN_LOCK_RECOVERY"
+  );
+}
+
+function isPersistedDisagreementResolution(payload: AgentFlowRunStateValue): boolean {
+  const output = mapping(payload);
+  return typeof output?.attempt === "number"
+    && Number.isSafeInteger(output.attempt)
+    && output.attempt > 0
+    && (output.resolution === "approved" || output.resolution === "changes_requested")
+    && typeof output.resolver === "string"
+    && typeof output.strategy === "string"
+    && typeof output.episode === "number"
+    && Number.isSafeInteger(output.episode)
+    && output.episode > 0
+    && typeof output.round === "number"
+    && Number.isSafeInteger(output.round)
+    && output.round > 0;
+}
+
+function latestPersistedStepFailure(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  stepId: string
+): { exitCode: number | null; timedOut: boolean; message: string } {
+  const failure = [...store.listFailures(runId)].reverse().find((entry) => entry.stepId === stepId);
+  if (failure === undefined) {
+    throw new AgentFlowRunStateError(
+      `Agent Flow run ${runId} cannot recover failed step ${stepId} because its persisted failure was not found.`,
+      "AGENT_FLOW_RUN_LOCK_RECOVERY"
+    );
+  }
+  const payload = mapping(failure.payload);
+  return {
+    exitCode: payload?.exitCode === null || typeof payload?.exitCode === "number" ? payload.exitCode : null,
+    timedOut: payload?.timedOut === true,
+    message: failure.message
+  };
+}
+
+function checkpointExecutionRouting(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  budget: SuccessfulRoutingBudget,
+  currentStepId?: string
+): void {
+  const persist = (): void => {
+    const run = store.getRun(runId)!;
+    store.updateRun(runId, {
+      ...(currentStepId === undefined ? {} : { currentStepId }),
+      context: {
+        ...run.context,
+        executionRouting: serializeRoutingBudget(budget) as unknown as AgentFlowRunStateValue,
+        ...(currentStepId === undefined ? {} : {
+          executionCheckpoint: {
+            stepId: currentStepId,
+            visit: budget.visits.get(currentStepId) ?? 0,
+            completedAttempts: budget.attempts.get(currentStepId) ?? 0
+          }
+        })
+      }
+    });
+  };
+  if (currentStepId === undefined) {
+    persist();
+  } else {
+    store.withRunStateTransaction(runId, persist);
+  }
 }
 
 function deserializeRoutingBudget(
@@ -2613,8 +3361,6 @@ async function routeAfterFailedStep(
   const onFailure = mapping(step.on_failure);
   const route = mapping(onFailure?.route_to);
   if (route === undefined) return undefined;
-  const recoveryGuard = recoveryGuardFailure(store, runId, workflow, completedSteps, stepId, step, budget);
-  if (recoveryGuard !== undefined) return { result: recoveryGuard };
   const failure = [...store.listFailures(runId)].reverse().find((entry) => entry.stepId === stepId);
   if (failure === undefined) {
     throw new AgentFlowRunStateError(
@@ -2624,6 +3370,28 @@ async function routeAfterFailedStep(
   }
   const routeKind = normalizedTarget(route.session) === undefined ? "workflow" : "session";
   const target = normalizedTarget(route[routeKind])!;
+  const persistedCompletion = persistedRecoveryCompletion(store, runId, stepId, failure.id);
+  if (persistedCompletion !== undefined) {
+    return routePersistedRecoveryCompletion(
+      store,
+      runId,
+      completedSteps,
+      stepId,
+      step,
+      currentSteps,
+      stepIndex,
+      stepLocations,
+      budget,
+      onFailure,
+      routeKind,
+      target,
+      persistedCompletion
+    );
+  }
+  const recoveryGuard = recoveryGuardFailure(store, runId, workflow, completedSteps, stepId, step, budget);
+  if (recoveryGuard !== undefined) return { result: recoveryGuard };
+  const interruptedRoute = incompleteRecoveryRoutePayload(store, runId, stepId, failure.id);
+  const resumingInterruptedRoute = interruptedRoute !== undefined;
   if (routeKind === "session" && sessionCanMerge(workflow, target)) {
     const staleApprovalIds = staleApprovalStepIdsAcrossLineage(store, runId);
     if (staleApprovalIds.length > 0) {
@@ -2636,17 +3404,25 @@ async function routeAfterFailedStep(
       };
     }
   }
-  const routeBudgetFailure = recoveryInvocationBudgetFailure(
-    store,
-    runId,
-    completedSteps,
-    stepId,
-    budget
-  );
-  if (routeBudgetFailure !== undefined) return { result: routeBudgetFailure };
+  if (!resumingInterruptedRoute) {
+    const routeBudgetFailure = recoveryInvocationBudgetFailure(
+      store,
+      runId,
+      completedSteps,
+      stepId,
+      budget
+    );
+    if (routeBudgetFailure !== undefined) return { result: routeBudgetFailure };
+  }
   let workspaceBefore: ReturnType<typeof captureAgentFlowWorkspaceSnapshot>;
+  let workspaceSnapshotContent: string | undefined;
   try {
-    workspaceBefore = captureAgentFlowWorkspaceSnapshot(store.repoRoot);
+    workspaceBefore = interruptedRoute === undefined
+      ? captureAgentFlowWorkspaceSnapshot(store.repoRoot)
+      : readRecoveryWorkspaceSnapshot(store, runId, stepId, failure.id, routeKind, target, interruptedRoute);
+    if (interruptedRoute === undefined) {
+      workspaceSnapshotContent = serializeRecoveryWorkspaceSnapshot(workspaceBefore);
+    }
   } catch (error) {
     const message = redactAgentFlowSensitiveText(error instanceof Error ? error.message : String(error));
     return {
@@ -2659,11 +3435,33 @@ async function routeAfterFailedStep(
       })
     };
   }
-  store.appendRunEvent(runId, {
-    type: "recovery.routed",
-    stepId,
-    payload: { failureId: failure.id, route: routeKind, target }
-  });
+  if (!resumingInterruptedRoute) {
+    store.withRunStateTransaction(runId, () => {
+      const coordinates = recoveryWorkspaceSnapshotCoordinates(stepId, failure.id);
+      const snapshotArtifact = store.writeArtifact({
+        id: coordinates.id,
+        runId,
+        path: coordinates.path,
+        kind: "recovery_workspace_snapshot",
+        contentType: "application/json; charset=utf-8",
+        content: workspaceSnapshotContent!,
+        requiredRunStatus: "running",
+        metadata: { failureId: failure.id, route: routeKind, target }
+      });
+      checkpointExecutionRouting(store, runId, budget);
+      store.appendRunEvent(runId, {
+        type: "recovery.routed",
+        stepId,
+        payload: {
+          failureId: failure.id,
+          route: routeKind,
+          target,
+          workspaceSnapshotPath: snapshotArtifact.declaredPath,
+          workspaceSnapshotChecksum: snapshotArtifact.checksum
+        }
+      });
+    });
+  }
 
   let status: AgentFlowRecoveryStatus = "unresolved";
   let recoveryRunId: string | undefined;
@@ -2679,13 +3477,25 @@ async function routeAfterFailedStep(
       recoveryRunId = nested.runId;
       message = nested.message;
     } else {
-      const sessionResult = await executeRecoverySession(
-        store, runId, workflow, stepId, failure.id, failure.payloadPath, route, sessionProviders
-      );
+      const sessionResult = resumingInterruptedRoute
+        ? recoveredRecoverySessionResult(store, runId, stepId, failure.id, target)
+          ?? await executeRecoverySession(
+            store, runId, workflow, stepId, failure.id, failure.payloadPath, route, sessionProviders
+          )
+        : await executeRecoverySession(
+          store, runId, workflow, stepId, failure.id, failure.payloadPath, route, sessionProviders
+        );
       status = sessionResult.status;
       message = sessionResult.message;
     }
+    const routeLockError = store.runLockInterruption();
+    if (routeLockError !== undefined) throw routeLockError;
   } catch (error) {
+    const lockError = store.runLockInterruption();
+    if (lockError !== undefined) throw lockError;
+    if (["AGENT_FLOW_RUN_LOCKED", "AGENT_FLOW_RUN_LOCK_LOST"].includes(agentFlowErrorCode(error) ?? "")) {
+      throw error;
+    }
     if (error instanceof AgentFlowSessionPolicyError) {
       recoveryPolicyError = error;
     } else {
@@ -2827,6 +3637,63 @@ async function routeAfterFailedStep(
     stepLocations,
     budget,
     handlerTarget
+  );
+}
+
+function persistedRecoveryCompletion(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  stepId: string,
+  failureId: string
+): AgentFlowRunStateValue | undefined {
+  return [...store.listEvents(runId)].reverse().find((event) =>
+    event.stepId === stepId
+      && event.type === "recovery.completed"
+      && mapping(event.payload)?.failureId === failureId
+  )?.payload;
+}
+
+function routePersistedRecoveryCompletion(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  completedSteps: string[],
+  stepId: string,
+  step: AgentFlowWorkflowStep,
+  currentSteps: AgentFlowWorkflowStep[],
+  stepIndex: number,
+  stepLocations: Map<string, RuntimeStepLocation>,
+  budget: SuccessfulRoutingBudget,
+  onFailure: AgentFlowYamlMapping | undefined,
+  routeKind: "session" | "workflow",
+  target: string,
+  payload: AgentFlowRunStateValue
+): SuccessfulRoute {
+  const completion = mapping(payload);
+  const status = normalizedTarget(completion?.status);
+  if ((status !== "remediated" && status !== "unresolved")
+      || normalizedTarget(completion?.route) !== routeKind
+      || normalizedTarget(completion?.target) !== target) {
+    throw new AgentFlowRunStateError(
+      `Agent Flow run ${runId} cannot route the persisted recovery decision for step ${stepId} because it no longer matches the workflow.`,
+      "AGENT_FLOW_RUN_LOCK_RECOVERY"
+    );
+  }
+  const handler = mapping(onFailure?.[status === "remediated" ? "on_remediated" : "on_unresolved"]);
+  const returnTo = normalizedTarget(handler?.return_to);
+  if (returnTo !== undefined && returnTo !== stepId) {
+    throw invalidRuntimeRecoveryRoute(stepId, "on_remediated.return_to must name the failed step");
+  }
+  return routeAfterSuccessfulStep(
+    store,
+    runId,
+    completedSteps,
+    stepId,
+    step,
+    currentSteps,
+    stepIndex,
+    stepLocations,
+    budget,
+    returnTo ?? normalizedTarget(handler?.then)
   );
 }
 
@@ -3272,13 +4139,7 @@ async function executeNestedRecoveryWorkflow(
   if (existing !== null) {
     assertExistingRecoveryRunIdentity(existing, nestedWorkflow, inputs, parentRunId);
   }
-  if (existing !== null && existing.status !== "pending") {
-    if (existing.status === "running") {
-      throw new AgentFlowRunStateError(
-        `Recovery run ${recoveryRunId} is already running.`,
-        "AGENT_FLOW_RUN_COLLISION"
-      );
-    }
+  if (existing !== null && existing.status !== "pending" && existing.status !== "running") {
     const output = mapping(existing.output);
     const resultStatus = normalizedTarget(output?.resultStatus);
     const status = existing.status === "completed" && resultStatus === "remediated"
@@ -3293,19 +4154,21 @@ async function executeNestedRecoveryWorkflow(
       ...(typeof output?.message === "string" ? { message: output.message } : {})
     };
   }
-  store.withRunFinalizationTransaction(parentRunId, () => {
-    const result = createAgentFlowLifecycleRun(store, {
-      id: recoveryRunId,
-      workflow: nestedWorkflow,
-      inputs,
-      parentRunId,
-      recoveryOfRunId: parentRunId
+  if (existing === null) {
+    store.withRunFinalizationTransaction(parentRunId, () => {
+      const result = createAgentFlowLifecycleRun(store, {
+        id: recoveryRunId,
+        workflow: nestedWorkflow,
+        inputs,
+        parentRunId,
+        recoveryOfRunId: parentRunId
+      });
+      if (result.changed) {
+        copyRecoveryInputArtifacts(store, parentRunId, recoveryRunId, preparedInputs);
+      }
+      return result;
     });
-    if (result.changed) {
-      copyRecoveryInputArtifacts(store, parentRunId, recoveryRunId, preparedInputs);
-    }
-    return result;
-  });
+  }
   const propagateParentStop = (): void => {
     const stopped = activeStopStatus(store, parentRunId);
     const child = store.getRun(recoveryRunId);
@@ -3323,7 +4186,9 @@ async function executeNestedRecoveryWorkflow(
   };
   propagateParentStop();
   const childBeforeStart = store.getRun(recoveryRunId);
-  if (childBeforeStart !== null && childBeforeStart.status !== "pending") {
+  if (childBeforeStart !== null
+      && childBeforeStart.status !== "pending"
+      && childBeforeStart.status !== "running") {
     return {
       status: "unresolved",
       runId: recoveryRunId,
@@ -3332,21 +4197,55 @@ async function executeNestedRecoveryWorkflow(
   }
   const stopMonitor = setInterval(propagateParentStop, 25);
   let result: AgentFlowCommandPipelineResult;
+  let terminalizeChildOnError = false;
   try {
-    result = await runAgentFlowCommandPipeline(
-      store,
-      recoveryRunId,
-      nestedWorkflow,
-      undefined,
-      transforms,
-      sessionProviders,
-      mcpCalls,
-      notifications,
-      workflows,
-      () => promoteNestedRecoveryOutputs(store, parentRunId, recoveryRunId, parentStep, nestedWorkflow)
-    );
+    let lockAttempt = 0;
+    while (true) {
+      lockAttempt += 1;
+      const startedStepCount = store.listEvents(recoveryRunId)
+        .filter((event) => event.type === "step.started").length;
+      try {
+        result = await store.withRunLock(recoveryRunId, "run", (lock) => {
+          terminalizeChildOnError = true;
+          const recoveredAttempts = recoverInterruptedExecution(store, lock);
+          return runAgentFlowCommandPipeline(
+            store,
+            recoveryRunId,
+            nestedWorkflow,
+            undefined,
+            transforms,
+            sessionProviders,
+            mcpCalls,
+            notifications,
+            workflows,
+            () => promoteNestedRecoveryOutputs(store, parentRunId, recoveryRunId, parentStep, nestedWorkflow),
+            recoveredAttempts
+          );
+        });
+        break;
+      } catch (error) {
+        if (agentFlowErrorCode(error) === "AGENT_FLOW_CONCURRENT_MUTATION") {
+          const stepStarted = store.listEvents(recoveryRunId)
+            .filter((event) => event.type === "step.started").length > startedStepCount;
+          if (!stepStarted) {
+            terminalizeChildOnError = false;
+            if (lockAttempt < 3) {
+              await Bun.sleep(lockAttempt * 25);
+              continue;
+            }
+          }
+        }
+        throw error;
+      }
+    }
   } catch (error) {
     const message = redactAgentFlowSensitiveText(error instanceof Error ? error.message : String(error));
+    if (["AGENT_FLOW_RUN_LOCKED", "AGENT_FLOW_RUN_LOCK_LOST"].includes(agentFlowErrorCode(error) ?? "")) {
+      throw error;
+    }
+    if (!terminalizeChildOnError) {
+      return { status: "unresolved", runId: recoveryRunId, message };
+    }
     const child = store.getRun(recoveryRunId);
     if (child !== null && !["completed", "failed", "cancelled"].includes(child.status)) {
       store.withRunFinalizationTransaction(recoveryRunId, () => {
@@ -3375,6 +4274,11 @@ async function executeNestedRecoveryWorkflow(
     runId: recoveryRunId,
     ...(result.message === undefined ? {} : { message: result.message })
   };
+}
+
+function agentFlowErrorCode(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null || !("code" in error)) return undefined;
+  return typeof error.code === "string" ? error.code : undefined;
 }
 
 function assertNestedRecoveryRequiredInputs(
@@ -3872,7 +4776,7 @@ async function executeRecoverySession(
           })),
           outputs: [],
           signal: new AbortController().signal
-        }, () => activeStopStatus(store, runId));
+        }, () => activeStopStatus(store, runId), () => store.runLockInterruption());
       } catch (error) {
         if (activeStopStatus(store, runId) === undefined
             && recoveryContextRevision(store.getSession(runId, sessionId)?.state ?? {}) !== appliedContextRevision) {
@@ -3932,45 +4836,39 @@ async function executeRecoverySession(
           recoveryStatus: status
         },
         interruptedState: { resume, recoveryOfStepId: stepId, failureId }
-      }, appliedContextRevision);
+      }, appliedContextRevision, () => {
+        const requestArtifact = persistAgentFlowSessionProviderEvidence({
+          store,
+          runId,
+          stepId: recoveryStepId,
+          sessionId,
+          provider,
+          providerKind: providerDescriptor.kind,
+          ...(providerDescriptor.profile === undefined
+            ? {}
+            : { providerProfile: providerDescriptor.profile }),
+          resume,
+          prompt: evidencePrompt,
+          inputs: evidenceInputs,
+          outputs: [],
+          ...(externalSessionId === undefined ? {} : { externalSessionId }),
+          ...(metadata === undefined
+            ? {}
+            : { providerMetadata: metadata as Record<string, AgentFlowRunStateValue> }),
+          recoveryFailureId: failureId,
+          recoveryContextRevision: appliedContextRevision
+        });
+        return { requestArtifact: requestArtifact.declaredPath };
+      });
       if (!settled.settled) continue;
       if (settled.stopped !== undefined) {
         throw new AgentFlowSessionRequestInterruptedError(settled.stopped);
       }
-      const requestArtifact = persistAgentFlowSessionProviderEvidence({
-        store,
-        runId,
-        stepId: recoveryStepId,
-        sessionId,
-        provider,
-        providerKind: providerDescriptor.kind,
-        ...(providerDescriptor.profile === undefined
-          ? {}
-          : { providerProfile: providerDescriptor.profile }),
-        resume,
-        prompt: evidencePrompt,
-        inputs: evidenceInputs,
-        outputs: [],
-        ...(externalSessionId === undefined ? {} : { externalSessionId }),
-        ...(metadata === undefined
-          ? {}
-          : { providerMetadata: metadata as Record<string, AgentFlowRunStateValue> }),
-        recoveryFailureId: failureId,
-        recoveryContextRevision: appliedContextRevision
-      });
-      const settledSession = store.getSession(runId, sessionId)!;
-      store.upsertSession({
-        id: sessionId,
-        runId,
-        stepId: recoveryStepId,
-        provider,
-        externalSessionId: externalSessionId ?? null,
-        status: "waiting",
-        state: { ...settledSession.state, requestArtifact: requestArtifact.declaredPath }
-      });
       break;
     }
   } catch (error) {
+    const lockError = store.runLockInterruption();
+    if (lockError !== undefined) throw lockError;
     const stopped = error instanceof AgentFlowSessionRequestInterruptedError
       ? error.status
       : activeStopStatus(store, runId);
@@ -4010,6 +4908,61 @@ async function executeRecoverySession(
     status,
     ...(typeof metadata?.message === "string" ? { message: metadata.message } : {})
   };
+}
+
+function recoveredRecoverySessionResult(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  stepId: string,
+  failureId: string,
+  sessionId: string
+): { status: AgentFlowRecoveryStatus; message?: string } | undefined {
+  const recoveryStepId = `${stepId}:recovery`;
+  const session = store.getSession(runId, sessionId);
+  const state = session?.state;
+  const status = normalizedTarget(state?.recoveryStatus);
+  const requestPath = normalizedTarget(state?.requestArtifact);
+  const appliedRevision = state?.appliedContextRevision;
+  const currentRevision = recoveryContextRevision(state ?? {});
+  if (session?.status !== "waiting"
+      || session.stepId !== recoveryStepId
+      || state?.recoveryOfStepId !== stepId
+      || state.failureId !== failureId
+      || state.providerResponded !== true
+      || state.dirty === true) {
+    return undefined;
+  }
+  const invalidEvidence = (cause?: unknown): AgentFlowRunStateError => new AgentFlowRunStateError(
+    `Recovery session ${sessionId} cannot reuse its settled response because its persisted evidence is invalid.`,
+    "AGENT_FLOW_RUN_LOCK_RECOVERY",
+    cause === undefined ? undefined : { cause }
+  );
+  if (status === undefined || !["remediated", "unresolved"].includes(status)
+      || requestPath === undefined
+      || !Number.isSafeInteger(appliedRevision) || appliedRevision !== currentRevision) {
+    throw invalidEvidence();
+  }
+  try {
+    const evidence = store.readArtifact(runId, requestPath);
+    const payload = mapping(JSON.parse(evidence.content.toString("utf8")));
+    const metadata = mapping(payload?.providerMetadata);
+    if (evidence.artifact.kind !== "session_request"
+        || evidence.artifact.producerStepId !== recoveryStepId
+        || payload?.stepId !== recoveryStepId
+        || payload.sessionId !== sessionId
+        || payload.recoveryFailureId !== failureId
+        || payload.recoveryContextRevision !== appliedRevision
+        || normalizedTarget(metadata?.recovery_status) !== status) {
+      throw invalidEvidence();
+    }
+    return {
+      status: status as AgentFlowRecoveryStatus,
+      ...(typeof metadata?.message === "string" ? { message: metadata.message } : {})
+    };
+  } catch (error) {
+    if (error instanceof AgentFlowRunStateError && error.code === "AGENT_FLOW_RUN_LOCK_RECOVERY") throw error;
+    throw invalidEvidence(error);
+  }
 }
 
 function recoveryContextRevision(state: Record<string, AgentFlowRunStateValue>): number {
@@ -4657,6 +5610,30 @@ function finishResultStep(
   store.upsertStep({ runId, stepId, attempt, status: "completed", output });
   store.appendRunEvent(runId, { type: "step.completed", stepId, payload: output });
   completedSteps.push(stepId);
+  return finalizeCompletedResultStep(
+    store,
+    runId,
+    completedSteps,
+    stepId,
+    attempt,
+    resultStatus,
+    returnTo,
+    terminalEffects,
+    beforeRemediatedResult
+  );
+}
+
+function finalizeCompletedResultStep(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  completedSteps: string[],
+  stepId: string,
+  attempt: number,
+  resultStatus: string,
+  returnTo: string | undefined,
+  terminalEffects: AgentFlowPipelineTerminalEffects,
+  beforeRemediatedResult?: () => void
+): AgentFlowCommandPipelineResult {
   const intendedStatus = resultStatus === "cancelled"
     ? "cancelled"
     : resultStatus === "paused" ? "paused" : ["failed", "unresolved"].includes(resultStatus) ? "failed" : "completed";
@@ -4729,6 +5706,143 @@ function resolveResultReturnTarget(
   const match = /^\{\{\s*inputs\.([A-Za-z_][A-Za-z0-9_-]*)\s*}}$/.exec(value);
   const resolved = match === null ? undefined : inputs[match[1]!];
   return typeof resolved === "string" && resolved.trim().length > 0 ? resolved.trim() : undefined;
+}
+
+function routeRecoveredCompletedStep(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  completedSteps: string[],
+  stepId: string,
+  step: AgentFlowWorkflowStep,
+  currentSteps: AgentFlowWorkflowStep[],
+  stepIndex: number,
+  stepLocations: Map<string, RuntimeStepLocation>,
+  budget: SuccessfulRoutingBudget,
+  payload: AgentFlowRunStateValue,
+  beforeRemediatedResult?: () => void
+): SuccessfulRoute {
+  const output = mapping(payload);
+  const successfulAttempt = typeof output?.attempt === "number"
+      && Number.isSafeInteger(output.attempt)
+      && output.attempt > 0
+    ? output.attempt
+    : Math.max(1, budget.attempts.get(stepId) ?? 0);
+  const recoveryFailure = resolveReturnedRecoveryFailures(
+    store,
+    runId,
+    completedSteps,
+    stepId,
+    successfulAttempt,
+    budget.terminalEffects
+  );
+  if (recoveryFailure !== undefined) return { result: recoveryFailure };
+  const stepType = normalizedTarget(step.type);
+  if (stepType === "result") {
+    const resultStatus = normalizedTarget(output?.resultStatus);
+    if (resultStatus === undefined || ![
+      "cancelled", "completed", "continue", "failed", "paused", "remediated", "unresolved"
+    ].includes(resultStatus)) {
+      throw new AgentFlowRunStateError(
+        `Result step ${stepId} cannot recover because its completed event has unsupported status ${String(output?.resultStatus)}.`,
+        "AGENT_FLOW_RUN_LOCK_RECOVERY"
+      );
+    }
+    const returnTo = normalizedTarget(output?.returnTo);
+    return {
+      result: finalizeCompletedResultStep(
+        store,
+        runId,
+        completedSteps,
+        stepId,
+        successfulAttempt,
+        resultStatus,
+        returnTo,
+        budget.terminalEffects,
+        beforeRemediatedResult
+      )
+    };
+  }
+  if (stepType === "consult") {
+    try {
+      if (recoveredConsultWasBlocked(store, runId, output)) {
+        return { result: finishBlockedConsult(store, runId, completedSteps, stepId, budget.terminalEffects) };
+      }
+    } catch (error) {
+      return {
+        result: finishFailure(store, runId, completedSteps, stepId, {
+          exitCode: null,
+          timedOut: false,
+          message: error instanceof Error ? error.message : String(error)
+        }, "paused", budget.terminalEffects)
+      };
+    }
+  }
+
+  let selectedTarget: string | undefined;
+  if (stepType === "condition") {
+    selectedTarget = normalizedTarget(output?.target);
+  } else if (stepType === "manual_gate") {
+    const outcome = normalizedTarget(output?.outcome);
+    selectedTarget = outcome === undefined ? undefined : manualGateOutcomeTarget(step, outcome);
+  } else if (stepType === "approval") {
+    const outcome = normalizedTarget(output?.outcome);
+    const approval = store.listApprovals(runId).filter((candidate) => candidate.stepId === stepId).at(-1);
+    const approvalStatus = normalizedTarget(output?.approvalStatus) ?? approval?.status;
+    selectedTarget = outcome === undefined
+      ? approvalStatus === "approved"
+        ? normalizedTarget(step.on_approve)
+        : approvalStatus === "rejected"
+          ? normalizedTarget(step.on_reject) ?? "cancel"
+          : approvalStatus === "cancelled" ? normalizedTarget(step.on_cancel) ?? "cancel" : undefined
+      : manualGateOutcomeTarget(step, outcome);
+  } else if (stepType === "review") {
+    const outcome = normalizedTarget(output?.outcome);
+    selectedTarget = outcome === "fail" || outcome === "cancel" ? outcome : undefined;
+  }
+  return routeAfterSuccessfulStep(
+    store,
+    runId,
+    completedSteps,
+    stepId,
+    step,
+    currentSteps,
+    stepIndex,
+    stepLocations,
+    budget,
+    selectedTarget
+  );
+}
+
+function recoveredConsultWasBlocked(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  output: AgentFlowYamlMapping | undefined
+): boolean {
+  const persistedStatus = normalizedTarget(output?.consultStatus);
+  if (persistedStatus === "blocked") return true;
+  if (persistedStatus === "advice") return false;
+  const outputPath = Array.isArray(output?.outputs) && typeof output.outputs[0] === "string"
+    ? output.outputs[0]
+    : undefined;
+  if (outputPath === undefined) {
+    throw new AgentFlowRunStateError(
+      `Completed consultation cannot recover because its blocking result was not persisted.`,
+      "AGENT_FLOW_RUN_LOCK_RECOVERY"
+    );
+  }
+  try {
+    const result = mapping(JSON.parse(store.readArtifact(runId, outputPath).content.toString("utf8")));
+    const status = normalizedTarget(result?.status);
+    if (status === "blocked") return true;
+    if (status === "advice") return false;
+    throw new Error(`unsupported consultation status ${String(result?.status)}`);
+  } catch (error) {
+    throw new AgentFlowRunStateError(
+      `Completed consultation cannot recover because its blocking evidence is unavailable: ${error instanceof Error ? error.message : String(error)}.`,
+      "AGENT_FLOW_RUN_LOCK_RECOVERY",
+      { cause: error }
+    );
+  }
 }
 
 function routeAfterSuccessfulStep(
@@ -4974,7 +6088,8 @@ function finishSuccessfulTerminalRoute(
 
 function createSuccessfulRoutingBudget(
   workflow: AgentFlowWorkflow,
-  notifications: AgentFlowNotificationRegistry
+  notifications: AgentFlowNotificationRegistry,
+  initialAttempts: Record<string, number> = {}
 ): SuccessfulRoutingBudget {
   const limits = mapping(workflow.limits);
   const configuredStepAttempts = mapping(limits?.max_step_attempts);
@@ -5006,7 +6121,7 @@ function createSuccessfulRoutingBudget(
     recoveryInvocations: new Map(),
     disagreementEpisodes: new Map(),
     disagreementRounds: new Map(),
-    attempts: new Map()
+    attempts: new Map(Object.entries(initialAttempts))
   };
 }
 
@@ -5865,9 +6980,10 @@ function runCommand(
   repoRoot: string,
   command: string,
   timeoutMs: number | undefined,
-  stopStatus: () => AgentFlowRunStopStatus | undefined
+  stopStatus: () => AgentFlowRunStopStatus | undefined,
+  interruptError: () => Error | undefined
 ): Promise<CommandAttemptResult> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     let capturedBytes = 0;
@@ -5875,6 +6991,7 @@ function runCommand(
     let settled = false;
     let killTimer: ReturnType<typeof setTimeout> | undefined;
     let terminationMessage: string | undefined;
+    let interruption: Error | undefined;
     const child = spawn(command, {
       cwd: repoRoot,
       shell: true,
@@ -5905,6 +7022,11 @@ function runCommand(
       requestTermination("Command exceeded timeout_seconds and was terminated.", true);
     }, timeoutMs);
     const lifecycleTimer = setInterval(() => {
+      interruption = interruptError();
+      if (interruption !== undefined) {
+        requestTermination(interruption.message, false);
+        return;
+      }
       const status = stopStatus();
       if (status !== undefined) requestTermination(`Agent Flow run was ${status}; command was terminated.`, false);
     }, 25);
@@ -5915,6 +7037,10 @@ function runCommand(
       if (timer !== undefined) clearTimeout(timer);
       if (killTimer !== undefined) clearTimeout(killTimer);
       if (lifecycleTimer !== undefined) clearInterval(lifecycleTimer);
+      if (interruption !== undefined) {
+        reject(interruption);
+        return;
+      }
       resolve({
         ...result,
         ...(result.message === undefined && terminationMessage !== undefined ? { message: terminationMessage } : {}),

@@ -404,7 +404,7 @@ approvals:
     store.close();
   });
 
-  test("rechecks human approval staleness after acquiring the resume transaction", async () => {
+  test("rechecks human approval staleness inside the resume transaction", async () => {
     const root = temporaryRepo();
     fs.writeFileSync(path.join(root, "consume.md"), "Consume the approval.\n");
     const workflow = parseAgentFlowWorkflowOrThrow(`name: concurrent-human-invalidation
@@ -436,9 +436,9 @@ approvals:
     expect(await executeAgentFlowCommandPipeline(store, "concurrent-human-invalidation", workflow))
       .toMatchObject({ status: "paused" });
 
-    const originalFinalization = store.withRunFinalizationTransaction.bind(store);
+    const originalResumeTransaction = store.withRunStateTransaction.bind(store);
     let invalidated = false;
-    store.withRunFinalizationTransaction = ((runId, callback) => {
+    store.withRunStateTransaction = ((runId, callback) => {
       if (!invalidated) {
         invalidated = true;
         competitor.writeArtifact({
@@ -451,8 +451,8 @@ approvals:
           overwrite: true
         });
       }
-      return originalFinalization(runId, callback);
-    }) as typeof store.withRunFinalizationTransaction;
+      return originalResumeTransaction(runId, callback);
+    }) as typeof store.withRunStateTransaction;
     let consumerInvoked = false;
     const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
       consumerInvoked = true;
@@ -466,12 +466,15 @@ approvals:
       { outcome: "approve" },
       undefined,
       providers
-    )).rejects.toMatchObject({ code: "AGENT_FLOW_APPROVAL_STALE" });
+    )).resolves.toMatchObject({ status: "paused" });
     expect(consumerInvoked).toBe(false);
     expect(store.getRun("concurrent-human-invalidation")).toMatchObject({ status: "paused" });
     expect(store.getArtifact("concurrent-human-invalidation", "approvals/approve.json")).toBeNull();
     expect(store.listApprovals("concurrent-human-invalidation"))
-      .toEqual([expect.objectContaining({ status: "stale" })]);
+      .toEqual([
+        expect.objectContaining({ status: "stale" }),
+        expect.objectContaining({ status: "requested" })
+      ]);
     competitor.close();
     store.close();
   });

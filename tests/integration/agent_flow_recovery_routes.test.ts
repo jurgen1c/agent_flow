@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import {
+  AgentFlowRunStateError,
   type AgentFlowYamlMapping,
   createAgentFlowArtifactTransformRegistry,
   createAgentFlowLifecycleRun,
@@ -1448,6 +1449,65 @@ steps:
     });
     expect(store.listFailures("session-recovery")[0]?.resolvedAt).not.toBeNull();
     store.close();
+  });
+
+  test("reuses a settled recovery-session response after lease takeover", async () => {
+    const root = temporaryRepo();
+    fs.writeFileSync(path.join(root, "fix.md"), "Fix the failure.\n");
+    const workflow = sessionRecoveryWorkflow("settled-session-takeover", "fix.md");
+    const runId = "settled-session-takeover";
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: runId, workflow });
+    const lockError = new AgentFlowRunStateError(
+      "simulated lease loss after recovery response settlement",
+      "AGENT_FLOW_RUN_LOCK_LOST"
+    );
+    const settleRecoverySession = store.settleRecoverySessionForRunAtContextRevision.bind(store);
+    const originalInterruption = store.runLockInterruption.bind(store);
+    let interrupted = false;
+    store.runLockInterruption = (() => interrupted ? lockError : originalInterruption()) as typeof store.runLockInterruption;
+    store.settleRecoverySessionForRunAtContextRevision = ((input, revision, settledState) => {
+      const settled = settleRecoverySession(input, revision, settledState);
+      if (settled.settled && settled.stopped === undefined) interrupted = true;
+      return settled;
+    }) as typeof store.settleRecoverySessionForRunAtContextRevision;
+    let providerCalls = 0;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+      providerCalls += 1;
+      return {
+        outputs: {},
+        externalSessionId: "settled-external-session",
+        metadata: { recovery_status: "remediated", message: "Persisted remediation." }
+      };
+    });
+
+    await expect(executeAgentFlowCommandPipeline(store, runId, workflow, undefined, providers))
+      .rejects.toMatchObject({ code: "AGENT_FLOW_RUN_LOCK_LOST" });
+    expect(providerCalls).toBe(1);
+    expect(store.getSession(runId, "fixer")).toMatchObject({
+      status: "waiting",
+      state: {
+        providerResponded: true,
+        recoveryStatus: "remediated",
+        requestArtifact: expect.stringMatching(/^session-requests\/recovery\//)
+      }
+    });
+    expect(store.listEvents(runId).map((event) => event.type)).not.toContain("recovery.completed");
+    store.close();
+
+    const recovered = await openAgentFlowRunState({ cwd: root });
+    const recoveredProviders = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+      providerCalls += 1;
+      throw new Error("settled recovery provider must not be replayed");
+    });
+    await expect(executeAgentFlowCommandPipeline(
+      recovered, runId, workflow, undefined, recoveredProviders
+    )).resolves.toMatchObject({ status: "completed" });
+    expect(providerCalls).toBe(1);
+    expect(recovered.listEvents(runId).filter((event) => event.type === "recovery.completed"))
+      .toHaveLength(1);
+    recovered.close();
+    fs.rmSync(root, { recursive: true, force: true });
   });
 
   test("keeps ordinary and recovery request evidence separate when their step IDs overlap", async () => {

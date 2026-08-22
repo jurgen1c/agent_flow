@@ -186,8 +186,10 @@ export interface AgentFlowSessionRequestExecutionResult {
 export interface ExecuteAgentFlowSessionRequestOptions {
   attempt?: number;
   beforePublish?: () => void;
+  finalize?: (result: AgentFlowSessionRequestExecutionResult) => void;
   requiredApprovalId?: string;
   stopStatus?: () => AgentFlowRunStopStatus | undefined;
+  interruptError?: () => Error | undefined;
 }
 
 interface ExecuteAgentFlowSessionStepOptions extends ExecuteAgentFlowSessionRequestOptions {
@@ -959,9 +961,11 @@ async function executeAgentFlowSessionStep(
       adapter,
       request,
       options.stopStatus,
-      () => staleMergeApprovalError(false)
+      () => options.interruptError?.() ?? staleMergeApprovalError(false)
     );
   } catch (error) {
+    const interruption = options.interruptError?.();
+    if (interruption !== undefined) throw interruption;
     const stopped = error instanceof AgentFlowSessionRequestInterruptedError
       ? error.status
       : options.stopStatus?.();
@@ -1066,24 +1070,6 @@ async function executeAgentFlowSessionStep(
     ...(externalSessionId === undefined ? {} : { externalSessionId }),
     ...(providerMetadata === undefined ? {} : { providerMetadata })
   };
-  const requestArtifact = store.writeArtifact({
-    id: `${requestIdPrefix}:${digest(requestPath)}`,
-    runId,
-    stepId,
-    path: requestPath,
-    kind: requestKind,
-    contentType: "application/json; charset=utf-8",
-    content: `${stableJson(requestMetadata)}\n`,
-    overwrite: store.getArtifact(runId, requestPath) !== null,
-    requiredRunStatus: "running",
-    requiredArtifacts: sourceInputEvidence,
-    metadata: {
-      sessionId,
-      provider,
-      resume,
-      ...(options.attempt === undefined ? {} : { attempt: options.attempt })
-    }
-  });
   const inputPathSet = new Set(inputPaths);
   const publicationOrder = [
     ...outputPaths.filter((outputPath) => !inputPathSet.has(outputPath)),
@@ -1123,35 +1109,80 @@ async function executeAgentFlowSessionStep(
   });
   const staleApprovalBeforeOutputs = staleMergeApprovalError();
   if (staleApprovalBeforeOutputs !== undefined) throw staleApprovalBeforeOutputs;
-  const published = new Map(store.writeArtifactsAtomically(publications)
-    .map((artifact) => [artifact.declaredPath, artifact]));
-  const outputArtifacts = outputPaths.map((outputPath) => published.get(outputPath)!);
-  options.beforePublish?.();
-  store.upsertSession({
-    id: sessionId,
-    runId,
-    stepId,
-    provider,
-    status: "waiting",
-    externalSessionId: externalSessionId ?? null,
-    state: {
-      resume,
-      lastStepId: stepId,
-      requestArtifact: requestPath,
-      outputArtifacts: outputPaths
+  let committedInterruption: AgentFlowSessionRequestInterruptedError | undefined;
+  const finalized = store.withRunFinalizationTransaction(runId, () => {
+    try {
+      const requestArtifact = store.writeArtifact({
+        id: `${requestIdPrefix}:${digest(requestPath)}`,
+        runId,
+        stepId,
+        path: requestPath,
+        kind: requestKind,
+        contentType: "application/json; charset=utf-8",
+        content: `${stableJson(requestMetadata)}\n`,
+        overwrite: store.getArtifact(runId, requestPath) !== null,
+        requiredRunStatus: "running",
+        requiredArtifacts: sourceInputEvidence,
+        metadata: {
+          sessionId,
+          provider,
+          resume,
+          ...(options.attempt === undefined ? {} : { attempt: options.attempt })
+        }
+      });
+      const published = new Map(store.writeArtifactsAtomically(publications)
+        .map((artifact) => [artifact.declaredPath, artifact]));
+      const outputArtifacts = outputPaths.map((outputPath) => published.get(outputPath)!);
+      options.beforePublish?.();
+      store.upsertSession({
+        id: sessionId,
+        runId,
+        stepId,
+        provider,
+        status: "waiting",
+        externalSessionId: externalSessionId ?? null,
+        state: {
+          resume,
+          lastStepId: stepId,
+          requestArtifact: requestPath,
+          outputArtifacts: outputPaths
+        }
+      });
+      const result = {
+        sessionId,
+        provider,
+        requestArtifact,
+        outputArtifacts,
+        inputEvidence: sourceInputEvidence,
+        ...(consultResult === undefined ? {} : { consultResult }),
+        ...(disagreementResult === undefined ? {} : { disagreementResult }),
+        ...(approvalResult === undefined ? {} : { approvalResult }),
+        ...(externalSessionId === undefined ? {} : { externalSessionId })
+      };
+      options.finalize?.(result);
+      return result;
+    } catch (error) {
+      const stopped = error instanceof AgentFlowSessionRequestInterruptedError
+        ? error.status
+        : options.stopStatus?.();
+      if (stopped === undefined) throw error;
+      store.upsertSession({
+        id: sessionId,
+        runId,
+        stepId,
+        provider,
+        status: stopped,
+        externalSessionId: effectiveExternalSessionId ?? null,
+        state: { resume, lastStepId: stepId, interrupted: stopped }
+      });
+      committedInterruption = error instanceof AgentFlowSessionRequestInterruptedError
+        ? error
+        : new AgentFlowSessionRequestInterruptedError(stopped);
+      return undefined;
     }
   });
-  return {
-    sessionId,
-    provider,
-    requestArtifact,
-    outputArtifacts,
-    inputEvidence: sourceInputEvidence,
-    ...(consultResult === undefined ? {} : { consultResult }),
-    ...(disagreementResult === undefined ? {} : { disagreementResult }),
-    ...(approvalResult === undefined ? {} : { approvalResult }),
-    ...(externalSessionId === undefined ? {} : { externalSessionId })
-  };
+  if (committedInterruption !== undefined) throw committedInterruption;
+  return finalized!;
   } catch (error) {
     const stopped = error instanceof AgentFlowSessionRequestInterruptedError
       ? error.status
@@ -1192,7 +1223,7 @@ export async function invokeAgentFlowSessionProvider(
   adapter: AgentFlowSessionProviderAdapter,
   request: AgentFlowSessionProviderRequest,
   stopStatus: ExecuteAgentFlowSessionRequestOptions["stopStatus"],
-  interruptError?: () => AgentFlowSessionRequestError | undefined
+  interruptError?: () => Error | undefined
 ): Promise<AgentFlowSessionProviderResponse> {
   const initialStatus = stopStatus?.();
   if (initialStatus !== undefined) throw new AgentFlowSessionRequestInterruptedError(initialStatus);
