@@ -90,6 +90,33 @@ describe("Agent Flow run lifecycle", () => {
     store.close();
   });
 
+  test("reuses a matching running execution when interrupted recovery races with creation", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(WORKFLOW_SOURCE);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    const createRunWithEvent = store.createRunWithEvent.bind(store);
+    let raced = false;
+    store.createRunWithEvent = ((input, event) => {
+      if (!raced) {
+        raced = true;
+        createRunWithEvent(input, event);
+        store.updateRun(input.id, { status: "running" });
+      }
+      return createRunWithEvent(input, event);
+    }) as typeof store.createRunWithEvent;
+
+    expect(createAgentFlowLifecycleRun(store, {
+      id: "run-create-race",
+      workflow,
+      allowInterruptedRecovery: true
+    })).toMatchObject({
+      changed: false,
+      run: { id: "run-create-race", status: "running" }
+    });
+    expect(raced).toBe(true);
+    store.close();
+  });
+
   test("rolls back lifecycle status when its ordered event cannot be written", async () => {
     const repoRoot = temporaryRepo();
     const workflow = parseAgentFlowWorkflowOrThrow(WORKFLOW_SOURCE);

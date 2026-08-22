@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  AgentFlowRunStateError,
   createAgentFlowLifecycleRun,
   createAgentFlowSessionProviderRegistry,
   executeAgentFlowCommandPipeline,
@@ -189,6 +190,54 @@ describe("Agent Flow collaborative disagreement handling", () => {
       error: expect.stringContaining("token=[REDACTED]")
     });
     expect(JSON.stringify(store.getSession("redacted-resolver", "arbiter"))).not.toContain("resolver-secret");
+    store.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  test("rolls back resolver completion when its routing checkpoint fails", async () => {
+    const policy = `
+    strategy: arbiter
+    arbiter: arbiter
+    max_rounds: 1`;
+    const { root, store, workflow } = await disagreementRun(policy, "resolver-checkpoint", true);
+    const providers = reviewProvider((request) => request.sessionId === "arbiter"
+      ? { status: "resolved", decision: "approved", rationale: "Approved by arbiter." }
+      : reviewResult("changes_requested", "Needs another revision."));
+    const updateRun = store.updateRun.bind(store);
+    let rejectCheckpoint = true;
+    store.updateRun = ((runId, input) => {
+      if (rejectCheckpoint
+          && input.context?.executionRouting !== undefined
+          && store.listEvents(runId).some((event) => event.type === "collaboration.disagreement.resolved")) {
+        rejectCheckpoint = false;
+        throw new Error("resolver checkpoint unavailable");
+      }
+      return updateRun(runId, input);
+    }) as typeof store.updateRun;
+
+    const result = await executeAgentFlowCommandPipeline(
+      store, "resolver-checkpoint", workflow, undefined, providers
+    );
+
+    expect(result).toMatchObject({ status: "failed" });
+    expect(store.listEvents("resolver-checkpoint").some((event) =>
+      event.type === "collaboration.disagreement.resolved" && event.payload.path === "arbiter"
+    )).toBe(false);
+    expect(store.listEvents("resolver-checkpoint").some((event) =>
+      event.type === "step.completed"
+        && typeof event.payload === "object"
+        && event.payload !== null
+        && "resolution" in event.payload
+    )).toBe(false);
+    expect(store.listEvents("resolver-checkpoint")).toContainEqual(expect.objectContaining({
+      type: "collaboration.disagreement.round_failed",
+      payload: expect.objectContaining({ message: "resolver checkpoint unavailable" })
+    }));
+    expect(JSON.parse(store.readArtifact("resolver-checkpoint", "reviews/review.json").content.toString()))
+      .toMatchObject({ status: "changes_requested" });
+    expect(store.getRun("resolver-checkpoint")?.context.executionRouting).toMatchObject({
+      disagreementRounds: { review: 1 }
+    });
     store.close();
     fs.rmSync(root, { recursive: true, force: true });
   });
@@ -830,22 +879,24 @@ steps:
     let resolutionTakenOver = false;
     store.withRunFinalizationTransaction = ((runId, callback) => {
       if (arbiterInvoked && !resolutionTakenOver) {
-        resolutionTakenOver = true;
         const existing = store.getArtifact(runId, resolutionPath);
-        store.writeArtifact({
-          id: existing!.id,
-          runId,
-          stepId: "external",
-          path: resolutionPath,
-          kind: "disagreement_output",
-          contentType: "application/json; charset=utf-8",
-          content: `${JSON.stringify({
-            status: "resolved",
-            decision: "changes_requested",
-            rationale: "Replacement decision."
-          })}\n`,
-          overwrite: true
-        });
+        if (existing !== null) {
+          resolutionTakenOver = true;
+          store.writeArtifact({
+            id: existing.id,
+            runId,
+            stepId: "external",
+            path: resolutionPath,
+            kind: "disagreement_output",
+            contentType: "application/json; charset=utf-8",
+            content: `${JSON.stringify({
+              status: "resolved",
+              decision: "changes_requested",
+              rationale: "Replacement decision."
+            })}\n`,
+            overwrite: true
+          });
+        }
       }
       return originalFinalization(runId, callback);
     }) as typeof store.withRunFinalizationTransaction;
@@ -862,6 +913,413 @@ steps:
       payload: expect.objectContaining({ message: expect.stringContaining(`${resolutionPath} was overwritten`) })
     }));
     store.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  test("resumes a persisted disagreement round without replaying review-cycle routing", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-flow-disagreement-recovery-"));
+    fs.mkdirSync(path.join(root, ".git"));
+    fs.writeFileSync(path.join(root, "package.json"), "{}\n");
+    const workflow = reviewLoopWorkflow(`
+    strategy: arbiter
+    arbiter: arbiter
+    max_rounds: 1`, true);
+    const runId = "recovered-disagreement";
+    const interrupted = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(interrupted, { id: runId, workflow });
+    interrupted.writeArtifact({
+      id: "implementation",
+      runId,
+      path: "implementation.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Implementation"
+    });
+    interrupted.writeArtifact({
+      id: "review",
+      runId,
+      stepId: "review",
+      path: "reviews/review.json",
+      kind: "review_output",
+      contentType: "application/json",
+      content: `${JSON.stringify(reviewResult("changes_requested", "Needs another revision."))}\n`
+    });
+    interrupted.acquireRunLock(runId, "run", { ttlMs: 60_000 });
+    interrupted.transitionRunWithEvent(runId, {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    interrupted.updateRun(runId, {
+      currentStepId: "review",
+      context: {
+        ...interrupted.getRun(runId)!.context,
+        executionRouting: {
+          maxReviewCycles: 1,
+          stepAttemptLimits: {},
+          visits: { review: 1, route: 1, revise: 1 },
+          recoveryCycles: {},
+          recoveryInvocations: {},
+          disagreementEpisodes: { review: 1 },
+          disagreementRounds: { review: 1 },
+          attempts: { review: 1, route: 1, revise: 1 }
+        }
+      }
+    });
+    for (const stepId of ["review", "route", "revise"]) {
+      const output = stepId === "review"
+        ? { attempt: 1, session: "reviewer", outputs: ["reviews/review.json"] }
+        : stepId === "route" ? { attempt: 1, target: "revise" } : { attempt: 1 };
+      interrupted.upsertStep({ runId, stepId, attempt: 1, status: "completed", output });
+      interrupted.appendRunEvent(runId, { type: "step.completed", stepId, payload: output });
+    }
+    interrupted.appendRunEvent(runId, {
+      type: "collaboration.disagreement",
+      stepId: "review",
+      payload: { strategy: "arbiter" }
+    });
+    interrupted.close();
+
+    let arbiterCalls = 0;
+    const providers = reviewProvider((request) => {
+      if (request.sessionId !== "arbiter") throw new Error("reviewer must not be replayed");
+      arbiterCalls += 1;
+      return { status: "resolved", decision: "approved", rationale: "Recovered approval." };
+    });
+    const recovered = await openAgentFlowRunState({ cwd: root });
+    await expect(executeAgentFlowCommandPipeline(recovered, runId, workflow, undefined, providers))
+      .resolves.toMatchObject({ status: "completed" });
+    expect(arbiterCalls).toBe(1);
+    expect(recovered.listEvents(runId).filter((event) => event.type === "collaboration.disagreement"))
+      .toHaveLength(1);
+    expect(JSON.parse(recovered.readArtifact(runId, "reviews/review.json").content.toString()))
+      .toMatchObject({ status: "approved", summary: expect.stringContaining("Recovered approval") });
+    recovered.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  test("resumes an arbiter round interrupted after its cursor checkpoint", async () => {
+    const { root, store, workflow } = await disagreementRun(`
+    strategy: arbiter
+    arbiter: arbiter
+    max_rounds: 1`, "interrupted-arbiter-round", true);
+    const lockError = new AgentFlowRunStateError(
+      "simulated disagreement lease loss",
+      "AGENT_FLOW_RUN_LOCK_LOST"
+    );
+    const originalInterruption = store.runLockInterruption.bind(store);
+    let interrupted = false;
+    store.runLockInterruption = (() => interrupted ? lockError : originalInterruption()) as typeof store.runLockInterruption;
+    const firstProviders = reviewProvider((request) => {
+      if (request.sessionId === "reviewer") {
+        return reviewResult("changes_requested", "Needs another revision.");
+      }
+      interrupted = true;
+      throw new Error("simulated interrupted arbiter request");
+    });
+
+    await expect(executeAgentFlowCommandPipeline(
+      store, "interrupted-arbiter-round", workflow, undefined, firstProviders
+    )).rejects.toMatchObject({ code: "AGENT_FLOW_RUN_LOCK_LOST" });
+    expect(store.getRun("interrupted-arbiter-round")).toMatchObject({
+      status: "running",
+      currentStepId: "review",
+      context: {
+        executionCheckpoint: { stepId: "review", completedAttempts: 1 },
+        executionRouting: {
+          disagreementEpisodes: { review: 1 },
+          disagreementRounds: { review: 1 }
+        }
+      }
+    });
+    store.close();
+
+    let arbiterCalls = 0;
+    const recoveredProviders = reviewProvider((request) => {
+      if (request.sessionId !== "arbiter") throw new Error("reviewer must not be replayed");
+      arbiterCalls += 1;
+      return { status: "resolved", decision: "approved", rationale: "Recovered approval." };
+    });
+    const recovered = await openAgentFlowRunState({ cwd: root });
+    await expect(executeAgentFlowCommandPipeline(
+      recovered, "interrupted-arbiter-round", workflow, undefined, recoveredProviders
+    )).resolves.toMatchObject({ status: "completed" });
+    expect(arbiterCalls).toBe(1);
+    expect(recovered.listEvents("interrupted-arbiter-round").filter((event) =>
+      event.type === "collaboration.disagreement"
+    )).toHaveLength(1);
+    recovered.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  for (const settledStatus of ["resolved", "unresolved", "failed"] as const) {
+    test(`does not replay a persisted ${settledStatus} disagreement round`, async () => {
+      const runId = `settled-${settledStatus}-round`;
+      const { root, store, workflow } = await disagreementRun(`
+    strategy: arbiter_then_user
+    arbiter: arbiter
+    max_rounds: 1`, runId, true);
+      const lockError = new AgentFlowRunStateError(
+        `simulated interruption after ${settledStatus} round persistence`,
+        "AGENT_FLOW_RUN_LOCK_LOST"
+      );
+      const originalAppend = store.appendRunEvent.bind(store);
+      const originalFinalization = store.withRunFinalizationTransaction.bind(store);
+      const originalInterruption = store.runLockInterruption.bind(store);
+      const settledEvent = settledStatus === "failed"
+        ? "collaboration.disagreement.round_failed"
+        : "collaboration.disagreement.round_completed";
+      let interrupted = false;
+      store.runLockInterruption = (() => interrupted ? lockError : originalInterruption()) as typeof store.runLockInterruption;
+      if (settledStatus === "failed") {
+        store.appendRunEvent = ((eventRunId, event) => {
+          originalAppend(eventRunId, event);
+          if (!interrupted && event.type === settledEvent) {
+            interrupted = true;
+            throw lockError;
+          }
+        }) as typeof store.appendRunEvent;
+      } else {
+        store.withRunFinalizationTransaction = ((eventRunId, callback) => {
+          const settledBefore = store.listEvents(eventRunId).filter((event) => event.type === settledEvent).length;
+          const result = originalFinalization(eventRunId, callback);
+          if (!interrupted && store.listEvents(eventRunId).filter((event) => event.type === settledEvent).length > settledBefore) {
+            interrupted = true;
+            throw lockError;
+          }
+          return result;
+        }) as typeof store.withRunFinalizationTransaction;
+      }
+      let resolverCalls = 0;
+      const providers = reviewProvider((request) => {
+        if (request.sessionId === "reviewer") {
+          return reviewResult("changes_requested", "Needs another revision.");
+        }
+        resolverCalls += 1;
+        if (settledStatus === "failed") throw new Error("Persisted arbiter failure.");
+        return settledStatus === "resolved"
+          ? { status: "resolved", decision: "approved", rationale: "Persisted approval." }
+          : { status: "unresolved", rationale: "Persisted unresolved result." };
+      });
+
+      await expect(executeAgentFlowCommandPipeline(store, runId, workflow, undefined, providers))
+        .rejects.toMatchObject({ code: "AGENT_FLOW_RUN_LOCK_LOST" });
+      expect(resolverCalls).toBe(1);
+      expect(store.listEvents(runId).filter((event) => event.type === settledEvent)).toHaveLength(1);
+      store.close();
+
+      const recovered = await openAgentFlowRunState({ cwd: root });
+      const recoveredProviders = reviewProvider((request) => {
+        if (request.sessionId === "arbiter") resolverCalls += 1;
+        return { status: "resolved", decision: "changes_requested", rationale: "Must not run." };
+      });
+      await expect(executeAgentFlowCommandPipeline(
+        recovered, runId, workflow, undefined, recoveredProviders
+      )).resolves.toMatchObject({
+        status: settledStatus === "resolved" ? "completed" : "paused"
+      });
+      expect(resolverCalls).toBe(1);
+      expect(recovered.listEvents(runId).filter((event) => event.type === settledEvent)).toHaveLength(1);
+      if (settledStatus === "resolved") {
+        expect(JSON.parse(recovered.readArtifact(runId, "reviews/review.json").content.toString()))
+          .toMatchObject({ status: "approved", summary: "Persisted approval." });
+      }
+      recovered.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    });
+  }
+
+  test("fails a recovered resolved round when its persisted evidence changed", async () => {
+    const runId = "stale-resolved-round";
+    const { root, store, workflow } = await disagreementRun(`
+    strategy: arbiter_then_user
+    arbiter: arbiter
+    max_rounds: 1`, runId, true);
+    const lockError = new AgentFlowRunStateError(
+      "simulated interruption after resolved round persistence",
+      "AGENT_FLOW_RUN_LOCK_LOST"
+    );
+    const originalFinalization = store.withRunFinalizationTransaction.bind(store);
+    const originalInterruption = store.runLockInterruption.bind(store);
+    let interrupted = false;
+    store.runLockInterruption = (() => interrupted ? lockError : originalInterruption()) as typeof store.runLockInterruption;
+    store.withRunFinalizationTransaction = ((eventRunId, callback) => {
+      const settledBefore = store.listEvents(eventRunId).filter((event) =>
+        event.type === "collaboration.disagreement.round_completed"
+      ).length;
+      const result = originalFinalization(eventRunId, callback);
+      if (!interrupted && store.listEvents(eventRunId).filter((event) =>
+        event.type === "collaboration.disagreement.round_completed"
+      ).length > settledBefore) {
+        interrupted = true;
+        throw lockError;
+      }
+      return result;
+    }) as typeof store.withRunFinalizationTransaction;
+    let resolverCalls = 0;
+    const providers = reviewProvider((request) => {
+      if (request.sessionId === "reviewer") {
+        return reviewResult("changes_requested", "Needs another revision.");
+      }
+      resolverCalls += 1;
+      return { status: "resolved", decision: "approved", rationale: "Persisted approval." };
+    });
+
+    await expect(executeAgentFlowCommandPipeline(store, runId, workflow, undefined, providers))
+      .rejects.toMatchObject({ code: "AGENT_FLOW_RUN_LOCK_LOST" });
+    expect(resolverCalls).toBe(1);
+    store.close();
+
+    const recovered = await openAgentFlowRunState({ cwd: root });
+    const resolutionPath = defaultAgentFlowDisagreementOutputPath("review", 1);
+    const resolution = recovered.getArtifact(runId, resolutionPath)!;
+    recovered.writeArtifact({
+      id: resolution.id,
+      runId,
+      stepId: "external",
+      path: resolutionPath,
+      kind: "disagreement_output",
+      contentType: "application/json; charset=utf-8",
+      content: `${JSON.stringify({
+        status: "resolved",
+        decision: "changes_requested",
+        rationale: "Replacement decision."
+      })}\n`,
+      overwrite: true
+    });
+    const recoveredProviders = reviewProvider(() => {
+      resolverCalls += 1;
+      throw new Error("resolver must not be replayed");
+    });
+
+    await expect(executeAgentFlowCommandPipeline(
+      recovered, runId, workflow, undefined, recoveredProviders
+    )).resolves.toMatchObject({ status: "paused" });
+    expect(resolverCalls).toBe(1);
+    expect(recovered.listEvents(runId).filter((event) =>
+      event.type === "collaboration.disagreement.round_completed"
+    )).toHaveLength(1);
+    expect(recovered.listEvents(runId)).toContainEqual(expect.objectContaining({
+      type: "collaboration.disagreement.round_failed",
+      payload: expect.objectContaining({ message: expect.stringContaining("was overwritten") })
+    }));
+    recovered.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  test("routes a completed persisted disagreement round without rerunning its resolver", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-flow-disagreement-completed-recovery-"));
+    fs.mkdirSync(path.join(root, ".git"));
+    fs.writeFileSync(path.join(root, "package.json"), "{}\n");
+    const workflow = reviewLoopWorkflow(`
+    strategy: arbiter
+    arbiter: arbiter
+    max_rounds: 1`, true);
+    const runId = "completed-disagreement";
+    const resolutionPath = defaultAgentFlowDisagreementOutputPath("review", 1);
+    const interrupted = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(interrupted, { id: runId, workflow });
+    interrupted.writeArtifact({
+      id: "implementation",
+      runId,
+      path: "implementation.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Implementation"
+    });
+    interrupted.writeArtifact({
+      id: "review",
+      runId,
+      stepId: "review",
+      path: "reviews/review.json",
+      kind: "review_output",
+      contentType: "application/json",
+      content: `${JSON.stringify(reviewResult("approved", "Recovered approval."))}\n`
+    });
+    interrupted.writeArtifact({
+      id: "resolution",
+      runId,
+      stepId: "review",
+      path: resolutionPath,
+      kind: "disagreement_output",
+      contentType: "application/json",
+      content: `${JSON.stringify({ status: "resolved", decision: "approved", rationale: "Recovered approval." })}\n`
+    });
+    interrupted.acquireRunLock(runId, "run", { ttlMs: 60_000 });
+    interrupted.transitionRunWithEvent(runId, {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    interrupted.updateRun(runId, {
+      currentStepId: "review",
+      context: {
+        ...interrupted.getRun(runId)!.context,
+        executionRouting: {
+          maxReviewCycles: 1,
+          stepAttemptLimits: {},
+          visits: { review: 1, route: 1, revise: 1 },
+          recoveryCycles: {},
+          recoveryInvocations: {},
+          disagreementEpisodes: { review: 1 },
+          disagreementRounds: { review: 1 },
+          attempts: { review: 1, route: 1, revise: 1 }
+        }
+      }
+    });
+    for (const stepId of ["review", "route", "revise"]) {
+      const output = stepId === "review"
+        ? { attempt: 1, session: "reviewer", outputs: ["reviews/review.json"] }
+        : stepId === "route" ? { attempt: 1, target: "revise" } : { attempt: 1 };
+      interrupted.upsertStep({ runId, stepId, attempt: 1, status: "completed", output });
+      interrupted.appendRunEvent(runId, { type: "step.completed", stepId, payload: output });
+    }
+    interrupted.appendRunEvent(runId, {
+      type: "collaboration.disagreement",
+      stepId: "review",
+      payload: { strategy: "arbiter" }
+    });
+    const resolution = {
+      attempt: 2,
+      resolution: "approved",
+      resolutionArtifact: resolutionPath,
+      resolver: "arbiter",
+      strategy: "arbiter",
+      episode: 1,
+      round: 1
+    };
+    interrupted.upsertStep({ runId, stepId: "review", attempt: 2, status: "completed", output: resolution });
+    interrupted.appendRunEvent(runId, { type: "step.completed", stepId: "review", payload: resolution });
+    interrupted.appendRunEvent(runId, {
+      type: "collaboration.disagreement.resolved",
+      stepId: "review",
+      payload: {
+        strategy: "arbiter",
+        path: "arbiter",
+        resolver: "arbiter",
+        episode: 1,
+        round: 1,
+        decision: "approved",
+        output: resolutionPath
+      }
+    });
+    interrupted.close();
+
+    let resolverCalls = 0;
+    const providers = reviewProvider(() => {
+      resolverCalls += 1;
+      return { status: "resolved", decision: "changes_requested", rationale: "Must not run." };
+    });
+    const recovered = await openAgentFlowRunState({ cwd: root });
+    await expect(executeAgentFlowCommandPipeline(recovered, runId, workflow, undefined, providers))
+      .resolves.toMatchObject({ status: "completed" });
+    expect(resolverCalls).toBe(0);
+    expect(recovered.listEvents(runId).filter((event) =>
+      event.type === "step.completed" && event.stepId === "review"
+    )).toHaveLength(2);
+    expect(JSON.parse(recovered.readArtifact(runId, "reviews/review.json").content.toString()))
+      .toMatchObject({ status: "approved", summary: "Recovered approval." });
+    recovered.close();
     fs.rmSync(root, { recursive: true, force: true });
   });
 

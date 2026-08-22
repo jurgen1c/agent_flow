@@ -2762,12 +2762,9 @@ steps:
     const failurePayload = JSON.parse(
       store.readArtifact("retry-session", failure.payloadPath!).content.toString("utf8")
     );
-    const requestSnapshotPath = (failurePayload.artifacts.available as string[])
-      .find((artifactPath) => artifactPath.endsWith(path.posix.basename(requestArtifact.declaredPath)));
-    expect(requestSnapshotPath).toMatch(/^failures\/.+\/attachments\//);
-    const requestSnapshot = store.readArtifact("retry-session", requestSnapshotPath!).content.toString("utf8");
-    expect(requestSnapshot).toContain("safe-first-attempt");
-    expect(requestSnapshot).not.toContain("secret-from-second-attempt");
+    expect((failurePayload.artifacts.available as string[])
+      .some((artifactPath) => artifactPath.endsWith(path.posix.basename(requestArtifact.declaredPath))))
+      .toBe(false);
     store.close();
   });
 
@@ -3145,6 +3142,32 @@ steps:
       status: "waiting",
       externalSessionId: null
     });
+    store.close();
+  });
+
+  test("rolls back provider artifacts when step finalization does not commit", async () => {
+    const { store, workflow } = await pendingProviderRun("atomic-session-finalization");
+    store.transitionRunWithEvent("atomic-session-finalization", {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => ({
+      outputs: { "response.md": "Response" }
+    }));
+
+    await expect(executeAgentFlowSessionRequest(
+      store,
+      "atomic-session-finalization",
+      workflow,
+      workflow.steps[0]!,
+      providers,
+      { finalize: () => { throw new Error("simulated finalization crash"); } }
+    )).rejects.toThrow("simulated finalization crash");
+
+    expect(store.listArtifacts("atomic-session-finalization").map((artifact) => artifact.declaredPath))
+      .toEqual(["request.md"]);
+    expect(store.getSession("atomic-session-finalization", "writer")).toMatchObject({ status: "paused" });
     store.close();
   });
 });

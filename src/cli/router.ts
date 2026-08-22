@@ -346,30 +346,9 @@ async function runLifecycleCommand(
       const result = createAgentFlowLifecycleRun(store, {
         id: args[2],
         workflow: workflowResult!.workflow,
-        ...(fixture === null ? {} : { inputs: fixture.inputs })
+        ...(fixture === null ? {} : { inputs: fixture.inputs }),
+        allowInterruptedRecovery: true
       });
-      if (fixture !== null) {
-        store.updateRun(result.run.id, {
-          context: {
-            ...result.run.context,
-            cliFixturePath: path.resolve(options.cwd ?? process.cwd(), args[4])
-          }
-        });
-      }
-      if (fixture !== null) {
-        for (const [index, [artifactPath, value]] of Object.entries(fixture.artifacts)
-          .sort(([left], [right]) => left.localeCompare(right)).entries()) {
-          store.writeArtifact({
-            id: `fixture:${index + 1}`,
-            runId: result.run.id,
-            stepId: "fixture",
-            path: artifactPath,
-            kind: "fixture",
-            contentType: artifactPath.endsWith(".json") ? "application/json; charset=utf-8" : "text/plain; charset=utf-8",
-            content: typeof value === "string" ? value : `${JSON.stringify(value)}\n`
-          });
-        }
-      }
       const providers = createAgentFlowSessionProviderRegistry();
       if (fixture !== null) providers.register("fixture", createAgentFlowFixtureSessionProvider(
         fixture.responses,
@@ -389,7 +368,29 @@ async function runLifecycleCommand(
         undefined,
         providers,
         undefined,
-        notifications
+        notifications,
+        undefined,
+        fixture === null ? undefined : () => {
+          store!.updateRun(result.run.id, {
+            context: {
+              ...store!.getRun(result.run.id)!.context,
+              cliFixturePath: path.resolve(options.cwd ?? process.cwd(), args[4])
+            }
+          });
+          if (result.run.status !== "pending") return;
+          for (const [index, [artifactPath, value]] of Object.entries(fixture.artifacts)
+            .sort(([left], [right]) => left.localeCompare(right)).entries()) {
+            store!.writeArtifact({
+              id: `fixture:${index + 1}`,
+              runId: result.run.id,
+              stepId: "fixture",
+              path: artifactPath,
+              kind: "fixture",
+              contentType: artifactPath.endsWith(".json") ? "application/json; charset=utf-8" : "text/plain; charset=utf-8",
+              content: typeof value === "string" ? value : `${JSON.stringify(value)}\n`
+            });
+          }
+        }
       );
       const lines = [
         `${result.changed ? "Created" : "Reused"} Agent Flow run ${result.run.id} for ${result.run.workflowName} (version ${result.run.workflowVersion}).`,

@@ -1,11 +1,17 @@
 import type { AgentFlowMaturity, AgentFlowWorkflowStyle } from "./workflow";
 export {
   AGENT_FLOW_RUN_STATE_SCHEMA_VERSION,
+  DEFAULT_AGENT_FLOW_RUN_LOCK_TTL_MS,
   AgentFlowRunStateError,
   AgentFlowRunStateStore,
   DEFAULT_AGENT_FLOW_DATABASE_PATH,
   normalizeAgentFlowArtifactPath,
   openAgentFlowRunState
+} from "./run_state";
+export type {
+  AcquireAgentFlowRunLockOptions,
+  AgentFlowRunLockOperation,
+  AgentFlowRunLockRecord
 } from "./run_state";
 export {
   AGENT_FLOW_FAILURE_REDACTION_MARKER,

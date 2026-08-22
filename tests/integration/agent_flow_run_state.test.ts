@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { Worker } from "node:worker_threads";
 import {
   AgentFlowRunStateError,
   openAgentFlowRunState
@@ -12,6 +13,459 @@ import {
 const FIXED_TIME = "2026-07-15T12:00:00.000Z";
 
 describe("Agent Flow run-state SQLite store", () => {
+  test("rejects active executor locks and deterministically recovers stale locks", async () => {
+    const repoRoot = temporaryRepo();
+    const owner = await openAgentFlowRunState({ cwd: repoRoot, now: () => FIXED_TIME });
+    owner.createRun({
+      id: "locked-run",
+      workflow: { name: "locked", version: 1, style: "pipeline", maturity: "experimental" }
+    });
+    const competitor = await openAgentFlowRunState({ cwd: repoRoot, now: () => FIXED_TIME });
+    const first = owner.acquireRunLock("locked-run", "run", { ownerToken: "owner-one", ttlMs: 1_000 });
+
+    expect(() => competitor.acquireRunLock("locked-run", "resume", { ownerToken: "owner-two", ttlMs: 1_000 }))
+      .toThrow(/locked for run by process .* Retry after/);
+
+    const database = new Database(owner.databasePath);
+    database.run(
+      "UPDATE run_locks SET expires_at = ? WHERE run_id = ?",
+      ["2000-01-01T00:00:00.000Z", "locked-run"]
+    );
+    expect(() => competitor.acquireRunLock("locked-run", "resume", { ownerToken: "owner-two", ttlMs: 1_000 }))
+      .toThrow(/expired lease or a lock abandoned by this executor is recovered/);
+    database.run(
+      "UPDATE run_locks SET owner_executor_id = ?, owner_process_id = ? WHERE run_id = ?",
+      ["stale-executor", 2_147_483_647, "locked-run"]
+    );
+    database.close();
+    const recovered = competitor.acquireRunLock(
+      "locked-run",
+      "resume",
+      { ownerToken: "owner-two", ttlMs: 1_000 }
+    );
+    expect(recovered).toMatchObject({
+      ownerToken: "owner-two",
+      operation: "resume",
+      recoveredStaleLock: true
+    });
+    owner.releaseRunLock(first);
+    expect(() => owner.acquireRunLock("locked-run", "run", { ttlMs: 1_000 }))
+      .toThrow(/locked for resume/);
+    competitor.releaseRunLock(recovered);
+    competitor.close();
+    owner.close();
+  });
+
+  test("does not let a stale handle release a newer acquisition with a reused owner token", async () => {
+    const repoRoot = temporaryRepo();
+    const owner = await openAgentFlowRunState({ cwd: repoRoot });
+    const competitor = await openAgentFlowRunState({ cwd: repoRoot });
+    owner.createRun({
+      id: "reused-owner-token",
+      workflow: { name: "reused-owner-token", version: 1, style: "pipeline", maturity: "experimental" }
+    });
+    const stale = owner.acquireRunLock("reused-owner-token", "run", {
+      ownerToken: "reused-token",
+      ttlMs: 60_000
+    });
+    owner.releaseRunLock(stale);
+    const current = owner.acquireRunLock("reused-owner-token", "run", {
+      ownerToken: "reused-token",
+      ttlMs: 60_000
+    });
+
+    owner.releaseRunLock(stale);
+
+    expect(() => owner.renewRunLock(current, 60_000)).not.toThrow();
+    expect(() => competitor.acquireRunLock("reused-owner-token", "resume", { ttlMs: 60_000 }))
+      .toThrow(/locked for run/);
+    owner.releaseRunLock(current);
+    competitor.close();
+    owner.close();
+  });
+
+  test("uses a shared wall clock for active locks across worker isolates", async () => {
+    const repoRoot = temporaryRepo();
+    const owner = await openAgentFlowRunState({ cwd: repoRoot, now: () => FIXED_TIME });
+    owner.createRun({
+      id: "worker-isolate-lock",
+      workflow: { name: "worker-isolate", version: 1, style: "pipeline", maturity: "experimental" }
+    });
+    const lock = owner.acquireRunLock("worker-isolate-lock", "run", { ttlMs: 60_000 });
+    const workerPath = path.join(repoRoot, "lock-worker.ts");
+    const runStateModule = path.resolve(import.meta.dir, "../../src/runtime/run_state.ts");
+    fs.writeFileSync(workerPath, `
+import { parentPort, workerData } from "node:worker_threads";
+import { openAgentFlowRunState } from ${JSON.stringify(runStateModule)};
+const store = await openAgentFlowRunState({ cwd: workerData.repoRoot });
+try {
+  store.acquireRunLock("worker-isolate-lock", "resume", { ttlMs: 60_000 });
+  parentPort!.postMessage({ acquired: true });
+} catch (error) {
+  parentPort!.postMessage({ acquired: false, code: error instanceof Error && "code" in error ? error.code : undefined });
+} finally {
+  store.close();
+}
+`);
+
+    const result = await new Promise<{ acquired: boolean; code?: string }>((resolve, reject) => {
+      const worker = new Worker(workerPath, { workerData: { repoRoot } });
+      worker.once("message", resolve);
+      worker.once("error", reject);
+    });
+    expect(result).toEqual({ acquired: false, code: "AGENT_FLOW_RUN_LOCKED" });
+    owner.releaseRunLock(lock);
+    owner.close();
+  });
+
+  test("fences state writes and final success after a lease is replaced", async () => {
+    const repoRoot = temporaryRepo();
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    for (const runId of [
+      "fenced-write",
+      "fenced-result",
+      "fenced-artifact",
+      "fenced-reconciliation",
+      "fenced-artifact-batch"
+    ]) {
+      store.createRun({
+        id: runId,
+        workflow: { name: runId, version: 1, style: "pipeline", maturity: "experimental" }
+      });
+    }
+    for (const runId of ["fenced-reconciliation", "fenced-artifact-batch"]) {
+      store.writeArtifact({
+        id: "existing",
+        runId,
+        path: "existing.txt",
+        kind: "fixture",
+        contentType: "text/plain",
+        content: "original"
+      });
+    }
+
+    await expect(store.withRunLock("fenced-write", "run", async () => {
+      replaceRunLockOwner(store.databasePath, "fenced-write");
+      store.updateRun("fenced-write", { status: "running" });
+      return "unreachable";
+    }, { ttlMs: 1_000 })).rejects.toMatchObject({
+      code: "AGENT_FLOW_RUN_LOCK_LOST",
+      message: "The Agent Flow execution lock was replaced while attempting to update run. Stop this executor and retry the operation."
+    });
+    expect(store.getRun("fenced-write")?.status).toBe("pending");
+
+    await expect(store.withRunLock("fenced-result", "run", async () => {
+      replaceRunLockOwner(store.databasePath, "fenced-result");
+      return "must not be accepted";
+    }, { ttlMs: 1_000 })).rejects.toMatchObject({ code: "AGENT_FLOW_RUN_LOCK_LOST" });
+
+    await expect(store.withRunLock("fenced-artifact", "run", async () => {
+      replaceRunLockOwner(store.databasePath, "fenced-artifact");
+      store.writeArtifact({
+        id: "fenced",
+        runId: "fenced-artifact",
+        path: "fenced.txt",
+        kind: "fixture",
+        contentType: "text/plain",
+        content: "must not be published"
+      });
+    }, { ttlMs: 1_000 })).rejects.toMatchObject({ code: "AGENT_FLOW_RUN_LOCK_LOST" });
+    expect(store.listArtifacts("fenced-artifact")).toHaveLength(0);
+
+    await expect(store.withRunLock("fenced-reconciliation", "run", async () => {
+      replaceRunLockOwner(store.databasePath, "fenced-reconciliation");
+      store.readArtifact("fenced-reconciliation", "existing.txt");
+    }, { ttlMs: 1_000 })).rejects.toMatchObject({ code: "AGENT_FLOW_RUN_LOCK_LOST" });
+
+    await expect(store.withRunLock("fenced-artifact-batch", "run", async () => {
+      replaceRunLockOwner(store.databasePath, "fenced-artifact-batch");
+      store.writeArtifactsAtomically([{
+        id: "existing",
+        runId: "fenced-artifact-batch",
+        path: "existing.txt",
+        kind: "fixture",
+        contentType: "text/plain",
+        content: "replacement",
+        overwrite: true
+      }]);
+    }, { ttlMs: 1_000 })).rejects.toMatchObject({ code: "AGENT_FLOW_RUN_LOCK_LOST" });
+    expect(store.readArtifact("fenced-artifact-batch", "existing.txt").content.toString()).toBe("original");
+    store.close();
+  });
+
+  test("clears a transient heartbeat error after a later renewal succeeds", async () => {
+    const repoRoot = temporaryRepo();
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    store.createRun({
+      id: "renewed-run",
+      workflow: { name: "renewed", version: 1, style: "pipeline", maturity: "experimental" }
+    });
+    const renew = store.renewRunLock.bind(store);
+    let attempts = 0;
+    store.renewRunLock = ((lock, ttlMs) => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw new AgentFlowRunStateError("temporary contention", "AGENT_FLOW_CONCURRENT_MUTATION");
+      }
+      return renew(lock, ttlMs);
+    }) as typeof store.renewRunLock;
+
+    await expect(store.withRunLock(
+      "renewed-run",
+      "run",
+      async () => {
+        await Bun.sleep(80);
+        return "completed";
+      },
+      { ttlMs: 30 }
+    )).resolves.toBe("completed");
+    expect(attempts).toBeGreaterThanOrEqual(2);
+    store.close();
+  });
+
+  test("exposes lost lease renewal to the active execution callback", async () => {
+    const repoRoot = temporaryRepo();
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    store.createRun({
+      id: "lost-heartbeat-run",
+      workflow: { name: "lost-heartbeat", version: 1, style: "pipeline", maturity: "experimental" }
+    });
+    store.renewRunLock = (() => {
+      throw new AgentFlowRunStateError("lease replaced", "AGENT_FLOW_RUN_LOCK_LOST");
+    }) as typeof store.renewRunLock;
+    let observedInsideCallback = false;
+
+    await expect(store.withRunLock(
+      "lost-heartbeat-run",
+      "run",
+      async () => {
+        while (store.runLockInterruption() === undefined) await Bun.sleep(5);
+        observedInsideCallback = true;
+        return "must not commit";
+      },
+      { ttlMs: 30 }
+    )).rejects.toMatchObject({ code: "AGENT_FLOW_RUN_LOCK_LOST" });
+    expect(observedInsideCallback).toBe(true);
+    store.close();
+  });
+
+  test("rechecks final heartbeat contention before returning committed success", async () => {
+    const repoRoot = temporaryRepo();
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    store.createRun({
+      id: "final-heartbeat-run",
+      workflow: { name: "final-heartbeat", version: 1, style: "pipeline", maturity: "experimental" }
+    });
+    const renew = store.renewRunLock.bind(store);
+    let attempts = 0;
+    store.renewRunLock = ((lock, ttlMs) => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw new AgentFlowRunStateError("temporary contention", "AGENT_FLOW_CONCURRENT_MUTATION");
+      }
+      return renew(lock, ttlMs);
+    }) as typeof store.renewRunLock;
+
+    await expect(store.withRunLock(
+      "final-heartbeat-run",
+      "run",
+      async () => {
+        await Bun.sleep(15);
+        return "committed";
+      },
+      { ttlMs: 30 }
+    )).resolves.toBe("committed");
+    expect(attempts).toBe(2);
+    store.close();
+  });
+
+  test("retries contended lock release and leaves the run immediately reusable", async () => {
+    const repoRoot = temporaryRepo();
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    store.createRun({
+      id: "release-retry-run",
+      workflow: { name: "release-retry", version: 1, style: "pipeline", maturity: "experimental" }
+    });
+    const release = store.releaseRunLock.bind(store);
+    let attempts = 0;
+    store.releaseRunLock = ((lock) => {
+      attempts += 1;
+      if (attempts < 3) {
+        throw new AgentFlowRunStateError("temporary contention", "AGENT_FLOW_CONCURRENT_MUTATION");
+      }
+      return release(lock);
+    }) as typeof store.releaseRunLock;
+
+    await expect(store.withRunLock(
+      "release-retry-run",
+      "run",
+      async () => "completed",
+      { ttlMs: 1_000 }
+    )).resolves.toBe("completed");
+    expect(attempts).toBe(3);
+    const next = store.acquireRunLock("release-retry-run", "resume", { ttlMs: 1_000 });
+    store.releaseRunLock = release;
+    store.releaseRunLock(next);
+    store.close();
+  });
+
+  test("abandons a callback-failed lease for immediate stale recovery", async () => {
+    const repoRoot = temporaryRepo();
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    store.createRun({
+      id: "callback-failed-run",
+      workflow: { name: "callback-failed", version: 1, style: "pipeline", maturity: "experimental" }
+    });
+
+    await expect(store.withRunLock(
+      "callback-failed-run",
+      "run",
+      async () => {
+        store.updateRun("callback-failed-run", { status: "running" });
+        throw new AgentFlowRunStateError("checkpoint contention", "AGENT_FLOW_CONCURRENT_MUTATION");
+      },
+      { ttlMs: 60_000 }
+    )).rejects.toMatchObject({ code: "AGENT_FLOW_CONCURRENT_MUTATION" });
+
+    const database = new Database(store.databasePath, { readonly: true });
+    expect(database.query(
+      "SELECT COUNT(*) AS count FROM run_locks WHERE run_id = ?"
+    ).get("callback-failed-run")).toEqual({ count: 1 });
+    database.close();
+    const recovered = store.acquireRunLock("callback-failed-run", "run", { ttlMs: 60_000 });
+    expect(recovered.recoveredStaleLock).toBe(true);
+    store.releaseRunLock(recovered);
+    store.close();
+  });
+
+  test("surfaces an unreleased lock and abandons it for immediate same-store recovery", async () => {
+    const repoRoot = temporaryRepo();
+    const store = await openAgentFlowRunState({ cwd: repoRoot, now: () => FIXED_TIME });
+    store.createRun({
+      id: "abandoned-release-run",
+      workflow: { name: "abandoned-release", version: 1, style: "pipeline", maturity: "experimental" }
+    });
+    const release = store.releaseRunLock.bind(store);
+    store.releaseRunLock = (() => {
+      throw new AgentFlowRunStateError("persistent contention", "AGENT_FLOW_CONCURRENT_MUTATION");
+    }) as typeof store.releaseRunLock;
+
+    await expect(store.withRunLock(
+      "abandoned-release-run",
+      "run",
+      async () => "completed",
+      { ttlMs: 1_000 }
+    )).rejects.toMatchObject({ code: "AGENT_FLOW_CONCURRENT_MUTATION" });
+    store.releaseRunLock = release;
+    const recovered = store.acquireRunLock("abandoned-release-run", "resume", { ttlMs: 1_000 });
+    expect(recovered.recoveredStaleLock).toBe(true);
+    store.releaseRunLock(recovered);
+    store.close();
+  });
+
+  test("translates state transaction acquisition contention", async () => {
+    const repoRoot = temporaryRepo();
+    const store = await openAgentFlowRunState({ cwd: repoRoot, busyTimeoutMs: 10 });
+    store.createRun({
+      id: "transaction-contention",
+      workflow: { name: "transaction-contention", version: 1, style: "pipeline", maturity: "experimental" }
+    });
+    const blocker = new Database(store.databasePath);
+    blocker.exec("BEGIN IMMEDIATE");
+
+    expect(() => store.withRunStateTransaction("transaction-contention", () => undefined))
+      .toThrow(/another Agent Flow state mutation is in progress/);
+    try {
+      store.withRunStateTransaction("transaction-contention", () => undefined);
+    } catch (error) {
+      expect(error).toMatchObject({ code: "AGENT_FLOW_CONCURRENT_MUTATION" });
+    }
+
+    blocker.exec("ROLLBACK");
+    blocker.close();
+    store.close();
+  });
+
+  test("translates contention while starting interrupted-run recovery", async () => {
+    const repoRoot = temporaryRepo();
+    const interrupted = await openAgentFlowRunState({ cwd: repoRoot, busyTimeoutMs: 10 });
+    interrupted.createRun({
+      id: "recovery-contention",
+      workflow: { name: "recovery-contention", version: 1, style: "pipeline", maturity: "experimental" },
+      status: "running"
+    });
+    interrupted.acquireRunLock("recovery-contention", "run", { ttlMs: 60_000 });
+    interrupted.close();
+
+    const store = await openAgentFlowRunState({ cwd: repoRoot, busyTimeoutMs: 10 });
+    const lock = store.acquireRunLock("recovery-contention", "run", { ttlMs: 60_000 });
+    const blocker = new Database(store.databasePath);
+    blocker.exec("BEGIN IMMEDIATE");
+
+    expect(() => store.recoverInterruptedRun(lock))
+      .toThrow(/another Agent Flow state mutation is in progress/);
+    try {
+      store.recoverInterruptedRun(lock);
+    } catch (error) {
+      expect(error).toMatchObject({ code: "AGENT_FLOW_CONCURRENT_MUTATION" });
+    }
+
+    blocker.exec("ROLLBACK");
+    blocker.close();
+    store.releaseRunLock(lock);
+    store.close();
+  });
+
+  test("returns an actionable error when artifact publication contends with another transaction", async () => {
+    const repoRoot = temporaryRepo();
+    const store = await openAgentFlowRunState({ cwd: repoRoot, busyTimeoutMs: 10 });
+    store.createRun({
+      id: "artifact-contention",
+      workflow: { name: "contention", version: 1, style: "pipeline", maturity: "experimental" }
+    });
+    const blocker = new Database(store.databasePath);
+    blocker.exec("BEGIN IMMEDIATE");
+    let failure: unknown;
+    try {
+      store.writeArtifact({
+        id: "result",
+        runId: "artifact-contention",
+        path: "result.txt",
+        kind: "output",
+        contentType: "text/plain",
+        content: "result\n"
+      });
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toMatchObject({ code: "AGENT_FLOW_CONCURRENT_MUTATION" });
+    expect((failure as Error).message).toContain("Retry after the active mutation completes");
+    blocker.exec("ROLLBACK");
+    blocker.close();
+    expect(store.getArtifact("artifact-contention", "result.txt")).toBeNull();
+
+    const batchBlocker = new Database(store.databasePath);
+    batchBlocker.exec("BEGIN IMMEDIATE");
+    failure = undefined;
+    try {
+      store.writeArtifactsAtomically([{
+        id: "batch-result",
+        runId: "artifact-contention",
+        path: "batch-result.txt",
+        kind: "output",
+        contentType: "text/plain",
+        content: "batch result\n"
+      }]);
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toMatchObject({ code: "AGENT_FLOW_CONCURRENT_MUTATION" });
+    batchBlocker.exec("ROLLBACK");
+    batchBlocker.close();
+    expect(store.getArtifact("artifact-contention", "batch-result.txt")).toBeNull();
+    store.close();
+  });
+
   test("preserves immediate recovery resolution unless callers explicitly defer it", async () => {
     const repoRoot = temporaryRepo();
     const store = await openAgentFlowRunState({ cwd: repoRoot, now: () => FIXED_TIME });
@@ -1227,7 +1681,7 @@ describe("Agent Flow run-state SQLite store", () => {
       writtenAt: null
     });
     const migrated = new Database(store.databasePath, { readonly: true });
-    expect(migrated.query("SELECT value FROM run_state_metadata WHERE key = 'schema_version'").get()).toEqual({ value: "4" });
+    expect(migrated.query("SELECT value FROM run_state_metadata WHERE key = 'schema_version'").get()).toEqual({ value: "5" });
     migrated.close();
     store.close();
 
@@ -1246,6 +1700,31 @@ describe("Agent Flow run-state SQLite store", () => {
     store.close();
     writer.exec("ROLLBACK");
     writer.close();
+  });
+
+  test("seeds an expired lease when migrating an interrupted version-four run", async () => {
+    const repoRoot = temporaryRepo();
+    let store = await openAgentFlowRunState({ cwd: repoRoot });
+    store.createRun({
+      id: "legacy-running",
+      workflow: { name: "legacy-running", version: 1, style: "pipeline", maturity: "experimental" },
+      status: "running"
+    });
+    store.close();
+
+    const legacy = new Database(path.join(repoRoot, ".agent-flow/agent-flow.sqlite"));
+    legacy.exec("DROP INDEX run_locks_expiry_lookup");
+    legacy.exec("DROP TABLE run_locks");
+    legacy.query("UPDATE run_state_metadata SET value = '4' WHERE key = 'schema_version'").run();
+    legacy.close();
+
+    store = await openAgentFlowRunState({ cwd: repoRoot });
+    const lock = store.acquireRunLock("legacy-running", "run", { ttlMs: 60_000 });
+    expect(lock.recoveredStaleLock).toBe(true);
+    expect(store.recoverInterruptedRun(lock)).toEqual({});
+    expect(store.getRun("legacy-running")?.status).toBe("pending");
+    store.releaseRunLock(lock);
+    store.close();
   });
 
   test("migrates version-three evidence invalidations to stale approvals", async () => {
@@ -1302,7 +1781,7 @@ describe("Agent Flow run-state SQLite store", () => {
     expect(store.getRun("missing")).toBeNull();
     const repaired = new Database(databasePath, { readonly: true });
     expect(repaired.query("SELECT value FROM run_state_metadata WHERE key = 'schema_version'").get())
-      .toEqual({ value: "4" });
+      .toEqual({ value: "5" });
     expect(repaired.query("SELECT name FROM pragma_table_info('artifacts') WHERE name = 'generation'").get())
       .toEqual({ name: "generation" });
     repaired.close();
@@ -1335,6 +1814,15 @@ function temporaryRepo(): string {
   fs.mkdirSync(path.join(repoRoot, ".git"));
   fs.mkdirSync(path.join(repoRoot, "nested"));
   return repoRoot;
+}
+
+function replaceRunLockOwner(databasePath: string, runId: string): void {
+  const competitor = new Database(databasePath);
+  competitor.run(
+    "UPDATE run_locks SET owner_token = ?, owner_executor_id = ? WHERE run_id = ?",
+    [`replacement-${runId}`, `replacement-executor-${runId}`, runId]
+  );
+  competitor.close();
 }
 
 function artifactRunDirectory(runId: string): string {

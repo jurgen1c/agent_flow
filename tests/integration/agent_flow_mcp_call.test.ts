@@ -8,6 +8,7 @@ import {
   createAgentFlowLifecycleRun,
   createAgentFlowMcpCallRegistry,
   AgentFlowMcpCallError,
+  AgentFlowRunStateError,
   executeAgentFlowCommandPipeline,
   executeAgentFlowMcpCall,
   MAX_AGENT_FLOW_MCP_ARGUMENT_BYTES,
@@ -72,10 +73,10 @@ steps:
     workflow.steps[0]!.arguments = new Uint8Array([1, 2, 3]) as never;
     const persistedRun = store.getRun("binary-arguments")!;
     const getRun = store.getRun.bind(store);
-    let initialRead = true;
+    let identityReadsRemaining = 2;
     store.getRun = (runId) => {
-      if (!initialRead) return getRun(runId);
-      initialRead = false;
+      if (runId !== "binary-arguments" || identityReadsRemaining <= 0) return getRun(runId);
+      identityReadsRemaining -= 1;
       return { ...persistedRun, context: { ...persistedRun.context, workflow: workflow as never } };
     };
 
@@ -770,6 +771,37 @@ steps:
       calls
     )).rejects.toMatchObject({ code: "AGENT_FLOW_SENSITIVE_INPUT" });
     expect(invoked).toBe(false);
+    store.close();
+  });
+
+  test("invokes a direct MCP pre-publication hook exactly once", async () => {
+    const root = temporaryRepo();
+    const workflow = mcpWorkflow();
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, {
+      id: "single-pre-publication-hook",
+      workflow,
+      inputs: { ticket_key: "AF-69" }
+    });
+    store.transitionRunWithEvent("single-pre-publication-hook", {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: {} }
+    });
+    const calls = createAgentFlowMcpCallRegistry().register("fixture", () => ({
+      outputs: { "ticket.json": { key: "AF-69" } }
+    }));
+    let hookCalls = 0;
+
+    await expect(executeAgentFlowMcpCall(
+      store,
+      "single-pre-publication-hook",
+      workflow,
+      workflow.steps[0]!,
+      calls,
+      { beforePublish: () => { hookCalls += 1; } }
+    )).resolves.toMatchObject({ server: "fixture", tool: "get_issue" });
+    expect(hookCalls).toBe(1);
     store.close();
   });
 
@@ -1525,7 +1557,7 @@ steps:
     store.close();
   });
 
-  test("rejects output ownership changes inside atomic publication", async () => {
+  test("rolls back output ownership changes injected inside atomic finalization", async () => {
     const root = temporaryRepo();
     const workflow = mcpWorkflow();
     const store = await openAgentFlowRunState({ cwd: root });
@@ -1552,7 +1584,7 @@ steps:
 
     expect(result).toMatchObject({ status: "paused", failedStep: "fetch" });
     expect(result.message).toContain("changed ownership");
-    expect(store.getArtifact("output-race", "ticket.json")?.producerStepId).toBe("other");
+    expect(store.getArtifact("output-race", "ticket.json")).toBeNull();
     expect(store.getArtifact("output-race", "mcp-calls/fetch-e7d3799ecc09.json")).toBeNull();
     store.close();
   });
@@ -1864,6 +1896,30 @@ steps:
     store.close();
   });
 
+  test("aborts an in-flight adapter when lease renewal loses ownership", async () => {
+    const root = temporaryRepo();
+    const workflow = mcpWorkflow();
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "lost-mcp-lease", workflow, inputs: { ticket_key: "AF-69" } });
+    let request: AgentFlowMcpCallRequest | undefined;
+    const calls = createAgentFlowMcpCallRegistry().register("fixture", (value) => {
+      request = value;
+      return new Promise(() => undefined);
+    });
+    const withRunLock = store.withRunLock.bind(store);
+    store.withRunLock = ((runId, operation, callback, options) =>
+      withRunLock(runId, operation, callback, { ...options, ttlMs: 30 })) as typeof store.withRunLock;
+    store.renewRunLock = (() => {
+      throw new AgentFlowRunStateError("lease replaced", "AGENT_FLOW_RUN_LOCK_LOST");
+    }) as typeof store.renewRunLock;
+
+    await expect(executeAgentFlowCommandPipeline(store, "lost-mcp-lease", workflow, undefined, undefined, calls))
+      .rejects.toMatchObject({ code: "AGENT_FLOW_RUN_LOCK_LOST" });
+    expect(request?.signal.aborted).toBe(true);
+    expect(store.listArtifacts("lost-mcp-lease")).toEqual([]);
+    store.close();
+  });
+
   test("returns the captured interruption result if the run resumes during adapter abort", async () => {
     const root = temporaryRepo();
     const workflow = mcpWorkflow();
@@ -1890,46 +1946,158 @@ steps:
     store.close();
   });
 
-  test("records interruption when cancellation lands immediately after atomic publication", async () => {
+  test("records interruption when cancellation lands before atomic publication", async () => {
     const root = temporaryRepo();
     const workflow = mcpWorkflow();
     const store = await openAgentFlowRunState({ cwd: root });
     createAgentFlowLifecycleRun(store, { id: "cancel-after-publish", workflow, inputs: { ticket_key: "AM-26" } });
-    const calls = createAgentFlowMcpCallRegistry().register("fixture", () => ({ outputs: { "ticket.json": {} } }));
-    const writeArtifactsAtomically = store.writeArtifactsAtomically.bind(store);
-    store.writeArtifactsAtomically = (inputs) => {
-      const artifacts = writeArtifactsAtomically(inputs);
+    const calls = createAgentFlowMcpCallRegistry().register("fixture", () => {
       transitionAgentFlowLifecycleRun(store, "cancel-after-publish", "cancel");
-      return artifacts;
-    };
+      return { outputs: { "ticket.json": {} } };
+    });
 
     const result = await executeAgentFlowCommandPipeline(store, "cancel-after-publish", workflow, undefined, undefined, calls);
 
     expect(result).toMatchObject({ status: "cancelled", completedSteps: [] });
-    expect(store.getArtifact("cancel-after-publish", "ticket.json")).not.toBeNull();
+    expect(store.getArtifact("cancel-after-publish", "ticket.json")).toBeNull();
     expect(store.listEvents("cancel-after-publish").map((event) => event.type)).toContain("step.interrupted");
     expect(store.listEvents("cancel-after-publish").map((event) => event.type)).not.toContain("step.completed");
     store.close();
   });
 
-  test("records interruption when cancellation races with an atomic publication error", async () => {
+  test("keeps committed MCP completion when cancellation lands after atomic finalization", async () => {
+    const root = temporaryRepo();
+    const workflow = mcpWorkflow();
+    const runId = "cancel-after-mcp-finalization";
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: runId, workflow, inputs: { ticket_key: "AF-69" } });
+    const calls = createAgentFlowMcpCallRegistry().register("fixture", () => ({
+      outputs: { "ticket.json": { key: "AF-69" } }
+    }));
+    const finalize = store.withRunFinalizationTransaction.bind(store);
+    let cancelAfterCommit = true;
+    let cancelling = false;
+    store.withRunFinalizationTransaction = ((id, callback) => {
+      const result = finalize(id, callback);
+      if (id === runId && cancelAfterCommit && !cancelling
+          && store.listEvents(runId).some((event) => event.type === "step.completed")) {
+        cancelAfterCommit = false;
+        cancelling = true;
+        try {
+          transitionAgentFlowLifecycleRun(store, runId, "cancel");
+        } finally {
+          cancelling = false;
+        }
+      }
+      return result;
+    }) as typeof store.withRunFinalizationTransaction;
+
+    const result = await executeAgentFlowCommandPipeline(store, runId, workflow, undefined, undefined, calls);
+
+    expect(result).toMatchObject({ status: "cancelled", completedSteps: ["fetch"] });
+    expect(store.latestStepRecoveryState(runId, "fetch")).toMatchObject({ status: "completed" });
+    expect(store.getArtifact(runId, "ticket.json")).not.toBeNull();
+    expect(store.listEvents(runId).map((event) => event.type)).toContain("step.completed");
+    expect(store.listEvents(runId).map((event) => event.type)).not.toContain("step.interrupted");
+    store.close();
+  });
+
+  test("rolls back MCP artifacts when step finalization fails", async () => {
     const root = temporaryRepo();
     const workflow = mcpWorkflow();
     const store = await openAgentFlowRunState({ cwd: root });
-    createAgentFlowLifecycleRun(store, { id: "cancel-with-error", workflow, inputs: { ticket_key: "AM-26" } });
+    createAgentFlowLifecycleRun(store, { id: "finalization-error", workflow, inputs: { ticket_key: "AM-26" } });
     const calls = createAgentFlowMcpCallRegistry().register("fixture", () => ({ outputs: { "ticket.json": {} } }));
-    store.writeArtifactsAtomically = () => {
-      transitionAgentFlowLifecycleRun(store, "cancel-with-error", "cancel");
-      throw new Error("publication raced with cancellation");
-    };
+    const appendRunEvent = store.appendRunEvent.bind(store);
+    store.appendRunEvent = ((runId, input) => {
+      if (input.type === "step.completed") throw new Error("step completion failed");
+      return appendRunEvent(runId, input);
+    }) as typeof store.appendRunEvent;
 
-    const result = await executeAgentFlowCommandPipeline(store, "cancel-with-error", workflow, undefined, undefined, calls);
+    const result = await executeAgentFlowCommandPipeline(store, "finalization-error", workflow, undefined, undefined, calls);
 
-    expect(result).toMatchObject({ status: "cancelled", completedSteps: [] });
-    expect(store.listEvents("cancel-with-error").map((event) => event.type)).toContain("step.interrupted");
-    expect(store.listEvents("cancel-with-error").find((event) => event.type === "step.interrupted")?.payload)
-      .toMatchObject({ status: "cancelled" });
+    expect(result).toMatchObject({ status: "paused", completedSteps: [], failedStep: "fetch" });
+    expect(result.message).toContain("step completion failed");
+    expect(store.getArtifact("finalization-error", "ticket.json")).toBeNull();
+    expect(store.getArtifact("finalization-error", "mcp-calls/fetch-e7d3799ecc09.json")).toBeNull();
+    expect(store.listEvents("finalization-error").map((event) => event.type)).not.toContain("step.completed");
     store.close();
+  });
+
+  test("recovers committed MCP completion without invoking the adapter again", async () => {
+    const root = temporaryRepo();
+    const workflow = mcpWorkflow();
+    const runId = "committed-mcp-completion";
+    const interrupted = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(interrupted, { id: runId, workflow, inputs: { ticket_key: "AF-69" } });
+    interrupted.transitionRunWithEvent(runId, {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    interrupted.updateRun(runId, {
+      currentStepId: "fetch",
+      context: {
+        ...interrupted.getRun(runId)!.context,
+        executionRouting: {
+          stepAttemptLimits: {},
+          visits: { fetch: 1 },
+          recoveryCycles: {},
+          recoveryInvocations: {},
+          disagreementEpisodes: {},
+          disagreementRounds: {},
+          attempts: { fetch: 1 }
+        },
+        executionCheckpoint: { stepId: "fetch", visit: 1, completedAttempts: 0 }
+      }
+    });
+    let invocations = 0;
+    const calls = createAgentFlowMcpCallRegistry().register("fixture", () => {
+      invocations += 1;
+      return { outputs: { "ticket.json": { key: "AF-69" } } };
+    });
+    const finalize = interrupted.withRunFinalizationTransaction.bind(interrupted);
+    let crashAfterCommit = true;
+    interrupted.withRunFinalizationTransaction = ((id, callback) => {
+      const result = finalize(id, callback);
+      if (crashAfterCommit) {
+        crashAfterCommit = false;
+        throw new Error("executor exited after commit");
+      }
+      return result;
+    }) as typeof interrupted.withRunFinalizationTransaction;
+
+    await expect(executeAgentFlowMcpCall(
+      interrupted,
+      runId,
+      workflow,
+      workflow.steps[0]!,
+      calls,
+      {
+        attempt: 1,
+        finalize: (result) => {
+          const output = {
+            attempt: 1,
+            server: result.server,
+            tool: result.tool,
+            requestArtifact: result.requestArtifact.declaredPath,
+            outputs: result.outputArtifacts.map((artifact) => artifact.declaredPath)
+          };
+          interrupted.upsertStep({ runId, stepId: "fetch", attempt: 1, status: "completed", output });
+          interrupted.appendRunEvent(runId, { type: "step.completed", stepId: "fetch", payload: output });
+        }
+      }
+    )).rejects.toThrow("executor exited after commit");
+    expect(interrupted.getArtifact(runId, "ticket.json")).not.toBeNull();
+    expect(interrupted.latestStepRecoveryState(runId, "fetch")).toMatchObject({ status: "completed" });
+    interrupted.acquireRunLock(runId, "run", { ttlMs: 60_000 });
+    interrupted.close();
+
+    const recovered = await openAgentFlowRunState({ cwd: root });
+    await expect(executeAgentFlowCommandPipeline(recovered, runId, workflow, undefined, undefined, calls))
+      .resolves.toMatchObject({ status: "completed", completedSteps: ["fetch"] });
+    expect(invocations).toBe(1);
+    recovered.close();
   });
 
   test("rejects oversized adapter metadata before atomic publication", async () => {

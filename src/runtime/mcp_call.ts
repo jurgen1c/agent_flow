@@ -53,7 +53,9 @@ export interface AgentFlowMcpCallExecutionResult {
 export interface ExecuteAgentFlowMcpCallOptions {
   attempt?: number;
   beforePublish?: () => void;
+  finalize?: (result: AgentFlowMcpCallExecutionResult) => void;
   stopStatus?: () => AgentFlowRunStopStatus | undefined;
+  interruptError?: () => Error | undefined;
 }
 
 export class AgentFlowMcpCallError extends Error {
@@ -223,7 +225,7 @@ export async function executeAgentFlowMcpCall(
   };
   let response: AgentFlowMcpCallResponse;
   try {
-    response = await invokeAdapter(adapter, request, options.stopStatus);
+    response = await invokeAdapter(adapter, request, options.stopStatus, options.interruptError);
   } catch (error) {
     if (error instanceof AgentFlowMcpCallInterruptedError) throw error;
     if (error instanceof AgentFlowMcpCallError) {
@@ -239,7 +241,6 @@ export async function executeAgentFlowMcpCall(
   try {
     const returned = validateResponse(stepId, outputs, response);
     const responseMetadata = validateMetadata(stepId, response.metadata);
-    options.beforePublish?.();
     const requestMetadata = {
     stepId,
     server,
@@ -293,14 +294,21 @@ export async function executeAgentFlowMcpCall(
       };
     })
   ];
-    const published = store.writeArtifactsAtomically(publications);
-    const byPath = new Map(published.map((artifact) => [artifact.declaredPath, artifact]));
-    return {
-      server,
-      tool,
-      requestArtifact: byPath.get(requestPath)!,
-      outputArtifacts: outputs.map((output) => byPath.get(output)!)
-    };
+    return store.withRunFinalizationTransaction(runId, () => {
+      options.beforePublish?.();
+      assertMcpCallActive(options);
+      const published = store.writeArtifactsAtomically(publications);
+      const byPath = new Map(published.map((artifact) => [artifact.declaredPath, artifact]));
+      const result = {
+        server,
+        tool,
+        requestArtifact: byPath.get(requestPath)!,
+        outputArtifacts: outputs.map((output) => byPath.get(output)!)
+      };
+      assertMcpCallActive(options);
+      options.finalize?.(result);
+      return result;
+    });
   } catch (error) {
     if (error instanceof AgentFlowMcpCallInterruptedError) throw error;
     if (error instanceof AgentFlowMcpCallError) {
@@ -315,6 +323,13 @@ export async function executeAgentFlowMcpCall(
       { cause: sanitizedErrorCause(error) }
     );
   }
+}
+
+function assertMcpCallActive(options: ExecuteAgentFlowMcpCallOptions): void {
+  const status = options.stopStatus?.();
+  if (status !== undefined) throw new AgentFlowMcpCallInterruptedError(status);
+  const interruption = options.interruptError?.();
+  if (interruption !== undefined) throw interruption;
 }
 
 function validateResponse(
@@ -403,22 +418,30 @@ function validateOutputSize(stepId: string, size: number, totalBytes: number): v
 async function invokeAdapter(
   adapter: AgentFlowMcpCallAdapter,
   request: AgentFlowMcpCallRequest,
-  stopStatus: ExecuteAgentFlowMcpCallOptions["stopStatus"]
+  stopStatus: ExecuteAgentFlowMcpCallOptions["stopStatus"],
+  interruptError: ExecuteAgentFlowMcpCallOptions["interruptError"]
 ): Promise<AgentFlowMcpCallResponse> {
   const initialStatus = stopStatus?.();
   if (initialStatus !== undefined) throw new AgentFlowMcpCallInterruptedError(initialStatus);
-  if (stopStatus === undefined) return adapter(request);
+  const initialError = interruptError?.();
+  if (initialError !== undefined) throw initialError;
+  if (stopStatus === undefined && interruptError === undefined) return adapter(request);
 
   const controller = new AbortController();
   request.signal = controller.signal;
   let timer: ReturnType<typeof setInterval> | undefined;
   const interrupted = new Promise<never>((_resolve, reject) => {
     timer = setInterval(() => {
-      const status = stopStatus();
-      if (status === undefined) return;
-      const error = new AgentFlowMcpCallInterruptedError(status);
-      controller.abort(error);
-      reject(error);
+      try {
+        const status = stopStatus?.();
+        const error = status === undefined ? interruptError?.() : new AgentFlowMcpCallInterruptedError(status);
+        if (error === undefined) return;
+        controller.abort(error);
+        reject(error);
+      } catch (error) {
+        controller.abort(error);
+        reject(error);
+      }
     }, 25);
   });
   try {
