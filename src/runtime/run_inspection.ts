@@ -132,41 +132,65 @@ export function buildAgentFlowRunInspectionPage(
     );
   }
   const page = { offset, limit: limit + 1 };
-  let items: AgentFlowRunInspectionPage["items"];
   switch (section) {
-    case "events":
-      items = store.listEvents(runId, page);
-      break;
-    case "steps":
-      items = store.listSteps(runId, page);
-      break;
-    case "artifacts":
-      items = store.listArtifactMetadata(runId, page)
-        .map((artifact) => store.inspectArtifactRecordForInspection(artifact));
-      break;
-    case "failures": {
-      const failures = store.listFailureMetadata(runId, page);
-      const artifactsByPath = new Map<string, AgentFlowArtifactRecord>();
-      for (const failure of failures) {
-        if (failure.payloadPath === null || artifactsByPath.has(failure.payloadPath)) continue;
-        const artifact = failurePayloadArtifactForInspection(store, runId, failure.payloadPath);
-        if (artifact !== null) artifactsByPath.set(failure.payloadPath, artifact);
-      }
-      items = inspectFailureRecords(store, failures, artifactsByPath, []);
-      break;
+    case "events": {
+      const items = store.withRunStateReadTransaction(() => store.listEvents(runId, page));
+      return inspectionPage(section, items, offset, limit);
     }
-    case "approvals":
-      items = store.listApprovals(runId, page);
-      break;
-    case "decisions": {
-      const decisions = store.listArtifactMetadataByKind(runId, "decision_record", page)
+    case "steps": {
+      const items = store.withRunStateReadTransaction(() => store.listSteps(runId, page));
+      return inspectionPage(section, items, offset, limit);
+    }
+    case "artifacts": {
+      const metadata = store.withRunStateReadTransaction(() => store.listArtifactMetadata(runId, page));
+      const items = metadata
         .map((artifact) => store.inspectArtifactRecordForInspection(artifact));
-      items = decisions.map((artifact) => readInspectionDocument(store, artifact));
-      break;
+      return inspectionPage(section, items, offset, limit);
+    }
+    case "failures": {
+      const snapshot = store.withRunStateReadTransaction(() => {
+        const failures = store.listFailureMetadata(runId, page);
+        const artifactMetadataByPath = new Map<string, AgentFlowArtifactRecord>();
+        for (const failure of failures) {
+          if (failure.payloadPath === null || artifactMetadataByPath.has(failure.payloadPath)) continue;
+          const artifact = failurePayloadArtifactForInspection(store, runId, failure.payloadPath);
+          if (artifact !== null) artifactMetadataByPath.set(failure.payloadPath, artifact);
+        }
+        return { failures, artifactMetadataByPath };
+      });
+      const artifactsByPath = new Map(
+        [...snapshot.artifactMetadataByPath].map(([path, artifact]) => [
+          path,
+          store.inspectArtifactRecordForInspection(artifact)
+        ])
+      );
+      const items = inspectFailureRecords(store, snapshot.failures, artifactsByPath, []);
+      return inspectionPage(section, items, offset, limit);
+    }
+    case "approvals": {
+      const items = store.withRunStateReadTransaction(() => store.listApprovals(runId, page));
+      return inspectionPage(section, items, offset, limit);
+    }
+    case "decisions": {
+      const metadata = store.withRunStateReadTransaction(() =>
+        store.listArtifactMetadataByKind(runId, "decision_record", page)
+      );
+      const decisions = metadata
+        .map((artifact) => store.inspectArtifactRecordForInspection(artifact));
+      const items = decisions.map((artifact) => readInspectionDocument(store, artifact));
+      return inspectionPage(section, items, offset, limit);
     }
     case "warnings":
       return buildWarningPage(store, runId, offset, limit);
   }
+}
+
+function inspectionPage(
+  section: AgentFlowRunInspectionSection,
+  items: AgentFlowRunInspectionPage["items"],
+  offset: number,
+  limit: number
+): AgentFlowRunInspectionPage {
   const hasMore = items.length > limit;
   return {
     section,
@@ -182,73 +206,107 @@ function buildWarningPage(
   offset: number,
   limit: number
 ): AgentFlowRunInspectionPage {
-  const warnings: AgentFlowRunInspectionWarning[] = [];
-  const workflow = workflowWarnings(requireInspectionRun(store, runId));
-  const counts = store.countInspectionWarningSources(runId);
-  const totalSourceRecords = workflow.length + counts.failures + counts.artifacts + counts.approvals;
-  let sourceOffset = offset;
-  let remaining = limit;
-  let scanned = 0;
-  const consume = <T>(total: number, load: (offset: number, limit: number) => T[], visit: (record: T) => void): void => {
-    if (remaining === 0) return;
-    if (sourceOffset >= total) {
-      sourceOffset -= total;
-      return;
-    }
-    const count = Math.min(remaining, total - sourceOffset);
-    for (const record of load(sourceOffset, count)) visit(record);
-    sourceOffset = 0;
-    remaining -= count;
-    scanned += count;
-  };
-
-  consume(workflow.length, (pageOffset, pageLimit) => workflow.slice(pageOffset, pageOffset + pageLimit), (warning) => {
-    warnings.push(warning);
-  });
-  consume(counts.failures, (pageOffset, pageLimit) =>
-    store.listFailureMetadata(runId, { offset: pageOffset, limit: pageLimit }), (failure) => {
-      const artifactsByPath = new Map<string, AgentFlowArtifactRecord>();
-      if (failure.payloadPath !== null) {
-        const artifact = failurePayloadArtifactForInspection(store, runId, failure.payloadPath);
-        if (artifact !== null) artifactsByPath.set(failure.payloadPath, artifact);
+  const snapshot = store.withRunStateReadTransaction(() => {
+    const workflow: AgentFlowRunInspectionWarning[] = [];
+    const failures: Array<{ record: AgentFlowFailureRecord; artifact: AgentFlowArtifactRecord | null }> = [];
+    const artifacts: AgentFlowArtifactRecord[] = [];
+    const approvals: AgentFlowApprovalRecord[] = [];
+    const workflowWarningsSnapshot = workflowWarnings(requireInspectionRun(store, runId));
+    const counts = store.countInspectionWarningSources(runId);
+    const totalSourceRecords = workflowWarningsSnapshot.length
+      + counts.failures + counts.artifacts + counts.approvals;
+    let sourceOffset = offset;
+    let remaining = limit;
+    let scanned = 0;
+    const consume = <T>(
+      total: number,
+      load: (offset: number, limit: number) => T[],
+      visit: (record: T) => void
+    ): void => {
+      if (remaining === 0) return;
+      if (sourceOffset >= total) {
+        sourceOffset -= total;
+        return;
       }
-      inspectFailureRecords(store, [failure], artifactsByPath, warnings);
+      const count = Math.min(remaining, total - sourceOffset);
+      for (const record of load(sourceOffset, count)) visit(record);
+      sourceOffset = 0;
+      remaining -= count;
+      scanned += count;
+    };
+
+    consume(
+      workflowWarningsSnapshot.length,
+      (pageOffset, pageLimit) => workflowWarningsSnapshot.slice(pageOffset, pageOffset + pageLimit),
+      (warning) => workflow.push(warning)
+    );
+    consume(
+      counts.failures,
+      (pageOffset, pageLimit) => store.listFailureMetadata(runId, { offset: pageOffset, limit: pageLimit }),
+      (failure) => failures.push({
+        record: failure,
+        artifact: failure.payloadPath === null
+          ? null
+          : failurePayloadArtifactForInspection(store, runId, failure.payloadPath)
+      })
+    );
+    consume(
+      counts.artifacts,
+      (pageOffset, pageLimit) => store.listArtifactMetadata(runId, { offset: pageOffset, limit: pageLimit }),
+      (artifact) => artifacts.push(artifact)
+    );
+    consume(
+      counts.approvals,
+      (pageOffset, pageLimit) => store.listApprovals(runId, { offset: pageOffset, limit: pageLimit }),
+      (approval) => approvals.push(approval)
+    );
+    return { workflow, failures, artifacts, approvals, scanned, totalSourceRecords };
+  });
+
+  const warnings: AgentFlowRunInspectionWarning[] = [];
+  warnings.push(...snapshot.workflow);
+  for (const failure of snapshot.failures) {
+    const artifactsByPath = new Map<string, AgentFlowArtifactRecord>();
+    if (failure.record.payloadPath !== null && failure.artifact !== null) {
+      artifactsByPath.set(
+        failure.record.payloadPath,
+        store.inspectArtifactRecordForInspection(failure.artifact)
+      );
     }
-  );
-  consume(counts.artifacts, (pageOffset, pageLimit) =>
-    store.listArtifactMetadata(runId, { offset: pageOffset, limit: pageLimit }), (metadataRecord) => {
-      const artifact = store.inspectArtifactRecordForInspection(metadataRecord);
-      if (artifact.status === "missing" || artifact.status === "stale") warnings.push({
+    inspectFailureRecords(store, [failure.record], artifactsByPath, warnings);
+  }
+  for (const metadataRecord of snapshot.artifacts) {
+    const artifact = store.inspectArtifactRecordForInspection(metadataRecord);
+    if (artifact.status === "missing" || artifact.status === "stale") warnings.push({
         code: `run.artifact.${artifact.status}`,
         message: `Artifact ${artifact.declaredPath} is ${artifact.status}.`,
         source: "artifact",
         path: artifact.declaredPath
-      });
-      if (artifact.kind === "decision_record") {
-        const decision = readInspectionDocument(store, artifact);
-        if (decision.error !== null) warnings.push({
+    });
+    if (artifact.kind === "decision_record") {
+      const decision = readInspectionDocument(store, artifact);
+      if (decision.error !== null) warnings.push({
           code: "run.decision.unavailable",
           message: `Decision record ${artifact.declaredPath} is unavailable: ${decision.error}`,
           source: "decision",
           path: artifact.declaredPath
-        });
-      }
+      });
     }
-  );
-  consume(counts.approvals, (pageOffset, pageLimit) =>
-    store.listApprovals(runId, { offset: pageOffset, limit: pageLimit }), (approval) => {
-      if (approval.status === "requested" || approval.status === "stale") warnings.push({
+  }
+  for (const approval of snapshot.approvals) {
+    if (approval.status === "requested" || approval.status === "stale") warnings.push({
         code: `run.approval.${approval.status}`,
         message: `Approval ${approval.id} is ${approval.status}.`,
         source: "approval"
-      });
-    }
-  );
+    });
+  }
   return {
     section: "warnings",
     items: warnings,
     offset,
-    nextOffset: offset + scanned < totalSourceRecords ? offset + scanned : null
+    nextOffset: offset + snapshot.scanned < snapshot.totalSourceRecords
+      ? offset + snapshot.scanned
+      : null
   };
 }
 

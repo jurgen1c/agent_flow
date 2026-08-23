@@ -195,6 +195,43 @@ steps:
     writer.close();
   });
 
+  test("captures each paged response in one database snapshot", async () => {
+    const repo = makeRepo();
+    const writer = await openAgentFlowRunState({ cwd: repo });
+    createInspectableRun(writer, "snapshot-page");
+    const reader = await openAgentFlowRunState({ cwd: repo });
+    const inspectArtifact = reader.inspectArtifactRecordForInspection.bind(reader);
+    let transitioned = false;
+    reader.inspectArtifactRecordForInspection = (artifact) => {
+      if (!transitioned) {
+        transitioned = true;
+        writer.transitionRunWithEvent("snapshot-page", {
+          status: "running",
+          allowedFrom: ["pending"],
+          event: { type: "run.started", payload: { status: "running" } }
+        });
+      }
+      return inspectArtifact(artifact);
+    };
+
+    const page = buildAgentFlowRunInspectionPage(reader, "snapshot-page", "failures", 0, 10);
+
+    expect(page.items).toEqual([
+      expect.objectContaining({
+        id: "failure:inspect:1",
+        failurePayload: expect.objectContaining({
+          document: expect.objectContaining({ id: "failure:inspect:1" }),
+          error: null
+        })
+      })
+    ]);
+    expect(writer.getRun("snapshot-page")?.status).toBe("running");
+    expect(writer.listEvents("snapshot-page").map((event) => event.type))
+      .toEqual(["run.created", "run.started"]);
+    reader.close();
+    writer.close();
+  });
+
   test("rejects asynchronous read-transaction callbacks without leaving a transaction open", async () => {
     const repo = makeRepo();
     const store = await openAgentFlowRunState({ cwd: repo });
@@ -454,6 +491,8 @@ steps:
       expect(javascript).not.toContain("model.events");
       expect(javascript).toContain("navigator.clipboard.writeText");
       expect(javascript).toContain('document.createElement(tag)');
+      expect(javascript).toContain('history.replaceState(null, "", location.pathname + location.search)');
+      expect(javascript).not.toContain('location.hash = "token="');
       expect(javascript).not.toContain("innerHTML");
 
       const detailHeaders = {

@@ -1688,7 +1688,7 @@ export class AgentFlowRunStateStore {
       "SELECT * FROM artifacts WHERE run_id = ? AND path = ?",
       [normalizedRunId, normalizedPath]
     );
-    return row === null ? null : this.inspectArtifact(row, false);
+    return row === null ? null : hydrateArtifact(this.repoRoot, row);
   }
 
   countInspectionWarningSources(runId: string): {

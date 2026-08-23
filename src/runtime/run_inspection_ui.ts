@@ -355,7 +355,6 @@ export const AGENT_FLOW_RUN_INSPECTION_UI_JAVASCRIPT = String.raw`(function () {
     var token = elements.tokenInput.value;
     if (!token) return;
     state.token = token;
-    location.hash = "token=" + encodeURIComponent(token);
     elements.tokenPanel.hidden = true;
     void loadRuns();
   }
@@ -374,8 +373,12 @@ export const AGENT_FLOW_RUN_INSPECTION_UI_JAVASCRIPT = String.raw`(function () {
     if (!fragment) return "";
     var params = new URLSearchParams(fragment);
     var token = params.get("token");
-    if (token) return token;
-    try { return decodeURIComponent(fragment); } catch (_) { return ""; }
+    if (!token) {
+      try { token = decodeURIComponent(fragment); } catch (_) { return ""; }
+    }
+    if (!token) return "";
+    history.replaceState(null, "", location.pathname + location.search);
+    return token;
   }
 
   async function api(path, headers) {
