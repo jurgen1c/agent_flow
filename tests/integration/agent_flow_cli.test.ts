@@ -204,6 +204,160 @@ steps:
     expect(await captureCli(["pause", "missing"], repo)).toMatchObject({ exitCode: 4 });
   });
 
+  test("recovers an interrupted running execution through the documented run command", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-recovery-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.writeFileSync(path.join(repo, "workflow.yml"), `
+name: cli-recovery
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: check, type: command, command: "echo recovered >> effects.txt" }
+`);
+    const workflow = parseAgentFlowWorkflowOrThrow(fs.readFileSync(path.join(repo, "workflow.yml"), "utf8"));
+    const interrupted = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(interrupted, { id: "cli-recovery", workflow });
+    interrupted.acquireRunLock("cli-recovery", "run", { ttlMs: 60_000 });
+    interrupted.transitionRunWithEvent("cli-recovery", {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    interrupted.close();
+
+    const recovered = await captureCli(["run", "workflow.yml", "--id", "cli-recovery"], repo);
+
+    expect(recovered).toMatchObject({ exitCode: 0, stderr: "" });
+    expect(recovered.stdout).toContain("Reused Agent Flow run cli-recovery");
+    expect(recovered.stdout).toContain("Status: completed");
+    expect(fs.readFileSync(path.join(repo, "effects.txt"), "utf8")).toBe("recovered\n");
+    expect((await captureCli(["logs", "cli-recovery"], repo)).stdout).toContain("run.execution_recovered");
+  });
+
+  test("does not rewrite fixture state before acquiring an active run lease", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-fixture-lock-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.writeFileSync(path.join(repo, "workflow.yml"), `
+name: cli-fixture-lock
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  writer: { provider: fixture }
+steps:
+  - { id: write, type: session_request, session: writer, prompt: prompts/write.md, inputs: [input.txt], outputs: [response.md] }
+`);
+    fs.writeFileSync(path.join(repo, "replacement.json"), JSON.stringify({
+      inputs: {},
+      artifacts: { "input.txt": "replacement" },
+      steps: { write: { outputs: { "response.md": "replacement" } } }
+    }));
+    const workflow = parseAgentFlowWorkflowOrThrow(fs.readFileSync(path.join(repo, "workflow.yml"), "utf8"));
+    const owner = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(owner, { id: "cli-fixture-lock", workflow, inputs: {} });
+    owner.updateRun("cli-fixture-lock", {
+      context: { ...owner.getRun("cli-fixture-lock")!.context, cliFixturePath: path.join(repo, "original.json") }
+    });
+    owner.writeArtifact({
+      id: "fixture:1",
+      runId: "cli-fixture-lock",
+      stepId: "fixture",
+      path: "input.txt",
+      kind: "fixture",
+      contentType: "text/plain; charset=utf-8",
+      content: "original"
+    });
+    const originalGeneration = owner.getArtifact("cli-fixture-lock", "input.txt")!.generation;
+    const lock = owner.acquireRunLock("cli-fixture-lock", "run", { ttlMs: 60_000 });
+    owner.transitionRunWithEvent("cli-fixture-lock", {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+
+    const contender = await captureCli([
+      "run", "workflow.yml", "--id", "cli-fixture-lock", "--fixture", "replacement.json"
+    ], repo);
+
+    expect(contender.exitCode).not.toBe(0);
+    expect(contender.stderr).toContain("is locked for run");
+    expect(owner.getRun("cli-fixture-lock")?.context.cliFixturePath).toBe(path.join(repo, "original.json"));
+    expect(owner.readArtifact("cli-fixture-lock", "input.txt").content.toString()).toBe("original");
+    expect(owner.getArtifact("cli-fixture-lock", "input.txt")?.generation).toBe(originalGeneration);
+    owner.releaseRunLock(lock);
+    owner.close();
+  });
+
+  test("retains a replacement fixture after a stale recovered run pauses", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-recovered-fixture-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.mkdirSync(path.join(repo, "prompts"));
+    fs.writeFileSync(path.join(repo, "prompts", "draft.md"), "Draft.\n");
+    fs.writeFileSync(path.join(repo, "workflow.yml"), `
+name: recovered-fixture
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  writer: { provider: fixture }
+steps:
+  - { id: first, type: session_request, session: writer, prompt: prompts/draft.md, inputs: [request.md], outputs: [first.md] }
+  - { id: approve, type: manual_gate, message: Continue?, options: [approve, cancel] }
+  - { id: second, type: session_request, session: writer, prompt: prompts/draft.md, inputs: [request.md], outputs: [second.md] }
+`);
+    const originalFixturePath = path.join(repo, "original.json");
+    const replacementFixturePath = path.join(repo, "replacement.json");
+    fs.writeFileSync(originalFixturePath, JSON.stringify({
+      steps: {
+        first: { outputs: { "first.md": "original first" } },
+        second: { outputs: { "second.md": "original second" } }
+      }
+    }));
+    fs.writeFileSync(replacementFixturePath, JSON.stringify({
+      steps: {
+        first: { outputs: { "first.md": "replacement first" } },
+        second: { outputs: { "second.md": "replacement second" } }
+      }
+    }));
+    const workflow = parseAgentFlowWorkflowOrThrow(fs.readFileSync(path.join(repo, "workflow.yml"), "utf8"));
+    const interrupted = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(interrupted, { id: "recovered-fixture", workflow });
+    interrupted.updateRun("recovered-fixture", {
+      context: { ...interrupted.getRun("recovered-fixture")!.context, cliFixturePath: originalFixturePath }
+    });
+    interrupted.writeArtifact({
+      id: "request",
+      runId: "recovered-fixture",
+      path: "request.md",
+      kind: "fixture",
+      contentType: "text/plain; charset=utf-8",
+      content: "Request"
+    });
+    interrupted.acquireRunLock("recovered-fixture", "run", { ttlMs: 60_000 });
+    interrupted.transitionRunWithEvent("recovered-fixture", {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    interrupted.close();
+
+    expect(await captureCli([
+      "run", "workflow.yml", "--id", "recovered-fixture", "--fixture", "replacement.json"
+    ], repo)).toMatchObject({ exitCode: 3 });
+    let store = await openAgentFlowRunState({ cwd: repo });
+    expect(store.getRun("recovered-fixture")?.context.cliFixturePath).toBe(replacementFixturePath);
+    expect(store.readArtifact("recovered-fixture", "first.md").content.toString()).toBe("replacement first");
+    store.close();
+
+    expect(await captureCli([
+      "resume", "recovered-fixture", "--outcome", "approve"
+    ], repo)).toMatchObject({ exitCode: 0 });
+    store = await openAgentFlowRunState({ cwd: repo });
+    expect(store.readArtifact("recovered-fixture", "second.md").content.toString()).toBe("replacement second");
+    store.close();
+  });
+
   test("renders terminal notifications and retained artifact status through the CLI", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-notification-"));
     fs.mkdirSync(path.join(repo, ".git"));

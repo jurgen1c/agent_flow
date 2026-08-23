@@ -1,17 +1,22 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  AgentFlowRunStateError,
   MAX_AGENT_FLOW_FAILURE_ATTACHMENT_COUNT,
   MAX_AGENT_FLOW_FAILURE_ATTACHMENT_SCAN_BYTES,
   MAX_AGENT_FLOW_FAILURE_TOTAL_ATTACHMENT_BYTES,
   type AgentFlowRunStateValue,
+  createAgentFlowSessionProviderRegistry,
+  createAgentFlowWorkflowRegistry,
   createAgentFlowLifecycleRun,
   executeAgentFlowCommandPipeline,
   openAgentFlowRunState,
   parseAgentFlowWorkflowOrThrow,
   persistAgentFlowFailurePayload,
+  resumeAgentFlowCommandPipeline,
   transitionAgentFlowLifecycleRun
 } from "../../src/runtime";
 
@@ -38,6 +43,55 @@ steps:
 
     expect(store.getRun("mismatched-workflow")?.status).toBe("pending");
     store.close();
+  });
+
+  test("rejects a mismatched workflow before stale recovery mutates the run", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: persisted-workflow
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: work, type: command, command: echo persisted }
+`);
+    const mismatched = parseAgentFlowWorkflowOrThrow(`
+name: mismatched-workflow
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: work, type: command, command: echo mismatched }
+`);
+    const interrupted = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(interrupted, { id: "stale-mismatched-workflow", workflow });
+    interrupted.acquireRunLock("stale-mismatched-workflow", "run", { ttlMs: 60_000 });
+    interrupted.transitionRunWithEvent("stale-mismatched-workflow", {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    interrupted.updateRun("stale-mismatched-workflow", { currentStepId: "work" });
+    interrupted.upsertStep({
+      runId: "stale-mismatched-workflow",
+      stepId: "work",
+      attempt: 1,
+      status: "running"
+    });
+    interrupted.close();
+
+    const recovered = await openAgentFlowRunState({ cwd: repoRoot });
+    await expect(executeAgentFlowCommandPipeline(recovered, "stale-mismatched-workflow", mismatched))
+      .rejects.toMatchObject({ code: "AGENT_FLOW_RUN_COLLISION" });
+    expect(recovered.getRun("stale-mismatched-workflow")).toMatchObject({
+      status: "running",
+      currentStepId: "work"
+    });
+    expect(recovered.latestStepRecoveryState("stale-mismatched-workflow", "work"))
+      .toMatchObject({ attempt: 1, status: "running" });
+    expect(recovered.listEvents("stale-mismatched-workflow").map((event) => event.type))
+      .toEqual(["run.created", "run.started"]);
+    recovered.close();
   });
 
   test("fails closed for invalid failure policies on externally persisted runs", async () => {
@@ -118,7 +172,7 @@ steps:
     store.close();
   });
 
-  test("does not allow a second executor to share a running run", async () => {
+  test("does not allow an executor from another store to share a running run", async () => {
     const repoRoot = temporaryRepo();
     const workflow = parseAgentFlowWorkflowOrThrow(`
 name: single-owner
@@ -131,13 +185,1895 @@ steps:
     command: sleep 0.1
 `);
     const store = await openAgentFlowRunState({ cwd: repoRoot });
+    const competitor = await openAgentFlowRunState({ cwd: repoRoot });
     createAgentFlowLifecycleRun(store, { id: "single-owner", workflow });
 
     const owner = executeAgentFlowCommandPipeline(store, "single-owner", workflow);
-    await expect(executeAgentFlowCommandPipeline(store, "single-owner", workflow))
-      .rejects.toThrow("status is running");
+    await expect(executeAgentFlowCommandPipeline(competitor, "single-owner", workflow))
+      .rejects.toMatchObject({ code: "AGENT_FLOW_RUN_LOCKED" });
     expect((await owner).status).toBe("completed");
+    competitor.close();
     store.close();
+  });
+
+  test("rolls back run start when the initial routing checkpoint fails", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: atomic-run-start
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: check, type: command, command: "printf passed" }
+`);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: "atomic-run-start", workflow });
+    const updateRun = store.updateRun.bind(store);
+    let rejectCheckpoint = true;
+    store.updateRun = ((runId, input) => {
+      if (rejectCheckpoint && input.context?.executionRouting !== undefined) {
+        rejectCheckpoint = false;
+        throw new Error("checkpoint unavailable");
+      }
+      return updateRun(runId, input);
+    }) as typeof store.updateRun;
+
+    await expect(executeAgentFlowCommandPipeline(store, "atomic-run-start", workflow))
+      .rejects.toThrow("checkpoint unavailable");
+    expect(store.getRun("atomic-run-start")?.status).toBe("pending");
+    expect(store.listEvents("atomic-run-start").map((event) => event.type)).toEqual(["run.created"]);
+
+    await expect(executeAgentFlowCommandPipeline(store, "atomic-run-start", workflow))
+      .resolves.toMatchObject({ status: "completed" });
+    store.close();
+  });
+
+  test("recovers a running execution after a later checkpoint failure", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: recover-failed-checkpoint
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: first, type: command, command: echo first >> effects.txt }
+  - { id: second, type: command, command: echo second >> effects.txt }
+`);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: "recover-failed-checkpoint", workflow });
+    const updateRun = store.updateRun.bind(store);
+    let rejectCheckpoint = true;
+    store.updateRun = ((runId, input) => {
+      const checkpoint = input.context?.executionCheckpoint;
+      if (rejectCheckpoint
+          && checkpoint !== null
+          && typeof checkpoint === "object"
+          && !Array.isArray(checkpoint)
+          && checkpoint.stepId === "second") {
+        rejectCheckpoint = false;
+        throw new AgentFlowRunStateError("checkpoint contention", "AGENT_FLOW_CONCURRENT_MUTATION");
+      }
+      return updateRun(runId, input);
+    }) as typeof store.updateRun;
+
+    await expect(executeAgentFlowCommandPipeline(store, "recover-failed-checkpoint", workflow))
+      .rejects.toMatchObject({ code: "AGENT_FLOW_CONCURRENT_MUTATION" });
+    expect(store.getRun("recover-failed-checkpoint")?.status).toBe("running");
+    store.updateRun = updateRun;
+
+    await expect(executeAgentFlowCommandPipeline(store, "recover-failed-checkpoint", workflow))
+      .resolves.toMatchObject({ status: "completed", completedSteps: ["first", "second"] });
+    expect(fs.readFileSync(path.join(repoRoot, "effects.txt"), "utf8")).toBe("first\nsecond\n");
+    store.close();
+  });
+
+  test("terminates an in-flight command when lease renewal loses ownership", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: lost-command-lease
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: slow
+    type: command
+    command: sleep 1; echo stale >> effects.txt
+`);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: "lost-command-lease", workflow });
+    const withRunLock = store.withRunLock.bind(store);
+    store.withRunLock = ((runId, operation, callback, options) =>
+      withRunLock(runId, operation, callback, { ...options, ttlMs: 30 })) as typeof store.withRunLock;
+    store.renewRunLock = (() => {
+      throw new AgentFlowRunStateError("lease replaced", "AGENT_FLOW_RUN_LOCK_LOST");
+    }) as typeof store.renewRunLock;
+
+    await expect(executeAgentFlowCommandPipeline(store, "lost-command-lease", workflow))
+      .rejects.toMatchObject({ code: "AGENT_FLOW_RUN_LOCK_LOST" });
+    await Bun.sleep(50);
+    expect(fs.existsSync(path.join(repoRoot, "effects.txt"))).toBe(false);
+    store.close();
+  });
+
+  test("propagates a lost nested recovery lease without settling the parent outcome", async () => {
+    const repoRoot = temporaryRepo();
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: lost-child-lease-parent
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - id: check
+    type: command
+    command: exit 1
+    on_failure:
+      route_to: { workflow: lost-child-lease-child }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: lost-child-lease-child
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - { id: repair, type: command, command: "sleep 1; echo stale >> effects.txt" }
+  - { id: done, type: result, status: remediated }
+`);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: "lost-child-lease-parent", workflow: parent });
+    const workflows = createAgentFlowWorkflowRegistry().register(child.name, child);
+    const childRunId = "lost-child-lease-parent:recovery:check-20f65c28:attempt-1";
+    const withRunLock = store.withRunLock.bind(store);
+    store.withRunLock = ((runId, operation, callback, options) => withRunLock(
+      runId,
+      operation,
+      callback,
+      runId === childRunId ? { ...options, ttlMs: 30 } : options
+    )) as typeof store.withRunLock;
+    const renewRunLock = store.renewRunLock.bind(store);
+    let replaced = false;
+    store.renewRunLock = ((lock, ttlMs) => {
+      if (lock.runId === childRunId && !replaced) {
+        replaced = true;
+        const competitor = new Database(store.databasePath);
+        competitor.run(
+          "UPDATE run_locks SET owner_token = ?, owner_executor_id = ? WHERE run_id = ?",
+          ["replacement-owner", "replacement-executor", childRunId]
+        );
+        competitor.close();
+      }
+      return renewRunLock(lock, ttlMs);
+    }) as typeof store.renewRunLock;
+
+    await expect(executeAgentFlowCommandPipeline(
+      store, "lost-child-lease-parent", parent,
+      undefined, undefined, undefined, undefined, workflows
+    )).rejects.toMatchObject({ code: "AGENT_FLOW_RUN_LOCK_LOST" });
+
+    expect(replaced).toBe(true);
+    expect(store.getRun("lost-child-lease-parent")?.status).toBe("running");
+    expect(store.getRun(childRunId)?.status).toBe("running");
+    expect(store.listEvents("lost-child-lease-parent").some((event) => event.type === "recovery.completed"))
+      .toBe(false);
+    expect(store.listEvents(childRunId).some((event) => event.type === "run.failed")).toBe(false);
+    await Bun.sleep(50);
+    expect(fs.existsSync(path.join(repoRoot, "effects.txt"))).toBe(false);
+    store.close();
+  });
+
+  test("locks nested recovery execution against a competing executor", async () => {
+    const repoRoot = temporaryRepo();
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: locked-recovery-parent
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - id: check
+    type: command
+    command: exit 1
+    on_failure:
+      route_to: { workflow: locked-recovery-child }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: locked-recovery-child
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - { id: repair, type: command, command: sleep 0.2 }
+  - { id: done, type: result, status: remediated }
+`);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    const competitor = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: "locked-recovery-parent", workflow: parent });
+    const workflows = createAgentFlowWorkflowRegistry().register("locked-recovery-child", child);
+    const owner = executeAgentFlowCommandPipeline(
+      store, "locked-recovery-parent", parent, undefined, undefined, undefined, undefined, workflows
+    );
+    const childRunId = "locked-recovery-parent:recovery:check-20f65c28:attempt-1";
+    for (let count = 0; count < 100 && store.getRun(childRunId)?.status !== "running"; count += 1) {
+      await Bun.sleep(5);
+    }
+
+    await expect(executeAgentFlowCommandPipeline(competitor, childRunId, child))
+      .rejects.toMatchObject({ code: "AGENT_FLOW_RUN_LOCKED" });
+    expect((await owner).status).toBe("completed");
+    competitor.close();
+    store.close();
+  });
+
+  test("propagates an active nested recovery lock without settling the parent outcome", async () => {
+    const repoRoot = temporaryRepo();
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: contended-recovery-parent
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - id: check
+    type: command
+    command: exit 1
+    on_failure:
+      route_to: { workflow: contended-recovery-child }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: contended-recovery-child
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - { id: repair, type: command, command: sleep 0.1 }
+  - { id: done, type: result, status: remediated }
+`);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    const competitor = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: "contended-recovery-parent", workflow: parent });
+    const workflows = createAgentFlowWorkflowRegistry().register("contended-recovery-child", child);
+    const withRunLock = store.withRunLock.bind(store);
+    let competitorLock: ReturnType<typeof competitor.acquireRunLock> | undefined;
+    store.withRunLock = ((runId, operation, callback, options) => {
+      if (runId.includes(":recovery:") && competitorLock === undefined) {
+        competitorLock = competitor.acquireRunLock(runId, "run", { ttlMs: 1_000 });
+      }
+      return withRunLock(runId, operation, callback, options);
+    }) as typeof store.withRunLock;
+
+    await expect(executeAgentFlowCommandPipeline(
+      store, "contended-recovery-parent", parent, undefined, undefined, undefined, undefined, workflows
+    )).rejects.toMatchObject({ code: "AGENT_FLOW_RUN_LOCKED" });
+    const childRunId = "contended-recovery-parent:recovery:check-20f65c28:attempt-1";
+    expect(store.getRun("contended-recovery-parent")?.status).toBe("running");
+    expect(store.getRun(childRunId)?.status).toBe("pending");
+    expect(store.listEvents("contended-recovery-parent").some((event) => event.type === "recovery.completed"))
+      .toBe(false);
+    expect(competitorLock).toBeDefined();
+    competitor.releaseRunLock(competitorLock!);
+    await expect(executeAgentFlowCommandPipeline(
+      store, "contended-recovery-parent", parent, undefined, undefined, undefined, undefined, workflows
+    )).resolves.toMatchObject({ status: "completed" });
+    expect(store.getRun(childRunId)?.status).toBe("completed");
+    competitor.close();
+    store.close();
+  });
+
+  test("retries nested recovery lock contention without replaying its source step", async () => {
+    const repoRoot = temporaryRepo();
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: mutation-recovery-parent
+version: 1
+style: recovery_pipeline
+maturity: experimental
+limits:
+  max_recovery_cycles: 1
+  max_step_attempts: { check: 1 }
+policies: { recovery_limits: fail }
+steps:
+  - id: check
+    type: command
+    command: echo attempted >> effects.txt; exit 1
+    on_failure:
+      route_to: { workflow: mutation-recovery-child }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: mutation-recovery-child
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - { id: repair, type: command, command: echo repaired }
+  - { id: done, type: result, status: remediated }
+`);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: "mutation-parent", workflow: parent });
+    const workflows = createAgentFlowWorkflowRegistry().register("mutation-recovery-child", child);
+    const withRunLock = store.withRunLock.bind(store);
+    let recoveryLockAttempts = 0;
+    store.withRunLock = ((runId, operation, callback, options) => {
+      if (runId.includes(":recovery:")) {
+        recoveryLockAttempts += 1;
+        if (recoveryLockAttempts === 1) {
+          throw new AgentFlowRunStateError(
+            "another state mutation is active",
+            "AGENT_FLOW_CONCURRENT_MUTATION"
+          );
+        }
+      }
+      return withRunLock(runId, operation, callback, options);
+    }) as typeof store.withRunLock;
+
+    await expect(executeAgentFlowCommandPipeline(
+      store, "mutation-parent", parent,
+      undefined, undefined, undefined, undefined, workflows
+    )).resolves.toMatchObject({
+      status: "completed"
+    });
+    const childRunId = "mutation-parent:recovery:check-20f65c28:attempt-1";
+    expect(recoveryLockAttempts).toBe(2);
+    expect(store.getRun("mutation-parent")?.status).toBe("completed");
+    expect(store.getRun(childRunId)?.status).toBe("completed");
+    expect(fs.readFileSync(path.join(repoRoot, "effects.txt"), "utf8")).toBe("attempted\n");
+    expect(store.listEvents("mutation-parent")).toContainEqual(expect.objectContaining({
+      type: "recovery.completed",
+      payload: expect.objectContaining({ status: "remediated" })
+    }));
+    store.close();
+  });
+
+  test("retries nested recovery startup contention before a child step begins", async () => {
+    const repoRoot = temporaryRepo();
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: startup-contention-parent
+version: 1
+style: recovery_pipeline
+maturity: experimental
+limits:
+  max_recovery_cycles: 1
+  max_step_attempts: { check: 1 }
+policies: { recovery_limits: fail }
+steps:
+  - id: check
+    type: command
+    command: exit 1
+    on_failure:
+      route_to: { workflow: startup-contention-child }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: startup-contention-child
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - { id: repair, type: command, command: echo repaired }
+  - { id: done, type: result, status: remediated }
+`);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: "startup-contention-parent", workflow: parent });
+    const workflows = createAgentFlowWorkflowRegistry().register("startup-contention-child", child);
+    const withRunStateTransaction = store.withRunStateTransaction.bind(store);
+    let startupContentions = 0;
+    store.withRunStateTransaction = ((runId, callback) => {
+      if (runId.includes(":recovery:") && startupContentions === 0) {
+        startupContentions += 1;
+        throw new AgentFlowRunStateError(
+          "another state mutation is active",
+          "AGENT_FLOW_CONCURRENT_MUTATION"
+        );
+      }
+      return withRunStateTransaction(runId, callback);
+    }) as typeof store.withRunStateTransaction;
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      "startup-contention-parent",
+      parent,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      workflows
+    );
+
+    const childRunId = "startup-contention-parent:recovery:check-20f65c28:attempt-1";
+    expect(result).toMatchObject({ status: "completed" });
+    expect(startupContentions).toBe(1);
+    expect(store.getRun(childRunId)).toMatchObject({ status: "completed", error: null });
+    expect(store.listEvents(childRunId).filter((event) => event.type === "step.started")).toHaveLength(1);
+    store.close();
+  });
+
+  test("reuses the pre-route snapshot when an interrupted recovery changed files outside scope", async () => {
+    const repoRoot = temporaryRepo();
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: interrupted-recovery-parent
+version: 1
+style: recovery_pipeline
+maturity: experimental
+limits: { max_recovery_cycles: 1 }
+policies:
+  recovery_limits: fail
+  file_scope: { include: [allowed/**] }
+steps:
+  - id: check
+    type: command
+    command: echo source >> effects.txt; exit 1
+    on_failure:
+      route_to: { workflow: interrupted-recovery-child }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: interrupted-recovery-child
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - { id: repair, type: command, command: printf child }
+  - { id: done, type: result, status: remediated }
+`);
+    const parentRunId = "interrupted-recovery-parent";
+    const childRunId = `${parentRunId}:recovery:check-20f65c28:attempt-1`;
+    const interrupted = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(interrupted, { id: parentRunId, workflow: parent });
+    interrupted.acquireRunLock(parentRunId, "run", { ttlMs: 60_000 });
+    interrupted.transitionRunWithEvent(parentRunId, {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    interrupted.updateRun(parentRunId, {
+      currentStepId: "check",
+      context: {
+        ...interrupted.getRun(parentRunId)!.context,
+        executionRouting: {
+          maxRecoveryCycles: 1,
+          stepAttemptLimits: {},
+          visits: { check: 1 },
+          recoveryCycles: {},
+          recoveryInvocations: { check: 1 },
+          disagreementEpisodes: {},
+          disagreementRounds: {},
+          attempts: { check: 1 }
+        }
+      }
+    });
+    persistAgentFlowFailurePayload(interrupted, {
+      id: "command:check:attempt-1",
+      runId: parentRunId,
+      stepId: "check",
+      stepType: "command",
+      attempt: 1,
+      summary: "failed",
+      classification: "command_failure",
+      retryable: false,
+      outcome: "fail"
+    });
+    interrupted.upsertStep({
+      runId: parentRunId,
+      stepId: "check",
+      attempt: 1,
+      status: "failed",
+      error: { attempt: 1, message: "failed", failureId: "command:check:attempt-1" }
+    });
+    interrupted.appendRunEvent(parentRunId, {
+      type: "step.failed",
+      stepId: "check",
+      payload: { attempt: 1, message: "failed", failureId: "command:check:attempt-1" }
+    });
+    const workspaceSnapshot = interrupted.writeArtifact({
+      id: "recovery-workspace:check-20f65c28:command-check-attempt-1-ee1428cf",
+      runId: parentRunId,
+      path: "recovery-workspace/check-20f65c28/command-check-attempt-1-ee1428cf.json",
+      kind: "recovery_workspace_snapshot",
+      contentType: "application/json; charset=utf-8",
+      content: `${JSON.stringify({ version: 1, entries: [] })}\n`,
+      metadata: { failureId: "command:check:attempt-1", route: "workflow", target: child.name }
+    });
+    interrupted.appendRunEvent(parentRunId, {
+      type: "recovery.routed",
+      stepId: "check",
+      payload: {
+        failureId: "command:check:attempt-1",
+        route: "workflow",
+        target: child.name,
+        workspaceSnapshotPath: workspaceSnapshot.declaredPath,
+        workspaceSnapshotChecksum: workspaceSnapshot.checksum
+      }
+    });
+    createAgentFlowLifecycleRun(interrupted, {
+      id: childRunId,
+      workflow: child,
+      inputs: {},
+      parentRunId,
+      recoveryOfRunId: parentRunId
+    });
+    interrupted.acquireRunLock(childRunId, "run", { ttlMs: 60_000 });
+    interrupted.transitionRunWithEvent(childRunId, {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    interrupted.updateRun(childRunId, { currentStepId: "repair" });
+    interrupted.upsertStep({ runId: childRunId, stepId: "repair", attempt: 1, status: "running" });
+    fs.writeFileSync(path.join(repoRoot, "effects.txt"), "source\n");
+    interrupted.close();
+
+    const recovered = await openAgentFlowRunState({ cwd: repoRoot });
+    const workflows = createAgentFlowWorkflowRegistry().register(child.name, child);
+    await expect(executeAgentFlowCommandPipeline(
+      recovered, parentRunId, parent,
+      undefined, undefined, undefined, undefined, workflows
+    )).resolves.toMatchObject({ status: "paused" });
+    expect(fs.readFileSync(path.join(repoRoot, "effects.txt"), "utf8")).toBe("source\n");
+    expect(recovered.getRun(childRunId)?.status).toBe("completed");
+    expect(recovered.latestStepRecoveryState(childRunId, "repair")).toMatchObject({
+      attempt: 2,
+      status: "completed"
+    });
+    expect(recovered.listRuns().filter((run) => run.parentRunId === parentRunId).map((run) => run.id))
+      .toEqual([childRunId]);
+    expect(recovered.listEvents(parentRunId)).toContainEqual(expect.objectContaining({
+      type: "recovery.workspace_scope_violated",
+      payload: expect.objectContaining({ deniedPaths: ["effects.txt"] })
+    }));
+    recovered.close();
+  });
+
+  test("routes a persisted failure left behind a running cursor before replaying its command", async () => {
+    const repoRoot = temporaryRepo();
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: unrouted-recovery-parent
+version: 1
+style: recovery_pipeline
+maturity: experimental
+limits: { max_recovery_cycles: 1 }
+policies: { recovery_limits: fail }
+steps:
+  - id: check
+    type: command
+    command: echo source >> effects.txt; exit 1
+    on_failure:
+      route_to: { workflow: unrouted-recovery-child }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: unrouted-recovery-child
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - { id: repair, type: command, command: printf repaired }
+  - { id: done, type: result, status: remediated }
+`);
+    const runId = "unrouted-recovery-parent";
+    const interrupted = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(interrupted, { id: runId, workflow: parent });
+    interrupted.acquireRunLock(runId, "run", { ttlMs: 60_000 });
+    interrupted.transitionRunWithEvent(runId, {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    interrupted.updateRun(runId, {
+      currentStepId: "check",
+      context: {
+        ...interrupted.getRun(runId)!.context,
+        executionRouting: {
+          maxRecoveryCycles: 1,
+          stepAttemptLimits: {},
+          visits: { check: 1 },
+          recoveryCycles: {},
+          recoveryInvocations: {},
+          disagreementEpisodes: {},
+          disagreementRounds: {},
+          attempts: { check: 1 }
+        }
+      }
+    });
+    persistAgentFlowFailurePayload(interrupted, {
+      id: "command:check:attempt-1",
+      runId,
+      stepId: "check",
+      stepType: "command",
+      attempt: 1,
+      summary: "failed",
+      classification: "command_failure",
+      retryable: false,
+      outcome: "fail"
+    });
+    interrupted.upsertStep({
+      runId,
+      stepId: "check",
+      attempt: 1,
+      status: "running"
+    });
+    fs.writeFileSync(path.join(repoRoot, "effects.txt"), "source\n");
+    interrupted.close();
+
+    const recovered = await openAgentFlowRunState({ cwd: repoRoot });
+    const workflows = createAgentFlowWorkflowRegistry().register(child.name, child);
+    await expect(executeAgentFlowCommandPipeline(
+      recovered, runId, parent, undefined, undefined, undefined, undefined, workflows
+    )).resolves.toMatchObject({ status: "completed" });
+    expect(fs.readFileSync(path.join(repoRoot, "effects.txt"), "utf8")).toBe("source\n");
+    expect(recovered.listEvents(runId)).toContainEqual(expect.objectContaining({
+      type: "recovery.routed",
+      stepId: "check"
+    }));
+    recovered.close();
+  });
+
+  test("routes a persisted recovery completion without replaying its source step", async () => {
+    const repoRoot = temporaryRepo();
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: completed-recovery-parent
+version: 1
+style: recovery_pipeline
+maturity: experimental
+limits: { max_recovery_cycles: 1, max_duration_seconds: 1 }
+steps:
+  - id: check
+    type: command
+    command: echo source >> effects.txt; exit 1
+    on_failure:
+      route_to: { workflow: completed-recovery-child }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: completed-recovery-child
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - { id: done, type: result, status: remediated }
+`);
+    const runId = "completed-recovery-parent";
+    const failureId = "command:check:attempt-1";
+    const interrupted = await openAgentFlowRunState({
+      cwd: repoRoot,
+      now: () => "2026-08-22T12:00:00.000Z"
+    });
+    createAgentFlowLifecycleRun(interrupted, { id: runId, workflow: parent });
+    interrupted.acquireRunLock(runId, "run", { ttlMs: 60_000 });
+    interrupted.transitionRunWithEvent(runId, {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    interrupted.updateRun(runId, {
+      currentStepId: "check",
+      context: {
+        ...interrupted.getRun(runId)!.context,
+        executionRouting: {
+          maxRecoveryCycles: 1,
+          stepAttemptLimits: {},
+          visits: { check: 1 },
+          recoveryCycles: {},
+          recoveryInvocations: { check: 1 },
+          disagreementEpisodes: {},
+          disagreementRounds: {},
+          attempts: { check: 1 }
+        }
+      }
+    });
+    persistAgentFlowFailurePayload(interrupted, {
+      id: failureId,
+      runId,
+      stepId: "check",
+      stepType: "command",
+      attempt: 1,
+      summary: "failed",
+      classification: "command_failure",
+      retryable: false,
+      outcome: "fail"
+    });
+    interrupted.upsertStep({
+      runId,
+      stepId: "check",
+      attempt: 1,
+      status: "failed",
+      error: { attempt: 1, message: "failed", failureId }
+    });
+    interrupted.appendRunEvent(runId, {
+      type: "step.failed",
+      stepId: "check",
+      payload: { attempt: 1, message: "failed", failureId }
+    });
+    interrupted.updateFailureRecovery(runId, failureId, {
+      status: "remediated",
+      route: "workflow",
+      target: child.name
+    });
+    interrupted.appendRunEvent(runId, {
+      type: "recovery.completed",
+      stepId: "check",
+      payload: { failureId, status: "remediated", route: "workflow", target: child.name }
+    });
+    fs.writeFileSync(path.join(repoRoot, "effects.txt"), "source\n");
+    interrupted.close();
+
+    const recovered = await openAgentFlowRunState({
+      cwd: repoRoot,
+      now: () => "2026-08-22T12:00:02.000Z"
+    });
+    const workflows = createAgentFlowWorkflowRegistry().register(child.name, child);
+    await expect(executeAgentFlowCommandPipeline(
+      recovered, runId, parent, undefined, undefined, undefined, undefined, workflows
+    )).resolves.toMatchObject({ status: "completed" });
+    expect(fs.readFileSync(path.join(repoRoot, "effects.txt"), "utf8")).toBe("source\n");
+    expect(recovered.listRuns().filter((run) => run.parentRunId === runId)).toHaveLength(0);
+    expect(recovered.listEvents(runId).some((event) => event.type === "recovery.limit_reached")).toBe(false);
+    recovered.close();
+  });
+
+  test("finalizes a persisted failed cursor that has no recovery route", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: failed-cursor-without-route
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: check
+    type: command
+    command: echo source >> effects.txt; exit 1
+    on_failure: { then: fail }
+`);
+    const runId = "failed-cursor-without-route";
+    const interrupted = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(interrupted, { id: runId, workflow });
+    interrupted.acquireRunLock(runId, "run", { ttlMs: 60_000 });
+    interrupted.transitionRunWithEvent(runId, {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    interrupted.updateRun(runId, {
+      currentStepId: "check",
+      context: {
+        ...interrupted.getRun(runId)!.context,
+        executionRouting: {
+          stepAttemptLimits: {},
+          visits: { check: 1 },
+          recoveryCycles: {},
+          recoveryInvocations: {},
+          disagreementEpisodes: {},
+          disagreementRounds: {},
+          attempts: { check: 1 }
+        }
+      }
+    });
+    persistAgentFlowFailurePayload(interrupted, {
+      id: "command:check:attempt-1",
+      runId,
+      stepId: "check",
+      stepType: "command",
+      attempt: 1,
+      summary: "failed",
+      classification: "command_failure",
+      retryable: false,
+      outcome: "fail"
+    });
+    interrupted.upsertStep({
+      runId,
+      stepId: "check",
+      attempt: 1,
+      status: "failed",
+      error: { attempt: 1, message: "failed" }
+    });
+    interrupted.appendRunEvent(runId, {
+      type: "step.failed",
+      stepId: "check",
+      payload: { attempt: 1, message: "failed" }
+    });
+    fs.writeFileSync(path.join(repoRoot, "effects.txt"), "source\n");
+    interrupted.close();
+
+    const recovered = await openAgentFlowRunState({ cwd: repoRoot });
+    await expect(executeAgentFlowCommandPipeline(recovered, runId, workflow)).resolves.toMatchObject({
+      status: "failed",
+      failedStep: "check",
+      message: "failed"
+    });
+    expect(recovered.getRun(runId)?.status).toBe("failed");
+    expect(fs.readFileSync(path.join(repoRoot, "effects.txt"), "utf8")).toBe("source\n");
+    recovered.close();
+  });
+
+  test("continues an interrupted retry before applying failure routing", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: recovered-retry
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: flaky
+    type: command
+    command: echo recovered >> effects.txt
+    on_failure: { retry: 1, then: fail }
+`);
+    const runId = "recovered-retry";
+    const interrupted = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(interrupted, { id: runId, workflow });
+    interrupted.acquireRunLock(runId, "run", { ttlMs: 60_000 });
+    interrupted.transitionRunWithEvent(runId, {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    interrupted.updateRun(runId, {
+      currentStepId: "flaky",
+      context: {
+        ...interrupted.getRun(runId)!.context,
+        executionRouting: {
+          stepAttemptLimits: {},
+          visits: { flaky: 1 },
+          recoveryCycles: {},
+          recoveryInvocations: {},
+          disagreementEpisodes: {},
+          disagreementRounds: {},
+          attempts: { flaky: 1 }
+        },
+        executionCheckpoint: { stepId: "flaky", visit: 1, completedAttempts: 0 }
+      }
+    });
+    interrupted.recordFailure({
+      id: "command:flaky:attempt-1",
+      runId,
+      stepId: "flaky",
+      classification: "command_failure",
+      message: "first attempt failed",
+      retryable: true,
+      payload: { attempt: 1, exitCode: 9, timedOut: false, outcome: "retry" }
+    });
+    interrupted.upsertStep({
+      runId,
+      stepId: "flaky",
+      attempt: 1,
+      status: "running"
+    });
+    interrupted.close();
+
+    const recovered = await openAgentFlowRunState({ cwd: repoRoot });
+    await expect(executeAgentFlowCommandPipeline(recovered, runId, workflow))
+      .resolves.toMatchObject({ status: "completed", completedSteps: ["flaky"] });
+    expect(fs.readFileSync(path.join(repoRoot, "effects.txt"), "utf8")).toBe("recovered\n");
+    expect(recovered.latestStepRecoveryState(runId, "flaky")).toMatchObject({
+      attempt: 2,
+      status: "completed"
+    });
+    expect(recovered.getRun(runId)?.context.executionRouting).toMatchObject({
+      visits: { flaky: 1 }
+    });
+    recovered.close();
+  });
+
+  test("restarts an interrupted running execution after recovering its stale lease", async () => {
+    for (const operation of ["run", "resume"] as const) {
+      const repoRoot = temporaryRepo();
+      const workflow = parseAgentFlowWorkflowOrThrow(`
+name: recovered-${operation}
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: work, type: command, command: echo recovered }
+`);
+      const runId = `recovered-${operation}`;
+      const interrupted = await openAgentFlowRunState({ cwd: repoRoot });
+      createAgentFlowLifecycleRun(interrupted, { id: runId, workflow });
+      interrupted.acquireRunLock(runId, operation, { ttlMs: 60_000 });
+      interrupted.transitionRunWithEvent(runId, {
+        status: "running",
+        allowedFrom: ["pending"],
+        event: { type: "run.started", payload: { status: "running" } }
+      });
+      interrupted.updateRun(runId, {
+        currentStepId: "work",
+        context: {
+          ...interrupted.getRun(runId)!.context,
+          executionRouting: {
+            stepAttemptLimits: {},
+            visits: { work: 1 },
+            recoveryCycles: {},
+            recoveryInvocations: {},
+            disagreementEpisodes: {},
+            disagreementRounds: {},
+            attempts: {}
+          },
+          executionCheckpoint: { stepId: "work", visit: 1, completedAttempts: 0 }
+        }
+      });
+      interrupted.upsertStep({ runId, stepId: "work", attempt: 1, status: "running" });
+      interrupted.upsertApproval({
+        id: "approval:work:attempt-1",
+        runId,
+        stepId: "work",
+        status: "requested",
+        requestedBy: "fixture"
+      });
+      interrupted.upsertSession({
+        id: "reusable",
+        runId,
+        provider: "fixture",
+        status: "waiting",
+        externalSessionId: "external-reusable"
+      });
+      interrupted.upsertSession({
+        id: "in-flight",
+        runId,
+        provider: "fixture",
+        status: "running",
+        externalSessionId: "external-in-flight"
+      });
+      interrupted.close();
+
+      const recovered = await openAgentFlowRunState({ cwd: repoRoot });
+      const result = operation === "run"
+        ? await executeAgentFlowCommandPipeline(recovered, runId, workflow)
+        : await resumeAgentFlowCommandPipeline(recovered, runId, workflow, { outcome: "approve" });
+      expect(result.status).toBe("completed");
+      expect(recovered.listEvents(runId).map((event) => event.type)).toContain("run.execution_recovered");
+      expect(recovered.listApprovals(runId)).toEqual([
+        expect.objectContaining({
+          id: "approval:work:attempt-1",
+          status: "cancelled",
+          decision: "execution_recovered"
+        })
+      ]);
+      expect(recovered.getSession(runId, "reusable")).toMatchObject({
+        status: "waiting",
+        externalSessionId: "external-reusable"
+      });
+      expect(recovered.getSession(runId, "in-flight")).toMatchObject({ status: "waiting" });
+      expect(recovered.getRun(runId)?.context.executionRouting).toMatchObject({ visits: { work: 1 } });
+      const database = new Database(recovered.databasePath, { readonly: true });
+      expect(database.query(
+        "SELECT attempt, status FROM run_steps WHERE run_id = ? AND step_id = ? ORDER BY attempt"
+      ).all(runId, "work")).toEqual([
+        { attempt: 1, status: "cancelled" },
+        { attempt: 2, status: "completed" }
+      ]);
+      database.close();
+      recovered.close();
+    }
+  });
+
+  test("reclaims an interrupted provider session after stale-lock recovery", async () => {
+    const repoRoot = temporaryRepo();
+    fs.mkdirSync(path.join(repoRoot, "prompts"), { recursive: true });
+    fs.writeFileSync(path.join(repoRoot, "prompts", "draft.md"), "Draft a response.\n");
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: recovered-provider-session
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  writer: { provider: fixture, resume: true }
+steps:
+  - id: draft
+    type: session_request
+    session: writer
+    prompt: prompts/draft.md
+    inputs: [request.md]
+    outputs: [response.md]
+`);
+    const runId = "recovered-provider-session";
+    const interrupted = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(interrupted, { id: runId, workflow });
+    interrupted.writeArtifact({
+      id: "request",
+      runId,
+      path: "request.md",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "Request"
+    });
+    interrupted.acquireRunLock(runId, "run", { ttlMs: 60_000 });
+    interrupted.transitionRunWithEvent(runId, {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    interrupted.updateRun(runId, { currentStepId: "draft" });
+    interrupted.upsertStep({ runId, stepId: "draft", attempt: 1, status: "running" });
+    interrupted.upsertSession({
+      id: "writer",
+      runId,
+      stepId: "draft",
+      provider: "fixture",
+      status: "running",
+      externalSessionId: "provider-session",
+      state: { resume: true, lastStepId: "draft" }
+    });
+    interrupted.close();
+
+    const externalIds: Array<string | undefined> = [];
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => {
+      externalIds.push(request.externalSessionId);
+      return { externalSessionId: "provider-session", outputs: { "response.md": "Recovered" } };
+    });
+    const recovered = await openAgentFlowRunState({ cwd: repoRoot });
+    await expect(executeAgentFlowCommandPipeline(
+      recovered, runId, workflow, undefined, providers
+    )).resolves.toMatchObject({ status: "completed", completedSteps: ["draft"] });
+    expect(externalIds).toEqual(["provider-session"]);
+    expect(recovered.getSession(runId, "writer")).toMatchObject({
+      status: "waiting",
+      externalSessionId: "provider-session"
+    });
+    expect(recovered.readArtifact(runId, "response.md").content.toString()).toBe("Recovered");
+    recovered.close();
+  });
+
+  test("preserves routing-cycle counters when recovering an interrupted execution", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: recovered-routing-budget
+version: 1
+style: recovery_pipeline
+maturity: experimental
+limits: { max_recovery_cycles: 1 }
+policies: { recovery_limits: fail }
+steps:
+  - { id: first, type: command, command: echo first, then: second }
+  - { id: second, type: command, command: echo second, then: first }
+`);
+    const interrupted = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(interrupted, { id: "recovered-routing-budget", workflow });
+    interrupted.acquireRunLock("recovered-routing-budget", "run", { ttlMs: 60_000 });
+    interrupted.transitionRunWithEvent("recovered-routing-budget", {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    const context = interrupted.getRun("recovered-routing-budget")!.context;
+    interrupted.updateRun("recovered-routing-budget", {
+      currentStepId: "first",
+      context: {
+        ...context,
+        executionRouting: {
+          maxRecoveryCycles: 1,
+          stepAttemptLimits: {},
+          visits: { first: 1, second: 1 },
+          recoveryCycles: { first: 1 },
+          recoveryInvocations: {},
+          disagreementEpisodes: {},
+          disagreementRounds: {},
+          attempts: { first: 1, second: 1 }
+        }
+      }
+    });
+    interrupted.upsertStep({
+      runId: "recovered-routing-budget",
+      stepId: "first",
+      attempt: 1,
+      status: "running"
+    });
+    interrupted.close();
+
+    const recovered = await openAgentFlowRunState({ cwd: repoRoot });
+    const result = await executeAgentFlowCommandPipeline(recovered, "recovered-routing-budget", workflow);
+    expect(result).toMatchObject({
+      status: "failed",
+      failedStep: "second",
+      message: "Step second exceeded limits.max_recovery_cycles 1 while routing to first."
+    });
+    expect(recovered.listEvents("recovered-routing-budget").map((event) => event.type))
+      .toContain("recovery.limit_reached");
+    recovered.close();
+  });
+
+  test("resumes stale recovery at the interrupted step without replaying completed commands", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: recovered-cursor
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: first, type: command, command: echo first >> effects.txt }
+  - { id: second, type: command, command: echo second >> effects.txt }
+`);
+    const interrupted = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(interrupted, { id: "recovered-cursor", workflow });
+    interrupted.acquireRunLock("recovered-cursor", "run", { ttlMs: 60_000 });
+    interrupted.transitionRunWithEvent("recovered-cursor", {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    interrupted.updateRun("recovered-cursor", {
+      currentStepId: "second",
+      context: {
+        ...interrupted.getRun("recovered-cursor")!.context,
+        executionRouting: {
+          stepAttemptLimits: {},
+          visits: { first: 1, second: 1 },
+          recoveryCycles: {},
+          recoveryInvocations: {},
+          disagreementEpisodes: {},
+          disagreementRounds: {},
+          attempts: { first: 1, second: 1 }
+        }
+      }
+    });
+    interrupted.upsertStep({ runId: "recovered-cursor", stepId: "first", attempt: 1, status: "completed" });
+    interrupted.appendRunEvent("recovered-cursor", {
+      type: "step.completed",
+      stepId: "first",
+      payload: { attempt: 1 }
+    });
+    fs.writeFileSync(path.join(repoRoot, "effects.txt"), "first\n");
+    interrupted.upsertStep({ runId: "recovered-cursor", stepId: "second", attempt: 1, status: "running" });
+    interrupted.close();
+
+    const recovered = await openAgentFlowRunState({ cwd: repoRoot });
+    expect(await executeAgentFlowCommandPipeline(recovered, "recovered-cursor", workflow)).toMatchObject({
+      status: "completed",
+      completedSteps: ["first", "second"]
+    });
+    expect(fs.readFileSync(path.join(repoRoot, "effects.txt"), "utf8")).toBe("first\nsecond\n");
+    recovered.close();
+  });
+
+  test("keeps the recovery cursor and visit durable across a second interrupted executor", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: repeated-recovery-cursor
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: first, type: command, command: echo first >> effects.txt }
+  - { id: second, type: command, command: echo second >> effects.txt }
+`);
+    const interrupted = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(interrupted, { id: "repeated-recovery-cursor", workflow });
+    interrupted.acquireRunLock("repeated-recovery-cursor", "run", { ttlMs: 60_000 });
+    interrupted.transitionRunWithEvent("repeated-recovery-cursor", {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    interrupted.updateRun("repeated-recovery-cursor", {
+      currentStepId: "second",
+      context: {
+        ...interrupted.getRun("repeated-recovery-cursor")!.context,
+        executionRouting: {
+          stepAttemptLimits: {},
+          visits: { first: 1, second: 1 },
+          recoveryCycles: {},
+          recoveryInvocations: {},
+          disagreementEpisodes: {},
+          disagreementRounds: {},
+          attempts: { first: 1, second: 1 }
+        }
+      }
+    });
+    interrupted.upsertStep({
+      runId: "repeated-recovery-cursor",
+      stepId: "first",
+      attempt: 1,
+      status: "completed",
+      output: { attempt: 1 }
+    });
+    interrupted.appendRunEvent("repeated-recovery-cursor", {
+      type: "step.completed",
+      stepId: "first",
+      payload: { attempt: 1 }
+    });
+    interrupted.upsertStep({
+      runId: "repeated-recovery-cursor",
+      stepId: "second",
+      attempt: 1,
+      status: "running"
+    });
+    fs.writeFileSync(path.join(repoRoot, "effects.txt"), "first\n");
+    interrupted.close();
+
+    const firstRecovery = await openAgentFlowRunState({ cwd: repoRoot });
+    const recoveredLock = firstRecovery.acquireRunLock("repeated-recovery-cursor", "run", { ttlMs: 60_000 });
+    expect(recoveredLock.recoveredStaleLock).toBe(true);
+    firstRecovery.recoverInterruptedRun(recoveredLock);
+    expect(firstRecovery.getRun("repeated-recovery-cursor")).toMatchObject({
+      status: "pending",
+      currentStepId: "second"
+    });
+    firstRecovery.close();
+
+    const recovered = await openAgentFlowRunState({ cwd: repoRoot });
+    expect(await executeAgentFlowCommandPipeline(recovered, "repeated-recovery-cursor", workflow)).toMatchObject({
+      status: "completed",
+      completedSteps: ["first", "second"]
+    });
+    expect(fs.readFileSync(path.join(repoRoot, "effects.txt"), "utf8")).toBe("first\nsecond\n");
+    expect(recovered.getRun("repeated-recovery-cursor")?.context.executionRouting).toMatchObject({
+      visits: { first: 1, second: 1 }
+    });
+    recovered.close();
+  });
+
+  test("routes past a completed recovery cursor without replaying its side effects", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: recovered-completed-cursor
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: first, type: command, command: echo first >> effects.txt }
+  - { id: second, type: command, command: echo second >> effects.txt }
+`);
+    const interrupted = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(interrupted, { id: "recovered-completed-cursor", workflow });
+    interrupted.acquireRunLock("recovered-completed-cursor", "run", { ttlMs: 60_000 });
+    interrupted.transitionRunWithEvent("recovered-completed-cursor", {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    interrupted.updateRun("recovered-completed-cursor", {
+      currentStepId: "first",
+      context: {
+        ...interrupted.getRun("recovered-completed-cursor")!.context,
+        executionRouting: {
+          stepAttemptLimits: {},
+          visits: { first: 1 },
+          recoveryCycles: {},
+          recoveryInvocations: {},
+          disagreementEpisodes: {},
+          disagreementRounds: {},
+          attempts: { first: 1 }
+        }
+      }
+    });
+    interrupted.upsertStep({
+      runId: "recovered-completed-cursor",
+      stepId: "first",
+      attempt: 1,
+      status: "completed",
+      output: { attempt: 1 }
+    });
+    interrupted.appendRunEvent("recovered-completed-cursor", {
+      type: "step.completed",
+      stepId: "first",
+      payload: { attempt: 1 }
+    });
+    interrupted.appendRunEvent("recovered-completed-cursor", {
+      type: "recovery.returned",
+      stepId: "first",
+      payload: { successfulAttempt: 1 }
+    });
+    fs.writeFileSync(path.join(repoRoot, "effects.txt"), "first\n");
+    interrupted.close();
+
+    const recovered = await openAgentFlowRunState({ cwd: repoRoot });
+    expect(await executeAgentFlowCommandPipeline(recovered, "recovered-completed-cursor", workflow)).toMatchObject({
+      status: "completed",
+      completedSteps: ["first", "second"]
+    });
+    expect(fs.readFileSync(path.join(repoRoot, "effects.txt"), "utf8")).toBe("first\nsecond\n");
+    expect(recovered.listEvents("recovered-completed-cursor").filter((event) =>
+      event.type === "step.completed" && event.stepId === "first"
+    )).toHaveLength(1);
+    recovered.close();
+  });
+
+  test("executes a checkpointed revisit instead of routing an earlier completion", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: checkpointed-revisit
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - { id: work, type: command, command: echo work >> effects.txt }
+  - { id: done, type: result, status: completed }
+`);
+    const runId = "checkpointed-revisit";
+    const interrupted = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(interrupted, { id: runId, workflow });
+    interrupted.acquireRunLock(runId, "run", { ttlMs: 60_000 });
+    interrupted.transitionRunWithEvent(runId, {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    interrupted.updateRun(runId, {
+      currentStepId: "work",
+      context: {
+        ...interrupted.getRun(runId)!.context,
+        executionRouting: {
+          stepAttemptLimits: {},
+          visits: { work: 2 },
+          recoveryCycles: {},
+          recoveryInvocations: {},
+          disagreementEpisodes: {},
+          disagreementRounds: {},
+          attempts: { work: 1 }
+        },
+        executionCheckpoint: { stepId: "work", visit: 2, completedAttempts: 1 }
+      }
+    });
+    interrupted.upsertStep({
+      runId,
+      stepId: "work",
+      attempt: 1,
+      status: "completed",
+      output: { attempt: 1, exitCode: 0, timedOut: false, signal: null }
+    });
+    interrupted.appendRunEvent(runId, {
+      type: "step.completed",
+      stepId: "work",
+      payload: { attempt: 1, exitCode: 0, timedOut: false, signal: null }
+    });
+    fs.writeFileSync(path.join(repoRoot, "effects.txt"), "work\n");
+    interrupted.close();
+
+    const recovered = await openAgentFlowRunState({ cwd: repoRoot });
+    await expect(executeAgentFlowCommandPipeline(recovered, runId, workflow))
+      .resolves.toMatchObject({ status: "completed" });
+    expect(fs.readFileSync(path.join(repoRoot, "effects.txt"), "utf8")).toBe("work\nwork\n");
+    expect(recovered.latestStepRecoveryState(runId, "work")).toMatchObject({
+      attempt: 2,
+      status: "completed"
+    });
+    expect(recovered.getRun(runId)?.context.executionRouting).toMatchObject({
+      visits: { work: 2 }
+    });
+    recovered.close();
+  });
+
+  test("recovers a checkpoint committed before the first attempt row without recounting the visit", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: checkpoint-before-attempt
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: work, type: command, command: "true" }
+`);
+    const runId = "checkpoint-before-attempt";
+    const interrupted = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(interrupted, { id: runId, workflow });
+    interrupted.acquireRunLock(runId, "run", { ttlMs: 60_000 });
+    interrupted.transitionRunWithEvent(runId, {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    interrupted.updateRun(runId, {
+      currentStepId: "work",
+      context: {
+        ...interrupted.getRun(runId)!.context,
+        executionRouting: {
+          stepAttemptLimits: {},
+          visits: { work: 1 },
+          recoveryCycles: {},
+          recoveryInvocations: {},
+          disagreementEpisodes: {},
+          disagreementRounds: {},
+          attempts: {}
+        },
+        executionCheckpoint: { stepId: "work", visit: 1, completedAttempts: 0 }
+      }
+    });
+    interrupted.close();
+
+    const recovered = await openAgentFlowRunState({ cwd: repoRoot });
+    await expect(executeAgentFlowCommandPipeline(recovered, runId, workflow))
+      .resolves.toMatchObject({ status: "completed", completedSteps: ["work"] });
+    expect(recovered.latestStepRecoveryState(runId, "work")).toMatchObject({
+      attempt: 1,
+      status: "completed"
+    });
+    expect(recovered.getRun(runId)?.context.executionRouting).toMatchObject({
+      visits: { work: 1 }
+    });
+    recovered.close();
+  });
+
+  test("repairs a missing completion event for the latest revisited attempt", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: repaired-latest-completion
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - { id: work, type: command, command: echo replay >> effects.txt }
+  - { id: done, type: result, status: completed }
+`);
+    const runId = "repaired-latest-completion";
+    const interrupted = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(interrupted, { id: runId, workflow });
+    interrupted.acquireRunLock(runId, "run", { ttlMs: 60_000 });
+    interrupted.transitionRunWithEvent(runId, {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    interrupted.updateRun(runId, {
+      currentStepId: "work",
+      context: {
+        ...interrupted.getRun(runId)!.context,
+        executionRouting: {
+          stepAttemptLimits: {},
+          visits: { work: 2 },
+          recoveryCycles: {},
+          recoveryInvocations: {},
+          disagreementEpisodes: {},
+          disagreementRounds: {},
+          attempts: { work: 2 }
+        },
+        executionCheckpoint: { stepId: "work", visit: 2, completedAttempts: 1 }
+      }
+    });
+    for (const attempt of [1, 2]) {
+      const output = { attempt, exitCode: 0, timedOut: false, signal: null };
+      interrupted.upsertStep({ runId, stepId: "work", attempt, status: "completed", output });
+      if (attempt === 1) {
+        interrupted.appendRunEvent(runId, { type: "step.completed", stepId: "work", payload: output });
+      }
+    }
+    fs.writeFileSync(path.join(repoRoot, "effects.txt"), "work\nwork\n");
+    interrupted.close();
+
+    const recovered = await openAgentFlowRunState({ cwd: repoRoot });
+    await expect(executeAgentFlowCommandPipeline(recovered, runId, workflow))
+      .resolves.toMatchObject({ status: "completed", completedSteps: ["work", "work", "done"] });
+    expect(fs.readFileSync(path.join(repoRoot, "effects.txt"), "utf8")).toBe("work\nwork\n");
+    expect(recovered.listEvents(runId).filter((event) =>
+      event.type === "step.completed" && event.stepId === "work"
+    ).map((event) => (event.payload as { attempt: number }).attempt)).toEqual([1, 2]);
+    recovered.close();
+  });
+
+  test("executes a checkpointed revisit instead of routing an earlier failure", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: checkpointed-failed-revisit
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - id: work
+    type: command
+    command: echo work >> effects.txt
+    on_failure: { then: continue, allowed: true }
+  - { id: done, type: result, status: completed }
+`);
+    const runId = "checkpointed-failed-revisit";
+    const interrupted = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(interrupted, { id: runId, workflow });
+    interrupted.acquireRunLock(runId, "run", { ttlMs: 60_000 });
+    interrupted.transitionRunWithEvent(runId, {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    interrupted.updateRun(runId, {
+      currentStepId: "work",
+      context: {
+        ...interrupted.getRun(runId)!.context,
+        executionRouting: {
+          stepAttemptLimits: {},
+          visits: { work: 2 },
+          recoveryCycles: {},
+          recoveryInvocations: {},
+          disagreementEpisodes: {},
+          disagreementRounds: {},
+          attempts: { work: 1 }
+        },
+        executionCheckpoint: { stepId: "work", visit: 2, completedAttempts: 1 }
+      }
+    });
+    interrupted.recordFailure({
+      id: "command:work:attempt-1",
+      runId,
+      stepId: "work",
+      classification: "command_failure",
+      message: "first attempt failed",
+      retryable: false,
+      payload: { attempt: 1, exitCode: 9, timedOut: false, outcome: "continue" }
+    });
+    interrupted.upsertStep({
+      runId,
+      stepId: "work",
+      attempt: 1,
+      status: "failed",
+      error: { attempt: 1, exitCode: 9, timedOut: false, outcome: "continue" }
+    });
+    interrupted.appendRunEvent(runId, {
+      type: "step.failed",
+      stepId: "work",
+      payload: { attempt: 1, exitCode: 9, timedOut: false, outcome: "continue" }
+    });
+    interrupted.close();
+
+    const recovered = await openAgentFlowRunState({ cwd: repoRoot });
+    await expect(executeAgentFlowCommandPipeline(recovered, runId, workflow))
+      .resolves.toMatchObject({ status: "completed", completedSteps: ["work", "done"] });
+    expect(fs.readFileSync(path.join(repoRoot, "effects.txt"), "utf8")).toBe("work\n");
+    expect(recovered.latestStepRecoveryState(runId, "work")).toMatchObject({
+      attempt: 2,
+      status: "completed"
+    });
+    recovered.close();
+  });
+
+  test("settles returned recovery evidence before routing a completed cursor", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: recovered-returned-evidence
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - { id: work, type: command, command: echo work >> effects.txt }
+  - { id: next, type: command, command: echo next >> effects.txt }
+`);
+    const runId = "recovered-returned-evidence";
+    const interrupted = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(interrupted, { id: runId, workflow });
+    interrupted.acquireRunLock(runId, "run", { ttlMs: 60_000 });
+    interrupted.transitionRunWithEvent(runId, {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    interrupted.updateRun(runId, {
+      currentStepId: "work",
+      context: {
+        ...interrupted.getRun(runId)!.context,
+        executionRouting: {
+          stepAttemptLimits: {},
+          visits: { work: 2 },
+          recoveryCycles: {},
+          recoveryInvocations: { work: 1 },
+          disagreementEpisodes: {},
+          disagreementRounds: {},
+          attempts: { work: 2 }
+        }
+      }
+    });
+    interrupted.recordFailure({
+      id: "failure-1",
+      runId,
+      stepId: "work",
+      classification: "command_failure",
+      message: "failed",
+      payload: {
+        attempt: 1,
+        outcome: "retry",
+        recovery: { status: "remediated", route: "session", target: "fix" }
+      }
+    });
+    interrupted.upsertStep({ runId, stepId: "work", attempt: 1, status: "failed", error: { attempt: 1 } });
+    interrupted.appendRunEvent(runId, { type: "step.failed", stepId: "work", payload: { attempt: 1 } });
+    interrupted.upsertStep({
+      runId,
+      stepId: "work",
+      attempt: 2,
+      status: "completed",
+      output: { attempt: 2, exitCode: 0, timedOut: false, signal: null }
+    });
+    interrupted.appendRunEvent(runId, {
+      type: "step.completed",
+      stepId: "work",
+      payload: { attempt: 2, exitCode: 0, timedOut: false, signal: null }
+    });
+    fs.writeFileSync(path.join(repoRoot, "effects.txt"), "work\n");
+    interrupted.close();
+
+    const recovered = await openAgentFlowRunState({ cwd: repoRoot });
+    await expect(executeAgentFlowCommandPipeline(recovered, runId, workflow))
+      .resolves.toMatchObject({ status: "completed" });
+    expect(recovered.listFailures(runId)[0]?.resolvedAt).not.toBeNull();
+    expect(recovered.listEvents(runId)).toContainEqual(expect.objectContaining({
+      type: "recovery.returned",
+      stepId: "work",
+      payload: expect.objectContaining({ failureId: "failure-1", successfulAttempt: 2 })
+    }));
+    expect(fs.readFileSync(path.join(repoRoot, "effects.txt"), "utf8")).toBe("work\nnext\n");
+    recovered.close();
+  });
+
+  test("routes past a completed recovery row when its completion event was not persisted", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: recovered-completed-row
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: first, type: command, command: echo first >> effects.txt }
+  - { id: second, type: command, command: echo second >> effects.txt }
+`);
+    const interrupted = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(interrupted, { id: "recovered-completed-row", workflow });
+    interrupted.acquireRunLock("recovered-completed-row", "run", { ttlMs: 60_000 });
+    interrupted.transitionRunWithEvent("recovered-completed-row", {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    interrupted.updateRun("recovered-completed-row", {
+      currentStepId: "first",
+      context: {
+        ...interrupted.getRun("recovered-completed-row")!.context,
+        executionRouting: {
+          stepAttemptLimits: {},
+          visits: { first: 1 },
+          recoveryCycles: {},
+          recoveryInvocations: {},
+          disagreementEpisodes: {},
+          disagreementRounds: {},
+          attempts: { first: 1 }
+        }
+      }
+    });
+    interrupted.upsertStep({
+      runId: "recovered-completed-row",
+      stepId: "first",
+      attempt: 1,
+      status: "completed",
+      output: { attempt: 1 }
+    });
+    fs.writeFileSync(path.join(repoRoot, "effects.txt"), "first\n");
+    interrupted.close();
+
+    const recovered = await openAgentFlowRunState({ cwd: repoRoot });
+    expect(await executeAgentFlowCommandPipeline(recovered, "recovered-completed-row", workflow)).toMatchObject({
+      status: "completed",
+      completedSteps: ["first", "second"]
+    });
+    expect(fs.readFileSync(path.join(repoRoot, "effects.txt"), "utf8")).toBe("first\nsecond\n");
+    expect(recovered.listEvents("recovered-completed-row").filter((event) =>
+      event.type === "step.completed" && event.stepId === "first"
+    )).toHaveLength(1);
+    recovered.close();
+  });
+
+  test("recovers an approved route from the atomic completion event", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: recovered-approval-route
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+sessions:
+  reviewer: { provider: fixture, role: reviewer, authority: { can_approve: true } }
+steps:
+  - { id: approve, type: approval, reviewer: reviewer, artifacts: [evidence.md], on_approve: accepted, on_reject: rejected }
+  - { id: accepted, type: command, command: echo accepted >> route.txt, then: complete }
+  - { id: rejected, type: command, command: echo rejected >> route.txt, then: complete }
+`);
+    const interrupted = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(interrupted, { id: "recovered-approval-route", workflow });
+    interrupted.writeArtifact({
+      id: "evidence",
+      runId: "recovered-approval-route",
+      path: "evidence.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Evidence"
+    });
+    interrupted.acquireRunLock("recovered-approval-route", "run", { ttlMs: 60_000 });
+    interrupted.transitionRunWithEvent("recovered-approval-route", {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    interrupted.updateRun("recovered-approval-route", {
+      currentStepId: "approve",
+      context: {
+        ...interrupted.getRun("recovered-approval-route")!.context,
+        executionRouting: {
+          maxReviewCycles: 1,
+          stepAttemptLimits: {},
+          visits: { approve: 1 },
+          recoveryCycles: {},
+          recoveryInvocations: {},
+          disagreementEpisodes: {},
+          disagreementRounds: {},
+          attempts: { approve: 1 }
+        }
+      }
+    });
+    interrupted.upsertApproval({
+      id: "approval:approve:attempt-1",
+      runId: "recovered-approval-route",
+      stepId: "approve",
+      status: "requested",
+      requestedBy: "reviewer"
+    });
+    interrupted.upsertStep({
+      runId: "recovered-approval-route",
+      stepId: "approve",
+      attempt: 1,
+      status: "completed",
+      output: { attempt: 1, approvalStatus: "approved" }
+    });
+    interrupted.appendRunEvent("recovered-approval-route", {
+      type: "step.completed",
+      stepId: "approve",
+      payload: { attempt: 1, approvalStatus: "approved" }
+    });
+    interrupted.close();
+
+    const recovered = await openAgentFlowRunState({ cwd: repoRoot });
+    expect(await executeAgentFlowCommandPipeline(recovered, "recovered-approval-route", workflow))
+      .toMatchObject({ status: "completed", completedSteps: ["approve", "accepted"] });
+    expect(fs.readFileSync(path.join(repoRoot, "route.txt"), "utf8")).toBe("accepted\n");
+    recovered.close();
+  });
+
+  test("recovers a cancelled human approval through its declared cancellation route", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: recovered-human-cancellation
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: approve, type: approval, reviewer: human, artifacts: [evidence.md], on_reject: rejected, on_cancel: cancelled }
+  - { id: rejected, type: command, command: echo rejected >> route.txt, then: complete }
+  - { id: cancelled, type: command, command: echo cancelled >> route.txt, then: complete }
+`);
+    const interrupted = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(interrupted, { id: "recovered-human-cancellation", workflow });
+    interrupted.writeArtifact({
+      id: "evidence",
+      runId: "recovered-human-cancellation",
+      path: "evidence.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Evidence"
+    });
+    interrupted.acquireRunLock("recovered-human-cancellation", "resume", { ttlMs: 60_000 });
+    interrupted.transitionRunWithEvent("recovered-human-cancellation", {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    interrupted.updateRun("recovered-human-cancellation", {
+      currentStepId: "approve",
+      context: {
+        ...interrupted.getRun("recovered-human-cancellation")!.context,
+        executionRouting: {
+          stepAttemptLimits: {},
+          visits: { approve: 1 },
+          recoveryCycles: {},
+          recoveryInvocations: {},
+          disagreementEpisodes: {},
+          disagreementRounds: {},
+          attempts: { approve: 1 }
+        }
+      }
+    });
+    interrupted.upsertApproval({
+      id: "approval:approve:attempt-1",
+      runId: "recovered-human-cancellation",
+      stepId: "approve",
+      status: "cancelled",
+      decidedBy: "human",
+      decision: "cancel"
+    });
+    interrupted.upsertStep({
+      runId: "recovered-human-cancellation",
+      stepId: "approve",
+      attempt: 1,
+      status: "completed",
+      output: { attempt: 1, outcome: "cancel" }
+    });
+    interrupted.appendRunEvent("recovered-human-cancellation", {
+      type: "step.completed",
+      stepId: "approve",
+      payload: { attempt: 1, outcome: "cancel" }
+    });
+    interrupted.close();
+
+    const recovered = await openAgentFlowRunState({ cwd: repoRoot });
+    expect(await executeAgentFlowCommandPipeline(recovered, "recovered-human-cancellation", workflow)).toMatchObject({
+      status: "completed",
+      completedSteps: ["approve", "cancelled"]
+    });
+    expect(fs.readFileSync(path.join(repoRoot, "route.txt"), "utf8")).toBe("cancelled\n");
+    recovered.close();
+  });
+
+  test("fails closed when completed blocking-consult evidence cannot be recovered", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: recovered-blocking-consult
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+sessions:
+  implementer: { provider: fixture, role: implementer }
+  designer: { provider: fixture, role: designer, authority: { can_block: true } }
+steps:
+  - id: consult
+    type: consult
+    from: implementer
+    to: designer
+    question: Is this safe?
+    artifacts: [evidence.md]
+    output: consultations/design.json
+    blocking: true
+  - { id: continue, type: command, command: echo continued >> effects.txt }
+`);
+    const interrupted = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(interrupted, { id: "recovered-blocking-consult", workflow });
+    interrupted.writeArtifact({
+      id: "evidence",
+      runId: "recovered-blocking-consult",
+      path: "evidence.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Evidence"
+    });
+    interrupted.acquireRunLock("recovered-blocking-consult", "run", { ttlMs: 60_000 });
+    interrupted.transitionRunWithEvent("recovered-blocking-consult", {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    interrupted.updateRun("recovered-blocking-consult", {
+      currentStepId: "consult",
+      context: {
+        ...interrupted.getRun("recovered-blocking-consult")!.context,
+        executionRouting: {
+          stepAttemptLimits: {},
+          visits: { consult: 1 },
+          recoveryCycles: {},
+          recoveryInvocations: {},
+          disagreementEpisodes: {},
+          disagreementRounds: {},
+          attempts: { consult: 1 }
+        }
+      }
+    });
+    interrupted.upsertStep({
+      runId: "recovered-blocking-consult",
+      stepId: "consult",
+      attempt: 1,
+      status: "completed",
+      output: { attempt: 1, outputs: ["consultations/design.json"] }
+    });
+    interrupted.appendRunEvent("recovered-blocking-consult", {
+      type: "step.completed",
+      stepId: "consult",
+      payload: { attempt: 1, outputs: ["consultations/design.json"] }
+    });
+    interrupted.close();
+
+    const recovered = await openAgentFlowRunState({ cwd: repoRoot });
+    await expect(executeAgentFlowCommandPipeline(recovered, "recovered-blocking-consult", workflow))
+      .resolves.toMatchObject({
+        status: "paused",
+        message: expect.stringContaining("blocking evidence is unavailable")
+      });
+    expect(recovered.getRun("recovered-blocking-consult")?.status).toBe("paused");
+    expect(fs.existsSync(path.join(repoRoot, "effects.txt"))).toBe(false);
+    recovered.close();
   });
 
   test("runs a safe command pipeline and persists logs, declared artifacts, and completion state", async () => {

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   findGitRepositoryRoot,
   PathContainmentError,
@@ -18,8 +19,9 @@ import {
 } from "./run_state_schema";
 import { defaultAgentFlowApprovalOutputPath } from "./approval";
 
-export const AGENT_FLOW_RUN_STATE_SCHEMA_VERSION = 4;
+export const AGENT_FLOW_RUN_STATE_SCHEMA_VERSION = 5;
 export const DEFAULT_AGENT_FLOW_DATABASE_PATH = ".agent-flow/agent-flow.sqlite";
+export const DEFAULT_AGENT_FLOW_RUN_LOCK_TTL_MS = 60_000;
 export const AGENT_FLOW_FINAL_SUMMARY_PATH = "final-summary.md";
 export const MAX_AGENT_FLOW_RECOVERY_CONTEXT_BYTES = 64 * 1024;
 export const MAX_AGENT_FLOW_RECOVERY_CONTEXT_INJECTIONS = 128;
@@ -38,6 +40,25 @@ export interface OpenAgentFlowRunStateOptions {
   databasePath?: string;
   now?: () => string;
   busyTimeoutMs?: number;
+}
+
+export type AgentFlowRunLockOperation = "run" | "resume";
+
+export interface AgentFlowRunLockRecord {
+  runId: string;
+  ownerToken: string;
+  acquisitionId: string;
+  ownerExecutorId: string;
+  ownerProcessId: number;
+  operation: AgentFlowRunLockOperation;
+  acquiredAt: string;
+  expiresAt: string;
+  recoveredStaleLock: boolean;
+}
+
+export interface AcquireAgentFlowRunLockOptions {
+  ownerToken?: string;
+  ttlMs?: number;
 }
 
 export interface AgentFlowRecordPage {
@@ -341,6 +362,12 @@ interface EventRow {
   created_at: string;
 }
 
+interface StepRecoveryRow {
+  attempt: number;
+  status: AgentFlowStepStatus;
+  output_json: string | null;
+}
+
 interface RunRow {
   id: string;
   workflow_name: string;
@@ -359,6 +386,17 @@ interface RunRow {
   updated_at: string;
   started_at: string | null;
   finished_at: string | null;
+}
+
+interface RunLockRow {
+  run_id: string;
+  owner_token: string;
+  acquisition_id: string;
+  owner_executor_id: string;
+  owner_process_id: number;
+  operation: AgentFlowRunLockOperation;
+  acquired_at: string;
+  expires_at: string;
 }
 
 interface SessionRow {
@@ -410,6 +448,9 @@ const TERMINAL_APPROVAL_STATUSES = new Set<AgentFlowApprovalStatus>(["approved",
 const WORKFLOW_STYLES = ["pipeline", "recovery_pipeline", "collaborative"] as const;
 const WORKFLOW_MATURITIES = ["draft", "experimental", "stable", "trusted"] as const;
 const FAILURE_OUTCOMES = new Set<AgentFlowFailureOutcome>(["retry", "pause", "fail", "continue"]);
+const agentFlowExecutorId = randomUUID();
+const activeRunLockOwners = new Set<string>();
+const RUN_LOCK_RELEASE_ATTEMPTS = 3;
 
 export class AgentFlowRunStateError extends Error {
   readonly code: string;
@@ -428,6 +469,8 @@ export class AgentFlowRunStateStore {
   private finalizationRollbackActions: Array<() => void> = [];
   private finalizationArtifactWrites = new Set<string>();
   private finalizationArtifactDeletions = new Set<string>();
+  private readonly heldRunLockOwnerKeys = new Set<string>();
+  private readonly runLockExecution = new AsyncLocalStorage<AbortSignal>();
   readonly repoRoot: string;
   readonly databasePath: string;
   private readonly database: SqliteDatabase;
@@ -439,6 +482,7 @@ export class AgentFlowRunStateStore {
     this.databasePath = input.databasePath;
     this.database = input.database;
     this.now = input.now;
+    installAgentFlowRunLockFencing(this.database);
   }
 
   currentTimestamp(): string {
@@ -449,6 +493,330 @@ export class AgentFlowRunStateStore {
   hasActiveFinalizationTransaction(): boolean {
     this.assertOpen();
     return this.finalizationTransactionActive;
+  }
+
+  acquireRunLock(
+    id: string,
+    operation: AgentFlowRunLockOperation,
+    options: AcquireAgentFlowRunLockOptions = {}
+  ): AgentFlowRunLockRecord {
+    this.assertOpen();
+    const runId = requiredString(id, "Run ID");
+    assertOneOf(operation, ["run", "resume"] as const, "run lock operation");
+    const ownerToken = options.ownerToken === undefined
+      ? randomUUID()
+      : requiredString(options.ownerToken, "Run lock owner token");
+    const acquisitionId = randomUUID();
+    const ttlMs = validRunLockTtl(options.ttlMs ?? DEFAULT_AGENT_FLOW_RUN_LOCK_TTL_MS);
+    // Lock leases coordinate independent executors, so they must share a real
+    // wall-clock domain. The injected clock is reserved for deterministic
+    // persisted business timestamps.
+    const acquiredAt = new Date().toISOString();
+    const expiresAt = new Date(Date.parse(acquiredAt) + ttlMs).toISOString();
+    let recoveredStaleLock = false;
+
+    try {
+      this.database.exec("BEGIN IMMEDIATE");
+      this.requireRun(runId);
+      const existing = this.database.get<RunLockRow>("SELECT * FROM run_locks WHERE run_id = ?", [runId]);
+      const existingOwnerIsActiveHere = existing !== null
+        && existing.owner_executor_id === agentFlowExecutorId
+        && activeRunLockOwners.has(runLockOwnerKey(
+          this.databasePath,
+          existing.run_id,
+          existing.owner_token,
+          existing.acquisition_id
+        ));
+      const existingOwnerWasAbandonedHere = existing !== null
+        && existing.owner_executor_id === agentFlowExecutorId
+        && !existingOwnerIsActiveHere;
+      if (existing !== null && (
+        (!existingOwnerWasAbandonedHere && Date.parse(existing.expires_at) > Date.parse(acquiredAt))
+        || existingOwnerIsActiveHere
+      )) {
+        throw new AgentFlowRunStateError(
+          `Agent Flow run ${runId} is locked for ${existing.operation} by process ${existing.owner_process_id} until ${existing.expires_at}. Retry after the active executor finishes; an expired lease or a lock abandoned by this executor is recovered deterministically.`,
+          "AGENT_FLOW_RUN_LOCKED"
+        );
+      }
+      recoveredStaleLock = existing !== null;
+      this.database.run(
+        `INSERT INTO run_locks (run_id, owner_token, acquisition_id, owner_executor_id, owner_process_id, operation, acquired_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(run_id) DO UPDATE SET
+           owner_token = excluded.owner_token,
+           acquisition_id = excluded.acquisition_id,
+           owner_executor_id = excluded.owner_executor_id,
+           owner_process_id = excluded.owner_process_id,
+           operation = excluded.operation,
+           acquired_at = excluded.acquired_at,
+           expires_at = excluded.expires_at`,
+        [runId, ownerToken, acquisitionId, agentFlowExecutorId, process.pid, operation, acquiredAt, expiresAt]
+      );
+      this.database.run(
+        "INSERT OR REPLACE INTO agent_flow_held_run_locks (run_id, owner_token, acquisition_id) VALUES (?, ?, ?)",
+        [runId, ownerToken, acquisitionId]
+      );
+      this.database.exec("COMMIT");
+      const lock = {
+        runId,
+        ownerToken,
+        acquisitionId,
+        ownerExecutorId: agentFlowExecutorId,
+        ownerProcessId: process.pid,
+        operation,
+        acquiredAt,
+        expiresAt,
+        recoveredStaleLock
+      };
+      const ownerKey = runLockOwnerKey(this.databasePath, runId, ownerToken, acquisitionId);
+      activeRunLockOwners.add(ownerKey);
+      this.heldRunLockOwnerKeys.add(ownerKey);
+      return lock;
+    } catch (error) {
+      rollback(this.database);
+      if (error instanceof AgentFlowRunStateError) throw error;
+      if (isSqliteContentionError(error)) throw concurrentMutationError(`acquire the ${operation} lock for run ${runId}`, error);
+      throw runStateWriteError(`acquire the ${operation} lock for run ${runId}`, error);
+    }
+  }
+
+  renewRunLock(lock: AgentFlowRunLockRecord, ttlMs = DEFAULT_AGENT_FLOW_RUN_LOCK_TTL_MS): AgentFlowRunLockRecord {
+    this.assertOpen();
+    const validatedTtlMs = validRunLockTtl(ttlMs);
+    const renewedAt = new Date().toISOString();
+    const expiresAt = new Date(Date.parse(renewedAt) + validatedTtlMs).toISOString();
+    try {
+      this.database.exec("BEGIN IMMEDIATE");
+      const current = this.database.get<RunLockRow>(
+        "SELECT * FROM run_locks WHERE run_id = ? AND owner_token = ? AND acquisition_id = ? AND owner_executor_id = ?",
+        [lock.runId, lock.ownerToken, lock.acquisitionId, lock.ownerExecutorId]
+      );
+      if (current === null) {
+        throw new AgentFlowRunStateError(
+          `Agent Flow run ${lock.runId} execution lock was lost before it could be renewed. Stop this executor and retry the operation.`,
+          "AGENT_FLOW_RUN_LOCK_LOST"
+        );
+      }
+      this.database.run(
+        "UPDATE run_locks SET expires_at = ? WHERE run_id = ? AND owner_token = ? AND acquisition_id = ? AND owner_executor_id = ?",
+        [expiresAt, lock.runId, lock.ownerToken, lock.acquisitionId, lock.ownerExecutorId]
+      );
+      this.database.exec("COMMIT");
+      return { ...lock, expiresAt };
+    } catch (error) {
+      rollback(this.database);
+      if (error instanceof AgentFlowRunStateError) throw error;
+      if (isSqliteContentionError(error)) throw concurrentMutationError(`renew the execution lock for run ${lock.runId}`, error);
+      throw runStateWriteError(`renew the execution lock for run ${lock.runId}`, error);
+    }
+  }
+
+  releaseRunLock(lock: AgentFlowRunLockRecord): void {
+    this.assertOpen();
+    try {
+      this.database.exec("BEGIN IMMEDIATE");
+      this.database.run(
+        "DELETE FROM run_locks WHERE run_id = ? AND owner_token = ? AND acquisition_id = ? AND owner_executor_id = ?",
+        [lock.runId, lock.ownerToken, lock.acquisitionId, lock.ownerExecutorId]
+      );
+      this.database.run(
+        "DELETE FROM agent_flow_held_run_locks WHERE run_id = ? AND owner_token = ? AND acquisition_id = ?",
+        [lock.runId, lock.ownerToken, lock.acquisitionId]
+      );
+      this.database.exec("COMMIT");
+      const ownerKey = runLockOwnerKey(this.databasePath, lock.runId, lock.ownerToken, lock.acquisitionId);
+      activeRunLockOwners.delete(ownerKey);
+      this.heldRunLockOwnerKeys.delete(ownerKey);
+    } catch (error) {
+      rollback(this.database);
+      if (isSqliteContentionError(error)) throw concurrentMutationError(`release the execution lock for run ${lock.runId}`, error);
+      throw runStateWriteError(`release the execution lock for run ${lock.runId}`, error);
+    }
+  }
+
+  private abandonRunLock(lock: AgentFlowRunLockRecord): void {
+    const ownerKey = runLockOwnerKey(this.databasePath, lock.runId, lock.ownerToken, lock.acquisitionId);
+    try {
+      this.database.exec("BEGIN IMMEDIATE");
+      this.database.run(
+        `UPDATE run_locks SET expires_at = acquired_at
+         WHERE run_id = ? AND owner_token = ? AND acquisition_id = ? AND owner_executor_id = ?`,
+        [lock.runId, lock.ownerToken, lock.acquisitionId, lock.ownerExecutorId]
+      );
+      this.database.run(
+        "DELETE FROM agent_flow_held_run_locks WHERE run_id = ? AND owner_token = ? AND acquisition_id = ?",
+        [lock.runId, lock.ownerToken, lock.acquisitionId]
+      );
+      this.database.exec("COMMIT");
+    } catch {
+      rollback(this.database);
+      // The original lease still expires at its configured TTL. Removing its
+      // in-process ownership below also permits immediate same-executor recovery.
+    } finally {
+      activeRunLockOwners.delete(ownerKey);
+      this.heldRunLockOwnerKeys.delete(ownerKey);
+    }
+  }
+
+  async withRunLock<T>(
+    runId: string,
+    operation: AgentFlowRunLockOperation,
+    callback: (lock: AgentFlowRunLockRecord) => Promise<T>,
+    options: AcquireAgentFlowRunLockOptions = {}
+  ): Promise<T> {
+    const ttlMs = validRunLockTtl(options.ttlMs ?? DEFAULT_AGENT_FLOW_RUN_LOCK_TTL_MS);
+    let lock = this.acquireRunLock(runId, operation, { ...options, ttlMs });
+    let renewalError: unknown;
+    const controller = new AbortController();
+    let callbackCompleted = false;
+    const parentSignal = this.runLockExecution.getStore();
+    const abortFromParent = (): void => controller.abort(parentSignal?.reason);
+    if (parentSignal?.aborted === true) abortFromParent();
+    else parentSignal?.addEventListener("abort", abortFromParent, { once: true });
+    const renewalTimer = setInterval(() => {
+      try {
+        lock = this.renewRunLock(lock, ttlMs);
+        renewalError = undefined;
+      } catch (error) {
+        renewalError = error;
+        if (runLockErrorCode(error) === "AGENT_FLOW_RUN_LOCK_LOST" && !controller.signal.aborted) {
+          controller.abort(error);
+        }
+      }
+    }, Math.max(1, Math.floor(ttlMs / 3)));
+    renewalTimer.unref?.();
+    try {
+      const result = await this.runLockExecution.run(controller.signal, () => {
+        const interruption = this.runLockInterruption();
+        if (interruption !== undefined) throw interruption;
+        return callback(lock);
+      });
+      callbackCompleted = true;
+      if (runLockErrorCode(renewalError) === "AGENT_FLOW_RUN_LOCK_LOST") throw renewalError;
+      let validationError: unknown;
+      for (let attempt = 1; attempt <= RUN_LOCK_RELEASE_ATTEMPTS; attempt += 1) {
+        try {
+          lock = this.renewRunLock(lock, ttlMs);
+          validationError = undefined;
+          break;
+        } catch (error) {
+          validationError = error;
+          if (runLockErrorCode(error) !== "AGENT_FLOW_CONCURRENT_MUTATION") break;
+          if (attempt < RUN_LOCK_RELEASE_ATTEMPTS) await waitForRunLockRetry(attempt * 25);
+        }
+      }
+      if (validationError !== undefined) throw validationError;
+      return result;
+    } catch (error) {
+      if (runLockErrorCode(error) === "AGENT_FLOW_RUN_LOCK_LOST") throw error;
+      if (isRunLockFenceError(error)) throw runLockLostError(runId, error);
+      throw error;
+    } finally {
+      clearInterval(renewalTimer);
+      parentSignal?.removeEventListener("abort", abortFromParent);
+      if (!callbackCompleted) {
+        this.abandonRunLock(lock);
+      } else {
+        let releaseError: unknown;
+        for (let attempt = 1; attempt <= RUN_LOCK_RELEASE_ATTEMPTS; attempt += 1) {
+          try {
+            this.releaseRunLock(lock);
+            releaseError = undefined;
+            break;
+          } catch (error) {
+            releaseError = error;
+            if (runLockErrorCode(error) !== "AGENT_FLOW_CONCURRENT_MUTATION") break;
+            if (attempt < RUN_LOCK_RELEASE_ATTEMPTS) await waitForRunLockRetry(attempt * 25);
+          }
+        }
+        if (releaseError !== undefined) {
+          const ownerKey = runLockOwnerKey(this.databasePath, lock.runId, lock.ownerToken, lock.acquisitionId);
+          activeRunLockOwners.delete(ownerKey);
+          this.heldRunLockOwnerKeys.delete(ownerKey);
+          throw releaseError;
+        }
+      }
+    }
+  }
+
+  runLockInterruption(): AgentFlowRunStateError | undefined {
+    const signal = this.runLockExecution.getStore();
+    if (signal?.aborted !== true) return undefined;
+    return signal.reason instanceof AgentFlowRunStateError
+      ? signal.reason
+      : new AgentFlowRunStateError(
+        "The active Agent Flow execution lock was lost. Stop this executor and retry the operation.",
+        "AGENT_FLOW_RUN_LOCK_LOST",
+        { cause: signal.reason }
+      );
+  }
+
+  recoverInterruptedRun(lock: AgentFlowRunLockRecord): Record<string, number> {
+    this.assertOpen();
+    if (!lock.recoveredStaleLock) {
+      throw new AgentFlowRunStateError(
+        `Agent Flow run ${lock.runId} does not have a recovered execution lease.`,
+        "AGENT_FLOW_RUN_LOCK_RECOVERY"
+      );
+    }
+    const timestamp = currentTimestamp(this.now);
+    try {
+      this.database.exec("BEGIN IMMEDIATE");
+      const currentLock = this.database.get<Pick<RunLockRow, "owner_token" | "acquisition_id" | "owner_executor_id">>(
+        "SELECT owner_token, acquisition_id, owner_executor_id FROM run_locks WHERE run_id = ?",
+        [lock.runId]
+      );
+      if (currentLock?.owner_token !== lock.ownerToken
+          || currentLock.acquisition_id !== lock.acquisitionId
+          || currentLock.owner_executor_id !== lock.ownerExecutorId) {
+        throw runLockLostError(lock.runId);
+      }
+      const run = this.requireRun(lock.runId);
+      const attempts = Object.fromEntries(this.database.all<{ step_id: string; attempt: number }>(
+        "SELECT step_id, MAX(attempt) AS attempt FROM run_steps WHERE run_id = ? GROUP BY step_id",
+        [lock.runId]
+      ).map((row) => [row.step_id, row.attempt]));
+      if (run.status !== "running") {
+        this.database.exec("COMMIT");
+        return attempts;
+      }
+      this.database.run(
+        `UPDATE run_steps SET status = 'cancelled', updated_at = ?, finished_at = COALESCE(finished_at, ?)
+         WHERE run_id = ? AND finished_at IS NULL`,
+        [timestamp, timestamp, lock.runId]
+      );
+      this.database.run(
+        `UPDATE sessions SET status = 'waiting', updated_at = ?, finished_at = NULL
+         WHERE run_id = ? AND status = 'running' AND finished_at IS NULL`,
+        [timestamp, lock.runId]
+      );
+      this.database.run(
+        `UPDATE approvals SET status = 'cancelled', decided_by = COALESCE(decided_by, 'system'),
+           decision = COALESCE(decision, 'execution_recovered'), updated_at = ?, decided_at = COALESCE(decided_at, ?)
+         WHERE run_id = ? AND status = 'requested'`,
+        [timestamp, timestamp, lock.runId]
+      );
+      this.database.run(
+        `UPDATE runs SET status = 'pending', error_json = NULL, updated_at = ?, finished_at = NULL
+         WHERE id = ? AND status = 'running'`,
+        [timestamp, lock.runId]
+      );
+      this.appendNextEvent(lock.runId, {
+        type: "run.execution_recovered",
+        payload: {
+          priorStatus: "running",
+          ...(run.currentStepId === null ? {} : { interruptedStepId: run.currentStepId })
+        }
+      });
+      this.database.exec("COMMIT");
+      return attempts;
+    } catch (error) {
+      rollback(this.database);
+      if (error instanceof AgentFlowRunStateError) throw error;
+      if (isRunLockFenceError(error)) throw runLockLostError(lock.runId, error);
+      throw runStateWriteError(`recover interrupted run ${lock.runId}`, error);
+    }
   }
 
   createRun(input: CreateAgentFlowRunInput): AgentFlowRunRecord {
@@ -531,37 +899,51 @@ export class AgentFlowRunStateStore {
     ).map(hydrateRun);
   }
 
-  withRunFinalizationTransaction<T>(runId: string, callback: () => T): T {
+  withRunStateTransaction<T>(runId: string, callback: () => T): T {
     this.assertOpen();
     const normalizedRunId = requiredString(runId, "Run ID");
-    this.requireRun(normalizedRunId);
-    if (this.finalizationTransactionActive) return callback();
-    this.database.exec("BEGIN IMMEDIATE");
-    this.finalizationTransactionActive = true;
-    this.finalizationCommitActions = [];
-    this.finalizationRollbackActions = [];
-    this.finalizationArtifactWrites = new Set();
-    this.finalizationArtifactDeletions = new Set();
+    if (this.finalizationTransactionActive) {
+      this.requireRun(normalizedRunId);
+      return callback();
+    }
+    let transactionStarted = false;
     let databaseCommitted = false;
     try {
+      this.database.exec("BEGIN IMMEDIATE");
+      transactionStarted = true;
+      this.requireRun(normalizedRunId);
+      this.finalizationTransactionActive = true;
+      this.finalizationCommitActions = [];
+      this.finalizationRollbackActions = [];
+      this.finalizationArtifactWrites = new Set();
+      this.finalizationArtifactDeletions = new Set();
       const result = callback();
       this.database.exec("COMMIT");
       databaseCommitted = true;
       this.finalizationCommitActions.forEach((action) => action());
       return result;
     } catch (error) {
-      if (!databaseCommitted) {
+      if (transactionStarted && !databaseCommitted) {
         rollback(this.database);
         [...this.finalizationRollbackActions].reverse().forEach((action) => action());
       }
+      if (isSqliteContentionError(error)) {
+        throw concurrentMutationError(`start a state transaction for run ${normalizedRunId}`, error);
+      }
       throw error;
     } finally {
-      this.finalizationTransactionActive = false;
-      this.finalizationCommitActions = [];
-      this.finalizationRollbackActions = [];
-      this.finalizationArtifactWrites = new Set();
-      this.finalizationArtifactDeletions = new Set();
+      if (transactionStarted) {
+        this.finalizationTransactionActive = false;
+        this.finalizationCommitActions = [];
+        this.finalizationRollbackActions = [];
+        this.finalizationArtifactWrites = new Set();
+        this.finalizationArtifactDeletions = new Set();
+      }
     }
+  }
+
+  withRunFinalizationTransaction<T>(runId: string, callback: () => T): T {
+    return this.withRunStateTransaction(runId, callback);
   }
 
   updateRun(id: string, input: UpdateAgentFlowRunInput): AgentFlowRunRecord {
@@ -729,6 +1111,24 @@ export class AgentFlowRunStateStore {
     ]);
   }
 
+  latestStepRecoveryState(
+    runId: string,
+    stepId: string
+  ): { attempt: number; status: AgentFlowStepStatus; output: AgentFlowRunStateValue | null } | null {
+    this.assertOpen();
+    const row = this.database.get<StepRecoveryRow>(
+      `SELECT attempt, status, output_json FROM run_steps
+       WHERE run_id = ? AND step_id = ?
+       ORDER BY attempt DESC LIMIT 1`,
+      [requiredString(runId, "Run ID"), requiredString(stepId, "Step ID")]
+    );
+    return row === null ? null : {
+      attempt: row.attempt,
+      status: row.status,
+      output: row.output_json === null ? null : JSON.parse(row.output_json) as AgentFlowRunStateValue
+    };
+  }
+
   upsertArtifact(input: UpsertAgentFlowArtifactInput): void {
     this.assertOpen();
     const runId = requiredString(input.runId, "Run ID");
@@ -838,8 +1238,8 @@ export class AgentFlowRunStateStore {
     let fileMutationStarted = false;
     let committed = false;
 
-    if (manageTransaction) this.database.exec("BEGIN IMMEDIATE");
     try {
+      if (manageTransaction) this.database.exec("BEGIN IMMEDIATE");
       if (input.requiredRunStatus !== undefined) {
         const status = this.database.get<{ status: AgentFlowRunStatus }>("SELECT status FROM runs WHERE id = ?", [runId])?.status;
         if (status !== input.requiredRunStatus) {
@@ -1044,6 +1444,10 @@ export class AgentFlowRunStateStore {
       if (!committed && fileMutationStarted) restoreArtifactWrite(target, temporaryPath, backupPath, targetExistedBeforeWrite);
       else removeArtifactStagingEntry(temporaryPath);
       if (error instanceof AgentFlowRunStateError) throw error;
+      if (isRunLockFenceError(error)) throw runLockLostError(runId, error);
+      if (isSqliteContentionError(error)) {
+        throw concurrentMutationError(`write artifact ${declaredPath} for run ${runId}`, error);
+      }
       throw new AgentFlowRunStateError(
         `Could not write artifact ${declaredPath} for run ${runId}: ${errorMessage(error)}`,
         "AGENT_FLOW_ARTIFACT_WRITE",
@@ -1073,8 +1477,10 @@ export class AgentFlowRunStateStore {
       return inputs.map((input) => this.writeArtifact(input));
     }
     let snapshots: Array<{ declaredPath: string; row: ArtifactRow | null; targetExisted: boolean }> = [];
-    this.database.exec("BEGIN IMMEDIATE");
+    let transactionStarted = false;
     try {
+      this.database.exec("BEGIN IMMEDIATE");
+      transactionStarted = true;
       snapshots = paths.map((declaredPath) => {
         const row = this.database.get<ArtifactRow>("SELECT * FROM artifacts WHERE run_id = ? AND path = ?", [runId, declaredPath]);
         const target = artifactStoragePath(this.repoRoot, runId, declaredPath, false);
@@ -1090,20 +1496,25 @@ export class AgentFlowRunStateStore {
       }
       return artifacts;
     } catch (error) {
-      rollback(this.database);
-      try {
-        this.restoreArtifactBatch(runId, snapshots);
-        for (const declaredPath of paths) {
-          const { temporaryPath, backupPath } = artifactStagingPaths(this.repoRoot, runId, declaredPath);
-          removeArtifactStagingEntry(temporaryPath);
-          removeArtifactStagingEntry(backupPath);
+      if (transactionStarted) {
+        rollback(this.database);
+        try {
+          this.restoreArtifactBatch(runId, snapshots);
+          for (const declaredPath of paths) {
+            const { temporaryPath, backupPath } = artifactStagingPaths(this.repoRoot, runId, declaredPath);
+            removeArtifactStagingEntry(temporaryPath);
+            removeArtifactStagingEntry(backupPath);
+          }
+        } catch (restoreError) {
+          throw new AgentFlowRunStateError(
+            `Could not roll back atomic artifact batch for run ${runId}: ${errorMessage(restoreError)}`,
+            "AGENT_FLOW_ARTIFACT_ROLLBACK",
+            { cause: error }
+          );
         }
-      } catch (restoreError) {
-        throw new AgentFlowRunStateError(
-          `Could not roll back atomic artifact batch for run ${runId}: ${errorMessage(restoreError)}`,
-          "AGENT_FLOW_ARTIFACT_ROLLBACK",
-          { cause: error }
-        );
+      }
+      if (isSqliteContentionError(error)) {
+        throw concurrentMutationError(`write an atomic artifact batch for run ${runId}`, error);
       }
       throw error;
     } finally {
@@ -1712,7 +2123,8 @@ export class AgentFlowRunStateStore {
 
   settleRecoverySessionForRunAtContextRevision(
     input: SettleAgentFlowSessionInput,
-    revision: number
+    revision: number,
+    settledState?: () => Record<string, AgentFlowRunStateValue>
   ): { settled: boolean; stopped?: AgentFlowRunStopStatus } {
     this.assertOpen();
     const runId = requiredString(input.runId, "Run ID");
@@ -1723,19 +2135,16 @@ export class AgentFlowRunStateStore {
         "AGENT_FLOW_RECOVERY_CONTEXT_INVALID"
       );
     }
-    this.database.exec("BEGIN IMMEDIATE");
-    try {
+    return this.withRunStateTransaction(runId, () => {
       const row = this.database.get<SessionRow>(
         "SELECT * FROM sessions WHERE run_id = ? AND id = ?",
         [runId, sessionId]
       );
       if (row === null || row.status !== "running") {
-        rollback(this.database);
         return { settled: false };
       }
       const state = JSON.parse(row.state_json) as Record<string, AgentFlowRunStateValue>;
       if (!isRecoveryRemediationState(state)) {
-        rollback(this.database);
         return { settled: false };
       }
       const currentRevision = typeof state.contextRevision === "number"
@@ -1744,7 +2153,6 @@ export class AgentFlowRunStateStore {
         ? state.contextRevision
         : 0;
       if (currentRevision !== revision) {
-        rollback(this.database);
         return { settled: false };
       }
       const runStatus = this.requireRun(runId).status;
@@ -1760,17 +2168,15 @@ export class AgentFlowRunStateStore {
         status: stopped ?? "waiting",
         state: {
           ...state,
-          ...(stopped === undefined ? input.waitingState : { ...input.interruptedState, interrupted: stopped }),
+          ...(stopped === undefined
+            ? { ...input.waitingState, ...(settledState?.() ?? {}) }
+            : { ...input.interruptedState, interrupted: stopped }),
           dirty: false,
           appliedContextRevision: revision
         }
       });
-      this.database.exec("COMMIT");
       return { settled: true, ...(stopped === undefined ? {} : { stopped }) };
-    } catch (error) {
-      rollback(this.database);
-      throw error;
-    }
+    });
   }
 
   recordFailure(input: RecordAgentFlowFailureInput): void {
@@ -2165,6 +2571,8 @@ export class AgentFlowRunStateStore {
 
   close(): void {
     if (this.closed) return;
+    for (const ownerKey of this.heldRunLockOwnerKeys) activeRunLockOwners.delete(ownerKey);
+    this.heldRunLockOwnerKeys.clear();
     this.database.close();
     this.closed = true;
   }
@@ -3148,6 +3556,16 @@ function validBusyTimeout(value: number): number {
   return value;
 }
 
+function validRunLockTtl(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 3) {
+    throw new AgentFlowRunStateError(
+      "Run lock TTL must be an integer of at least 3 milliseconds.",
+      "AGENT_FLOW_RUN_LOCK_OPTION"
+    );
+  }
+  return value;
+}
+
 function rollback(database: SqliteDatabase): void {
   try {
     database.exec("ROLLBACK");
@@ -3165,7 +3583,95 @@ function isSqliteContentionError(error: unknown): boolean {
 }
 
 function runStateWriteError(operation: string, error: unknown): AgentFlowRunStateError {
+  if (isRunLockFenceError(error)) {
+    return new AgentFlowRunStateError(
+      `The Agent Flow execution lock was replaced while attempting to ${operation}. Stop this executor and retry the operation.`,
+      "AGENT_FLOW_RUN_LOCK_LOST",
+      { cause: error }
+    );
+  }
+  if (isSqliteContentionError(error)) return concurrentMutationError(operation, error);
   return new AgentFlowRunStateError(`Could not ${operation}: ${errorMessage(error)}`, "AGENT_FLOW_RUN_STATE_WRITE", { cause: error });
+}
+
+function isRunLockFenceError(error: unknown): boolean {
+  const visited = new Set<unknown>();
+  let current = error;
+  while (typeof current === "object" && current !== null && !visited.has(current)) {
+    visited.add(current);
+    if (current instanceof Error && current.message.includes("agent_flow_run_lock_lost")) return true;
+    current = "cause" in current ? current.cause : undefined;
+  }
+  return false;
+}
+
+function runLockLostError(runId: string, cause?: unknown): AgentFlowRunStateError {
+  return new AgentFlowRunStateError(
+    `Agent Flow run ${runId} execution lock was replaced. Stop this executor and retry the operation.`,
+    "AGENT_FLOW_RUN_LOCK_LOST",
+    cause === undefined ? undefined : { cause }
+  );
+}
+
+function concurrentMutationError(operation: string, error: unknown): AgentFlowRunStateError {
+  return new AgentFlowRunStateError(
+    `Could not ${operation} because another Agent Flow state mutation is in progress. Retry after the active mutation completes.`,
+    "AGENT_FLOW_CONCURRENT_MUTATION",
+    { cause: error }
+  );
+}
+
+function runLockOwnerKey(databasePath: string, runId: string, ownerToken: string, acquisitionId: string): string {
+  return `${databasePath}\0${runId}\0${ownerToken}\0${acquisitionId}`;
+}
+
+function runLockErrorCode(error: unknown): string | undefined {
+  return error instanceof AgentFlowRunStateError ? error.code : undefined;
+}
+
+async function waitForRunLockRetry(delayMs: number): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+}
+
+function installAgentFlowRunLockFencing(database: SqliteDatabase): void {
+  const tables = [
+    ["runs", "id"],
+    ["run_steps", "run_id"],
+    ["artifacts", "run_id"],
+    ["events", "run_id"],
+    ["sessions", "run_id"],
+    ["failures", "run_id"],
+    ["approvals", "run_id"],
+    ["budgets", "run_id"]
+  ] as const;
+  const triggers = tables.flatMap(([table, runIdColumn]) => ["INSERT", "UPDATE", "DELETE"].map((operation) => {
+    const row = operation === "DELETE" ? "OLD" : "NEW";
+    const runId = `${row}.${runIdColumn}`;
+    return `
+CREATE TEMP TRIGGER IF NOT EXISTS agent_flow_fence_${table}_${operation.toLowerCase()}
+BEFORE ${operation} ON ${table}
+WHEN EXISTS (
+  SELECT 1 FROM agent_flow_held_run_locks held WHERE held.run_id = ${runId}
+) AND NOT EXISTS (
+  SELECT 1 FROM run_locks locks
+  JOIN agent_flow_held_run_locks held
+    ON held.run_id = locks.run_id
+      AND held.owner_token = locks.owner_token
+      AND held.acquisition_id = locks.acquisition_id
+  WHERE locks.run_id = ${runId}
+)
+BEGIN
+  SELECT RAISE(ABORT, 'agent_flow_run_lock_lost');
+END;`;
+  })).join("\n");
+  database.exec(`
+CREATE TEMP TABLE IF NOT EXISTS agent_flow_held_run_locks (
+  run_id TEXT PRIMARY KEY,
+  owner_token TEXT NOT NULL,
+  acquisition_id TEXT NOT NULL
+);
+${triggers}
+  `);
 }
 
 function errorMessage(error: unknown): string {

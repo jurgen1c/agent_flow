@@ -29,6 +29,7 @@ export interface CreateAgentFlowLifecycleRunInput {
   inputs?: Record<string, AgentFlowRunStateValue>;
   parentRunId?: string;
   recoveryOfRunId?: string;
+  allowInterruptedRecovery?: boolean;
 }
 
 export function createAgentFlowLifecycleRun(
@@ -58,7 +59,7 @@ export function createAgentFlowLifecycleRun(
         "AGENT_FLOW_RUN_COLLISION"
       );
     }
-    if (existing.status !== "pending") {
+    if (!canReuseLifecycleRun(existing, input.allowInterruptedRecovery === true)) {
       throw new AgentFlowRunStateError(
         `Agent Flow run ${input.id} already exists with status ${existing.status} and cannot be reopened. Choose a different run ID.`,
         "AGENT_FLOW_RUN_COLLISION"
@@ -85,7 +86,7 @@ export function createAgentFlowLifecycleRun(
   } catch (error) {
     if (error instanceof AgentFlowRunStateError && error.code === "AGENT_FLOW_RUN_COLLISION") {
       const raced = store.getRun(input.id);
-      if (raced !== null && raced.status === "pending" && matchesWorkflow(
+      if (raced !== null && canReuseLifecycleRun(raced, input.allowInterruptedRecovery === true) && matchesWorkflow(
         raced,
         input.workflow,
         input.inputs ?? {},
@@ -97,6 +98,10 @@ export function createAgentFlowLifecycleRun(
     }
     throw error;
   }
+}
+
+function canReuseLifecycleRun(run: AgentFlowRunRecord, allowInterruptedRecovery: boolean): boolean {
+  return run.status === "pending" || (allowInterruptedRecovery && run.status === "running");
 }
 
 export function transitionAgentFlowLifecycleRun(

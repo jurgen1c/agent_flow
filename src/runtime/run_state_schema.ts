@@ -12,6 +12,8 @@ const REQUIRED_SCHEMA_OBJECTS = [
   "runs_resume_lookup",
   "runs_parent_lookup",
   "runs_recovery_lookup",
+  "run_locks",
+  "run_locks_expiry_lookup",
   "run_steps",
   "run_steps_status_lookup",
   "artifacts",
@@ -37,10 +39,15 @@ export function initializeAgentFlowRunStateSchema(database: SchemaDatabase, sche
     migrateVersionTwoToThree(database);
     existingVersion = "3";
   }
-  if (existingVersion === "3" && schemaVersion === 4) {
+  if (existingVersion === "3" && schemaVersion >= 4) {
     if (schemaNeedsRepair(database)) createSchema(database, 3);
     migrateVersionThreeToFour(database);
     existingVersion = "4";
+  }
+  if (existingVersion === "4" && schemaVersion === 5) {
+    if (schemaNeedsRepair(database)) createSchema(database, 4);
+    migrateVersionFourToFive(database);
+    existingVersion = "5";
   }
   verifySchemaVersion(database, schemaVersion);
   if (existingVersion !== null && schemaNeedsRepair(database)) createSchema(database, schemaVersion);
@@ -107,6 +114,19 @@ CREATE TABLE IF NOT EXISTS runs (
 CREATE INDEX IF NOT EXISTS runs_resume_lookup ON runs(workflow_name, workflow_version, status, updated_at DESC, id ASC);
 CREATE INDEX IF NOT EXISTS runs_parent_lookup ON runs(parent_run_id, id);
 CREATE INDEX IF NOT EXISTS runs_recovery_lookup ON runs(recovery_of_run_id, id);
+
+CREATE TABLE IF NOT EXISTS run_locks (
+  run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+  owner_token TEXT NOT NULL,
+  acquisition_id TEXT NOT NULL CHECK (length(acquisition_id) > 0),
+  owner_executor_id TEXT NOT NULL CHECK (length(owner_executor_id) > 0),
+  owner_process_id INTEGER NOT NULL CHECK (owner_process_id > 0),
+  operation TEXT NOT NULL CHECK (operation IN ('run', 'resume')),
+  acquired_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS run_locks_expiry_lookup ON run_locks(expires_at, run_id);
 
 CREATE TABLE IF NOT EXISTS run_steps (
   run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
@@ -232,7 +252,7 @@ function migrateVersionOneToTwo(database: SchemaDatabase): void {
   database.exec("BEGIN IMMEDIATE");
   try {
     const lockedVersion = existingSchemaVersion(database);
-    if (lockedVersion === "2" || lockedVersion === "3" || lockedVersion === "4") {
+    if (lockedVersion === "2" || lockedVersion === "3" || lockedVersion === "4" || lockedVersion === "5") {
       database.exec("COMMIT");
       return;
     }
@@ -256,7 +276,7 @@ function migrateVersionTwoToThree(database: SchemaDatabase): void {
   database.exec("BEGIN IMMEDIATE");
   try {
     const lockedVersion = existingSchemaVersion(database);
-    if (lockedVersion === "3" || lockedVersion === "4") {
+    if (lockedVersion === "3" || lockedVersion === "4" || lockedVersion === "5") {
       database.exec("COMMIT");
       return;
     }
@@ -279,7 +299,7 @@ function migrateVersionThreeToFour(database: SchemaDatabase): void {
   database.exec("BEGIN IMMEDIATE");
   try {
     const lockedVersion = existingSchemaVersion(database);
-    if (lockedVersion === "4") {
+    if (lockedVersion === "4" || lockedVersion === "5") {
       database.exec("COMMIT");
       return;
     }
@@ -316,6 +336,51 @@ FROM approvals_version_three;
 DROP TABLE approvals_version_three;
     `);
     database.run("UPDATE run_state_metadata SET value = '4' WHERE key = 'schema_version'");
+    database.exec("COMMIT");
+  } catch (error) {
+    rollback(database);
+    throw error;
+  }
+}
+
+function migrateVersionFourToFive(database: SchemaDatabase): void {
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    const lockedVersion = existingSchemaVersion(database);
+    if (lockedVersion === "5") {
+      database.exec("COMMIT");
+      return;
+    }
+    if (lockedVersion !== "4") throw schemaVersionError(lockedVersion ?? "missing", 5);
+    database.exec(`
+CREATE TABLE IF NOT EXISTS run_locks (
+  run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+  owner_token TEXT NOT NULL,
+  acquisition_id TEXT NOT NULL CHECK (length(acquisition_id) > 0),
+  owner_executor_id TEXT NOT NULL CHECK (length(owner_executor_id) > 0),
+  owner_process_id INTEGER NOT NULL CHECK (owner_process_id > 0),
+  operation TEXT NOT NULL CHECK (operation IN ('run', 'resume')),
+  acquired_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+INSERT OR IGNORE INTO run_locks (
+  run_id, owner_token, acquisition_id, owner_executor_id, owner_process_id,
+  operation, acquired_at, expires_at
+)
+SELECT
+  id,
+  'legacy-v4-migration',
+  'legacy-v4:' || id,
+  'legacy-v4-migration',
+  1,
+  'run',
+  '1970-01-01T00:00:00.000Z',
+  '1970-01-01T00:00:00.000Z'
+FROM runs
+WHERE status = 'running';
+CREATE INDEX IF NOT EXISTS run_locks_expiry_lookup ON run_locks(expires_at, run_id);
+    `);
+    database.run("UPDATE run_state_metadata SET value = '5' WHERE key = 'schema_version'");
     database.exec("COMMIT");
   } catch (error) {
     rollback(database);

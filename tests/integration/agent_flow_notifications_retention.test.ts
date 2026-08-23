@@ -844,7 +844,8 @@ notify:
         expect(store.getRun(runId)).toMatchObject({
           error: { code: "notification.required.failed", event: "approval.waiting" }
         });
-        expect(store.getRun(runId)?.context).toEqual(initialContext);
+        expect(store.getRun(runId)?.context).toMatchObject(initialContext);
+        expect(store.getRun(runId)?.context.waiting).toBeUndefined();
         expect(store.listFailures(runId)).toContainEqual(expect.objectContaining({
           classification: "notification_failure",
           stepId: "approve"

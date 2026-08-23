@@ -173,6 +173,51 @@ steps:
     store.close();
   });
 
+  test("rolls back a resumed decision when its routing checkpoint fails", async () => {
+    const repoRoot = temporaryRepo();
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: resume-checkpoint-rollback
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: gate, type: manual_gate, message: Continue?, options: [approve, cancel] }
+  - { id: after, type: command, command: echo after >> effects.txt }
+`);
+    const runId = "resume-checkpoint-rollback";
+    createAgentFlowLifecycleRun(store, { id: runId, workflow });
+    await expect(executeAgentFlowCommandPipeline(store, runId, workflow))
+      .resolves.toMatchObject({ status: "paused" });
+
+    const updateRun = store.updateRun.bind(store);
+    let resumeUpdates = 0;
+    store.updateRun = ((id, input) => {
+      resumeUpdates += 1;
+      if (resumeUpdates === 2) {
+        throw new AgentFlowRunStateError(
+          "checkpoint contention",
+          "AGENT_FLOW_CONCURRENT_MUTATION"
+        );
+      }
+      return updateRun(id, input);
+    }) as typeof store.updateRun;
+
+    await expect(resumeAgentFlowCommandPipeline(store, runId, workflow, { outcome: "approve" }))
+      .rejects.toMatchObject({ code: "AGENT_FLOW_CONCURRENT_MUTATION" });
+    expect(store.getRun(runId)).toMatchObject({
+      status: "paused",
+      context: { waiting: { stepId: "gate" } }
+    });
+    expect(store.latestStepRecoveryState(runId, "gate")).toMatchObject({ status: "waiting" });
+
+    store.updateRun = updateRun;
+    await expect(resumeAgentFlowCommandPipeline(store, runId, workflow, { outcome: "approve" }))
+      .resolves.toMatchObject({ status: "completed" });
+    expect(fs.readFileSync(path.join(repoRoot, "effects.txt"), "utf8")).toBe("after\n");
+    store.close();
+  });
+
   test("honors a declared cancellation without starting later steps", async () => {
     const repoRoot = temporaryRepo();
     const store = await openAgentFlowRunState({ cwd: repoRoot });
@@ -395,8 +440,9 @@ steps:
 `);
     createAgentFlowLifecycleRun(store, { id: "cancel-waiting-run", workflow });
     await executeAgentFlowCommandPipeline(store, "cancel-waiting-run", workflow);
+    const competitor = await openAgentFlowRunState({ cwd: repoRoot });
 
-    const cancelled = transitionAgentFlowLifecycleRun(store, "cancel-waiting-run", "cancel");
+    const cancelled = transitionAgentFlowLifecycleRun(competitor, "cancel-waiting-run", "cancel");
 
     expect(cancelled).toMatchObject({
       changed: true,
@@ -411,6 +457,7 @@ steps:
       "SELECT status, decision FROM approvals WHERE run_id = ?"
     ).get("cancel-waiting-run")).toEqual({ status: "cancelled", decision: "cancel" });
     database.close();
+    competitor.close();
     store.close();
   });
 
