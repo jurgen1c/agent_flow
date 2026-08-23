@@ -104,6 +104,18 @@ describe("Agent Flow run inspection API", () => {
     writer.close();
   });
 
+  test("rejects asynchronous read-transaction callbacks without leaving a transaction open", async () => {
+    const repo = makeRepo();
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createInspectableRun(store, "synchronous-snapshot");
+
+    expect(() => store.withRunStateReadTransaction(async () => store.getRun("synchronous-snapshot")))
+      .toThrow("require a synchronous callback");
+    expect(store.withRunStateReadTransaction(() => store.getRun("synchronous-snapshot")?.id))
+      .toBe("synchronous-snapshot");
+    store.close();
+  });
+
   test("reports structurally malformed persisted workflows as warnings", async () => {
     const repo = makeRepo();
     const store = await openAgentFlowRunState({ cwd: repo });
@@ -283,6 +295,17 @@ steps:
       });
       expect(mutation.status).toBe(405);
       expect(mutation.headers.get("allow")).toBe("GET");
+
+      const gitDirectory = path.join(repo, ".git");
+      const hiddenGitDirectory = path.join(repo, ".git-hidden");
+      fs.renameSync(gitDirectory, hiddenGitDirectory);
+      try {
+        const unknown = await fetch(`${server.url}/not-an-inspection-endpoint`, { headers });
+        expect(unknown.status).toBe(404);
+        expect(await unknown.json()).toMatchObject({ code: "AGENT_FLOW_INSPECTION_NOT_FOUND" });
+      } finally {
+        fs.renameSync(hiddenGitDirectory, gitDirectory);
+      }
     } finally {
       await server.close();
     }

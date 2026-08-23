@@ -98,48 +98,22 @@ async function handleInspectionRequest(
     }
 
     const requestPath = rawRequestPath(request.url ?? "/");
+    const route = inspectionRoute(requestPath);
     const store = await openAgentFlowRunStateForInspection({
       cwd: context.cwd,
       databasePath: context.databasePath
     });
     try {
-      if (requestPath === "/api/runs") {
+      if (route.kind === "list") {
         sendJson(response, 200, { runs: listAgentFlowRunInspectionSummaries(store) });
         return;
       }
-
-      const match = /^\/api\/runs\/([^/]+)$/.exec(requestPath);
-      if (match !== null) {
-        let runId: string;
-        try {
-          runId = decodeURIComponent(match[1]!);
-        } catch {
-          throw new AgentFlowRunInspectionApiError(
-            "Run ID must use valid URL encoding.",
-            400,
-            "AGENT_FLOW_INSPECTION_BAD_REQUEST"
-          );
-        }
-        if (runId.length === 0 || runId !== runId.trim()) {
-          throw new AgentFlowRunInspectionApiError(
-            "Run ID must be a non-empty canonical identifier without surrounding whitespace.",
-            400,
-            "AGENT_FLOW_INSPECTION_BAD_REQUEST"
-          );
-        }
-        const model = buildAgentFlowRunInspectionModel(store, runId);
-        sendJson(response, 200, model);
-        return;
-      }
+      const model = buildAgentFlowRunInspectionModel(store, route.runId);
+      sendJson(response, 200, model);
+      return;
     } finally {
       store.close();
     }
-
-    throw new AgentFlowRunInspectionApiError(
-      "Endpoint not found.",
-      404,
-      "AGENT_FLOW_INSPECTION_NOT_FOUND"
-    );
   } catch (error) {
     if (response.headersSent) {
       response.end();
@@ -174,6 +148,36 @@ function requireToken(value: string | string[] | undefined, expected: string): v
 function rawRequestPath(requestTarget: string): string {
   const queryIndex = requestTarget.indexOf("?");
   return queryIndex === -1 ? requestTarget : requestTarget.slice(0, queryIndex);
+}
+
+function inspectionRoute(requestPath: string): { kind: "list" } | { kind: "detail"; runId: string } {
+  if (requestPath === "/api/runs") return { kind: "list" };
+  const match = /^\/api\/runs\/([^/]+)$/.exec(requestPath);
+  if (match === null) {
+    throw new AgentFlowRunInspectionApiError(
+      "Endpoint not found.",
+      404,
+      "AGENT_FLOW_INSPECTION_NOT_FOUND"
+    );
+  }
+  let runId: string;
+  try {
+    runId = decodeURIComponent(match[1]!);
+  } catch {
+    throw new AgentFlowRunInspectionApiError(
+      "Run ID must use valid URL encoding.",
+      400,
+      "AGENT_FLOW_INSPECTION_BAD_REQUEST"
+    );
+  }
+  if (runId.length === 0 || runId !== runId.trim()) {
+    throw new AgentFlowRunInspectionApiError(
+      "Run ID must be a non-empty canonical identifier without surrounding whitespace.",
+      400,
+      "AGENT_FLOW_INSPECTION_BAD_REQUEST"
+    );
+  }
+  return { kind: "detail", runId };
 }
 
 function tokensEqual(left: string, right: string): boolean {

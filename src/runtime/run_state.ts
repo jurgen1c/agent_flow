@@ -936,6 +936,12 @@ export class AgentFlowRunStateStore {
     this.database.exec("BEGIN");
     try {
       const result = callback();
+      if (isPromiseLike(result)) {
+        throw new AgentFlowRunStateError(
+          "Run-state read transactions require a synchronous callback.",
+          "AGENT_FLOW_RUN_STATE_TRANSACTION"
+        );
+      }
       this.database.exec("COMMIT");
       return result;
     } catch (error) {
@@ -3703,6 +3709,12 @@ function requiredString(value: unknown, label: string): string {
   const normalized = value.trim();
   if (normalized.length === 0) throw new AgentFlowRunStateError(`${label} must be a non-empty string.`, "AGENT_FLOW_RUN_STATE_INVALID");
   return normalized;
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return (typeof value === "object" && value !== null) || typeof value === "function"
+    ? typeof (value as { then?: unknown }).then === "function"
+    : false;
 }
 
 function optionalString(value: unknown, label: string): string | null {
