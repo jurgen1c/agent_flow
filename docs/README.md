@@ -25,6 +25,8 @@ does not replace Agent Memory or depend on it.
    repository also uses Agent Memory.
 7. Use [operations and packaging](operations-and-packaging.md) to promote a
    workflow from draft to execution and to validate a package or release.
+8. Use the [run inspection API](run-inspection-api.md) to expose token-protected
+   local run summaries, timelines, failures, approvals, and decisions.
 
 ## Deeper references
 
@@ -39,6 +41,8 @@ does not replace Agent Memory or depend on it.
 - [Workflow specifications](specifications/) define the supported workflow
   styles and runtime behavior in detail.
 - [Release checklist](releasing.md) documents the maintainer release process.
+- [Run inspection API](run-inspection-api.md) defines the loopback and token
+  boundary for read-only persisted run data.
 
 Documentation in this directory is versioned with the runtime. That keeps
 commands, schemas, examples, and operational guidance reviewable at the same

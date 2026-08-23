@@ -131,6 +131,22 @@ export interface UpsertAgentFlowStepInput {
   error?: AgentFlowRunStateValue;
 }
 
+export interface AgentFlowStepRecord {
+  runId: string;
+  stepId: string;
+  attempt: number;
+  parentStepId: string | null;
+  sessionId: string | null;
+  status: AgentFlowStepStatus;
+  input: AgentFlowRunStateValue | null;
+  output: AgentFlowRunStateValue | null;
+  error: AgentFlowRunStateValue | null;
+  createdAt: string;
+  updatedAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+}
+
 export interface UpsertAgentFlowArtifactInput {
   id: string;
   runId: string;
@@ -360,6 +376,22 @@ interface EventRow {
   type: string;
   payload_json: string | null;
   created_at: string;
+}
+
+interface StepRow {
+  run_id: string;
+  step_id: string;
+  attempt: number;
+  parent_step_id: string | null;
+  session_id: string | null;
+  status: AgentFlowStepStatus;
+  input_json: string | null;
+  output_json: string | null;
+  error_json: string | null;
+  created_at: string;
+  updated_at: string;
+  started_at: string | null;
+  finished_at: string | null;
 }
 
 interface StepRecoveryRow {
@@ -899,6 +931,25 @@ export class AgentFlowRunStateStore {
     ).map(hydrateRun);
   }
 
+  withRunStateReadTransaction<T>(callback: () => T): T {
+    this.assertOpen();
+    this.database.exec("BEGIN");
+    try {
+      const result = callback();
+      if (isPromiseLike(result)) {
+        throw new AgentFlowRunStateError(
+          "Run-state read transactions require a synchronous callback.",
+          "AGENT_FLOW_RUN_STATE_TRANSACTION"
+        );
+      }
+      this.database.exec("COMMIT");
+      return result;
+    } catch (error) {
+      rollback(this.database);
+      throw error;
+    }
+  }
+
   withRunStateTransaction<T>(runId: string, callback: () => T): T {
     this.assertOpen();
     const normalizedRunId = requiredString(runId, "Run ID");
@@ -1109,6 +1160,16 @@ export class AgentFlowRunStateStore {
       input.output === undefined ? 1 : 0,
       input.error === undefined ? 1 : 0
     ]);
+  }
+
+  listSteps(runId: string): AgentFlowStepRecord[] {
+    this.assertOpen();
+    const normalizedRunId = requiredString(runId, "Run ID");
+    this.requireRun(normalizedRunId);
+    return this.database.all<StepRow>(
+      "SELECT * FROM run_steps WHERE run_id = ? ORDER BY created_at ASC, step_id ASC, attempt ASC",
+      [normalizedRunId]
+    ).map(hydrateStep);
   }
 
   latestStepRecoveryState(
@@ -1593,6 +1654,22 @@ export class AgentFlowRunStateStore {
     return rows.map((row) => hydrateArtifact(this.repoRoot, row));
   }
 
+  listArtifactInspectionMetadata(runId: string): AgentFlowArtifactRecord[] {
+    this.assertOpen();
+    const normalizedRunId = artifactRunId(runId);
+    this.requireRun(normalizedRunId);
+    const rows = this.database.all<ArtifactRow>(
+      "SELECT * FROM artifacts WHERE run_id = ? ORDER BY path ASC, id ASC",
+      [normalizedRunId]
+    );
+    return rows.map((row) => this.inspectArtifact(row, false));
+  }
+
+  inspectArtifactRecordForInspection(artifact: AgentFlowArtifactRecord): AgentFlowArtifactRecord {
+    this.assertOpen();
+    return this.inspectArtifact(artifactRow(artifact), false);
+  }
+
   getArtifact(runId: string, declaredPath: string): AgentFlowArtifactRecord | null {
     this.assertOpen();
     const normalizedRunId = artifactRunId(runId);
@@ -1746,15 +1823,53 @@ export class AgentFlowRunStateStore {
     declaredPath: string,
     options: ReadAgentFlowArtifactOptions = {}
   ): AgentFlowArtifactContent {
+    return this.readArtifactInternal(runId, declaredPath, options, true);
+  }
+
+  readArtifactForInspection(
+    runId: string,
+    declaredPath: string,
+    options: ReadAgentFlowArtifactOptions = {}
+  ): AgentFlowArtifactContent {
+    return this.readArtifactInternal(runId, declaredPath, options, false);
+  }
+
+  readArtifactRecordForInspection(
+    artifact: AgentFlowArtifactRecord,
+    options: ReadAgentFlowArtifactOptions = {}
+  ): AgentFlowArtifactContent {
+    return this.readArtifactInternal(
+      artifact.runId,
+      artifact.declaredPath,
+      options,
+      false,
+      artifactRow(artifact)
+    );
+  }
+
+  private readArtifactInternal(
+    runId: string,
+    declaredPath: string,
+    options: ReadAgentFlowArtifactOptions,
+    persistInspection: boolean,
+    snapshotRow?: ArtifactRow
+  ): AgentFlowArtifactContent {
     this.assertOpen();
     const normalizedRunId = artifactRunId(runId);
-    this.requireRun(normalizedRunId);
     const normalizedPath = normalizeAgentFlowArtifactPath(declaredPath);
+    if (snapshotRow === undefined) {
+      this.requireRun(normalizedRunId);
+    } else if (snapshotRow.run_id !== normalizedRunId || snapshotRow.path !== normalizedPath) {
+      throw new AgentFlowRunStateError(
+        "Inspection artifact snapshot does not match the requested run and path.",
+        "AGENT_FLOW_ARTIFACT_INVALID"
+      );
+    }
     const maxBytes = options.maxBytes;
     if (maxBytes !== undefined && (!Number.isSafeInteger(maxBytes) || maxBytes < 0)) {
       throw new AgentFlowRunStateError("Artifact read maxBytes must be a non-negative integer.", "AGENT_FLOW_ARTIFACT_INVALID");
     }
-    const row = this.database.get<ArtifactRow>(
+    const row = snapshotRow ?? this.database.get<ArtifactRow>(
       "SELECT * FROM artifacts WHERE run_id = ? AND path = ?",
       [normalizedRunId, normalizedPath]
     );
@@ -1836,12 +1951,14 @@ export class AgentFlowRunStateStore {
       }
       const timestamp = currentTimestamp(this.now);
       const status: AgentFlowArtifactStatus = row.previous_checksum === null ? "available" : "overwritten";
-      this.database.run(
-        `UPDATE artifacts SET status = ?, checked_at = ?, updated_at = CASE WHEN status = ? THEN updated_at ELSE ? END
-         WHERE run_id = ? AND id = ? AND checksum = ?`,
-        [status, timestamp, status, timestamp, normalizedRunId, row.id, row.checksum]
-      );
-      const current = this.database.get<ArtifactRow>(
+      if (persistInspection) {
+        this.database.run(
+          `UPDATE artifacts SET status = ?, checked_at = ?, updated_at = CASE WHEN status = ? THEN updated_at ELSE ? END
+           WHERE run_id = ? AND id = ? AND checksum = ?`,
+          [status, timestamp, status, timestamp, normalizedRunId, row.id, row.checksum]
+        );
+      }
+      const current = snapshotRow ?? this.database.get<ArtifactRow>(
         "SELECT * FROM artifacts WHERE run_id = ? AND id = ?",
         [normalizedRunId, row.id]
       );
@@ -1851,7 +1968,9 @@ export class AgentFlowRunStateStore {
           "AGENT_FLOW_ARTIFACT_STALE"
         );
       }
-      const artifact = hydrateArtifact(this.repoRoot, current);
+      const artifact = hydrateArtifact(this.repoRoot, persistInspection
+        ? current
+        : { ...current, status, checked_at: timestamp });
       return { artifact, content };
     } finally {
       fs.closeSync(descriptor);
@@ -2199,16 +2318,8 @@ export class AgentFlowRunStateStore {
   }
 
   listFailures(runId: string, page?: AgentFlowRecordPage): AgentFlowFailureRecord[] {
-    this.assertOpen();
     const normalizedRunId = requiredString(runId, "Run ID");
-    this.requireRun(normalizedRunId);
-    const pagination = recordPage(page, "created_at");
-    const order = page === undefined ? "created_at ASC, rowid ASC" : "created_at ASC, id ASC";
-    return this.database.all<FailureRow>(
-      `SELECT * FROM failures WHERE run_id = ?${pagination.where} ORDER BY ${order}${pagination.sql}`,
-      [normalizedRunId, ...pagination.parameters]
-    ).map((row) => {
-      const failure = hydrateFailure(row);
+    return this.listFailureMetadata(normalizedRunId, page).map((failure) => {
       if (failure.payloadPath === null) return failure;
       let artifact: AgentFlowArtifactRecord | null;
       try {
@@ -2226,6 +2337,18 @@ export class AgentFlowRunStateStore {
         ? failure
         : { ...failure, payloadPath: null };
     });
+  }
+
+  listFailureMetadata(runId: string, page?: AgentFlowRecordPage): AgentFlowFailureRecord[] {
+    this.assertOpen();
+    const normalizedRunId = requiredString(runId, "Run ID");
+    this.requireRun(normalizedRunId);
+    const pagination = recordPage(page, "created_at");
+    const order = page === undefined ? "created_at ASC, rowid ASC" : "created_at ASC, id ASC";
+    return this.database.all<FailureRow>(
+      `SELECT * FROM failures WHERE run_id = ?${pagination.where} ORDER BY ${order}${pagination.sql}`,
+      [normalizedRunId, ...pagination.parameters]
+    ).map(hydrateFailure);
   }
 
   listPendingReturnedRecoveryFailures(
@@ -2715,7 +2838,7 @@ export class AgentFlowRunStateStore {
     }
   }
 
-  private inspectArtifact(row: ArtifactRow): AgentFlowArtifactRecord {
+  private inspectArtifact(row: ArtifactRow, persistInspection = true): AgentFlowArtifactRecord {
     let status: AgentFlowArtifactStatus;
     let actualChecksum: string | null = null;
     const metadata = JSON.parse(row.metadata_json) as Record<string, AgentFlowRunStateValue>;
@@ -2730,6 +2853,8 @@ export class AgentFlowRunStateStore {
           const stat = fs.statSync(target);
           if (!stat.isFile() || row.checksum === null || row.size_bytes === null || stat.size !== row.size_bytes) {
             status = "stale";
+          } else if (!persistInspection) {
+            status = row.previous_checksum !== null ? "overwritten" : "available";
           } else {
             actualChecksum = artifactChecksum(target);
             status = actualChecksum !== row.checksum
@@ -2742,12 +2867,18 @@ export class AgentFlowRunStateStore {
         if ((error instanceof AgentFlowRunStateError && error.code === "AGENT_FLOW_ARTIFACT_PATH") || code === "ELOOP") {
           status = "stale";
         } else if (["ENOENT", "ENOTDIR"].includes(code)) {
-          const { deletionBackupPath } = artifactStagingPaths(this.repoRoot, row.run_id, row.path);
-          status = isSymbolicLink(deletionBackupPath)
-            ? "stale"
-            : fs.existsSync(deletionBackupPath) && fs.statSync(deletionBackupPath).isFile()
-              ? row.status
-              : "missing";
+          if (!persistInspection) {
+            status = "missing";
+          } else {
+            const { deletionBackupPath } = artifactStagingPaths(this.repoRoot, row.run_id, row.path);
+            status = isSymbolicLink(deletionBackupPath)
+              ? "stale"
+              : fs.existsSync(deletionBackupPath) && fs.statSync(deletionBackupPath).isFile()
+                ? row.status
+                : "missing";
+          }
+        } else if (!persistInspection) {
+          status = "stale";
         } else {
           throw error;
         }
@@ -2755,8 +2886,9 @@ export class AgentFlowRunStateStore {
     }
     const timestamp = currentTimestamp(this.now);
     const original = row;
-    const updatedAt = status === row.status ? row.updated_at : timestamp;
+    const updatedAt = !persistInspection || status === row.status ? row.updated_at : timestamp;
     const inspected = { ...row, status, checked_at: timestamp, updated_at: updatedAt };
+    if (!persistInspection) return hydrateArtifact(this.repoRoot, inspected);
     let statusPersisted = false;
     try {
       this.database.run(
@@ -2824,12 +2956,25 @@ export interface AgentFlowRunMutationResult {
 }
 
 export async function openAgentFlowRunState(options: OpenAgentFlowRunStateOptions = {}): Promise<AgentFlowRunStateStore> {
+  return openAgentFlowRunStateInternal(options, false);
+}
+
+export async function openAgentFlowRunStateForInspection(
+  options: OpenAgentFlowRunStateOptions = {}
+): Promise<AgentFlowRunStateStore> {
+  return openAgentFlowRunStateInternal(options, true);
+}
+
+async function openAgentFlowRunStateInternal(
+  options: OpenAgentFlowRunStateOptions,
+  readonly: boolean
+): Promise<AgentFlowRunStateStore> {
   const repoRoot = findRepositoryRoot(options.cwd ?? process.cwd());
   const databasePath = resolveLocalDatabasePath(repoRoot, options.databasePath ?? DEFAULT_AGENT_FLOW_DATABASE_PATH);
   const busyTimeoutMs = validBusyTimeout(options.busyTimeoutMs ?? 5_000);
-  fs.mkdirSync(path.dirname(databasePath), { recursive: true });
+  if (!readonly) fs.mkdirSync(path.dirname(databasePath), { recursive: true });
 
-  const database = await openSqliteDatabase(databasePath, { busyTimeoutMs });
+  const database = await openSqliteDatabase(databasePath, { busyTimeoutMs, readonly });
   try {
     database.exec("PRAGMA foreign_keys = ON");
     initializeAgentFlowRunStateSchema(database, AGENT_FLOW_RUN_STATE_SCHEMA_VERSION);
@@ -2939,6 +3084,27 @@ function hydrateArtifact(repoRoot: string, row: ArtifactRow): AgentFlowArtifactR
   };
 }
 
+function artifactRow(artifact: AgentFlowArtifactRecord): ArtifactRow {
+  return {
+    run_id: artifact.runId,
+    id: artifact.id,
+    step_id: artifact.producerStepId,
+    path: artifact.declaredPath,
+    kind: artifact.kind,
+    content_type: artifact.contentType,
+    checksum: artifact.checksum,
+    size_bytes: artifact.sizeBytes,
+    status: artifact.status,
+    previous_checksum: artifact.previousChecksum,
+    metadata_json: stableJson(artifact.metadata),
+    created_at: artifact.createdAt,
+    updated_at: artifact.updatedAt,
+    written_at: artifact.writtenAt,
+    checked_at: artifact.checkedAt,
+    generation: artifact.generation
+  };
+}
+
 function hydrateEvent(row: EventRow): AgentFlowEventRecord {
   return {
     id: row.id,
@@ -2949,6 +3115,24 @@ function hydrateEvent(row: EventRow): AgentFlowEventRecord {
     type: row.type,
     payload: row.payload_json === null ? null : JSON.parse(row.payload_json) as AgentFlowRunStateValue,
     createdAt: row.created_at
+  };
+}
+
+function hydrateStep(row: StepRow): AgentFlowStepRecord {
+  return {
+    runId: row.run_id,
+    stepId: row.step_id,
+    attempt: row.attempt,
+    parentStepId: row.parent_step_id,
+    sessionId: row.session_id,
+    status: row.status,
+    input: row.input_json === null ? null : JSON.parse(row.input_json) as AgentFlowRunStateValue,
+    output: row.output_json === null ? null : JSON.parse(row.output_json) as AgentFlowRunStateValue,
+    error: row.error_json === null ? null : JSON.parse(row.error_json) as AgentFlowRunStateValue,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    startedAt: row.started_at,
+    finishedAt: row.finished_at
   };
 }
 
@@ -3525,6 +3709,12 @@ function requiredString(value: unknown, label: string): string {
   const normalized = value.trim();
   if (normalized.length === 0) throw new AgentFlowRunStateError(`${label} must be a non-empty string.`, "AGENT_FLOW_RUN_STATE_INVALID");
   return normalized;
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return (typeof value === "object" && value !== null) || typeof value === "function"
+    ? typeof (value as { then?: unknown }).then === "function"
+    : false;
 }
 
 function optionalString(value: unknown, label: string): string | null {
