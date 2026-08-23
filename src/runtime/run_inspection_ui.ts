@@ -132,7 +132,7 @@ h3 { margin-bottom: 6px; font-size: 0.95rem; }
   background: #211b12;
 }
 
-.token-panel form { max-width: 520px; }
+.token-panel #token-form { max-width: 520px; }
 .token-panel label { display: block; margin-bottom: 6px; font-size: 0.8rem; font-weight: 700; }
 .token-panel p { margin: 7px 0 0; color: var(--muted); font-size: 0.76rem; }
 .token-controls { display: flex; gap: 8px; }

@@ -115,6 +115,8 @@ describe("Agent Flow run inspection API", () => {
       limit: 1,
       after: { sortValue: firstStep.createdAt }
     })).toThrow("offset pagination only");
+    expect(() => buildAgentFlowRunInspectionPage(store, "paged-model", "events", 0, 201))
+      .toThrow("limit between 1 and 200");
     store.listEvents = listEvents;
     store.close();
   });
@@ -474,6 +476,8 @@ steps:
       expect(stylesheet.headers.get("content-type")).toBe("text/css; charset=utf-8");
       const css = await stylesheet.text();
       expect(css).toContain(".timeline-entry");
+      expect(css).toContain(".token-panel #token-form { max-width: 520px; }");
+      expect(css).not.toContain(".token-panel form { max-width: 520px; }");
       expect(css).toContain(".code-toolbar { display: flex; justify-content: flex-end;");
       expect(css).not.toContain(".code-block .copy-button { position: absolute;");
 

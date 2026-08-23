@@ -124,10 +124,10 @@ export function buildAgentFlowRunInspectionPage(
   limit: number
 ): AgentFlowRunInspectionPage {
   if (!Number.isSafeInteger(offset) || offset < 0
-      || !Number.isSafeInteger(limit) || limit < 1 || limit > 999
+      || !Number.isSafeInteger(limit) || limit < 1 || limit > 200
       || offset > Number.MAX_SAFE_INTEGER - limit - 1) {
     throw new AgentFlowRunStateError(
-      "Inspection pages require a non-negative offset and a limit between 1 and 999.",
+      "Inspection pages require a non-negative offset and a limit between 1 and 200.",
       "AGENT_FLOW_RUN_STATE_PAGE"
     );
   }
