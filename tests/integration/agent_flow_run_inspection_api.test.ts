@@ -5,7 +5,9 @@ import net from "node:net";
 import path from "node:path";
 import {
   AGENT_FLOW_RUN_INSPECTION_TOKEN_HEADER,
+  AGENT_FLOW_RUN_INSPECTION_RUN_ID_HEADER,
   buildAgentFlowRunInspectionModel,
+  buildAgentFlowRunInspectionPage,
   createAgentFlowLifecycleRun,
   listAgentFlowRunInspectionSummaries,
   openAgentFlowRunState,
@@ -74,6 +76,97 @@ describe("Agent Flow run inspection API", () => {
     store.close();
   });
 
+  test("loads paged evidence without materializing unrelated run sections", async () => {
+    const repo = makeRepo();
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createInspectableRun(store, "paged-model");
+    const listArtifactMetadata = store.listArtifactMetadata.bind(store);
+    const listEvents = store.listEvents.bind(store);
+    const listSteps = store.listSteps.bind(store);
+
+    store.listArtifactMetadata = (() => {
+      throw new Error("failure and decision pages must use targeted artifact queries");
+    }) as typeof store.listArtifactMetadata;
+    expect(buildAgentFlowRunInspectionPage(store, "paged-model", "failures", 0, 1).items)
+      .toHaveLength(1);
+    expect(buildAgentFlowRunInspectionPage(store, "paged-model", "decisions", 0, 1).items)
+      .toHaveLength(1);
+
+    store.listArtifactMetadata = listArtifactMetadata;
+    store.listEvents = (() => { throw new Error("warning pages must not load events"); }) as typeof store.listEvents;
+    store.listSteps = (() => { throw new Error("warning pages must not load steps"); }) as typeof store.listSteps;
+    expect(buildAgentFlowRunInspectionPage(store, "paged-model", "warnings", 0, 10).items)
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ code: "run.failure.unresolved" }),
+        expect.objectContaining({ code: "run.approval.requested" })
+      ]));
+    let artifactPage: { offset?: number; limit: number } | undefined;
+    store.listArtifactMetadata = ((runId, page) => {
+      artifactPage = page;
+      return listArtifactMetadata(runId, page);
+    }) as typeof store.listArtifactMetadata;
+    const warningPage = buildAgentFlowRunInspectionPage(store, "paged-model", "warnings", 1, 1);
+    expect(artifactPage).toEqual({ offset: 0, limit: 1 });
+    expect(warningPage.nextOffset).toBe(2);
+
+    store.listSteps = listSteps;
+    const firstStep = store.listSteps("paged-model")[0]!;
+    expect(() => store.listSteps("paged-model", {
+      limit: 1,
+      after: { sortValue: firstStep.createdAt }
+    })).toThrow("offset pagination only");
+    expect(() => buildAgentFlowRunInspectionPage(store, "paged-model", "events", 0, 201))
+      .toThrow("limit between 1 and 200");
+    store.listEvents = listEvents;
+    store.close();
+  });
+
+  test("treats noncanonical paged failure payload pointers as unavailable evidence", async () => {
+    const repo = makeRepo();
+    const store = await openAgentFlowRunState({ cwd: repo });
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: invalid-payload-pointer
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: inspect, type: command, command: echo inspect }
+`);
+    createAgentFlowLifecycleRun(store, { id: "invalid-payload-pointer", workflow });
+    store.recordFailure({
+      id: "failure:invalid-pointer",
+      runId: "invalid-payload-pointer",
+      stepId: "inspect",
+      classification: "command_failure",
+      message: "Invalid persisted payload pointer",
+      retryable: false,
+      payload: { failurePayloadPath: "../escape.json" }
+    });
+
+    const failures = buildAgentFlowRunInspectionPage(
+      store,
+      "invalid-payload-pointer",
+      "failures",
+      0,
+      10
+    );
+    const warnings = buildAgentFlowRunInspectionPage(
+      store,
+      "invalid-payload-pointer",
+      "warnings",
+      0,
+      10
+    );
+
+    expect(failures.items).toEqual([
+      expect.objectContaining({ id: "failure:invalid-pointer", failurePayload: null })
+    ]);
+    expect(warnings.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "run.failure.payload_unavailable" })
+    ]));
+    store.close();
+  });
+
   test("captures database rows in one snapshot before inspecting artifact files", async () => {
     const repo = makeRepo();
     const writer = await openAgentFlowRunState({ cwd: repo });
@@ -99,6 +192,43 @@ describe("Agent Flow run inspection API", () => {
     expect(model.events.map((event) => event.type)).toEqual(["run.created"]);
     expect(writer.getRun("snapshot-model")?.status).toBe("running");
     expect(writer.listEvents("snapshot-model").map((event) => event.type))
+      .toEqual(["run.created", "run.started"]);
+    reader.close();
+    writer.close();
+  });
+
+  test("captures each paged response in one database snapshot", async () => {
+    const repo = makeRepo();
+    const writer = await openAgentFlowRunState({ cwd: repo });
+    createInspectableRun(writer, "snapshot-page");
+    const reader = await openAgentFlowRunState({ cwd: repo });
+    const inspectArtifact = reader.inspectArtifactRecordForInspection.bind(reader);
+    let transitioned = false;
+    reader.inspectArtifactRecordForInspection = (artifact) => {
+      if (!transitioned) {
+        transitioned = true;
+        writer.transitionRunWithEvent("snapshot-page", {
+          status: "running",
+          allowedFrom: ["pending"],
+          event: { type: "run.started", payload: { status: "running" } }
+        });
+      }
+      return inspectArtifact(artifact);
+    };
+
+    const page = buildAgentFlowRunInspectionPage(reader, "snapshot-page", "failures", 0, 10);
+
+    expect(page.items).toEqual([
+      expect.objectContaining({
+        id: "failure:inspect:1",
+        failurePayload: expect.objectContaining({
+          document: expect.objectContaining({ id: "failure:inspect:1" }),
+          error: null
+        })
+      })
+    ]);
+    expect(writer.getRun("snapshot-page")?.status).toBe("running");
+    expect(writer.listEvents("snapshot-page").map((event) => event.type))
       .toEqual(["run.created", "run.started"]);
     reader.close();
     writer.close();
@@ -311,6 +441,115 @@ steps:
     }
   });
 
+  test("serves a secure run inspection UI with fragment-held credentials", async () => {
+    const repo = makeRepo();
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createInspectableRun(store, "run-ui");
+    store.appendRunEvent("run-ui", { type: "inspection.page.one", payload: { page: 1 } });
+    store.appendRunEvent("run-ui", { type: "inspection.page.two", payload: { page: 2 } });
+    store.close();
+    const server = await startAgentFlowRunInspectionApi({
+      cwd: repo,
+      port: 0,
+      token: "inspection-token&with=specials"
+    });
+
+    try {
+      expect(server.uiUrl).toBe(`${server.url}/#token=inspection-token%26with%3Dspecials`);
+
+      const page = await fetch(server.url);
+      expect(page.status).toBe(200);
+      expect(page.headers.get("content-type")).toBe("text/html; charset=utf-8");
+      expect(page.headers.get("cache-control")).toBe("no-store");
+      expect(page.headers.get("content-security-policy")).toContain("script-src 'self'");
+      expect(page.headers.get("content-security-policy")).toContain("form-action 'none'");
+      expect(page.headers.get("referrer-policy")).toBe("no-referrer");
+      const html = await page.text();
+      expect(html).toContain("Run inspector");
+      expect(html).toContain("Select a run");
+      expect(html).not.toContain("inspection-token");
+      expect(html).not.toContain("<form");
+      expect(html).not.toContain('name="token"');
+
+      const stylesheet = await fetch(`${server.url}/inspection.css`);
+      expect(stylesheet.status).toBe(200);
+      expect(stylesheet.headers.get("content-type")).toBe("text/css; charset=utf-8");
+      const css = await stylesheet.text();
+      expect(css).toContain(".timeline-entry");
+      expect(css).toContain(".token-panel #token-form { max-width: 520px; }");
+      expect(css).not.toContain(".token-panel form { max-width: 520px; }");
+      expect(css).toContain(".code-toolbar { display: flex; justify-content: flex-end;");
+      expect(css).not.toContain(".code-block .copy-button { position: absolute;");
+
+      const script = await fetch(`${server.url}/inspection.js`);
+      expect(script.status).toBe(200);
+      expect(script.headers.get("content-type")).toBe("text/javascript; charset=utf-8");
+      const javascript = await script.text();
+      expect(javascript).toContain('var TOKEN_HEADER = "x-agent-flow-token"');
+      expect(javascript).toContain('var RUN_ID_HEADER = "x-agent-flow-run-id"');
+      expect(javascript).toContain("EVENT_PAGE_SIZE = 100");
+      expect(javascript).toContain("requestId !== state.detailRequestId");
+      expect(javascript).toContain('api("/api/run?section=overview"');
+      expect(javascript).toContain("async function loadSection(id)");
+      expect(javascript).toContain("appendSectionPage(id, view");
+      expect(javascript).not.toContain("model.events");
+      expect(javascript).toContain("navigator.clipboard.writeText");
+      expect(javascript).toContain('document.createElement(tag)');
+      expect(javascript).toContain('history.replaceState(null, "", location.pathname + location.search)');
+      expect(javascript).not.toContain('location.hash = "token="');
+      expect(javascript).not.toContain("innerHTML");
+
+      const detailHeaders = {
+        [AGENT_FLOW_RUN_INSPECTION_TOKEN_HEADER]: "inspection-token&with=specials",
+        [AGENT_FLOW_RUN_INSPECTION_RUN_ID_HEADER]: encodeURIComponent("run-ui")
+      };
+      const overview = await fetch(`${server.url}/api/run?section=overview`, { headers: detailHeaders });
+      expect(overview.status).toBe(200);
+      const overviewBody = await overview.json();
+      expect(overviewBody).toMatchObject({ run: { id: "run-ui" } });
+      expect(overviewBody).not.toHaveProperty("state");
+      expect(overviewBody).not.toHaveProperty("events");
+      expect(overviewBody).not.toHaveProperty("artifacts");
+
+      const stateSection = await fetch(`${server.url}/api/run?section=state`, { headers: detailHeaders });
+      expect(stateSection.status).toBe(200);
+      expect(await stateSection.json()).toMatchObject({ state: { inputs: { ticket: "AF-58" } } });
+
+      const firstPage = await fetch(`${server.url}/api/run?section=events&offset=0&limit=1`, {
+        headers: detailHeaders
+      });
+      expect(firstPage.status).toBe(200);
+      expect(await firstPage.json()).toMatchObject({
+        section: "events",
+        items: [{ sequence: 1, type: "run.created" }],
+        offset: 0,
+        nextOffset: 1
+      });
+
+      const secondPage = await fetch(`${server.url}/api/run?section=events&offset=1&limit=1`, {
+        headers: detailHeaders
+      });
+      expect(secondPage.status).toBe(200);
+      expect(await secondPage.json()).toMatchObject({
+        section: "events",
+        items: [{ sequence: 2, type: "inspection.page.one" }],
+        offset: 1,
+        nextOffset: 2
+      });
+
+      const badPage = await fetch(`${server.url}/api/run?section=events&limit=201`, { headers: detailHeaders });
+      expect(badPage.status).toBe(400);
+      expect(await badPage.json()).toMatchObject({ code: "AGENT_FLOW_INSPECTION_BAD_REQUEST" });
+
+      const response = await fetch(`${server.url}/api/runs/run-ui`, {
+        headers: { [AGENT_FLOW_RUN_INSPECTION_TOKEN_HEADER]: "inspection-token&with=specials" }
+      });
+      expect(response.status).toBe(200);
+    } finally {
+      await server.close();
+    }
+  });
+
   test("preserves encoded dot-segment run IDs in detail routes", async () => {
     const repo = makeRepo();
     const store = await openAgentFlowRunState({ cwd: repo });
@@ -341,7 +580,22 @@ steps:
         });
         expect(response.status).toBe(200);
         expect(JSON.parse(response.body)).toMatchObject({ run: { id } });
+
+        const browserRoute = await fetch(`${server.url}/api/run`, {
+          headers: {
+            [AGENT_FLOW_RUN_INSPECTION_TOKEN_HEADER]: "inspection-token",
+            [AGENT_FLOW_RUN_INSPECTION_RUN_ID_HEADER]: encoded
+          }
+        });
+        expect(browserRoute.status).toBe(200);
+        expect(await browserRoute.json()).toMatchObject({ run: { id } });
       }
+
+      const missingRunId = await fetch(`${server.url}/api/run`, {
+        headers: { [AGENT_FLOW_RUN_INSPECTION_TOKEN_HEADER]: "inspection-token" }
+      });
+      expect(missingRunId.status).toBe(400);
+      expect(await missingRunId.json()).toMatchObject({ code: "AGENT_FLOW_INSPECTION_BAD_REQUEST" });
     } finally {
       await server.close();
     }

@@ -1162,13 +1162,20 @@ export class AgentFlowRunStateStore {
     ]);
   }
 
-  listSteps(runId: string): AgentFlowStepRecord[] {
+  listSteps(runId: string, page?: AgentFlowRecordPage): AgentFlowStepRecord[] {
     this.assertOpen();
     const normalizedRunId = requiredString(runId, "Run ID");
     this.requireRun(normalizedRunId);
+    if (page?.after !== undefined) {
+      throw new AgentFlowRunStateError(
+        "Step pages support offset pagination only.",
+        "AGENT_FLOW_RUN_STATE_PAGE"
+      );
+    }
+    const pagination = recordPage(page, "created_at", null);
     return this.database.all<StepRow>(
-      "SELECT * FROM run_steps WHERE run_id = ? ORDER BY created_at ASC, step_id ASC, attempt ASC",
-      [normalizedRunId]
+      `SELECT * FROM run_steps WHERE run_id = ?${pagination.where} ORDER BY created_at ASC, step_id ASC, attempt ASC${pagination.sql}`,
+      [normalizedRunId, ...pagination.parameters]
     ).map(hydrateStep);
   }
 
@@ -1643,15 +1650,60 @@ export class AgentFlowRunStateStore {
     return rows.map((row) => this.inspectArtifact(row));
   }
 
-  listArtifactMetadata(runId: string): AgentFlowArtifactRecord[] {
+  listArtifactMetadata(runId: string, page?: AgentFlowRecordPage): AgentFlowArtifactRecord[] {
     this.assertOpen();
     const normalizedRunId = artifactRunId(runId);
     this.requireRun(normalizedRunId);
+    const pagination = recordPage(page, "path");
     const rows = this.database.all<ArtifactRow>(
-      "SELECT * FROM artifacts WHERE run_id = ? ORDER BY path ASC, id ASC",
-      [normalizedRunId]
+      `SELECT * FROM artifacts WHERE run_id = ?${pagination.where} ORDER BY path ASC, id ASC${pagination.sql}`,
+      [normalizedRunId, ...pagination.parameters]
     );
     return rows.map((row) => hydrateArtifact(this.repoRoot, row));
+  }
+
+  listArtifactMetadataByKind(
+    runId: string,
+    kind: string,
+    page?: AgentFlowRecordPage
+  ): AgentFlowArtifactRecord[] {
+    this.assertOpen();
+    const normalizedRunId = artifactRunId(runId);
+    this.requireRun(normalizedRunId);
+    const normalizedKind = requiredString(kind, "Artifact kind");
+    const pagination = recordPage(page, "path");
+    const rows = this.database.all<ArtifactRow>(
+      `SELECT * FROM artifacts WHERE run_id = ? AND kind = ?${pagination.where} ORDER BY path ASC, id ASC${pagination.sql}`,
+      [normalizedRunId, normalizedKind, ...pagination.parameters]
+    );
+    return rows.map((row) => hydrateArtifact(this.repoRoot, row));
+  }
+
+  getArtifactMetadataForInspection(runId: string, declaredPath: string): AgentFlowArtifactRecord | null {
+    this.assertOpen();
+    const normalizedRunId = artifactRunId(runId);
+    this.requireRun(normalizedRunId);
+    const normalizedPath = normalizeAgentFlowArtifactPath(declaredPath);
+    const row = this.database.get<ArtifactRow>(
+      "SELECT * FROM artifacts WHERE run_id = ? AND path = ?",
+      [normalizedRunId, normalizedPath]
+    );
+    return row === null ? null : hydrateArtifact(this.repoRoot, row);
+  }
+
+  countInspectionWarningSources(runId: string): {
+    failures: number;
+    artifacts: number;
+    approvals: number;
+  } {
+    this.assertOpen();
+    const normalizedRunId = requiredString(runId, "Run ID");
+    this.requireRun(normalizedRunId);
+    return this.database.get<{ failures: number; artifacts: number; approvals: number }>(`SELECT
+      (SELECT COUNT(*) FROM failures WHERE run_id = ?) AS failures,
+      (SELECT COUNT(*) FROM artifacts WHERE run_id = ?) AS artifacts,
+      (SELECT COUNT(*) FROM approvals WHERE run_id = ?) AS approvals`,
+    [normalizedRunId, normalizedRunId, normalizedRunId])!;
   }
 
   listArtifactInspectionMetadata(runId: string): AgentFlowArtifactRecord[] {

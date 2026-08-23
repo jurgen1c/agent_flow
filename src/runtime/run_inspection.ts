@@ -65,10 +65,258 @@ export interface AgentFlowRunInspectionModel {
   warnings: AgentFlowRunInspectionWarning[];
 }
 
+export type AgentFlowRunInspectionSection =
+  | "events"
+  | "steps"
+  | "artifacts"
+  | "failures"
+  | "approvals"
+  | "decisions"
+  | "warnings";
+
+export interface AgentFlowRunInspectionOverview {
+  run: AgentFlowRunInspectionSummary;
+}
+
+export interface AgentFlowRunInspectionPage {
+  section: AgentFlowRunInspectionSection;
+  items: Array<
+    | AgentFlowEventRecord
+    | AgentFlowStepRecord
+    | AgentFlowArtifactRecord
+    | AgentFlowFailureInspection
+    | AgentFlowApprovalRecord
+    | AgentFlowInspectionDocument
+    | AgentFlowRunInspectionWarning
+  >;
+  offset: number;
+  nextOffset: number | null;
+}
+
 export function listAgentFlowRunInspectionSummaries(
   store: AgentFlowRunStateStore
 ): AgentFlowRunInspectionSummary[] {
   return store.listRuns().map(agentFlowRunInspectionSummary);
+}
+
+export function buildAgentFlowRunInspectionOverview(
+  store: AgentFlowRunStateStore,
+  runId: string
+): AgentFlowRunInspectionOverview {
+  const run = requireInspectionRun(store, runId);
+  return {
+    run: agentFlowRunInspectionSummary(run)
+  };
+}
+
+export function buildAgentFlowRunInspectionState(
+  store: AgentFlowRunStateStore,
+  runId: string
+): AgentFlowRunInspectionModel["state"] {
+  return inspectionRunState(requireInspectionRun(store, runId));
+}
+
+export function buildAgentFlowRunInspectionPage(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  section: AgentFlowRunInspectionSection,
+  offset: number,
+  limit: number
+): AgentFlowRunInspectionPage {
+  if (!Number.isSafeInteger(offset) || offset < 0
+      || !Number.isSafeInteger(limit) || limit < 1 || limit > 200
+      || offset > Number.MAX_SAFE_INTEGER - limit - 1) {
+    throw new AgentFlowRunStateError(
+      "Inspection pages require a non-negative offset and a limit between 1 and 200.",
+      "AGENT_FLOW_RUN_STATE_PAGE"
+    );
+  }
+  const page = { offset, limit: limit + 1 };
+  switch (section) {
+    case "events": {
+      const items = store.withRunStateReadTransaction(() => store.listEvents(runId, page));
+      return inspectionPage(section, items, offset, limit);
+    }
+    case "steps": {
+      const items = store.withRunStateReadTransaction(() => store.listSteps(runId, page));
+      return inspectionPage(section, items, offset, limit);
+    }
+    case "artifacts": {
+      const metadata = store.withRunStateReadTransaction(() => store.listArtifactMetadata(runId, page));
+      const items = metadata
+        .map((artifact) => store.inspectArtifactRecordForInspection(artifact));
+      return inspectionPage(section, items, offset, limit);
+    }
+    case "failures": {
+      const snapshot = store.withRunStateReadTransaction(() => {
+        const failures = store.listFailureMetadata(runId, page);
+        const artifactMetadataByPath = new Map<string, AgentFlowArtifactRecord>();
+        for (const failure of failures) {
+          if (failure.payloadPath === null || artifactMetadataByPath.has(failure.payloadPath)) continue;
+          const artifact = failurePayloadArtifactForInspection(store, runId, failure.payloadPath);
+          if (artifact !== null) artifactMetadataByPath.set(failure.payloadPath, artifact);
+        }
+        return { failures, artifactMetadataByPath };
+      });
+      const artifactsByPath = new Map(
+        [...snapshot.artifactMetadataByPath].map(([path, artifact]) => [
+          path,
+          store.inspectArtifactRecordForInspection(artifact)
+        ])
+      );
+      const items = inspectFailureRecords(store, snapshot.failures, artifactsByPath, []);
+      return inspectionPage(section, items, offset, limit);
+    }
+    case "approvals": {
+      const items = store.withRunStateReadTransaction(() => store.listApprovals(runId, page));
+      return inspectionPage(section, items, offset, limit);
+    }
+    case "decisions": {
+      const metadata = store.withRunStateReadTransaction(() =>
+        store.listArtifactMetadataByKind(runId, "decision_record", page)
+      );
+      const decisions = metadata
+        .map((artifact) => store.inspectArtifactRecordForInspection(artifact));
+      const items = decisions.map((artifact) => readInspectionDocument(store, artifact));
+      return inspectionPage(section, items, offset, limit);
+    }
+    case "warnings":
+      return buildWarningPage(store, runId, offset, limit);
+  }
+}
+
+function inspectionPage(
+  section: AgentFlowRunInspectionSection,
+  items: AgentFlowRunInspectionPage["items"],
+  offset: number,
+  limit: number
+): AgentFlowRunInspectionPage {
+  const hasMore = items.length > limit;
+  return {
+    section,
+    items: items.slice(0, limit),
+    offset,
+    nextOffset: hasMore ? offset + limit : null
+  };
+}
+
+function buildWarningPage(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  offset: number,
+  limit: number
+): AgentFlowRunInspectionPage {
+  const snapshot = store.withRunStateReadTransaction(() => {
+    const workflow: AgentFlowRunInspectionWarning[] = [];
+    const failures: Array<{ record: AgentFlowFailureRecord; artifact: AgentFlowArtifactRecord | null }> = [];
+    const artifacts: AgentFlowArtifactRecord[] = [];
+    const approvals: AgentFlowApprovalRecord[] = [];
+    const workflowWarningsSnapshot = workflowWarnings(requireInspectionRun(store, runId));
+    const counts = store.countInspectionWarningSources(runId);
+    const totalSourceRecords = workflowWarningsSnapshot.length
+      + counts.failures + counts.artifacts + counts.approvals;
+    let sourceOffset = offset;
+    let remaining = limit;
+    let scanned = 0;
+    const consume = <T>(
+      total: number,
+      load: (offset: number, limit: number) => T[],
+      visit: (record: T) => void
+    ): void => {
+      if (remaining === 0) return;
+      if (sourceOffset >= total) {
+        sourceOffset -= total;
+        return;
+      }
+      const count = Math.min(remaining, total - sourceOffset);
+      for (const record of load(sourceOffset, count)) visit(record);
+      sourceOffset = 0;
+      remaining -= count;
+      scanned += count;
+    };
+
+    consume(
+      workflowWarningsSnapshot.length,
+      (pageOffset, pageLimit) => workflowWarningsSnapshot.slice(pageOffset, pageOffset + pageLimit),
+      (warning) => workflow.push(warning)
+    );
+    consume(
+      counts.failures,
+      (pageOffset, pageLimit) => store.listFailureMetadata(runId, { offset: pageOffset, limit: pageLimit }),
+      (failure) => failures.push({
+        record: failure,
+        artifact: failure.payloadPath === null
+          ? null
+          : failurePayloadArtifactForInspection(store, runId, failure.payloadPath)
+      })
+    );
+    consume(
+      counts.artifacts,
+      (pageOffset, pageLimit) => store.listArtifactMetadata(runId, { offset: pageOffset, limit: pageLimit }),
+      (artifact) => artifacts.push(artifact)
+    );
+    consume(
+      counts.approvals,
+      (pageOffset, pageLimit) => store.listApprovals(runId, { offset: pageOffset, limit: pageLimit }),
+      (approval) => approvals.push(approval)
+    );
+    return { workflow, failures, artifacts, approvals, scanned, totalSourceRecords };
+  });
+
+  const warnings: AgentFlowRunInspectionWarning[] = [];
+  warnings.push(...snapshot.workflow);
+  for (const failure of snapshot.failures) {
+    const artifactsByPath = new Map<string, AgentFlowArtifactRecord>();
+    if (failure.record.payloadPath !== null && failure.artifact !== null) {
+      artifactsByPath.set(
+        failure.record.payloadPath,
+        store.inspectArtifactRecordForInspection(failure.artifact)
+      );
+    }
+    inspectFailureRecords(store, [failure.record], artifactsByPath, warnings);
+  }
+  for (const metadataRecord of snapshot.artifacts) {
+    const artifact = store.inspectArtifactRecordForInspection(metadataRecord);
+    if (artifact.status === "missing" || artifact.status === "stale") warnings.push({
+        code: `run.artifact.${artifact.status}`,
+        message: `Artifact ${artifact.declaredPath} is ${artifact.status}.`,
+        source: "artifact",
+        path: artifact.declaredPath
+    });
+    if (artifact.kind === "decision_record") {
+      const decision = readInspectionDocument(store, artifact);
+      if (decision.error !== null) warnings.push({
+          code: "run.decision.unavailable",
+          message: `Decision record ${artifact.declaredPath} is unavailable: ${decision.error}`,
+          source: "decision",
+          path: artifact.declaredPath
+      });
+    }
+  }
+  for (const approval of snapshot.approvals) {
+    if (approval.status === "requested" || approval.status === "stale") warnings.push({
+        code: `run.approval.${approval.status}`,
+        message: `Approval ${approval.id} is ${approval.status}.`,
+        source: "approval"
+    });
+  }
+  return {
+    section: "warnings",
+    items: warnings,
+    offset,
+    nextOffset: offset + snapshot.scanned < snapshot.totalSourceRecords
+      ? offset + snapshot.scanned
+      : null
+  };
+}
+
+function failurePayloadArtifactForInspection(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  payloadPath: string
+): AgentFlowArtifactRecord | null {
+  if (!isNormalizedStaticAgentFlowArtifactPath(payloadPath)) return null;
+  return store.getArtifactMetadataForInspection(runId, payloadPath);
 }
 
 export function buildAgentFlowRunInspectionModel(
@@ -98,36 +346,7 @@ export function buildAgentFlowRunInspectionModel(
   );
   const artifactsByPath = new Map(artifacts.map((artifact) => [artifact.declaredPath, artifact]));
   const warnings = workflowWarnings(run);
-  const failures = failureRecords.map((failure) => {
-    const failureArtifact = failure.payloadPath === null
-      ? null
-      : matchingFailurePayloadArtifact(failure, artifactsByPath.get(failure.payloadPath));
-    const failurePayload = failureArtifact === null
-      ? null
-      : readInspectionDocument(store, failureArtifact, failure);
-    if (failure.resolvedAt === null) {
-      warnings.push({
-        code: "run.failure.unresolved",
-        message: `Failure ${failure.id} remains unresolved.`,
-        source: "failure"
-      });
-    }
-    if (failurePayload === null) {
-      warnings.push({
-        code: "run.failure.payload_unavailable",
-        message: `Failure ${failure.id} does not have a readable persisted payload.`,
-        source: "failure"
-      });
-    } else if (failurePayload.error !== null) {
-      warnings.push({
-        code: "run.failure.payload_unavailable",
-        message: `Failure ${failure.id} payload at ${failurePayload.artifact.declaredPath} is unavailable: ${failurePayload.error}`,
-        source: "failure",
-        path: failurePayload.artifact.declaredPath
-      });
-    }
-    return { ...failure, failurePayload };
-  });
+  const failures = inspectFailureRecords(store, failureRecords, artifactsByPath, warnings);
 
   for (const artifact of artifacts) {
     if (artifact.status === "missing" || artifact.status === "stale") {
@@ -164,12 +383,7 @@ export function buildAgentFlowRunInspectionModel(
   }
   return {
     run: agentFlowRunInspectionSummary(run),
-    state: {
-      inputs: run.inputs,
-      output: run.output,
-      error: run.error,
-      waiting: run.context.waiting ?? null
-    },
+    state: inspectionRunState(run),
     steps,
     events,
     artifacts,
@@ -178,6 +392,64 @@ export function buildAgentFlowRunInspectionModel(
     decisions,
     warnings
   };
+}
+
+function requireInspectionRun(store: AgentFlowRunStateStore, runId: string): AgentFlowRunRecord {
+  const run = store.getRun(runId);
+  if (run === null) {
+    throw new AgentFlowRunStateError(
+      `Agent Flow run ${runId} was not found.`,
+      "AGENT_FLOW_RUN_NOT_FOUND"
+    );
+  }
+  return run;
+}
+
+function inspectionRunState(run: AgentFlowRunRecord): AgentFlowRunInspectionModel["state"] {
+  return {
+    inputs: run.inputs,
+    output: run.output,
+    error: run.error,
+    waiting: run.context.waiting ?? null
+  };
+}
+
+function inspectFailureRecords(
+  store: AgentFlowRunStateStore,
+  failureRecords: AgentFlowFailureRecord[],
+  artifactsByPath: Map<string, AgentFlowArtifactRecord>,
+  warnings: AgentFlowRunInspectionWarning[]
+): AgentFlowFailureInspection[] {
+  return failureRecords.map((failure) => {
+    const failureArtifact = failure.payloadPath === null
+      ? null
+      : matchingFailurePayloadArtifact(failure, artifactsByPath.get(failure.payloadPath));
+    const failurePayload = failureArtifact === null
+      ? null
+      : readInspectionDocument(store, failureArtifact, failure);
+    if (failure.resolvedAt === null) {
+      warnings.push({
+        code: "run.failure.unresolved",
+        message: `Failure ${failure.id} remains unresolved.`,
+        source: "failure"
+      });
+    }
+    if (failurePayload === null) {
+      warnings.push({
+        code: "run.failure.payload_unavailable",
+        message: `Failure ${failure.id} does not have a readable persisted payload.`,
+        source: "failure"
+      });
+    } else if (failurePayload.error !== null) {
+      warnings.push({
+        code: "run.failure.payload_unavailable",
+        message: `Failure ${failure.id} payload at ${failurePayload.artifact.declaredPath} is unavailable: ${failurePayload.error}`,
+        source: "failure",
+        path: failurePayload.artifact.declaredPath
+      });
+    }
+    return { ...failure, failurePayload };
+  });
 }
 
 function agentFlowRunInspectionSummary(run: AgentFlowRunRecord): AgentFlowRunInspectionSummary {
