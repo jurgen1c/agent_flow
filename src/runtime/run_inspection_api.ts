@@ -7,12 +7,22 @@ import {
 } from "./run_state";
 import {
   buildAgentFlowRunInspectionModel,
+  buildAgentFlowRunInspectionOverview,
+  buildAgentFlowRunInspectionPage,
+  buildAgentFlowRunInspectionState,
   listAgentFlowRunInspectionSummaries
 } from "./run_inspection";
+import type { AgentFlowRunInspectionSection } from "./run_inspection";
+import {
+  AGENT_FLOW_RUN_INSPECTION_UI_CSS,
+  AGENT_FLOW_RUN_INSPECTION_UI_HTML,
+  AGENT_FLOW_RUN_INSPECTION_UI_JAVASCRIPT
+} from "./run_inspection_ui";
 
 export const DEFAULT_AGENT_FLOW_RUN_INSPECTION_API_HOST = "127.0.0.1";
 export const DEFAULT_AGENT_FLOW_RUN_INSPECTION_API_PORT = 4318;
 export const AGENT_FLOW_RUN_INSPECTION_TOKEN_HEADER = "x-agent-flow-token";
+export const AGENT_FLOW_RUN_INSPECTION_RUN_ID_HEADER = "x-agent-flow-run-id";
 
 export interface AgentFlowRunInspectionApiOptions {
   cwd?: string;
@@ -26,6 +36,7 @@ export interface AgentFlowRunInspectionApiHandle {
   host: string;
   port: number;
   url: string;
+  uiUrl: string;
   token: string;
   close(): Promise<void>;
 }
@@ -60,10 +71,12 @@ export async function startAgentFlowRunInspectionApi(
   });
   const listeningPort = await listenOnAvailablePort(server, host, port);
 
+  const url = `http://${formatUrlHost(host)}:${listeningPort}`;
   return {
     host,
     port: listeningPort,
-    url: `http://${formatUrlHost(host)}:${listeningPort}`,
+    url,
+    uiUrl: `${url}/#token=${encodeURIComponent(token)}`,
     token,
     close: () => new Promise((resolve, reject) => {
       server.close((error) => error === undefined ? resolve() : reject(error));
@@ -87,6 +100,8 @@ async function handleInspectionRequest(
   context: { cwd?: string; databasePath?: string; token: string }
 ): Promise<void> {
   try {
+    const requestPath = rawRequestPath(request.url ?? "/");
+    if (request.method === "GET" && sendInspectionUiAsset(response, requestPath)) return;
     requireToken(request.headers[AGENT_FLOW_RUN_INSPECTION_TOKEN_HEADER], context.token);
     if (request.method !== "GET") {
       response.setHeader("allow", "GET");
@@ -97,8 +112,10 @@ async function handleInspectionRequest(
       );
     }
 
-    const requestPath = rawRequestPath(request.url ?? "/");
-    const route = inspectionRoute(requestPath);
+    const route = inspectionRoute(
+      requestPath,
+      request.headers[AGENT_FLOW_RUN_INSPECTION_RUN_ID_HEADER]
+    );
     const store = await openAgentFlowRunStateForInspection({
       cwd: context.cwd,
       databasePath: context.databasePath
@@ -106,6 +123,25 @@ async function handleInspectionRequest(
     try {
       if (route.kind === "list") {
         sendJson(response, 200, { runs: listAgentFlowRunInspectionSummaries(store) });
+        return;
+      }
+      const query = inspectionQuery(request.url ?? "/");
+      if (query.section === "overview") {
+        sendJson(response, 200, buildAgentFlowRunInspectionOverview(store, route.runId));
+        return;
+      }
+      if (query.section === "state") {
+        sendJson(response, 200, { state: buildAgentFlowRunInspectionState(store, route.runId) });
+        return;
+      }
+      if (query.section !== null) {
+        sendJson(response, 200, buildAgentFlowRunInspectionPage(
+          store,
+          route.runId,
+          query.section,
+          query.offset,
+          query.limit
+        ));
         return;
       }
       const model = buildAgentFlowRunInspectionModel(store, route.runId);
@@ -134,6 +170,22 @@ async function handleInspectionRequest(
   }
 }
 
+function sendInspectionUiAsset(response: http.ServerResponse, requestPath: string): boolean {
+  if (requestPath === "/" || requestPath === "/index.html") {
+    sendAsset(response, "text/html; charset=utf-8", AGENT_FLOW_RUN_INSPECTION_UI_HTML);
+    return true;
+  }
+  if (requestPath === "/inspection.css") {
+    sendAsset(response, "text/css; charset=utf-8", AGENT_FLOW_RUN_INSPECTION_UI_CSS);
+    return true;
+  }
+  if (requestPath === "/inspection.js") {
+    sendAsset(response, "text/javascript; charset=utf-8", AGENT_FLOW_RUN_INSPECTION_UI_JAVASCRIPT);
+    return true;
+  }
+  return false;
+}
+
 function requireToken(value: string | string[] | undefined, expected: string): void {
   const values = Array.isArray(value) ? value : value === undefined ? [] : [value];
   if (!values.some((candidate) => tokensEqual(candidate, expected))) {
@@ -150,8 +202,81 @@ function rawRequestPath(requestTarget: string): string {
   return queryIndex === -1 ? requestTarget : requestTarget.slice(0, queryIndex);
 }
 
-function inspectionRoute(requestPath: string): { kind: "list" } | { kind: "detail"; runId: string } {
+function inspectionQuery(requestTarget: string): {
+  section: "overview" | "state" | AgentFlowRunInspectionSection | null;
+  offset: number;
+  limit: number;
+} {
+  const queryIndex = requestTarget.indexOf("?");
+  if (queryIndex === -1) return { section: null, offset: 0, limit: 100 };
+  const parameters = new URLSearchParams(requestTarget.slice(queryIndex + 1));
+  const rawSection = parameters.get("section");
+  if (rawSection === null) return { section: null, offset: 0, limit: 100 };
+  const sections = new Set([
+    "overview", "state", "events", "steps", "artifacts", "failures", "approvals", "decisions", "warnings"
+  ]);
+  if (!sections.has(rawSection)) {
+    throw new AgentFlowRunInspectionApiError(
+      "Unknown run inspection section.",
+      400,
+      "AGENT_FLOW_INSPECTION_BAD_REQUEST"
+    );
+  }
+  if (rawSection === "overview") return { section: "overview", offset: 0, limit: 100 };
+  if (rawSection === "state") return { section: "state", offset: 0, limit: 100 };
+  const limit = integerQueryParameter(parameters, "limit", 100, 1, 200);
+  const offset = integerQueryParameter(
+    parameters,
+    "offset",
+    0,
+    0,
+    Number.MAX_SAFE_INTEGER - limit - 1
+  );
+  return { section: rawSection as AgentFlowRunInspectionSection, offset, limit };
+}
+
+function integerQueryParameter(
+  parameters: URLSearchParams,
+  name: string,
+  fallback: number,
+  minimum: number,
+  maximum: number
+): number {
+  const raw = parameters.get(name);
+  if (raw === null) return fallback;
+  if (!/^\d+$/.test(raw)) {
+    throw new AgentFlowRunInspectionApiError(
+      `Inspection ${name} must be an integer from ${minimum} to ${maximum}.`,
+      400,
+      "AGENT_FLOW_INSPECTION_BAD_REQUEST"
+    );
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new AgentFlowRunInspectionApiError(
+      `Inspection ${name} must be an integer from ${minimum} to ${maximum}.`,
+      400,
+      "AGENT_FLOW_INSPECTION_BAD_REQUEST"
+    );
+  }
+  return value;
+}
+
+function inspectionRoute(
+  requestPath: string,
+  encodedRunIdHeader?: string | string[]
+): { kind: "list" } | { kind: "detail"; runId: string } {
   if (requestPath === "/api/runs") return { kind: "list" };
+  if (requestPath === "/api/run") {
+    if (encodedRunIdHeader === undefined || Array.isArray(encodedRunIdHeader)) {
+      throw new AgentFlowRunInspectionApiError(
+        "Run inspection requires one encoded run ID header.",
+        400,
+        "AGENT_FLOW_INSPECTION_BAD_REQUEST"
+      );
+    }
+    return { kind: "detail", runId: decodeRunId(encodedRunIdHeader) };
+  }
   const match = /^\/api\/runs\/([^/]+)$/.exec(requestPath);
   if (match === null) {
     throw new AgentFlowRunInspectionApiError(
@@ -160,9 +285,13 @@ function inspectionRoute(requestPath: string): { kind: "list" } | { kind: "detai
       "AGENT_FLOW_INSPECTION_NOT_FOUND"
     );
   }
+  return { kind: "detail", runId: decodeRunId(match[1]!) };
+}
+
+function decodeRunId(value: string): string {
   let runId: string;
   try {
-    runId = decodeURIComponent(match[1]!);
+    runId = decodeURIComponent(value);
   } catch {
     throw new AgentFlowRunInspectionApiError(
       "Run ID must use valid URL encoding.",
@@ -177,7 +306,7 @@ function inspectionRoute(requestPath: string): { kind: "list" } | { kind: "detai
       "AGENT_FLOW_INSPECTION_BAD_REQUEST"
     );
   }
-  return { kind: "detail", runId };
+  return runId;
 }
 
 function tokensEqual(left: string, right: string): boolean {
@@ -263,4 +392,16 @@ function sendJson(response: http.ServerResponse, status: number, data: unknown):
     "x-content-type-options": "nosniff"
   });
   response.end(JSON.stringify(data, null, 2));
+}
+
+function sendAsset(response: http.ServerResponse, contentType: string, content: string): void {
+  response.writeHead(200, {
+    "content-type": contentType,
+    "cache-control": "no-store",
+    "content-security-policy": "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+    "referrer-policy": "no-referrer",
+    "x-content-type-options": "nosniff",
+    "x-frame-options": "DENY"
+  });
+  response.end(content);
 }

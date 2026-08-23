@@ -40,9 +40,13 @@ export {
 export {
   MAX_AGENT_FLOW_INSPECTION_DOCUMENT_BYTES,
   buildAgentFlowRunInspectionModel,
+  buildAgentFlowRunInspectionOverview,
+  buildAgentFlowRunInspectionPage,
+  buildAgentFlowRunInspectionState,
   listAgentFlowRunInspectionSummaries
 } from "./run_inspection";
 export {
+  AGENT_FLOW_RUN_INSPECTION_RUN_ID_HEADER,
   AGENT_FLOW_RUN_INSPECTION_TOKEN_HEADER,
   DEFAULT_AGENT_FLOW_RUN_INSPECTION_API_HOST,
   DEFAULT_AGENT_FLOW_RUN_INSPECTION_API_PORT,
@@ -231,6 +235,9 @@ export type {
   AgentFlowFailureInspection,
   AgentFlowInspectionDocument,
   AgentFlowRunInspectionModel,
+  AgentFlowRunInspectionOverview,
+  AgentFlowRunInspectionPage,
+  AgentFlowRunInspectionSection,
   AgentFlowRunInspectionSummary,
   AgentFlowRunInspectionWarning
 } from "./run_inspection";
