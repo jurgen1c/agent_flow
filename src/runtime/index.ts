@@ -38,6 +38,17 @@ export {
   renderAgentFlowWorkflowGraph
 } from "./inspection";
 export {
+  MAX_AGENT_FLOW_INSPECTION_DOCUMENT_BYTES,
+  buildAgentFlowRunInspectionModel,
+  listAgentFlowRunInspectionSummaries
+} from "./run_inspection";
+export {
+  AGENT_FLOW_RUN_INSPECTION_TOKEN_HEADER,
+  DEFAULT_AGENT_FLOW_RUN_INSPECTION_API_HOST,
+  DEFAULT_AGENT_FLOW_RUN_INSPECTION_API_PORT,
+  startAgentFlowRunInspectionApi
+} from "./run_inspection_api";
+export {
   AGENT_FLOW_AMBIGUOUS_SUCCESS_TARGET_CODE,
   AgentFlowAmbiguousSuccessTargetError
 } from "./success_routing";
@@ -217,6 +228,17 @@ export type {
   AgentFlowWorkflowGraphSession
 } from "./inspection";
 export type {
+  AgentFlowFailureInspection,
+  AgentFlowInspectionDocument,
+  AgentFlowRunInspectionModel,
+  AgentFlowRunInspectionSummary,
+  AgentFlowRunInspectionWarning
+} from "./run_inspection";
+export type {
+  AgentFlowRunInspectionApiHandle,
+  AgentFlowRunInspectionApiOptions
+} from "./run_inspection_api";
+export type {
   AgentFlowSimulationFixture,
   AgentFlowSimulationFixtureParseResult,
   AgentFlowSimulationMissingArtifact,
@@ -295,6 +317,7 @@ export type {
   AgentFlowRunMutationResult,
   AgentFlowRunRecord,
   AgentFlowSessionRecord,
+  AgentFlowStepRecord,
   AgentFlowRunStateValue,
   AgentFlowRunStopStatus,
   AgentFlowRunStatus,

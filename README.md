@@ -177,6 +177,8 @@ The [documentation hub](docs/README.md) provides an end-to-end guide:
   Agent Flow, Agent Memory, Agentic Development, and Agent Core.
 - [Operations and packaging](docs/operations-and-packaging.md) for validation,
   simulation, cleanup, archives, package verification, and release expectations.
+- [Run inspection API](docs/run-inspection-api.md) for token-protected local run
+  state, timelines, failures, approvals, and decisions.
 
 ## Development
 
