@@ -62,11 +62,11 @@ try {
     fail(`Packed artifact contains forbidden files:\n${forbidden.join("\n")}`);
   }
 
-  const packedPackage = JSON.parse(
+  const sourcePackage = JSON.parse(
     fs.readFileSync(path.join(repositoryRoot, "package.json"), "utf8")
   );
   if (
-    Object.values(packedPackage.dependencies ?? {}).some(
+    Object.values(sourcePackage.dependencies ?? {}).some(
       (range) => typeof range === "string" && /^(?:workspace:|file:)/.test(range)
     )
   ) {
@@ -102,6 +102,8 @@ import {
 } from "@jurgen1c/agent-flow";
 import { dispatch } from "@jurgen1c/agent-flow/cli";
 
+const expectedVersion = ${JSON.stringify(sourcePackage.version)};
+
 const workflow = parseAgentFlowWorkflowOrThrow(
   "name: smoke\\nversion: 1\\nstyle: pipeline\\nmaturity: stable\\nsteps: []\\n"
 );
@@ -128,7 +130,7 @@ const binary = path.join(
 );
 for (const args of [["help"], ["--version"]]) {
   const result = spawnSync(process.execPath, [binary, ...args], { encoding: "utf8" });
-  if (result.status !== 0 || !result.stdout.includes(args[0] === "help" ? "agent-flow" : "0.1.0")) {
+  if (result.status !== 0 || !result.stdout.includes(args[0] === "help" ? "agent-flow" : expectedVersion)) {
     throw new Error(\`Agent Flow binary smoke test failed for \${args.join(" ")}: \${result.stderr}\`);
   }
 }
@@ -146,7 +148,33 @@ console.log("Agent Flow tarball smoke test passed.");
     "--ignore-scripts",
     ...installTargets
   ], consumerRoot);
+  const installedPackageRoot = path.join(
+    consumerRoot,
+    "node_modules",
+    "@jurgen1c",
+    "agent-flow"
+  );
+  const installedPackage = JSON.parse(
+    fs.readFileSync(path.join(installedPackageRoot, "package.json"), "utf8")
+  );
+  if (installedPackage.name !== sourcePackage.name) {
+    fail(`Installed package name ${installedPackage.name} does not match ${sourcePackage.name}.`);
+  }
+  if (installedPackage.version !== sourcePackage.version) {
+    fail(
+      `Installed package version ${installedPackage.version} does not match ${sourcePackage.version}.`
+    );
+  }
+  if (installedPackage.bin?.["agent-flow"] !== "dist/agent-flow.js") {
+    fail("Installed package manifest is missing bin.agent-flow.");
+  }
+  const installedBinary = path.join(consumerRoot, "node_modules", ".bin", "agent-flow");
+  if (!fs.existsSync(installedBinary)) {
+    fail("Clean consumer install is missing node_modules/.bin/agent-flow.");
+  }
   run("npm", ["audit", "--audit-level", "moderate"], consumerRoot);
+  run(installedBinary, ["help"], consumerRoot);
+  run(installedBinary, ["--version"], consumerRoot);
   run(process.execPath, ["smoke.mjs"], consumerRoot);
 
   console.log(
