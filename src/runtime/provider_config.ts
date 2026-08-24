@@ -273,7 +273,7 @@ function parseTargets(
   if (!isMapping(root.targets)) throw configError(sourcePath, "targets", "Targets must be a mapping.");
   const targets = emptyMap<AgentFlowConfiguredTarget>();
   for (const [name, value] of Object.entries(root.targets)) {
-    validateName(name, sourcePath, `targets.${name}`);
+    validateName(name, sourcePath, "targets.<name>");
     if (!isMapping(value)) throw configError(sourcePath, `targets.${name}`, "Target must be a mapping.");
     rejectUnknownFields(value, TARGET_FIELDS, sourcePath, `targets.${name}`);
     const kind = requiredEnum(value.kind, ["local", "frontier"] as const, sourcePath, `targets.${name}.kind`);
@@ -308,7 +308,7 @@ function parseProviders(
   if (!isMapping(root.providers)) throw configError(sourcePath, "providers", "Providers must be a mapping.");
   const providers = emptyMap<AgentFlowProviderAlias>();
   for (const [name, value] of Object.entries(root.providers)) {
-    validateName(name, sourcePath, `providers.${name}`);
+    validateName(name, sourcePath, "providers.<name>");
     if (RESERVED_ALIASES.has(name) || name.startsWith("codex:")) {
       throw configError(sourcePath, `providers.${name}`, `Alias ${JSON.stringify(name)} is reserved by the programmatic registry.`);
     }
@@ -353,7 +353,7 @@ function validateTargetShape(name: string, target: AgentFlowConfiguredTarget, so
 function validateBaseUrl(value: string, kind: AgentFlowConfiguredProviderKind, sourcePath: string, field: string): void {
   let url: URL;
   try { url = new URL(value); } catch { throw configError(sourcePath, field, "base_url must be an absolute URL."); }
-  if (url.username || url.password || url.search || url.hash) {
+  if (url.username || url.password || value.includes("?") || value.includes("#")) {
     throw configError(sourcePath, field, "base_url must not contain credentials, a query, or a fragment.");
   }
   if (kind === "frontier" && url.protocol !== "https:") {
@@ -370,6 +370,9 @@ function validateBaseUrl(value: string, kind: AgentFlowConfiguredProviderKind, s
 function parseOverrides(values: readonly string[]): Record<string, string> {
   const result = emptyMap<string>();
   for (const value of values) {
+    if (redactAgentFlowSensitiveText(value) !== value) {
+      throw new AgentFlowProviderConfigError("Provider overrides must use non-secret canonical alias=target names.");
+    }
     const separator = value.indexOf("=");
     if (separator <= 0 || separator === value.length - 1) {
       throw new AgentFlowProviderConfigError(`Provider override ${JSON.stringify(value)} must use alias=target.`);
@@ -422,8 +425,9 @@ function rejectUnknownFields(value: Record<string, JsonValue>, allowed: Set<stri
 }
 
 function validateName(value: string, sourcePath: string, field: string): void {
-  if (!value || value !== value.trim() || /[\s=\u0000-\u001F\u007F-\u009F]/.test(value)) {
-    throw configError(sourcePath, field, "Names must be non-empty and contain no whitespace, equals signs, or control characters.");
+  if (!value || value !== value.trim() || /[\s=\u0000-\u001F\u007F-\u009F]/.test(value)
+      || redactAgentFlowSensitiveText(value) !== value) {
+    throw configError(sourcePath, field, "Names must be non-secret, non-empty, and contain no whitespace, equals signs, or control characters.");
   }
   if (RESERVED_OBJECT_NAMES.has(value)) {
     throw configError(sourcePath, field, `Name ${JSON.stringify(value)} is reserved.`);

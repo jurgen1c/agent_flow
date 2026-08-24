@@ -220,6 +220,50 @@ targets:
     expect(() => loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} }))
       .toThrow("Model identifiers must not contain control characters");
 
+    const secretIdentifier = "ghp_abcdefghijklmnopqrstuvwxyz1234567890";
+    fs.writeFileSync(globalConfig, `version: 1
+targets:
+  ${secretIdentifier}: { kind: local, driver: openai-compatible, model: model, base_url: http://127.0.0.1:11434/v1, enabled: true }
+`);
+    let secretIdentifierError: unknown;
+    try {
+      loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} });
+    } catch (error) {
+      secretIdentifierError = error;
+    }
+    expect(String(secretIdentifierError)).toContain("Names must be non-secret");
+    expect(String(secretIdentifierError)).not.toContain(secretIdentifier);
+
+    fs.writeFileSync(globalConfig, `version: 1
+targets:
+  qwen-local: { kind: local, driver: openai-compatible, model: model, base_url: http://127.0.0.1:11434/v1, enabled: true }
+`);
+    fs.writeFileSync(path.join(repo, ".agent-flow.yml"), `version: 1
+providers:
+  ${secretIdentifier}: { kind: local, target: qwen-local }
+`);
+    secretIdentifierError = undefined;
+    try {
+      loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} });
+    } catch (error) {
+      secretIdentifierError = error;
+    }
+    expect(String(secretIdentifierError)).toContain("Names must be non-secret");
+    expect(String(secretIdentifierError)).not.toContain(secretIdentifier);
+
+    fs.writeFileSync(path.join(repo, ".agent-flow.yml"), `version: 1
+providers:
+  drafter: { kind: local, target: qwen-local }
+`);
+    for (const baseUrl of ["http://127.0.0.1:11434/v1?", "http://127.0.0.1:11434/v1#"]) {
+      fs.writeFileSync(globalConfig, `version: 1
+targets:
+  qwen-local: { kind: local, driver: openai-compatible, model: model, base_url: "${baseUrl}", enabled: true }
+`);
+      expect(() => loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} }))
+        .toThrow("base_url must not contain credentials, a query, or a fragment");
+    }
+
     fs.writeFileSync(globalConfig, `version: 1
 targets:
   unsafe:
