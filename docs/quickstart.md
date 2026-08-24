@@ -277,6 +277,47 @@ preserve native conversational state.
 See [session provider boundaries](session-providers.md) for registration kinds,
 the programmatic extension API, permission behavior, and evidence handling.
 
+### Keep using a custom provider
+
+The YAML configuration path does not replace the original provider registry.
+Use a custom provider when an application already owns the model client, needs
+a native coding CLI, supports provider-native resume, or must enforce a custom
+filesystem/process sandbox:
+
+```ts
+import {
+  createAgentFlowSessionProviderRegistry,
+  executeAgentFlowCommandPipeline,
+  type AgentFlowSessionProviderAdapter
+} from "@jurgen1c/agent-flow";
+
+const customAdapter: AgentFlowSessionProviderAdapter = async (request) => ({
+  outputs: await privateControlPlane.generate(request)
+});
+
+const providers = createAgentFlowSessionProviderRegistry([
+  { kind: "custom", name: "private-control-plane", adapter: customAdapter }
+]);
+
+await executeAgentFlowCommandPipeline(
+  store,
+  runId,
+  workflow,
+  undefined,
+  providers
+);
+```
+
+The workflow uses `provider: private-control-plane` directly; it does not need
+a global target or repository alias. This path is programmatic because the
+installed CLI does not load arbitrary adapter code from YAML.
+
+Custom registrations retain the previous logical-name binding. Agent Flow
+cannot detect that an application changed the implementation behind that name
+between processes. If that adapter needs target/model drift detection and
+local/frontier budget classification, register it with `registerConfigured`
+and provide complete, privacy-safe target metadata instead.
+
 ## Try the offline examples
 
 From a clone of this repository, the collaborative example can complete with a

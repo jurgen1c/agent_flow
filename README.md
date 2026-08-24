@@ -124,6 +124,11 @@ const recoveryWorkflows = createAgentFlowWorkflowRegistry()
 The CLI loads concrete model targets from the user config and portable aliases
 from the repository. Programmatic registration remains available for custom
 integrations; see [Session provider boundaries](docs/session-providers.md).
+The configuration layer is additive: the original fixture, local, frontier,
+named Codex-profile, and custom registry APIs remain supported. A workflow
+host can continue registering `kind: "custom"` adapters without either config
+file. The installed CLI cannot load arbitrary application code, so those
+providers still run through the programmatic API.
 
 Put concrete models and endpoints in
 `${XDG_CONFIG_HOME:-~/.config}/agent-flow/config.yml`:
@@ -175,6 +180,12 @@ swap Qwen for Gemma, Claude for Codex, or another same-kind target. See
 for all three built-in HTTP drivers and a multi-model workflow. Native coding
 CLIs remain available only through application-defined custom adapters because
 the built-in boundary sends declared prompt and artifact content only.
+
+Ordinary custom registrations preserve the previous behavior: Agent Flow pins
+the provider name in the workflow but cannot fingerprint changes inside
+application-owned adapter code. Applications that want configured-provider
+drift protection for their own adapter can use `registerConfigured` with a
+complete local/frontier descriptor and a privacy-safe target fingerprint.
 
 Pass the workflow registry as the final `executeAgentFlowCommandPipeline`
 argument when a workflow uses `route_to.workflow`. Recovery session providers

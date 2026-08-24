@@ -178,6 +178,46 @@ Reserved live programmatic registrations still require explicit
 `enabled: true`. Applications can also call `loadAgentFlowProviderCatalog` and
 `createAgentFlowConfiguredProviderRegistry` directly.
 
+### Compatibility with the original provider system
+
+The configured-provider layer is additive. It does not remove or reinterpret
+existing registrations:
+
+| Provider path | Registration | Config files required | Drift identity |
+|---|---|---|---|
+| Fixture | `{ kind: "fixture", adapter }` | No | Logical `fixture` name |
+| Reserved local/frontier | `{ kind: "local" | "frontier", enabled: true, adapter }` | No | Logical reserved name |
+| Named Codex profile | `{ kind: "codex_profile", profile, enabled: true, adapter }` | No | Logical profile name |
+| Custom | `{ kind: "custom", name, adapter }` or `.register(name, adapter)` | No | Logical custom name |
+| Configured built-in | Global target plus repository alias | Yes | Target, kind, driver, model hash, endpoint settings, and fingerprint |
+| Programmatic configured | `.registerConfigured(descriptor, adapter)` | No | Complete descriptor and fingerprint |
+
+Workflows using a custom registration name it directly:
+
+```yaml
+sessions:
+  implementer:
+    provider: private-control-plane
+```
+
+No `.agent-flow.yml` entry is required. The application must pass that registry
+to `executeAgentFlowCommandPipeline` and `resumeAgentFlowCommandPipeline`; the
+installed CLI cannot discover or execute arbitrary application adapter code.
+
+An ordinary custom provider intentionally keeps the previous reproducibility
+boundary. Agent Flow persists the logical provider name and request evidence,
+but it cannot tell whether application code changed the adapter implementation
+behind that name. Use `registerConfigured` when an application-owned adapter
+should also receive:
+
+- local or frontier budget classification;
+- complete target/model identity evidence; and
+- resume rejection when its privacy-safe fingerprint changes.
+
+`registerConfigured` requires `name`, `kind`, `target`, `driver`, `model`, and
+`fingerprint`. Its adapter remains application-defined; registration neither
+loads executable code from YAML nor grants filesystem or process authority.
+
 `request.fileScope.layers` preserves the global, session, and operation scopes
 separately. A file-writing adapter must require every layer to allow a path;
 combining include globs into one union would broaden authority incorrectly.
