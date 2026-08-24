@@ -1,0 +1,30 @@
+version: 1
+targets:
+  codex-main:
+    kind: frontier
+    driver: openai-responses
+    model: YOUR_CODEX_MODEL
+    api_key_env: OPENAI_API_KEY
+    enabled: true
+
+  claude-main:
+    kind: frontier
+    driver: anthropic-messages
+    model: YOUR_CLAUDE_MODEL
+    api_key_env: ANTHROPIC_API_KEY
+    max_output_tokens: 4096
+    enabled: true
+
+  qwen-local:
+    kind: local
+    driver: openai-compatible
+    base_url: http://127.0.0.1:11434/v1
+    model: qwen3
+    enabled: true
+
+  gemma-local:
+    kind: local
+    driver: openai-compatible
+    base_url: http://127.0.0.1:11434/v1
+    model: gemma4
+    enabled: true

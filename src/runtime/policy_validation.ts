@@ -11,6 +11,7 @@ import {
   quotePolicyValue,
   stringList
 } from "./policy_utils";
+import type { AgentFlowProviderKindResolver } from "./policy_utils";
 
 export interface AgentFlowPolicyIssue {
   code: string;
@@ -22,7 +23,10 @@ const POLICY_MODES = new Set(["allow", "deny", "require_approval"]);
 const RECOVERY_LIMIT_MODES = new Set(["pause", "fail"]);
 const SENSITIVE_INPUT_MODES = new Set(["allow", "deny", "redact"]);
 
-export function validateAgentFlowPolicyPrimitives(workflow: AgentFlowWorkflow): AgentFlowPolicyIssue[] {
+export function validateAgentFlowPolicyPrimitives(
+  workflow: AgentFlowWorkflow,
+  providerKind?: AgentFlowProviderKindResolver
+): AgentFlowPolicyIssue[] {
   const errors: AgentFlowPolicyIssue[] = [];
   const limits = mapping(workflow.limits);
   const policies = mapping(workflow.policies);
@@ -31,7 +35,7 @@ export function validateAgentFlowPolicyPrimitives(workflow: AgentFlowWorkflow): 
   const frontierSessions = Object.entries(workflow.sessions ?? {})
     .filter(([, session]) => {
       const provider = mapping(session)?.provider;
-      return isAgentFlowFrontierProvider(provider);
+      return isAgentFlowFrontierProvider(provider, providerKind);
     })
     .map(([name]) => name);
 

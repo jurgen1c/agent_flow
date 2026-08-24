@@ -4,11 +4,108 @@
   "type": "object",
   "required": ["version"],
   "properties": {
-    "version": { "type": "integer", "minimum": 1 },
+    "version": { "const": 1 },
     "workflows": { "type": "string" },
     "prompts": { "type": "string" },
     "templates": { "type": "string" },
-    "runs": { "type": "string" }
+    "runs": { "type": "string" },
+    "targets": {
+      "type": "object",
+      "propertyNames": { "pattern": "^(?!__proto__$|prototype$|constructor$)[^\\s=\\u0000-\\u001F\\u007F-\\u009F]+$" },
+      "additionalProperties": { "$ref": "#/$defs/target" }
+    },
+    "providers": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^(?!fixture$|local$|frontier$|codex:|__proto__$|prototype$|constructor$)[^\\s=\\u0000-\\u001F\\u007F-\\u009F]+$"
+      },
+      "additionalProperties": { "$ref": "#/$defs/providerAlias" }
+    }
   },
-  "additionalProperties": true
+  "additionalProperties": false,
+  "$defs": {
+    "target": {
+      "type": "object",
+      "required": ["kind", "driver", "model", "enabled"],
+      "properties": {
+        "kind": { "enum": ["local", "frontier"] },
+        "driver": {
+          "enum": ["openai-responses", "anthropic-messages", "openai-compatible"]
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^\\S(?:.*\\S)?$",
+          "not": { "pattern": "[\\u0000-\\u001F\\u007F-\\u009F]" }
+        },
+        "enabled": { "type": "boolean" },
+        "base_url": { "type": "string", "format": "uri" },
+        "api_key_env": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+        "max_output_tokens": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "driver": { "enum": ["openai-responses", "anthropic-messages"] } }, "required": ["driver"] },
+          "then": { "properties": { "kind": { "const": "frontier" } }, "required": ["api_key_env"] }
+        },
+        {
+          "if": { "properties": { "driver": { "const": "openai-compatible" } }, "required": ["driver"] },
+          "then": { "required": ["base_url"] },
+          "else": { "not": { "required": ["base_url"] } }
+        },
+        {
+          "if": { "properties": { "driver": { "const": "anthropic-messages" } }, "required": ["driver"] },
+          "else": { "not": { "required": ["max_output_tokens"] } }
+        },
+        {
+          "if": {
+            "properties": { "kind": { "const": "local" } },
+            "required": ["kind", "base_url"]
+          },
+          "then": {
+            "properties": {
+              "base_url": {
+                "pattern": "^https?://(?:localhost|127\\.0\\.0\\.1|\\[::1\\])(?::[0-9]+)?(?:/[^?#]*)?$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "kind": { "const": "frontier" } },
+            "required": ["kind", "base_url"]
+          },
+          "then": {
+            "properties": {
+              "base_url": { "pattern": "^https://[^/?#@]+(?:/[^?#]*)?$" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "driver": { "enum": ["openai-responses", "anthropic-messages", "openai-compatible"] }
+            },
+            "required": ["driver"]
+          },
+          "else": { "not": { "required": ["api_key_env"] } }
+        }
+      ]
+    },
+    "providerAlias": {
+      "type": "object",
+      "required": ["kind", "target"],
+      "properties": {
+        "kind": { "enum": ["local", "frontier"] },
+        "target": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\s=\\u0000-\\u001F\\u007F-\\u009F]+$",
+          "not": { "enum": ["__proto__", "prototype", "constructor"] }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
 }

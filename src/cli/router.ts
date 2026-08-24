@@ -12,7 +12,7 @@ import {
   createAgentFlowLifecycleRun,
   createAgentFlowNotificationRegistry,
   createAgentFlowFixtureSessionProvider,
-  createAgentFlowSessionProviderRegistry,
+  createAgentFlowConfiguredProviderRegistry,
   collectAgentFlowReviewCycleStepIds,
   executeAgentFlowCommandPipeline,
   defaultAgentFlowArchivePath,
@@ -21,18 +21,24 @@ import {
   formatAgentFlowWorkflowIssues,
   formatWorkflowParseIssues,
   injectAgentFlowRecoveryContext,
+  loadAgentFlowProviderCatalog,
+  loadAgentFlowRepositoryProviderAliases,
   lintAgentFlowWorkflow,
   normalizeAgentFlowArtifactPath,
+  providerBindingsForWorkflow,
   parseAgentFlowWorkflow,
   parseAgentFlowDisagreementPolicy,
   parseAgentFlowSimulationFixture,
   openAgentFlowRunState,
   plannedAgentFlowRuntimeCommands,
   renderAgentFlowSimulationSummary,
+  renderAgentFlowProviderCatalog,
   renderAgentFlowWorkflowGraph,
   resumeAgentFlowCommandPipeline,
   simulateAgentFlowWorkflow,
   transitionAgentFlowLifecycleRun,
+  doctorAgentFlowProviderCatalog,
+  serializeAgentFlowProviderBindings,
   validateAgentFlowWorkflow,
   writeAgentFlowPortableArchive
 } from "../runtime/index";
@@ -94,7 +100,7 @@ export function dispatch(args: string[], options: AgentFlowCliOptions = {}): Age
   if (command === "help") {
     const topic = rest[0];
 
-    if (topic && !["help", "version", "skills", "validate", "lint", "explain", "graph", "simulate"].includes(topic)
+    if (topic && !["help", "version", "skills", "config", "providers", "validate", "lint", "explain", "graph", "simulate"].includes(topic)
         && !isActiveLifecycleCommand(topic) && !isPlannedRuntimeCommand(topic)) {
       return {
         exitCode: 7,
@@ -119,12 +125,15 @@ export function dispatch(args: string[], options: AgentFlowCliOptions = {}): Age
     return manageSkills(rest, options);
   }
 
+  if (command === "config") return manageConfig(rest, options);
+  if (command === "providers") return manageProviders(rest, options);
+
   if (command === "validate" || command === "lint" || command === "explain" || command === "graph") {
-    return checkWorkflow(command, rest);
+    return checkWorkflow(command, rest, options);
   }
 
   if (command === "simulate") {
-    return simulateWorkflow(rest);
+    return simulateWorkflow(rest, options);
   }
 
   if (isActiveLifecycleCommand(command)) {
@@ -158,6 +167,14 @@ function renderHelp(topic?: string): string {
     ].join("\n");
   }
 
+  if (topic === "config") {
+    return "agent-flow config\n\nUsage: agent-flow config validate [--config <file>]";
+  }
+
+  if (topic === "providers") {
+    return "agent-flow providers\n\nUsage: agent-flow providers <list|doctor> [--config <file>]";
+  }
+
   if (topic && topic !== "help" && topic !== "version") {
     return [
       `agent-flow ${topic}`,
@@ -178,12 +195,15 @@ function renderHelp(topic?: string): string {
     "  agent-flow --version",
     "  agent-flow skills list",
     "  agent-flow skills install --destination <agents|codex>",
+    "  agent-flow config validate [--config <file>]",
+    "  agent-flow providers list [--config <file>]",
+    "  agent-flow providers doctor [--config <file>]",
     "  agent-flow validate <workflow>",
     "  agent-flow lint <workflow>",
     "  agent-flow explain <workflow>",
     "  agent-flow graph <workflow>",
     "  agent-flow simulate <workflow> --fixture <file>",
-    "  agent-flow run <workflow> --id <run-id>",
+    "  agent-flow run <workflow> --id <run-id> [--provider <alias=target>]",
     "  agent-flow run <workflow> --id <run-id> --fixture <file>",
     "  agent-flow resume <run-id> --outcome <choice> [--fixture <file>]",
     "  agent-flow resume <run-id> --answer <value> [--fixture <file>]",
@@ -202,6 +222,8 @@ function renderHelp(topic?: string): string {
     "  help       Show this help output.",
     "  version    Print the Agent Flow package version.",
     "  skills     List or install the bundled authoring and review skills.",
+    "  config     Validate global targets and repository provider aliases.",
+    "  providers  List configured aliases or check local readiness.",
     "  validate <workflow>  Validate workflow structure, references, and safety.",
     "  lint <workflow>      Warn about complexity and risky authoring patterns.",
     "  explain <workflow>   Explain steps, artifacts, policies, and warnings.",
@@ -271,15 +293,75 @@ function manageSkills(args: string[], options: AgentFlowCliOptions): AgentFlowCl
   }
 }
 
+function manageConfig(args: string[], options: AgentFlowCliOptions): AgentFlowCliResult {
+  const parsed = parseCatalogCommandArgs(args, "validate", "agent-flow config validate [--config <file>]");
+  if ("exitCode" in parsed) return parsed;
+  try {
+    const catalog = loadAgentFlowProviderCatalog({
+      cwd: options.cwd,
+      env: options.env,
+      homeDir: options.homeDir,
+      ...(parsed.configPath === undefined ? {} : { configPath: parsed.configPath })
+    });
+    return {
+      exitCode: 0,
+      stdout: `Agent Flow provider configuration is valid.\nGlobal: ${catalog.globalConfigPath}\nRepository: ${catalog.repoConfigPath}\nTargets: ${Object.keys(catalog.targets).length}\nAliases: ${Object.keys(catalog.providers).length}`
+    };
+  } catch (error) {
+    return { exitCode: 2, stderr: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function manageProviders(args: string[], options: AgentFlowCliOptions): AgentFlowCliResult {
+  const action = args[0];
+  if (action !== "list" && action !== "doctor") {
+    return { exitCode: 1, stderr: "Usage: agent-flow providers <list|doctor> [--config <file>]" };
+  }
+  const parsed = parseCatalogCommandArgs(args, action, `agent-flow providers ${action} [--config <file>]`);
+  if ("exitCode" in parsed) return parsed;
+  try {
+    const catalog = loadAgentFlowProviderCatalog({
+      cwd: options.cwd,
+      env: options.env,
+      homeDir: options.homeDir,
+      ...(parsed.configPath === undefined ? {} : { configPath: parsed.configPath })
+    });
+    if (action === "list") return { exitCode: 0, stdout: renderAgentFlowProviderCatalog(catalog) };
+    const result = doctorAgentFlowProviderCatalog(catalog, options.env ?? process.env);
+    return { exitCode: result.ok ? 0 : 2, [result.ok ? "stdout" : "stderr"]: result.lines.join("\n") };
+  } catch (error) {
+    return { exitCode: 2, stderr: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function parseCatalogCommandArgs(
+  args: string[],
+  action: string,
+  usage: string
+): { configPath?: string } | AgentFlowCliResult {
+  if (args[0] !== action || (args.length !== 1 && !(args.length === 3 && args[1] === "--config" && args[2]))) {
+    return { exitCode: 1, stderr: `Usage: ${usage}` };
+  }
+  return args.length === 3 ? { configPath: args[2] } : {};
+}
+
 async function runLifecycleCommand(
   command: ActiveLifecycleCommand,
   args: string[],
   options: AgentFlowCliOptions
 ): Promise<AgentFlowCliResult> {
   const usage = lifecycleUsage(command);
-  if (!validLifecycleArgs(command, args)) return { exitCode: 1, stderr: usage! };
+  const parsedRun = command === "run" ? parseRunLifecycleArgs(args) : undefined;
+  const parsedResume = command === "resume" ? parseResumeLifecycleArgs(args) : undefined;
+  if ((parsedRun !== undefined && "exitCode" in parsedRun)
+      || (parsedResume !== undefined && "exitCode" in parsedResume)
+      || ((command !== "run" && command !== "resume") && !validLifecycleArgs(command, args))) {
+    return { exitCode: 1, stderr: usage! };
+  }
 
-  const workflowPath = command === "run" && options.cwd ? path.resolve(options.cwd, args[0]) : args[0];
+  const workflowPath = command === "run"
+    ? path.resolve(options.cwd ?? process.cwd(), (parsedRun as ParsedRunLifecycleArgs).workflowPath)
+    : args[0];
   const workflowResult = command === "run" ? readWorkflow(workflowPath, "run") : null;
   if (workflowResult && "exitCode" in workflowResult) return workflowResult;
 
@@ -305,36 +387,52 @@ async function runLifecycleCommand(
     }
 
     if (command === "run") {
-      const fixture = args.length === 5 ? readRunFixture(args[4], options.cwd) : null;
+      const runArgs = parsedRun as ParsedRunLifecycleArgs;
+      const fixture = runArgs.fixturePath === undefined ? null : readRunFixture(runArgs.fixturePath, options.cwd);
       if (fixture !== null && "exitCode" in fixture) return fixture;
       const sessionRequestSteps = collectSessionRequestSteps(workflowResult!.workflow.steps);
-      if (sessionRequestSteps.length > 0 && fixture === null) {
+      const requiredProviders = collectRequiredWorkflowProviders(workflowResult!.workflow, sessionRequestSteps);
+      const usesFixtureProvider = requiredProviders.includes("fixture");
+      const repositoryAliases = loadAgentFlowRepositoryProviderAliases({ cwd: options.cwd });
+      const catalog = loadAgentFlowProviderCatalog({
+        cwd: options.cwd,
+        env: options.env,
+        homeDir: options.homeDir,
+        ...(runArgs.configPath === undefined ? {} : { configPath: runArgs.configPath }),
+        overrides: runArgs.providerOverrides,
+        aliases: requiredProviders.filter((provider) => provider !== "fixture")
+      });
+      const configuredValidation = validateAgentFlowWorkflow(
+        workflowResult!.workflow,
+        (provider) => Object.hasOwn(repositoryAliases, provider) ? repositoryAliases[provider]!.kind : undefined
+      );
+      if (!configuredValidation.valid) {
         return {
-          exitCode: 1,
-          stderr: "Session-request workflows require --fixture <file> until a non-fixture provider adapter is configured."
+          exitCode: 2,
+          stderr: `Agent Flow run failed: ${workflowPath}\n${formatAgentFlowWorkflowIssues(configuredValidation.errors)}`
         };
       }
-      const resolverSessions = collectDisagreementResolverSessions(workflowResult!.workflow, sessionRequestSteps);
-      const unsupportedProviders = [
-        ...sessionRequestSteps.map((step) => step.type === "review" || step.type === "approval" ? step.reviewer
-          : step.type === "consult" || step.type === "challenge" ? step.to : step.session)
-          .filter((session): session is string => typeof session === "string"),
-        ...resolverSessions
-      ]
-        .map((session) => workflowResult!.workflow.sessions?.[session.trim()])
-        .flatMap((session) => session !== null && typeof session === "object" && !Array.isArray(session)
-          ? [String((session as Record<string, unknown>).provider ?? "").trim()]
-          : [])
-        .filter((provider) => provider !== "fixture");
-      if (unsupportedProviders.length > 0) {
+      if (usesFixtureProvider && fixture === null) {
         return {
           exitCode: 1,
-          stderr: `CLI fixture mode supports only provider "fixture"; unsupported providers: ${[...new Set(unsupportedProviders)].sort().join(", ")}.`
+          stderr: "Session-request workflows using provider \"fixture\" require --fixture <file>."
+        };
+      }
+      const missingProviders = [...new Set(requiredProviders)]
+        .filter((provider) => provider !== "fixture" && !Object.hasOwn(catalog.bindings, provider))
+        .sort();
+      if (missingProviders.length > 0) {
+        return {
+          exitCode: 1,
+          stderr: fixture === null
+            ? `No configured CLI target resolves unsupported providers: ${missingProviders.join(", ")}. Add aliases to .agent-flow.yml or use provider "fixture" with --fixture.`
+            : `CLI fixture mode supports only provider "fixture" unless other providers are configured; unsupported providers: ${missingProviders.join(", ")}.`
         };
       }
       if (fixture !== null) {
         const unsupportedOutputStep = sessionRequestSteps.find((step) =>
           fixture.arrayOutputSteps.has(String(step.id ?? "").trim())
+          && providerForSessionRequestStep(workflowResult!.workflow, step) === "fixture"
         );
         if (unsupportedOutputStep !== undefined) {
           return {
@@ -343,13 +441,19 @@ async function runLifecycleCommand(
           };
         }
       }
+      const serializedBindings = serializeAgentFlowProviderBindings(
+        providerBindingsForWorkflow(workflowResult!.workflow, catalog)
+      );
       const result = createAgentFlowLifecycleRun(store, {
-        id: args[2],
+        id: runArgs.runId,
         workflow: workflowResult!.workflow,
         ...(fixture === null ? {} : { inputs: fixture.inputs }),
+        ...(Object.keys(serializedBindings).length === 0
+          ? {}
+          : { context: { providerBindings: serializedBindings } }),
         allowInterruptedRecovery: true
       });
-      const providers = createAgentFlowSessionProviderRegistry();
+      const providers = createAgentFlowConfiguredProviderRegistry(catalog, { env: options.env });
       if (fixture !== null) providers.register("fixture", createAgentFlowFixtureSessionProvider(
         fixture.responses,
         fixture.outcomes,
@@ -371,12 +475,14 @@ async function runLifecycleCommand(
         notifications,
         undefined,
         fixture === null ? undefined : () => {
-          store!.updateRun(result.run.id, {
-            context: {
-              ...store!.getRun(result.run.id)!.context,
-              cliFixturePath: path.resolve(options.cwd ?? process.cwd(), args[4])
-            }
-          });
+          if (usesFixtureProvider) {
+            store!.updateRun(result.run.id, {
+              context: {
+                ...store!.getRun(result.run.id)!.context,
+                cliFixturePath: path.resolve(options.cwd ?? process.cwd(), runArgs.fixturePath!)
+              }
+            });
+          }
           if (result.run.status !== "pending") return;
           for (const [index, [artifactPath, value]] of Object.entries(fixture.artifacts)
             .sort(([left], [right]) => left.localeCompare(right)).entries()) {
@@ -442,6 +548,7 @@ async function runLifecycleCommand(
     }
 
     if (command === "resume") {
+      const resumeArgs = parsedResume as ParsedResumeLifecycleArgs;
       const run = requireRun(store, runId);
       const workflow = run.context.workflow;
       if (workflow === null || typeof workflow !== "object" || Array.isArray(workflow)) {
@@ -450,19 +557,23 @@ async function runLifecycleCommand(
           "AGENT_FLOW_RESUME_STATE"
         );
       }
-      const response = args[1] === "--outcome"
-        ? { outcome: args[2] }
-        : { answer: parseCliAnswer(args[2]) };
+      const response = resumeArgs.responseKind === "outcome"
+        ? { outcome: resumeArgs.responseValue }
+        : { answer: parseCliAnswer(resumeArgs.responseValue) };
       const persistedFixturePath = typeof run.context.cliFixturePath === "string"
         ? run.context.cliFixturePath
         : undefined;
-      const fixturePath = args.length === 5 ? args[4] : persistedFixturePath;
+      const fixturePath = resumeArgs.fixturePath ?? persistedFixturePath;
       const fixture = fixturePath === undefined ? null : readRunFixture(fixturePath, options.cwd);
       if (fixture !== null && "exitCode" in fixture) return fixture;
       if (fixture !== null) {
         const unsupportedOutputStep = collectSessionRequestSteps(
           (workflow as unknown as import("../runtime/index").AgentFlowWorkflow).steps
-        ).find((step) => fixture.arrayOutputSteps.has(String(step.id ?? "").trim()));
+        ).find((step) => fixture.arrayOutputSteps.has(String(step.id ?? "").trim())
+          && providerForSessionRequestStep(
+            workflow as unknown as import("../runtime/index").AgentFlowWorkflow,
+            step
+          ) === "fixture");
         if (unsupportedOutputStep !== undefined) {
           return {
             exitCode: 2,
@@ -470,7 +581,18 @@ async function runLifecycleCommand(
           };
         }
       }
-      const providers = createAgentFlowSessionProviderRegistry();
+      const persistedWorkflow = workflow as unknown as import("../runtime/index").AgentFlowWorkflow;
+      const usesFixtureProvider = collectRequiredWorkflowProviders(persistedWorkflow).includes("fixture");
+      const pinnedOverrides = persistedProviderOverrides(run.context.providerBindings, runId);
+      const catalog = loadAgentFlowProviderCatalog({
+        cwd: options.cwd,
+        env: options.env,
+        homeDir: options.homeDir,
+        ...(resumeArgs.configPath === undefined ? {} : { configPath: resumeArgs.configPath }),
+        overrides: pinnedOverrides,
+        aliases: pinnedOverrides.map((override) => override.slice(0, override.indexOf("=")))
+      });
+      const providers = createAgentFlowConfiguredProviderRegistry(catalog, { env: options.env });
       if (fixture !== null) {
         providers.register("fixture", createAgentFlowFixtureSessionProvider(
           fixture.responses,
@@ -487,19 +609,19 @@ async function runLifecycleCommand(
       const execution = await resumeAgentFlowCommandPipeline(
         store,
         runId,
-        workflow as unknown as import("../runtime/index").AgentFlowWorkflow,
+        persistedWorkflow,
         response,
         undefined,
         providers,
         undefined,
         notifications
       );
-      if (args.length === 5 && execution.status === "paused") {
+      if (usesFixtureProvider && resumeArgs.fixturePath !== undefined && execution.status === "paused") {
         const resumedRun = requireRun(store, runId);
         store.updateRun(runId, {
           context: {
             ...resumedRun.context,
-            cliFixturePath: path.resolve(options.cwd ?? process.cwd(), args[4])
+            cliFixturePath: path.resolve(options.cwd ?? process.cwd(), resumeArgs.fixturePath)
           }
         });
       }
@@ -554,17 +676,94 @@ async function runLifecycleCommand(
   }
 }
 
+interface ParsedRunLifecycleArgs {
+  workflowPath: string;
+  runId: string;
+  fixturePath?: string;
+  configPath?: string;
+  providerOverrides: string[];
+}
+
+interface ParsedResumeLifecycleArgs {
+  runId: string;
+  responseKind: "outcome" | "answer";
+  responseValue: string;
+  fixturePath?: string;
+  configPath?: string;
+}
+
+function parseRunLifecycleArgs(args: string[]): ParsedRunLifecycleArgs | AgentFlowCliResult {
+  if (!args[0]) return { exitCode: 1 };
+  let runId: string | undefined;
+  let fixturePath: string | undefined;
+  let configPath: string | undefined;
+  const providerOverrides: string[] = [];
+  for (let index = 1; index < args.length; index += 2) {
+    const flag = args[index];
+    const value = args[index + 1];
+    if (!value) return { exitCode: 1 };
+    if (flag === "--id" && runId === undefined) runId = value;
+    else if (flag === "--fixture" && fixturePath === undefined) fixturePath = value;
+    else if (flag === "--config" && configPath === undefined) configPath = value;
+    else if (flag === "--provider") providerOverrides.push(value);
+    else return { exitCode: 1 };
+  }
+  if (runId === undefined) return { exitCode: 1 };
+  return {
+    workflowPath: args[0],
+    runId,
+    providerOverrides,
+    ...(fixturePath === undefined ? {} : { fixturePath }),
+    ...(configPath === undefined ? {} : { configPath })
+  };
+}
+
+function parseResumeLifecycleArgs(args: string[]): ParsedResumeLifecycleArgs | AgentFlowCliResult {
+  if (!args[0] || (args[1] !== "--outcome" && args[1] !== "--answer") || args[2] === undefined) return { exitCode: 1 };
+  if (args[1] === "--outcome" && args[2].length === 0) return { exitCode: 1 };
+  let fixturePath: string | undefined;
+  let configPath: string | undefined;
+  for (let index = 3; index < args.length; index += 2) {
+    const flag = args[index];
+    const value = args[index + 1];
+    if (!value) return { exitCode: 1 };
+    if (flag === "--fixture" && fixturePath === undefined) fixturePath = value;
+    else if (flag === "--config" && configPath === undefined) configPath = value;
+    else return { exitCode: 1 };
+  }
+  return {
+    runId: args[0],
+    responseKind: args[1] === "--outcome" ? "outcome" : "answer",
+    responseValue: args[2],
+    ...(fixturePath === undefined ? {} : { fixturePath }),
+    ...(configPath === undefined ? {} : { configPath })
+  };
+}
+
+function persistedProviderOverrides(
+  value: import("../runtime/index").AgentFlowRunStateValue | undefined,
+  runId: string
+): string[] {
+  if (value === undefined) return [];
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new AgentFlowRunStateError(
+      `Agent Flow run ${runId} has invalid pinned provider configuration.`,
+      "AGENT_FLOW_PROVIDER_CONFIG_STATE"
+    );
+  }
+  return Object.entries(value).sort(([left], [right]) => left.localeCompare(right)).map(([alias, binding]) => {
+    if (binding === null || typeof binding !== "object" || Array.isArray(binding)
+        || typeof binding.target !== "string") {
+      throw new AgentFlowRunStateError(
+        `Agent Flow run ${runId} has invalid pinned provider configuration for alias ${JSON.stringify(alias)}.`,
+        "AGENT_FLOW_PROVIDER_CONFIG_STATE"
+      );
+    }
+    return `${alias}=${binding.target}`;
+  });
+}
+
 function validLifecycleArgs(command: ActiveLifecycleCommand, args: string[]): boolean {
-  if (command === "run") {
-    return (args.length === 3 || (args.length === 5 && args[3] === "--fixture" && args[4].length > 0))
-      && args[1] === "--id" && args[0].length > 0 && args[2].length > 0
-  }
-  if (command === "resume") {
-    return (args.length === 3 || (args.length === 5 && args[3] === "--fixture" && args[4].length > 0))
-      && args[0].length > 0
-      && ["--outcome", "--answer"].includes(args[1])
-      && (args[1] === "--answer" || args[2].length > 0);
-  }
   if (command === "inject") {
     return args.length === 3 && args.every((entry) => entry.length > 0);
   }
@@ -575,7 +774,7 @@ function validLifecycleArgs(command: ActiveLifecycleCommand, args: string[]): bo
 
 function lifecycleUsage(topic: string): string | null {
   if (topic === "run") return "Usage: agent-flow run <workflow> --id <run-id> [--fixture <file>]";
-  if (topic === "resume") return "Usage: agent-flow resume <run-id> (--outcome <choice> | --answer <value>) [--fixture <file>]";
+  if (topic === "resume") return "Usage: agent-flow resume <run-id> (--outcome <choice> | --answer <value>) [--fixture <file>] [--config <file>]";
   if (topic === "inject") return "Usage: agent-flow inject <run-id> <session-name> <context>";
   if (topic === "cleanup") return "Usage: agent-flow cleanup ([--] <run-id> | --older-than <duration> [--status <status>]) [--approve]";
   if (topic === "archive") return "Usage: agent-flow archive [--] <run-id> [--output <file>]";
@@ -878,7 +1077,7 @@ function renderRunStatus(run: NonNullable<ReturnType<Awaited<ReturnType<typeof o
   return lines.join("\n");
 }
 
-function simulateWorkflow(args: string[]): AgentFlowCliResult {
+function simulateWorkflow(args: string[], options: AgentFlowCliOptions): AgentFlowCliResult {
   if (args.length !== 3 || args[1] !== "--fixture") {
     return { exitCode: 1, stderr: "Usage: agent-flow simulate <workflow> --fixture <file>" };
   }
@@ -886,6 +1085,17 @@ function simulateWorkflow(args: string[]): AgentFlowCliResult {
   const [workflowPath, , fixturePath] = args;
   const workflowResult = readWorkflow(workflowPath, "simulate");
   if ("exitCode" in workflowResult) return workflowResult;
+  const aliasResult = repositoryProviderAliases(options);
+  if (!aliasResult.ok) return aliasResult.result;
+  const aliases = aliasResult.aliases;
+  const providerKind = (provider: string) => Object.hasOwn(aliases, provider) ? aliases[provider]!.kind : undefined;
+  const configuredValidation = validateAgentFlowWorkflow(
+    workflowResult.workflow,
+    providerKind
+  );
+  if (!configuredValidation.valid) {
+    return { exitCode: 2, stderr: formatAgentFlowWorkflowIssues(configuredValidation.errors) };
+  }
 
   let fixtureSource: string;
   try {
@@ -905,14 +1115,23 @@ function simulateWorkflow(args: string[]): AgentFlowCliResult {
     };
   }
 
-  const result = simulateAgentFlowWorkflow(workflowResult.workflow, fixture.fixture);
+  const result = simulateAgentFlowWorkflow(
+    workflowResult.workflow,
+    fixture.fixture,
+    undefined,
+    providerKind
+  );
   return {
     exitCode: result.status === "unresolved" ? 2 : 0,
     stdout: renderAgentFlowSimulationSummary(result)
   };
 }
 
-function checkWorkflow(command: "validate" | "lint" | "explain" | "graph", args: string[]): AgentFlowCliResult {
+function checkWorkflow(
+  command: "validate" | "lint" | "explain" | "graph",
+  args: string[],
+  options: AgentFlowCliOptions
+): AgentFlowCliResult {
   const workflowPath = args[0];
 
   if (!workflowPath || args.length !== 1) {
@@ -922,6 +1141,20 @@ function checkWorkflow(command: "validate" | "lint" | "explain" | "graph", args:
   const workflowResult = readWorkflow(workflowPath, command);
   if ("exitCode" in workflowResult) return workflowResult;
   const workflow = workflowResult.workflow;
+  const aliasResult = repositoryProviderAliases(options);
+  if (!aliasResult.ok) return aliasResult.result;
+  const aliases = aliasResult.aliases;
+  const providerKind = (provider: string) => Object.hasOwn(aliases, provider) ? aliases[provider]!.kind : undefined;
+  const configuredValidation = validateAgentFlowWorkflow(
+    workflow,
+    providerKind
+  );
+  if (!configuredValidation.valid) {
+    return {
+      exitCode: 2,
+      stderr: `Agent Flow ${command} failed: ${workflowPath}\n${formatAgentFlowWorkflowIssues(configuredValidation.errors)}`
+    };
+  }
 
   if (command === "explain") {
     return { exitCode: 0, stdout: explainAgentFlowWorkflow(workflow) };
@@ -945,7 +1178,7 @@ function checkWorkflow(command: "validate" | "lint" | "explain" | "graph", args:
   }
 
   if (command === "validate") {
-    const warnings = lintAgentFlowWorkflow(workflow).warnings;
+    const warnings = lintAgentFlowWorkflow(workflow, providerKind).warnings;
 
     return warnings.length === 0
       ? { exitCode: 0, stdout: `Agent Flow validation passed: ${workflowPath}` }
@@ -955,7 +1188,7 @@ function checkWorkflow(command: "validate" | "lint" | "explain" | "graph", args:
         };
   }
 
-  const lint = lintAgentFlowWorkflow(workflow);
+  const lint = lintAgentFlowWorkflow(workflow, providerKind);
 
   if (lint.warnings.length === 0) {
     return { exitCode: 0, stdout: `Agent Flow lint passed with no warnings: ${workflowPath}` };
@@ -965,6 +1198,17 @@ function checkWorkflow(command: "validate" | "lint" | "explain" | "graph", args:
     exitCode: 0,
     stdout: `Agent Flow lint found ${lint.warnings.length} warning${lint.warnings.length === 1 ? "" : "s"}: ${workflowPath}\n${formatAgentFlowWorkflowIssues(lint.warnings)}`
   };
+}
+
+function repositoryProviderAliases(
+  options: AgentFlowCliOptions
+): { ok: true; aliases: Readonly<Record<string, import("../runtime/index").AgentFlowProviderAlias>> }
+  | { ok: false; result: AgentFlowCliResult } {
+  try {
+    return { ok: true, aliases: loadAgentFlowRepositoryProviderAliases({ cwd: options.cwd }) };
+  } catch (error) {
+    return { ok: false, result: { exitCode: 2, stderr: error instanceof Error ? error.message : String(error) } };
+  }
 }
 
 function readWorkflow(
@@ -1024,6 +1268,41 @@ function collectSessionRequestSteps(
   return requests;
 }
 
+function collectRequiredWorkflowProviders(
+  workflow: import("../runtime/index").AgentFlowWorkflow,
+  sessionRequestSteps = collectSessionRequestSteps(workflow.steps)
+): string[] {
+  const configuredSessionNames = [
+    ...sessionRequestSteps.map((step) => {
+      const type = typeof step.type === "string" ? step.type.trim() : "";
+      return type === "review" || type === "approval" ? step.reviewer
+        : type === "consult" || type === "challenge" ? step.to : step.session;
+    })
+      .filter((session): session is string => typeof session === "string"),
+    ...collectDisagreementResolverSessions(workflow, sessionRequestSteps),
+    ...collectRecoveryRouteSessions(workflow.steps)
+  ];
+  return configuredSessionNames
+    .map((session) => workflow.sessions?.[session.trim()])
+    .flatMap((session) => session !== null && typeof session === "object" && !Array.isArray(session)
+      ? [String((session as Record<string, unknown>).provider ?? "").trim()]
+      : []);
+}
+
+function providerForSessionRequestStep(
+  workflow: import("../runtime/index").AgentFlowWorkflow,
+  step: import("../runtime/index").AgentFlowWorkflowStep
+): string | undefined {
+  const type = typeof step.type === "string" ? step.type.trim() : "";
+  const sessionName = type === "review" || type === "approval" ? step.reviewer
+    : type === "consult" || type === "challenge" ? step.to : step.session;
+  if (typeof sessionName !== "string") return undefined;
+  const session = workflow.sessions?.[sessionName.trim()];
+  if (session === null || typeof session !== "object" || Array.isArray(session)) return undefined;
+  const provider = (session as Record<string, unknown>).provider;
+  return typeof provider === "string" ? provider.trim() : undefined;
+}
+
 function collectDisagreementResolverSessions(
   workflow: import("../runtime/index").AgentFlowWorkflow,
   sessionRequestSteps: import("../runtime/index").AgentFlowWorkflowStep[]
@@ -1036,9 +1315,37 @@ function collectDisagreementResolverSessions(
   if (policy.strategy !== "owner_decides") return [];
   const reviewCycleIds = collectAgentFlowReviewCycleStepIds(workflow.steps);
   return sessionRequestSteps
-    .filter((step) => step.type === "review" && reviewCycleIds.has(String(step.id ?? "").trim()))
+    .filter((step) => typeof step.type === "string" && step.type.trim() === "review"
+      && reviewCycleIds.has(String(step.id ?? "").trim()))
     .map((step) => String(step.subject ?? "").trim())
     .filter((session) => session.length > 0);
+}
+
+function collectRecoveryRouteSessions(
+  steps: import("../runtime/index").AgentFlowWorkflowStep[]
+): string[] {
+  const sessions: string[] = [];
+  const visit = (step: import("../runtime/index").AgentFlowWorkflowStep): void => {
+    const onFailure = step.on_failure;
+    if (onFailure !== null && typeof onFailure === "object" && !Array.isArray(onFailure)) {
+      const route = (onFailure as Record<string, unknown>).route_to;
+      if (route !== null && typeof route === "object" && !Array.isArray(route)) {
+        const session = (route as Record<string, unknown>).session;
+        if (typeof session === "string" && session.trim().length > 0) sessions.push(session.trim());
+      }
+    }
+    for (const field of ["body", "steps", "branches"] as const) {
+      const nested = step[field];
+      if (!Array.isArray(nested)) continue;
+      for (const entry of nested) {
+        if (entry !== null && typeof entry === "object" && !Array.isArray(entry)) {
+          visit(entry as import("../runtime/index").AgentFlowWorkflowStep);
+        }
+      }
+    }
+  };
+  steps.forEach(visit);
+  return sessions;
 }
 
 function isPlannedRuntimeCommand(command: string): boolean {

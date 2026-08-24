@@ -114,7 +114,7 @@ Inputs and outputs:
 - <list durable artifacts it should produce>
 
 Execution:
-- Use <no model / fixture / local / frontier / codex:profile> for model-backed steps.
+- Use the configured <provider alias> for each model-backed session.
 - Require human approval before <any consequential action>.
 - Do not allow writes outside <the permitted paths>.
 - Bound retries, duration, model calls, and review cycles.
@@ -130,104 +130,152 @@ The skill may also recommend `$pipeline-designer`, `$recovery-designer`,
 specific design pass. Authoring skills inspect and write definitions; they do
 not start workflow runs.
 
+For a concrete multi-model starting point, use:
+
+```text
+Create an Agent Flow workflow at workflows/feature-delivery.yml.
+
+Use the `planner` provider to turn the feature request into plan.md.
+Use `implementer` to turn the plan into implementation-design.md.
+Use `local-reviewer` to review the result and produce review.md.
+Make implementation depend on planning and review depend on implementation.
+Keep every configured model session artifact-only, declare every input and
+output explicitly, and add appropriate timeouts and retry limits.
+
+Validate the workflow with Agent Flow and show me the commands to explain,
+simulate, and run it. Do not start the run.
+```
+
 ## Configure local or cloud models
 
-Agent Flow separates workflow policy from model-specific configuration. The
-workflow names a provider boundary; the application that hosts the runtime
-chooses the actual endpoint and model and supplies credentials to an adapter.
+Agent Flow keeps machine-specific model settings outside workflow YAML. Create
+the global config at
+`${XDG_CONFIG_HOME:-~/.config}/agent-flow/config.yml` (or set
+`AGENT_FLOW_CONFIG`/pass `--config`):
 
-For a local model, declare `provider: local`. For a remote model, use
-`provider: frontier`, `provider: codex:<profile>`, or an application-defined
-custom provider name. Allow the exact name in policy and add budgets:
+```yaml
+version: 1
+targets:
+  codex-main:
+    kind: frontier
+    driver: openai-responses
+    model: YOUR_CODEX_MODEL
+    api_key_env: OPENAI_API_KEY
+    enabled: true
+
+  claude-main:
+    kind: frontier
+    driver: anthropic-messages
+    model: YOUR_CLAUDE_MODEL
+    api_key_env: ANTHROPIC_API_KEY
+    max_output_tokens: 4096
+    enabled: true
+
+  openai-api:
+    kind: frontier
+    driver: openai-responses
+    model: YOUR_OPENAI_MODEL
+    api_key_env: OPENAI_API_KEY
+    enabled: true
+
+  anthropic-api:
+    kind: frontier
+    driver: anthropic-messages
+    model: YOUR_ANTHROPIC_MODEL
+    api_key_env: ANTHROPIC_API_KEY
+    max_output_tokens: 4096
+    enabled: true
+
+  qwen-local:
+    kind: local
+    driver: openai-compatible
+    base_url: http://127.0.0.1:11434/v1
+    model: qwen3
+    enabled: true
+
+  gemma-local:
+    kind: local
+    driver: openai-compatible
+    base_url: http://127.0.0.1:11434/v1
+    model: gemma4
+    enabled: true
+```
+
+Do not put API keys in YAML. `api_key_env` names the environment variable to
+read. Built-in drivers send only the declared prompt and input artifact content;
+native coding CLIs require an application-defined custom adapter with its own
+filesystem and process boundary.
+
+Commit a repository-root `.agent-flow.yml` containing portable aliases:
+
+```yaml
+version: 1
+providers:
+  planner: { kind: frontier, target: claude-main }
+  implementer: { kind: frontier, target: codex-main }
+  local-drafter: { kind: local, target: qwen-local }
+  local-reviewer: { kind: local, target: gemma-local }
+```
+
+The alias kind is a safety boundary: a local alias cannot be redirected to a
+frontier target, or vice versa. Validate and inspect the resolved catalog
+without contacting a model:
+
+```bash
+agent-flow config validate
+agent-flow providers list
+agent-flow providers doctor
+```
+
+`doctor` checks required credential variables and target readiness only. It
+does not make a paid API call or generate model output.
+
+Use aliases in workflow sessions. Each step selects its session, so one step
+can use Claude, another Codex, and local steps can use Qwen and Gemma:
 
 ```yaml
 sessions:
-  writer:
-    provider: local
-    resume: false
+  planner: { provider: planner }
+  implementer:
+    provider: implementer
+  drafter: { provider: local-drafter }
+  reviewer: { provider: local-reviewer }
 
 policies:
   model_usage:
-    allowed_providers: [local]
+    allowed_providers: [planner, implementer, local-drafter, local-reviewer]
 
 limits:
-  max_model_calls: 2
+  max_model_calls: 8
+  max_frontier_calls: 4
 ```
 
-Changing `local` to `frontier` also requires a suitable
-`max_frontier_calls` limit. Named Codex profiles, such as `codex:reviewer`, are
-treated as frontier providers for budgeting.
-
-There is intentionally no built-in `model` field in workflow YAML and no
-automatic credential or provider discovery. A host application registers the
-adapter explicitly:
-
-```ts
-import {
-  createAgentFlowSessionProviderRegistry,
-  type AgentFlowSessionProviderAdapter
-} from "@jurgen1c/agent-flow";
-
-const localModel = process.env.MY_APP_LOCAL_MODEL;
-const cloudModel = process.env.MY_APP_CLOUD_MODEL;
-
-if (!localModel || !cloudModel) {
-  throw new Error("Configure MY_APP_LOCAL_MODEL and MY_APP_CLOUD_MODEL.");
-}
-
-const localAdapter: AgentFlowSessionProviderAdapter = async (request) => ({
-  outputs: await localModelClient.generateOutputs({
-    model: localModel,
-    prompt: request.prompt.content,
-    inputs: request.inputs,
-    outputPaths: request.outputs,
-    signal: request.signal
-  }),
-  metadata: { model: localModel }
-});
-
-const cloudAdapter: AgentFlowSessionProviderAdapter = async (request) => ({
-  outputs: await cloudModelClient.generateOutputs({
-    model: cloudModel,
-    prompt: request.prompt.content,
-    inputs: request.inputs,
-    outputPaths: request.outputs,
-    signal: request.signal
-  }),
-  metadata: { model: cloudModel }
-});
-
-const providers = createAgentFlowSessionProviderRegistry([
-  { kind: "local", enabled: true, adapter: localAdapter },
-  { kind: "frontier", enabled: true, adapter: cloudAdapter }
-]);
-```
-
-`localModelClient` and `cloudModelClient` represent your application or model
-SDK. Their `generateOutputs` function must return an object whose keys exactly
-match `request.outputs`. Keep API keys in the host process or secret manager;
-never put them in workflow YAML, prompts, returned metadata, or artifacts. Pass
-the resulting registry to `executeAgentFlowCommandPipeline` and to
-`resumeAgentFlowCommandPipeline` when resuming a run.
-
-The packaged `agent-flow run` command currently creates only a fixture
-provider. It does not load live adapters, so live local/cloud execution requires
-a host application using the programmatic API. For deterministic CLI execution,
-declare `provider: fixture` in the workflow and supply the matching fixture:
+Swap a target for one new run without editing either file:
 
 ```bash
-agent-flow run workflows/fixture-backed.yml \
-  --id fixture-backed-demo \
-  --fixture fixtures/fixture-backed.json
+agent-flow run examples/workflows/multi-provider.yml \
+  --id gemma-draft \
+  --fixture examples/fixtures/multi-provider/inputs.json \
+  --provider local-drafter=gemma-local
 ```
 
-A workflow that declares `local`, `frontier`, `codex:<profile>`, or a custom
-live provider cannot be switched to fixture mode only by adding `--fixture`;
-use a fixture-provider authoring variant or change the declaration deliberately.
+Overrides are repeatable and apply only when creating a run. Agent Flow pins a
+privacy-safe target fingerprint; resume rejects model, endpoint, driver, kind,
+or permission drift. Credential rotation does not change the fingerprint.
+
+All built-in configured drivers return declared artifacts without
+file-modification authority and receive only the declared prompt and input
+artifacts. Native coding CLIs and file-writing providers require a custom
+adapter with an application-enforced execution boundary.
+
+All built-in drivers accept UTF-8 text inputs and require one structured JSON
+response with exactly the declared output paths. Provider retries are not
+hidden: the workflow's retry policy remains authoritative. All three built-in
+HTTP drivers are non-resumable; use a custom adapter when a provider needs to
+preserve native conversational state.
 
 See [session provider boundaries](session-providers.md) for registration kinds,
-the full adapter request/response contract, opt-in behavior, and evidence
-handling.
+the programmatic extension API, permission behavior, and evidence handling.
 
 ## Try the offline examples
 

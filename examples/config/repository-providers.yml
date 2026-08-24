@@ -1,0 +1,6 @@
+version: 1
+providers:
+  planner: { kind: frontier, target: claude-main }
+  implementer: { kind: frontier, target: codex-main }
+  local-drafter: { kind: local, target: qwen-local }
+  local-reviewer: { kind: local, target: gemma-local }

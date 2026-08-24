@@ -42,6 +42,7 @@ export type AgentFlowPolicyRequest =
       session: string;
       usage: Record<string, number>;
       requested?: Record<string, number>;
+      providerKind?: "local" | "frontier";
     }
   | {
       kind: "approval";
@@ -166,7 +167,12 @@ function checkModelUsage(
     return fail("policy.model.provider.denied", `Provider "${provider}" is not allowed for session "${sessionName}".`);
   }
 
-  const budgets = ["model_calls", ...(isAgentFlowFrontierProvider(provider) ? ["frontier_calls"] : [])];
+  const budgets = [
+    "model_calls",
+    ...(isAgentFlowFrontierProvider(provider) || request.providerKind === "frontier"
+      ? ["frontier_calls"]
+      : [])
+  ];
   for (const budget of budgets) {
     const limit = mapping(workflow.limits)?.[`max_${budget}`];
     if (limit === undefined && budget !== "frontier_calls") continue;

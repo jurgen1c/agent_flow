@@ -144,8 +144,9 @@ fixture outputs, and runtime tests can register the fixture provider adapter to
 return deterministic responses without network access.
 The CLI exposes that same deterministic boundary with
 `agent-flow run <workflow> --id <run-id> --fixture <file>` for workflows whose
-session provider is `fixture`; non-fixture provider adapters remain an explicit
-embedding concern.
+session provider is `fixture`. It also resolves configured local and frontier
+aliases from the global provider config and repository `.agent-flow.yml`;
+custom adapters remain an explicit embedding concern.
 
 ## 7. Failure Behavior
 
@@ -258,9 +259,11 @@ agent-flow resume <run-id> --answer '{"environment":"staging"}'
 String answers are stored as UTF-8 text. Other JSON values are stored as
 UTF-8 JSON. The artifact is attributed to the input-request step and must obey
 the same normalized, repo-relative, collision-safe artifact contract as other
-declared outputs. CLI fixture-backed providers are restored from the fixture
-path persisted by `agent-flow run`; `--fixture <file>` may be supplied again to
-use an updated deterministic response set.
+declared outputs. When a workflow actually uses the `fixture` provider, the CLI
+restores it from the fixture path persisted by `agent-flow run`; `--fixture
+<file>` may be supplied again to use an updated deterministic response set.
+Fixtures used only to seed inputs for configured providers are not needed on
+resume and their paths are not persisted.
 
 ## 11. Notifications
 

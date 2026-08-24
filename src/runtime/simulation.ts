@@ -26,7 +26,10 @@ import {
   secureAgentFlowTextInput
 } from "./execution_security";
 import { agentFlowInputKeyLooksSensitive } from "./failure_payload";
-import { isAgentFlowFrontierProvider } from "./policy_utils";
+import {
+  isAgentFlowFrontierProvider,
+  type AgentFlowProviderKindResolver
+} from "./policy_utils";
 import {
   MAX_AGENT_FLOW_SESSION_INPUT_BYTES,
   MAX_AGENT_FLOW_SESSION_INPUTS,
@@ -145,6 +148,7 @@ interface SimulationState {
   approvalStatuses: Map<string, "approved" | "stale">;
   approvalInvalidations: Map<string, number>;
   transforms: AgentFlowArtifactTransformRegistry;
+  providerKind: AgentFlowProviderKindResolver | undefined;
   visitedSteps: AgentFlowSimulationVisitedStep[];
   missingArtifacts: AgentFlowSimulationMissingArtifact[];
   handledMissingArtifacts: Set<string>;
@@ -256,7 +260,8 @@ export function parseAgentFlowSimulationFixture(source: string): AgentFlowSimula
 export function simulateAgentFlowWorkflow(
   workflow: AgentFlowWorkflow,
   fixture: AgentFlowSimulationFixture,
-  transforms: AgentFlowArtifactTransformRegistry = createAgentFlowArtifactTransformRegistry()
+  transforms: AgentFlowArtifactTransformRegistry = createAgentFlowArtifactTransformRegistry(),
+  providerKind?: AgentFlowProviderKindResolver
 ): AgentFlowSimulationResult {
   const fixtureArtifacts = canonicalFixtureArtifacts(fixture.artifacts ?? {});
   const state: SimulationState = {
@@ -271,6 +276,7 @@ export function simulateAgentFlowWorkflow(
     approvalStatuses: new Map(),
     approvalInvalidations: new Map(),
     transforms,
+    providerKind,
     visitedSteps: [],
     missingArtifacts: [],
     handledMissingArtifacts: new Set(),
@@ -944,7 +950,10 @@ function simulationSessionBudgetControl(
     ? undefined
     : state.workflow.sessions[sessionId];
   const provider = isRecord(session) ? nonEmptyString(session.provider) : undefined;
-  const kinds = ["model_calls", ...(isAgentFlowFrontierProvider(provider) ? ["frontier_calls"] : [])];
+  const kinds = [
+    "model_calls",
+    ...(isAgentFlowFrontierProvider(provider, state.providerKind) ? ["frontier_calls"] : [])
+  ];
   const limits = isRecord(state.workflow.limits) ? state.workflow.limits : undefined;
   for (const kind of kinds) {
     const limit = limits?.[`max_${kind}`];

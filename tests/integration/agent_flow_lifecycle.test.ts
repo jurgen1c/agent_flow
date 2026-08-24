@@ -90,6 +90,38 @@ describe("Agent Flow run lifecycle", () => {
     store.close();
   });
 
+  test("requires initial lifecycle context to match when reusing a run ID", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(WORKFLOW_SOURCE);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, {
+      id: "context-pinned",
+      workflow,
+      context: { providerBindings: { writer: { target: "qwen-local" } } }
+    });
+
+    expect(createAgentFlowLifecycleRun(store, {
+      id: "context-pinned",
+      workflow,
+      context: { providerBindings: { writer: { target: "qwen-local" } } }
+    }).changed).toBe(false);
+    expect(() => createAgentFlowLifecycleRun(store, {
+      id: "context-pinned",
+      workflow,
+      context: { providerBindings: { writer: { target: "gemma-local" } } }
+    })).toThrow("already exists");
+    expect(() => createAgentFlowLifecycleRun(store, {
+      id: "context-pinned",
+      workflow
+    })).toThrow("already exists");
+    expect(() => createAgentFlowLifecycleRun(store, {
+      id: "reserved-context",
+      workflow,
+      context: { agentFlowInitialContext: {} }
+    })).toThrow("reserved");
+    store.close();
+  });
+
   test("reuses a matching running execution when interrupted recovery races with creation", async () => {
     const repoRoot = temporaryRepo();
     const workflow = parseAgentFlowWorkflowOrThrow(WORKFLOW_SOURCE);

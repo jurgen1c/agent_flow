@@ -23,7 +23,11 @@ import {
   validateAgentFlowWorkflow,
   type AgentFlowSessionProviderRequest
 } from "../../src/runtime";
-import { invokeAgentFlowSessionProvider, readAgentFlowSessionPrompt } from "../../src/runtime/session_request";
+import {
+  invokeAgentFlowSessionProvider,
+  readAgentFlowSessionPrompt,
+  reserveAgentFlowSessionModelCallBudgets
+} from "../../src/runtime/session_request";
 import {
   assertAgentFlowAdapterStringSafe,
   secureAgentFlowByteInput,
@@ -1303,6 +1307,72 @@ steps:
     store.close();
   });
 
+  test("preserves ancestor file scopes for sessions reached through direct routing", async () => {
+    const root = temporaryRepo();
+    fs.writeFileSync(path.join(root, "prompt.md"), "Draft the response.\n");
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: routed-nested-session-scope
+version: 1
+style: collaborative
+maturity: experimental
+collaboration: { enabled: true }
+inputs: { ready: {} }
+sessions:
+  writer:
+    provider: custom
+    role: writer
+    authority: { can_modify_files: true }
+    file_scope: { include: ["**"] }
+steps:
+  - { id: route, type: condition, if: ready, then: write, else: fail }
+  - id: container
+    type: loop
+    max_iterations: 1
+    file_scope: { include: [src/**] }
+    body:
+      - id: write
+        type: session_request
+        session: writer
+        prompt: prompt.md
+        inputs: [request.md]
+        outputs: [response.md]
+        then: completed
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, {
+      id: "routed-nested-session-scope",
+      workflow,
+      inputs: { ready: true }
+    });
+    store.writeArtifact({
+      id: "request",
+      runId: "routed-nested-session-scope",
+      path: "request.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Please draft this."
+    });
+    let fileScope: AgentFlowSessionProviderRequest["fileScope"];
+    const providers = createAgentFlowSessionProviderRegistry().register("custom", (request) => {
+      fileScope = request.fileScope;
+      return { outputs: { "response.md": "Drafted." } };
+    });
+
+    expect((await executeAgentFlowCommandPipeline(
+      store,
+      "routed-nested-session-scope",
+      workflow,
+      undefined,
+      providers
+    )).status).toBe("completed");
+    expect(fileScope).toEqual({
+      layers: [
+        { include: ["**"], exclude: [] },
+        { include: ["src/**"], exclude: [] }
+      ]
+    });
+    store.close();
+  });
+
   test("preserves generated prompt source provenance when a field is redacted", async () => {
     const root = temporaryRepo();
     const message = "Approve with API_TOKEN=generated-prompt-secret";
@@ -2089,6 +2159,82 @@ steps:
       providers
     )).rejects.toMatchObject({ code: "AGENT_FLOW_SENSITIVE_INPUT" });
     expect(calls).toBe(0);
+    store.close();
+  });
+
+  test("rejects secret-bearing configured provider metadata before invocation", async () => {
+    const root = temporaryRepo();
+    fs.writeFileSync(path.join(root, "prompt.md"), "Draft.\n");
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: blocked-provider-metadata
+version: 1
+style: pipeline
+maturity: experimental
+policies: { sensitive_inputs: deny }
+sessions: { writer: { provider: configured } }
+steps:
+  - { id: draft, type: session_request, session: writer, prompt: prompt.md, inputs: [in.md], outputs: [out.md] }
+limits: { max_model_calls: 1 }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    store.createRun({
+      id: "blocked-provider-metadata",
+      status: "running",
+      workflow: { name: workflow.name, version: workflow.version, style: workflow.style, maturity: workflow.maturity },
+      context: { workflow }
+    });
+    store.writeArtifact({
+      id: "input",
+      runId: "blocked-provider-metadata",
+      path: "in.md",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "Input"
+    });
+    let calls = 0;
+    const providers = createAgentFlowSessionProviderRegistry().registerConfigured({
+      name: "configured",
+      kind: "local",
+      target: "local-target",
+      driver: "openai-compatible",
+      model: "API_TOKEN=configured-provider-secret",
+      fingerprint: "sha256:test"
+    }, () => {
+      calls += 1;
+      return { outputs: { "out.md": "unexpected" } };
+    });
+
+    await expect(executeAgentFlowSessionRequest(
+      store,
+      "blocked-provider-metadata",
+      workflow,
+      workflow.steps[0]!,
+      providers
+    )).rejects.toMatchObject({ code: "AGENT_FLOW_SENSITIVE_INPUT" });
+    expect(calls).toBe(0);
+    expect(store.getBudget("blocked-provider-metadata", "model:model_calls")).toBeNull();
+    store.close();
+  });
+
+  test("keeps reserved frontier provider names on the frontier budget", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: reserved-frontier-budget
+version: 1
+style: pipeline
+maturity: experimental
+sessions: { writer: { provider: frontier } }
+steps: []
+limits: { max_model_calls: 4, max_frontier_calls: 1 }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "reserved-frontier-budget", workflow });
+
+    reserveAgentFlowSessionModelCallBudgets(
+      store, "reserved-frontier-budget", workflow, "first", "writer", "frontier", "local"
+    );
+    expect(store.getBudget("reserved-frontier-budget", "model:frontier_calls")).toMatchObject({ used: 1, limit: 1 });
+    expect(() => reserveAgentFlowSessionModelCallBudgets(
+      store, "reserved-frontier-budget", workflow, "second", "writer", "frontier", "local"
+    )).toThrow('Budget "frontier_calls" would exceed its limit of 1');
     store.close();
   });
 

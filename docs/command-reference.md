@@ -13,6 +13,9 @@ for a future runtime surface and is not active.
 | `agent-flow skills list` | List bundled workflow authoring and review skills. |
 | `agent-flow skills install --destination agents` | Install skills under the current repository's `.agents/skills/`. Existing skill directories are not replaced. |
 | `agent-flow skills install --destination codex` | Install skills under `$CODEX_HOME/skills`, falling back to `~/.codex/skills`. Existing skill directories are not replaced. |
+| `agent-flow config validate [--config <file>]` | Validate global targets, repository aliases, kinds, endpoints, and references without contacting a model. |
+| `agent-flow providers list [--config <file>]` | Print the redacted resolved alias-to-target catalog. |
+| `agent-flow providers doctor [--config <file>]` | Check credential environment variables and target readiness without generating model output. |
 | `agent-flow validate <workflow>` | Validate YAML structure, references, policies, and safety constraints. |
 | `agent-flow lint <workflow>` | Report complexity and risky authoring patterns. |
 | `agent-flow explain <workflow>` | Explain normalized steps, artifacts, policies, collaboration, and warnings. |
@@ -26,9 +29,9 @@ lifecycle commands.
 
 | Command | Purpose |
 |---|---|
-| `agent-flow run <workflow> --id <run-id> [--fixture <file>]` | Create or reuse a persistent run and execute supported steps. CLI session providers currently require a fixture unless an application configures a provider programmatically. |
-| `agent-flow resume <run-id> --outcome <choice> [--fixture <file>]` | Continue a paused approval or other choice-based interaction. |
-| `agent-flow resume <run-id> --answer <value> [--fixture <file>]` | Continue a paused input request. JSON scalar, array, and object values are parsed; other input remains text. |
+| `agent-flow run <workflow> --id <run-id> [--fixture <file>] [--config <file>] [--provider <alias=target>]...` | Create or reuse a persistent run, load configured providers, and execute supported steps. Overrides are repeatable and new-run only. |
+| `agent-flow resume <run-id> --outcome <choice> [--fixture <file>] [--config <file>]` | Continue a paused approval or other choice-based interaction after verifying pinned provider bindings. |
+| `agent-flow resume <run-id> --answer <value> [--fixture <file>] [--config <file>]` | Continue a paused input request after verifying pinned provider bindings. JSON scalar, array, and object values are parsed; other input remains text. |
 | `agent-flow inject <run-id> <session-name> <context>` | Persist additional context for an active recovery session and mark it dirty for rerun. |
 | `agent-flow status <run-id>` | Print the durable run status and current lifecycle details. |
 | `agent-flow logs <run-id>` | Print ordered events with sequence, timestamp, event type, and JSON payload. |
