@@ -203,9 +203,11 @@ export async function executeAgentFlowCommandPipeline(
   mcpCalls: AgentFlowMcpCallRegistry = createAgentFlowMcpCallRegistry(),
   notifications: AgentFlowNotificationRegistry = createAgentFlowNotificationRegistry(),
   workflows: AgentFlowWorkflowRegistry = createAgentFlowWorkflowRegistry(),
-  prepareExecution?: () => void
+  prepareExecution?: () => void,
+  beforeRecovery?: () => void
 ): Promise<AgentFlowCommandPipelineResult> {
   return store.withRunLock(runId, "run", (lock) => {
+    beforeRecovery?.();
     assertPersistedWorkflowIdentity(store, runId, workflow);
     const recoveredExecution = recoverInterruptedExecution(store, lock);
     prepareExecution?.();
@@ -225,15 +227,17 @@ export async function resumeAgentFlowCommandPipeline(
   sessionProviders: AgentFlowSessionProviderRegistry = createAgentFlowSessionProviderRegistry(),
   mcpCalls: AgentFlowMcpCallRegistry = createAgentFlowMcpCallRegistry(),
   notifications: AgentFlowNotificationRegistry = createAgentFlowNotificationRegistry(),
-  workflows: AgentFlowWorkflowRegistry = createAgentFlowWorkflowRegistry()
+  workflows: AgentFlowWorkflowRegistry = createAgentFlowWorkflowRegistry(),
+  prepareResume?: () => void
 ): Promise<AgentFlowCommandPipelineResult> {
   return store.withRunLock(runId, "resume", (lock) => {
+    prepareResume?.();
     assertPersistedWorkflowIdentity(store, runId, workflow);
     const recoveredExecution = recoverInterruptedExecution(store, lock);
     const effectiveResponse = recoveredExecution === undefined ? response : undefined;
     return runAgentFlowCommandPipeline(
       store, runId, workflow, effectiveResponse, transforms, sessionProviders, mcpCalls, notifications, workflows,
-      undefined, recoveredExecution
+      undefined, recoveredExecution, prepareResume
     );
   });
 }
@@ -361,7 +365,8 @@ async function runAgentFlowCommandPipeline(
   notifications: AgentFlowNotificationRegistry,
   workflows: AgentFlowWorkflowRegistry,
   beforeRemediatedResult?: () => void,
-  recoveredExecution?: RecoveredAgentFlowExecution
+  recoveredExecution?: RecoveredAgentFlowExecution,
+  prepareResume?: () => void
 ): Promise<AgentFlowCommandPipelineResult> {
   const existing = store.getRun(runId);
   if (existing === null) throw new Error(`Agent Flow run ${runId} was not found.`);
@@ -460,7 +465,8 @@ async function runAgentFlowCommandPipeline(
       existing.context,
       resumeInput,
       stepLocations,
-      notifications
+      notifications,
+      prepareResume
     );
     if ("result" in resumed) return resumed.result;
     completedSteps = resumed.completedSteps;
@@ -2225,9 +2231,11 @@ function resumeWaitingStep(
   context: Record<string, AgentFlowRunStateValue>,
   response: AgentFlowPipelineResumeInput,
   stepLocations: Map<string, RuntimeStepLocation>,
-  notifications: AgentFlowNotificationRegistry
+  notifications: AgentFlowNotificationRegistry,
+  prepareResume?: () => void
 ): ResumedWaitingStep {
   const decision = store.withRunStateTransaction(runId, () => {
+    prepareResume?.();
     const persisted = persistWaitingStepResume(
       store, runId, workflow, context, response, stepLocations, notifications
     );
@@ -3016,6 +3024,10 @@ function parseWaitingState(value: AgentFlowRunStateValue | undefined): AgentFlow
     completedSteps,
     routing: serialized
   };
+}
+
+export function validateAgentFlowPipelineWaitingState(value: AgentFlowRunStateValue | undefined): void {
+  parseWaitingState(value);
 }
 
 function parseSerializedRoutingBudget(value: AgentFlowYamlMapping): SerializedSuccessfulRoutingBudget {

@@ -108,7 +108,8 @@ export function transitionAgentFlowLifecycleRun(
   store: AgentFlowRunStateStore,
   runId: string,
   action: AgentFlowLifecycleAction,
-  notifications: AgentFlowNotificationRegistry = createAgentFlowNotificationRegistry()
+  notifications: AgentFlowNotificationRegistry = createAgentFlowNotificationRegistry(),
+  prepareTransition?: () => void
 ): AgentFlowRunMutationResult {
   const current = store.getRun(runId);
   if (current === null) {
@@ -143,10 +144,16 @@ export function transitionAgentFlowLifecycleRun(
       store,
       runId,
       () => ({ changed: false, run: store.getRun(runId)! }),
-      () => transitionAgentFlowLifecycleRunUnlocked(store, runId, action, notifications)
+      () => {
+        prepareTransition?.();
+        return transitionAgentFlowLifecycleRunUnlocked(store, runId, action, notifications);
+      }
     );
   }
-  return transitionAgentFlowLifecycleRunUnlocked(store, runId, action, notifications);
+  return store.withRunStateTransaction(runId, () => {
+    prepareTransition?.();
+    return transitionAgentFlowLifecycleRunUnlocked(store, runId, action, notifications);
+  });
 }
 
 function transitionAgentFlowLifecycleRunUnlocked(

@@ -85,7 +85,7 @@ body {
   color: var(--text);
 }
 
-button, input { font: inherit; }
+button, input, textarea { font: inherit; }
 button { cursor: pointer; }
 
 .topbar {
@@ -138,7 +138,7 @@ h3 { margin-bottom: 6px; font-size: 0.95rem; }
 .token-controls { display: flex; gap: 8px; }
 .token-controls input { flex: 1; min-width: 0; }
 
-input {
+input, textarea {
   width: 100%;
   border: 1px solid var(--line-strong);
   border-radius: 7px;
@@ -148,7 +148,7 @@ input {
   color: var(--text);
 }
 
-input:focus { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(120, 220, 232, 0.12); }
+input:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(120, 220, 232, 0.12); }
 
 button {
   border: 1px solid var(--line-strong);
@@ -234,6 +234,28 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .badge.status-failed, .badge.status-rejected, .badge.status-cancelled { border-color: #6b3636; color: var(--bad); }
 .badge.status-paused, .badge.status-waiting, .badge.status-requested, .badge.status-stale { border-color: #665788; color: var(--waiting); }
 .badge.status-running { border-color: #25616a; color: var(--accent); }
+
+.action-panel {
+  margin: 0 0 22px;
+  padding: 15px;
+  border: 1px solid var(--line-strong);
+  border-radius: 9px;
+  background: var(--surface-raised);
+}
+.action-panel h3 { margin-bottom: 3px; }
+.action-prompt { margin: 10px 0; color: var(--text); }
+.action-warning-list { margin: 12px 0; display: grid; gap: 7px; }
+.action-warning { margin: 0; padding: 9px 10px; border-left: 3px solid var(--warn); background: #211b12; color: var(--muted); }
+.action-warning.danger { border-left-color: var(--bad); background: #211416; }
+.action-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-end; }
+.action-controls button.primary { border-color: #25616a; background: var(--accent-soft); color: var(--accent); }
+.action-controls button.danger { border-color: #6b3636; color: var(--bad); }
+.action-controls button:disabled { cursor: not-allowed; opacity: 0.45; border-color: var(--line); }
+.answer-control { flex: 1 1 320px; }
+.answer-control label { display: block; margin-bottom: 6px; color: var(--muted); font-size: 0.72rem; font-weight: 700; }
+.answer-control textarea { width: 100%; min-height: 84px; resize: vertical; }
+.action-result { margin: 10px 0 0; color: var(--muted); }
+.action-result.failed { color: var(--bad); }
 
 .summary-grid {
   margin-top: 16px;
@@ -381,9 +403,12 @@ export const AGENT_FLOW_RUN_INSPECTION_UI_JAVASCRIPT = String.raw`(function () {
     return token;
   }
 
-  async function api(path, headers) {
+  async function api(path, headers, requestOptions) {
+    var options = requestOptions || {};
     var response = await fetch(path, {
-      headers: Object.assign({}, headers, Object.fromEntries([[TOKEN_HEADER, state.token]])),
+      method: options.method || "GET",
+      headers: Object.assign({}, headers, options.headers, Object.fromEntries([[TOKEN_HEADER, state.token]])),
+      body: options.body,
       cache: "no-store"
     });
     var body;
@@ -465,9 +490,14 @@ export const AGENT_FLOW_RUN_INSPECTION_UI_JAVASCRIPT = String.raw`(function () {
     renderRunList();
     elements.workspace.replaceChildren(elements.loadingTemplate.content.cloneNode(true));
     try {
-      var model = await api("/api/run?section=overview", Object.fromEntries([[RUN_ID_HEADER, encodeURIComponent(runId)]]));
+      var detailHeaders = Object.fromEntries([[RUN_ID_HEADER, encodeURIComponent(runId)]]);
+      var responses = await Promise.all([
+        api("/api/run?section=overview", detailHeaders),
+        api("/api/run/actions", detailHeaders)
+      ]);
       if (requestId !== state.detailRequestId || state.selectedRunId !== runId) return;
-      state.model = model;
+      state.model = responses[0];
+      state.model.actionSnapshot = responses[1];
       renderModel();
     } catch (error) {
       if (requestId !== state.detailRequestId || state.selectedRunId !== runId) return;
@@ -494,6 +524,7 @@ export const AGENT_FLOW_RUN_INSPECTION_UI_JAVASCRIPT = String.raw`(function () {
     titleRow.append(title, badges);
     header.append(titleRow, summaryGrid(run));
     elements.workspace.append(header);
+    elements.workspace.append(renderActionPanel(model.actionSnapshot));
 
     var tabs = [
       ["timeline", "Timeline"],
@@ -525,6 +556,107 @@ export const AGENT_FLOW_RUN_INSPECTION_UI_JAVASCRIPT = String.raw`(function () {
     elements.workspace.append(tabBar);
     panels.forEach(function (panel) { elements.workspace.append(panel); });
     void loadSection("timeline");
+  }
+
+  function renderActionPanel(snapshot) {
+    var panel = node("section", "action-panel");
+    panel.append(textNode("p", "Guarded actions", "eyebrow"), textNode("h3", "Operate this run"));
+    if (snapshot.waiting) {
+      panel.append(textNode("p", snapshot.waiting.prompt, "action-prompt"));
+      panel.append(textNode("p", "Waiting at " + snapshot.waiting.stepId + " · " + snapshot.waiting.kind, "eyebrow"));
+    } else {
+      panel.append(textNode("p", "Actions are checked against the latest durable run state before they execute.", "action-prompt"));
+    }
+    if (snapshot.warnings.length > 0) {
+      var warningList = node("div", "action-warning-list");
+      snapshot.warnings.forEach(function (warning) {
+        var item = node("p", "action-warning " + warning.severity);
+        item.append(textNode("strong", warning.code + ": "), document.createTextNode(warning.message));
+        warningList.append(item);
+      });
+      panel.append(warningList);
+    }
+    var controls = node("div", "action-controls");
+    var answerInput = null;
+    var inputAction = snapshot.actions.find(function (action) { return action.action === "provide_input"; });
+    if (inputAction && inputAction.enabled) {
+      var answerControl = node("div", "answer-control");
+      var answerLabel = textNode("label", "Input answer");
+      answerLabel.setAttribute("for", "run-action-answer");
+      answerInput = node("textarea");
+      answerInput.id = "run-action-answer";
+      answerInput.placeholder = "Text or JSON value";
+      answerControl.append(answerLabel, answerInput);
+      controls.append(answerControl);
+    }
+    snapshot.actions.forEach(function (availability) {
+      var button = textNode(
+        "button",
+        availability.label,
+        availability.action === "cancel" || availability.action === "reject" ? "danger" : availability.action === "approve" ? "primary" : ""
+      );
+      button.type = "button";
+      button.disabled = !availability.enabled;
+      if (availability.reason) button.title = availability.reason;
+      button.addEventListener("click", function () {
+        void performAction(snapshot, availability, answerInput, panel, controls);
+      });
+      controls.append(button);
+    });
+    panel.append(controls);
+    return panel;
+  }
+
+  async function performAction(snapshot, availability, answerInput, panel, controls) {
+    if (availability.confirmation && !window.confirm(availability.confirmation)) return;
+    var status = textNode("p", "Applying " + availability.label.toLowerCase() + "…", "action-result");
+    panel.append(status);
+    try {
+      var payload = { action: availability.action, guard: snapshot.guard };
+      if (availability.action === "provide_input") {
+        payload.answer = parseActionAnswer(answerInput ? answerInput.value : "");
+      }
+      Array.from(controls.querySelectorAll("button, textarea")).forEach(function (control) { control.disabled = true; });
+      var result = await api(
+        "/api/run/actions",
+        Object.fromEntries([[RUN_ID_HEADER, encodeURIComponent(snapshot.runId)]]),
+        { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) }
+      );
+      status.textContent = availability.label + " completed. Run status: " + result.status + ".";
+      await loadRuns(snapshot.runId);
+    } catch (error) {
+      status.textContent = (error.code ? error.code + ": " : "") + (error.message || String(error));
+      status.classList.add("failed");
+      var refresh = textNode("button", "Refresh action state");
+      refresh.type = "button";
+      refresh.addEventListener("click", function () { void selectRun(snapshot.runId); });
+      panel.append(refresh);
+    }
+  }
+
+  function assertFiniteActionAnswer(value) {
+    if (typeof value === "number" && !Number.isFinite(value)) {
+      var error = new Error("Input answer JSON numbers must be finite.");
+      error.code = "AGENT_FLOW_ACTION_BODY_INVALID";
+      throw error;
+    }
+    if (Array.isArray(value)) {
+      value.forEach(assertFiniteActionAnswer);
+    } else if (value !== null && typeof value === "object") {
+      Object.values(value).forEach(assertFiniteActionAnswer);
+    }
+    return value;
+  }
+
+  function parseActionAnswer(value) {
+    var trimmed = value.trim();
+    if (!trimmed) return "";
+    try {
+      return assertFiniteActionAnswer(JSON.parse(trimmed));
+    } catch (error) {
+      if (error && error.code === "AGENT_FLOW_ACTION_BODY_INVALID") throw error;
+      return value;
+    }
   }
 
   function summaryGrid(run) {

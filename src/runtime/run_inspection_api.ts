@@ -18,11 +18,22 @@ import {
   AGENT_FLOW_RUN_INSPECTION_UI_HTML,
   AGENT_FLOW_RUN_INSPECTION_UI_JAVASCRIPT
 } from "./run_inspection_ui";
+import {
+  AGENT_FLOW_RUN_ACTIONS,
+  MAX_AGENT_FLOW_RUN_ACTION_ANSWER_DEPTH,
+  AgentFlowRunActionError,
+  buildAgentFlowRunActionSnapshot,
+  executeAgentFlowRunAction,
+  type AgentFlowRunAction,
+  type AgentFlowRunActionRuntime
+} from "./run_actions";
+import type { AgentFlowRunStateValue } from "./run_state";
 
 export const DEFAULT_AGENT_FLOW_RUN_INSPECTION_API_HOST = "127.0.0.1";
 export const DEFAULT_AGENT_FLOW_RUN_INSPECTION_API_PORT = 4318;
 export const AGENT_FLOW_RUN_INSPECTION_TOKEN_HEADER = "x-agent-flow-token";
 export const AGENT_FLOW_RUN_INSPECTION_RUN_ID_HEADER = "x-agent-flow-run-id";
+export const MAX_AGENT_FLOW_RUN_ACTION_BODY_BYTES = 64 * 1024;
 
 export interface AgentFlowRunInspectionApiOptions {
   cwd?: string;
@@ -30,6 +41,7 @@ export interface AgentFlowRunInspectionApiOptions {
   host?: string;
   port?: number;
   token?: string;
+  actionRuntime?: AgentFlowRunActionRuntime;
 }
 
 export interface AgentFlowRunInspectionApiHandle {
@@ -64,7 +76,8 @@ export async function startAgentFlowRunInspectionApi(
   const requestContext = {
     cwd: inspectionTarget.repoRoot,
     databasePath: inspectionTarget.databasePath,
-    token
+    token,
+    actionRuntime: options.actionRuntime
   };
   const server = http.createServer((request, response) => {
     void handleInspectionRequest(request, response, requestContext);
@@ -97,12 +110,56 @@ async function prepareInspectionDatabase(
 async function handleInspectionRequest(
   request: http.IncomingMessage,
   response: http.ServerResponse,
-  context: { cwd?: string; databasePath?: string; token: string }
+  context: {
+    cwd?: string;
+    databasePath?: string;
+    token: string;
+    actionRuntime?: AgentFlowRunActionRuntime;
+  }
 ): Promise<void> {
   try {
     const requestPath = rawRequestPath(request.url ?? "/");
     if (request.method === "GET" && sendInspectionUiAsset(response, requestPath)) return;
     requireToken(request.headers[AGENT_FLOW_RUN_INSPECTION_TOKEN_HEADER], context.token);
+    if (requestPath === "/api/run/actions") {
+      const runId = runIdFromHeader(request.headers[AGENT_FLOW_RUN_INSPECTION_RUN_ID_HEADER]);
+      if (request.method === "GET") {
+        const store = await openAgentFlowRunStateForInspection({
+          cwd: context.cwd,
+          databasePath: context.databasePath
+        });
+        try {
+          sendJson(response, 200, buildAgentFlowRunActionSnapshot(store, runId));
+        } finally {
+          store.close();
+        }
+        return;
+      }
+      if (request.method === "POST") {
+        const input = await readActionInput(request);
+        const store = await openAgentFlowRunState({
+          cwd: context.cwd,
+          databasePath: context.databasePath
+        });
+        try {
+          sendJson(response, 200, await executeAgentFlowRunAction(
+            store,
+            runId,
+            input,
+            context.actionRuntime ?? {}
+          ));
+        } finally {
+          store.close();
+        }
+        return;
+      }
+      response.setHeader("allow", "GET, POST");
+      throw new AgentFlowRunInspectionApiError(
+        "Method not allowed.",
+        405,
+        "AGENT_FLOW_INSPECTION_METHOD_NOT_ALLOWED"
+      );
+    }
     if (request.method !== "GET") {
       response.setHeader("allow", "GET");
       throw new AgentFlowRunInspectionApiError(
@@ -159,8 +216,16 @@ async function handleInspectionRequest(
       sendJson(response, error.status, { error: error.message, code: error.code });
       return;
     }
+    if (error instanceof AgentFlowRunActionError) {
+      sendJson(response, error.status, { error: error.message, code: error.code });
+      return;
+    }
     if (error instanceof AgentFlowRunStateError && error.code === "AGENT_FLOW_RUN_NOT_FOUND") {
       sendJson(response, 404, { error: error.message, code: error.code });
+      return;
+    }
+    if (error instanceof AgentFlowRunStateError) {
+      sendJson(response, 409, { error: error.message, code: error.code });
       return;
     }
     sendJson(response, 500, {
@@ -168,6 +233,135 @@ async function handleInspectionRequest(
       code: "AGENT_FLOW_INSPECTION_ERROR"
     });
   }
+}
+
+function runIdFromHeader(value: string | string[] | undefined): string {
+  if (value === undefined || Array.isArray(value)) {
+    throw new AgentFlowRunInspectionApiError(
+      "Run action requests require one encoded run ID header.",
+      400,
+      "AGENT_FLOW_INSPECTION_BAD_REQUEST"
+    );
+  }
+  return decodeRunId(value);
+}
+
+async function readActionInput(request: http.IncomingMessage): Promise<{
+  action: AgentFlowRunAction;
+  guard: string;
+  answer?: AgentFlowRunStateValue;
+}> {
+  const contentType = request.headers["content-type"]?.split(";", 1)[0]?.trim().toLowerCase();
+  if (contentType !== "application/json") {
+    throw new AgentFlowRunInspectionApiError(
+      "Run action requests require an application/json body.",
+      415,
+      "AGENT_FLOW_ACTION_CONTENT_TYPE"
+    );
+  }
+  const declaredLength = request.headers["content-length"];
+  if (declaredLength !== undefined && (!/^\d+$/.test(declaredLength)
+      || Number(declaredLength) > MAX_AGENT_FLOW_RUN_ACTION_BODY_BYTES)) {
+    throw new AgentFlowRunInspectionApiError(
+      `Run action request bodies cannot exceed ${MAX_AGENT_FLOW_RUN_ACTION_BODY_BYTES} bytes.`,
+      413,
+      "AGENT_FLOW_ACTION_BODY_TOO_LARGE"
+    );
+  }
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  for await (const chunk of request) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    bytes += buffer.length;
+    if (bytes > MAX_AGENT_FLOW_RUN_ACTION_BODY_BYTES) {
+      throw new AgentFlowRunInspectionApiError(
+        `Run action request bodies cannot exceed ${MAX_AGENT_FLOW_RUN_ACTION_BODY_BYTES} bytes.`,
+        413,
+        "AGENT_FLOW_ACTION_BODY_TOO_LARGE"
+      );
+    }
+    chunks.push(buffer);
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    throw new AgentFlowRunInspectionApiError(
+      "Run action request body must be valid JSON.",
+      400,
+      "AGENT_FLOW_ACTION_BODY_INVALID"
+    );
+  }
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new AgentFlowRunInspectionApiError(
+      "Run action request body must be a JSON object.",
+      400,
+      "AGENT_FLOW_ACTION_BODY_INVALID"
+    );
+  }
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record);
+  if (keys.some((key) => !["action", "guard", "answer"].includes(key))
+      || typeof record.action !== "string"
+      || !(AGENT_FLOW_RUN_ACTIONS as readonly string[]).includes(record.action)
+      || typeof record.guard !== "string") {
+    throw new AgentFlowRunInspectionApiError(
+      "Run action request body requires a supported action and its latest guard.",
+      400,
+      "AGENT_FLOW_ACTION_BODY_INVALID"
+    );
+  }
+  if (record.action === "provide_input" && !("answer" in record)) {
+    throw new AgentFlowRunInspectionApiError(
+      "Providing input requires an answer value.",
+      400,
+      "AGENT_FLOW_ACTION_ANSWER_REQUIRED"
+    );
+  }
+  if (record.action !== "provide_input" && "answer" in record) {
+    throw new AgentFlowRunInspectionApiError(
+      "Only provide_input actions accept an answer value.",
+      400,
+      "AGENT_FLOW_ACTION_BODY_INVALID"
+    );
+  }
+  if (record.action === "provide_input" && !isRunStateValue(record.answer)) {
+    throw new AgentFlowRunInspectionApiError(
+      `Input answers must contain only finite JSON values nested no more than ${MAX_AGENT_FLOW_RUN_ACTION_ANSWER_DEPTH} levels.`,
+      400,
+      "AGENT_FLOW_ACTION_BODY_INVALID"
+    );
+  }
+  return {
+    action: record.action as AgentFlowRunAction,
+    guard: record.guard,
+    ...(record.action === "provide_input"
+      ? { answer: record.answer as AgentFlowRunStateValue }
+      : {})
+  };
+}
+
+function isRunStateValue(value: unknown): value is AgentFlowRunStateValue {
+  const pending = [{ value, depth: 0 }];
+  while (pending.length > 0) {
+    const { value: candidate, depth } = pending.pop()!;
+    if (depth > MAX_AGENT_FLOW_RUN_ACTION_ANSWER_DEPTH) return false;
+    if (candidate === null || typeof candidate === "string" || typeof candidate === "boolean") continue;
+    if (typeof candidate === "number") {
+      if (Number.isFinite(candidate)) continue;
+      return false;
+    }
+    if (Array.isArray(candidate)) {
+      pending.push(...candidate.map((entry) => ({ value: entry, depth: depth + 1 })));
+      continue;
+    }
+    if (typeof candidate === "object") {
+      pending.push(...Object.values(candidate).map((entry) => ({ value: entry, depth: depth + 1 })));
+      continue;
+    }
+    return false;
+  }
+  return true;
 }
 
 function sendInspectionUiAsset(response: http.ServerResponse, requestPath: string): boolean {

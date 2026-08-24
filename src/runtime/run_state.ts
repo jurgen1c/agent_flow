@@ -1722,6 +1722,11 @@ export class AgentFlowRunStateStore {
     return this.inspectArtifact(artifactRow(artifact), false);
   }
 
+  inspectArtifactRecordForActionGuard(artifact: AgentFlowArtifactRecord): AgentFlowArtifactRecord {
+    this.assertOpen();
+    return this.inspectArtifact(artifactRow(artifact), false, true);
+  }
+
   getArtifact(runId: string, declaredPath: string): AgentFlowArtifactRecord | null {
     this.assertOpen();
     const normalizedRunId = artifactRunId(runId);
@@ -2890,7 +2895,11 @@ export class AgentFlowRunStateStore {
     }
   }
 
-  private inspectArtifact(row: ArtifactRow, persistInspection = true): AgentFlowArtifactRecord {
+  private inspectArtifact(
+    row: ArtifactRow,
+    persistInspection = true,
+    verifyChecksum = persistInspection
+  ): AgentFlowArtifactRecord {
     let status: AgentFlowArtifactStatus;
     let actualChecksum: string | null = null;
     const metadata = JSON.parse(row.metadata_json) as Record<string, AgentFlowRunStateValue>;
@@ -2905,7 +2914,7 @@ export class AgentFlowRunStateStore {
           const stat = fs.statSync(target);
           if (!stat.isFile() || row.checksum === null || row.size_bytes === null || stat.size !== row.size_bytes) {
             status = "stale";
-          } else if (!persistInspection) {
+          } else if (!verifyChecksum) {
             status = row.previous_checksum !== null ? "overwritten" : "available";
           } else {
             actualChecksum = artifactChecksum(target);

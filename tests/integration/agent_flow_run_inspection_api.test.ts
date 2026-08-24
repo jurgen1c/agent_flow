@@ -3,16 +3,23 @@ import { Database } from "bun:sqlite";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
+import vm from "node:vm";
 import {
   AGENT_FLOW_RUN_INSPECTION_TOKEN_HEADER,
   AGENT_FLOW_RUN_INSPECTION_RUN_ID_HEADER,
+  type AgentFlowRunAction,
+  buildAgentFlowRunActionSnapshot,
   buildAgentFlowRunInspectionModel,
   buildAgentFlowRunInspectionPage,
+  createAgentFlowSessionProviderRegistry,
   createAgentFlowLifecycleRun,
+  executeAgentFlowRunAction,
+  executeAgentFlowCommandPipeline,
   listAgentFlowRunInspectionSummaries,
   openAgentFlowRunState,
   parseAgentFlowWorkflowOrThrow,
-  startAgentFlowRunInspectionApi
+  startAgentFlowRunInspectionApi,
+  transitionAgentFlowLifecycleRun
 } from "../../src/runtime";
 
 describe("Agent Flow run inspection API", () => {
@@ -365,7 +372,7 @@ steps:
     store.close();
   });
 
-  test("serves only token-protected read endpoints on loopback", async () => {
+  test("serves token-protected inspection endpoints on loopback", async () => {
     const repo = makeRepo();
     const store = await openAgentFlowRunState({ cwd: repo });
     createInspectableRun(store, "run-api");
@@ -441,6 +448,1071 @@ steps:
     }
   });
 
+  test("guards token-protected approval actions and completes successful decisions", async () => {
+    const repo = makeRepo();
+    const store = await openAgentFlowRunState({ cwd: repo });
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: ui-approval
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: approve, type: approval, reviewer: human, artifacts: [release.md] }
+  - { id: done, type: result, status: completed }
+`);
+    createAgentFlowLifecycleRun(store, { id: "ui-approval", workflow });
+    store.writeArtifact({
+      id: "release",
+      runId: "ui-approval",
+      path: "release.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Release candidate"
+    });
+    expect(await executeAgentFlowCommandPipeline(store, "ui-approval", workflow))
+      .toMatchObject({ status: "paused" });
+    createAgentFlowLifecycleRun(store, { id: "ui-rejection", workflow });
+    store.writeArtifact({
+      id: "release",
+      runId: "ui-rejection",
+      path: "release.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Rejected candidate"
+    });
+    expect(await executeAgentFlowCommandPipeline(store, "ui-rejection", workflow))
+      .toMatchObject({ status: "paused" });
+    store.close();
+    const server = await startAgentFlowRunInspectionApi({
+      cwd: repo,
+      port: 0,
+      token: "inspection-token"
+    });
+    const headers = {
+      [AGENT_FLOW_RUN_INSPECTION_TOKEN_HEADER]: "inspection-token",
+      [AGENT_FLOW_RUN_INSPECTION_RUN_ID_HEADER]: encodeURIComponent("ui-approval")
+    };
+
+    try {
+      const denied = await fetch(`${server.url}/api/run/actions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action: "approve", guard: "x".repeat(43) })
+      });
+      expect(denied.status).toBe(403);
+
+      const snapshotResponse = await fetch(`${server.url}/api/run/actions`, { headers });
+      expect(snapshotResponse.status).toBe(200);
+      const snapshot = await snapshotResponse.json() as {
+        guard: string;
+        waiting: { kind: string; stepId: string };
+        staleApprovals: unknown[];
+        actions: Array<{ action: string; enabled: boolean }>;
+      };
+      expect(snapshot.waiting).toEqual(expect.objectContaining({ kind: "approval", stepId: "approve" }));
+      expect(snapshot.staleApprovals).toEqual([]);
+      expect(snapshot.actions).toContainEqual(expect.objectContaining({ action: "approve", enabled: true }));
+
+      const approved = await fetch(`${server.url}/api/run/actions`, {
+        method: "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        body: JSON.stringify({ action: "approve", guard: snapshot.guard })
+      });
+      expect(approved.status).toBe(200);
+      expect(await approved.json()).toMatchObject({
+        action: "approve",
+        status: "completed",
+        completedSteps: ["approve", "done"]
+      });
+
+      const rejectionHeaders = {
+        ...headers,
+        [AGENT_FLOW_RUN_INSPECTION_RUN_ID_HEADER]: encodeURIComponent("ui-rejection")
+      };
+      const rejectionSnapshot = await (await fetch(`${server.url}/api/run/actions`, {
+        headers: rejectionHeaders
+      })).json() as { guard: string };
+      const rejected = await fetch(`${server.url}/api/run/actions`, {
+        method: "POST",
+        headers: { ...rejectionHeaders, "content-type": "application/json" },
+        body: JSON.stringify({ action: "reject", guard: rejectionSnapshot.guard })
+      });
+      expect(rejected.status).toBe(200);
+      expect(await rejected.json()).toMatchObject({ action: "reject", status: "cancelled" });
+
+      const inspected = await openAgentFlowRunState({ cwd: repo });
+      expect(inspected.listApprovals("ui-approval")).toEqual([
+        expect.objectContaining({ status: "approved", decidedBy: "local-ui", decision: "approve" })
+      ]);
+      expect(inspected.listApprovals("ui-rejection")).toEqual([
+        expect.objectContaining({ status: "rejected", decidedBy: "local-ui", decision: "reject" })
+      ]);
+      inspected.close();
+    } finally {
+      await server.close();
+    }
+  });
+
+  test("rejects stale action guards and exposes stale approval warnings before mutation", async () => {
+    const repo = makeRepo();
+    const store = await openAgentFlowRunState({ cwd: repo });
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: stale-ui-approval
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: approve, type: approval, reviewer: human, artifacts: [release.md] }
+  - { id: done, type: result, status: completed }
+`);
+    createAgentFlowLifecycleRun(store, { id: "stale-ui-approval", workflow });
+    const release = store.writeArtifact({
+      id: "release",
+      runId: "stale-ui-approval",
+      path: "release.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "First candidate"
+    });
+    expect(await executeAgentFlowCommandPipeline(store, "stale-ui-approval", workflow))
+      .toMatchObject({ status: "paused" });
+    store.close();
+    const server = await startAgentFlowRunInspectionApi({
+      cwd: repo,
+      port: 0,
+      token: "inspection-token"
+    });
+    const headers = {
+      [AGENT_FLOW_RUN_INSPECTION_TOKEN_HEADER]: "inspection-token",
+      [AGENT_FLOW_RUN_INSPECTION_RUN_ID_HEADER]: encodeURIComponent("stale-ui-approval")
+    };
+
+    try {
+      const initial = await (await fetch(`${server.url}/api/run/actions`, { headers })).json() as { guard: string };
+      const writer = await openAgentFlowRunState({ cwd: repo });
+      writer.writeArtifact({
+        id: release.id,
+        runId: "stale-ui-approval",
+        path: release.declaredPath,
+        kind: release.kind,
+        contentType: release.contentType,
+        content: "Changed candidate",
+        overwrite: true
+      });
+      writer.close();
+
+      const staleAction = await fetch(`${server.url}/api/run/actions`, {
+        method: "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        body: JSON.stringify({ action: "approve", guard: initial.guard })
+      });
+      expect(staleAction.status).toBe(409);
+      expect(await staleAction.json()).toMatchObject({ code: "AGENT_FLOW_ACTION_STALE" });
+
+      const refreshed = await (await fetch(`${server.url}/api/run/actions`, { headers })).json() as {
+        staleApprovals: Array<{ id: string }>;
+        warnings: Array<{ code: string }>;
+        actions: Array<{ action: string; enabled: boolean; reason: string | null }>;
+      };
+      expect(refreshed.staleApprovals).toHaveLength(1);
+      expect(refreshed.warnings).toContainEqual(expect.objectContaining({ code: "action.approval.stale" }));
+      expect(refreshed.actions).toContainEqual(expect.objectContaining({
+        action: "approve",
+        enabled: false,
+        reason: expect.stringContaining("stale")
+      }));
+      const inspected = await openAgentFlowRunState({ cwd: repo });
+      expect(inspected.getRun("stale-ui-approval")?.status).toBe("paused");
+      expect(inspected.listApprovals("stale-ui-approval")).toHaveLength(1);
+      inspected.close();
+    } finally {
+      await server.close();
+    }
+  });
+
+  test("detects same-size approval evidence changes without mutating inspection state", async () => {
+    const repo = makeRepo();
+    const store = await openAgentFlowRunState({ cwd: repo });
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: byte-guarded-ui-approval
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: approve, type: approval, reviewer: human, artifacts: [release.md] }
+`);
+    createAgentFlowLifecycleRun(store, { id: "byte-guarded-ui-approval", workflow });
+    const release = store.writeArtifact({
+      id: "release",
+      runId: "byte-guarded-ui-approval",
+      path: "release.md",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "AAAA"
+    });
+    expect(await executeAgentFlowCommandPipeline(store, "byte-guarded-ui-approval", workflow))
+      .toMatchObject({ status: "paused" });
+    const initial = buildAgentFlowRunActionSnapshot(store, "byte-guarded-ui-approval");
+
+    fs.writeFileSync(path.join(repo, release.storagePath), "BBBB");
+    const changed = buildAgentFlowRunActionSnapshot(store, "byte-guarded-ui-approval");
+
+    expect(changed.guard).not.toBe(initial.guard);
+    expect(changed.staleApprovals).toHaveLength(1);
+    expect(changed.actions).toContainEqual(expect.objectContaining({ action: "approve", enabled: false }));
+    expect(store.listApprovals("byte-guarded-ui-approval")[0]?.status).toBe("requested");
+    store.close();
+  });
+
+  test("accepts checksum-verified evidence overwritten before approval waiting", async () => {
+    const repo = makeRepo();
+    const store = await openAgentFlowRunState({ cwd: repo });
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: overwritten-evidence-guard
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: approve, type: approval, reviewer: human, artifacts: [release.md] }
+`);
+    createAgentFlowLifecycleRun(store, { id: "overwritten-evidence-guard", workflow });
+    store.writeArtifact({
+      id: "release",
+      runId: "overwritten-evidence-guard",
+      path: "release.md",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "First candidate"
+    });
+    store.writeArtifact({
+      id: "release",
+      runId: "overwritten-evidence-guard",
+      path: "release.md",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "Retried candidate",
+      overwrite: true
+    });
+    expect(await executeAgentFlowCommandPipeline(store, "overwritten-evidence-guard", workflow))
+      .toMatchObject({ status: "paused" });
+
+    const snapshot = buildAgentFlowRunActionSnapshot(store, "overwritten-evidence-guard");
+
+    expect(snapshot.staleApprovals).toEqual([]);
+    expect(snapshot.actions).toContainEqual(expect.objectContaining({ action: "approve", enabled: true }));
+    expect(snapshot.actions).toContainEqual(expect.objectContaining({ action: "reject", enabled: true }));
+    store.close();
+  });
+
+  test("clears historical stale warnings after a later approval attempt succeeds", async () => {
+    const repo = makeRepo();
+    const store = await openAgentFlowRunState({ cwd: repo });
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: rerun-approval-guard
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: approve, type: approval, reviewer: human, artifacts: [release.md] }
+`);
+    createAgentFlowLifecycleRun(store, { id: "rerun-approval-guard", workflow });
+    const evidence = store.writeArtifact({
+      id: "release",
+      runId: "rerun-approval-guard",
+      path: "release.md",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "Retried candidate"
+    });
+    const context = { evidence: [{ path: evidence.declaredPath, checksum: evidence.checksum! }] };
+    store.upsertApproval({
+      id: "approval:approve:attempt-1",
+      runId: "rerun-approval-guard",
+      stepId: "approve",
+      status: "stale",
+      decision: "approve",
+      context
+    });
+    store.upsertApproval({
+      id: "approval:approve:attempt-2",
+      runId: "rerun-approval-guard",
+      stepId: "approve",
+      status: "approved",
+      decision: "approve",
+      context
+    });
+
+    const snapshot = buildAgentFlowRunActionSnapshot(store, "rerun-approval-guard");
+
+    expect(snapshot.staleApprovals).toEqual([]);
+    expect(snapshot.warnings).not.toContainEqual(expect.objectContaining({ code: "action.approval.stale" }));
+    store.close();
+  });
+
+  test("guards prior approval output bytes while a later interaction is waiting", async () => {
+    const repo = makeRepo();
+    const store = await openAgentFlowRunState({ cwd: repo });
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: approval-output-guard
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: approve, type: approval, reviewer: human, artifacts: [release.md], output: approval.json }
+  - { id: confirm, type: manual_gate, message: Continue?, options: [approve, reject] }
+`);
+    createAgentFlowLifecycleRun(store, { id: "approval-output-guard", workflow });
+    store.writeArtifact({
+      id: "release",
+      runId: "approval-output-guard",
+      path: "release.md",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "Candidate"
+    });
+    expect(await executeAgentFlowCommandPipeline(store, "approval-output-guard", workflow))
+      .toMatchObject({ status: "paused" });
+    const first = buildAgentFlowRunActionSnapshot(store, "approval-output-guard");
+    expect(await executeAgentFlowRunAction(store, "approval-output-guard", {
+      action: "approve",
+      guard: first.guard
+    })).toMatchObject({ status: "paused" });
+    const initial = buildAgentFlowRunActionSnapshot(store, "approval-output-guard");
+    const output = store.getArtifact("approval-output-guard", "approval.json")!;
+    const bytes = fs.readFileSync(path.join(repo, output.storagePath));
+
+    fs.writeFileSync(path.join(repo, output.storagePath), Buffer.alloc(bytes.length, 0x20));
+    const changed = buildAgentFlowRunActionSnapshot(store, "approval-output-guard");
+
+    expect(changed.guard).not.toBe(initial.guard);
+    expect(changed.staleApprovals).toContainEqual(expect.objectContaining({
+      id: expect.stringContaining("approval:approve"),
+      detected: true
+    }));
+    expect(changed.actions).toContainEqual(expect.objectContaining({
+      action: "approve",
+      enabled: false,
+      reason: expect.stringContaining("stale")
+    }));
+    expect(changed.actions).toContainEqual(expect.objectContaining({ action: "cancel", enabled: true }));
+    await expect(executeAgentFlowRunAction(store, "approval-output-guard", {
+      action: "approve",
+      guard: changed.guard
+    })).rejects.toMatchObject({ code: "AGENT_FLOW_ACTION_NOT_ALLOWED" });
+    expect(store.getRun("approval-output-guard")).toMatchObject({
+      status: "paused",
+      context: { waiting: expect.objectContaining({ kind: "manual_gate", stepId: "confirm" }) }
+    });
+    expect(store.listApprovals("approval-output-guard")[0]?.status).toBe("approved");
+    store.close();
+  });
+
+  test("rejects guards captured before another actor finalizes the active approval", async () => {
+    const repo = makeRepo();
+    const store = await openAgentFlowRunState({ cwd: repo });
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: concurrent-ui-approval
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: gate, type: manual_gate, message: Ship it?, options: [approve, reject] }
+  - { id: done, type: result, status: completed }
+`);
+    createAgentFlowLifecycleRun(store, { id: "concurrent-ui-approval", workflow });
+    expect(await executeAgentFlowCommandPipeline(store, "concurrent-ui-approval", workflow))
+      .toMatchObject({ status: "paused" });
+    store.close();
+    const server = await startAgentFlowRunInspectionApi({
+      cwd: repo,
+      port: 0,
+      token: "inspection-token"
+    });
+    const headers = {
+      [AGENT_FLOW_RUN_INSPECTION_TOKEN_HEADER]: "inspection-token",
+      [AGENT_FLOW_RUN_INSPECTION_RUN_ID_HEADER]: encodeURIComponent("concurrent-ui-approval")
+    };
+
+    try {
+      const initial = await (await fetch(`${server.url}/api/run/actions`, { headers })).json() as { guard: string };
+      const writer = await openAgentFlowRunState({ cwd: repo });
+      const active = writer.listApprovals("concurrent-ui-approval")[0]!;
+      writer.upsertApproval({
+        id: active.id,
+        runId: active.runId,
+        stepId: active.stepId!,
+        status: "rejected",
+        decision: "reject",
+        decidedBy: "another-reviewer"
+      });
+      writer.close();
+
+      const staleAction = await fetch(`${server.url}/api/run/actions`, {
+        method: "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        body: JSON.stringify({ action: "approve", guard: initial.guard })
+      });
+      expect(staleAction.status).toBe(409);
+      expect(await staleAction.json()).toMatchObject({ code: "AGENT_FLOW_ACTION_STALE" });
+
+      const refreshed = await (await fetch(`${server.url}/api/run/actions`, { headers })).json() as {
+        warnings: Array<{ code: string }>;
+        actions: Array<{ action: string; enabled: boolean; reason: string | null }>;
+      };
+      expect(refreshed.warnings).toContainEqual(expect.objectContaining({ code: "action.approval.finalized" }));
+      expect(refreshed.actions).toContainEqual(expect.objectContaining({
+        action: "approve",
+        enabled: false,
+        reason: expect.stringContaining("finalized")
+      }));
+      const inspected = await openAgentFlowRunState({ cwd: repo });
+      expect(inspected.getRun("concurrent-ui-approval")?.status).toBe("paused");
+      expect(inspected.listApprovals("concurrent-ui-approval")[0]).toMatchObject({
+        status: "rejected",
+        decision: "reject",
+        decidedBy: "another-reviewer"
+      });
+      inspected.close();
+    } finally {
+      await server.close();
+    }
+  });
+
+  test("rechecks approval freshness inside the response transaction", async () => {
+    const repo = makeRepo();
+    const store = await openAgentFlowRunState({ cwd: repo });
+    const competitor = await openAgentFlowRunState({ cwd: repo });
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: transactional-ui-approval
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: gate, type: manual_gate, message: Ship it?, options: [approve, reject] }
+  - { id: done, type: result, status: completed }
+`);
+    createAgentFlowLifecycleRun(store, { id: "transactional-ui-approval", workflow });
+    expect(await executeAgentFlowCommandPipeline(store, "transactional-ui-approval", workflow))
+      .toMatchObject({ status: "paused" });
+    const snapshot = buildAgentFlowRunActionSnapshot(store, "transactional-ui-approval");
+    const approval = competitor.listApprovals("transactional-ui-approval")[0]!;
+    const withRunStateTransaction = store.withRunStateTransaction.bind(store);
+    let finalized = false;
+    store.withRunStateTransaction = ((runId, callback) => {
+      if (!finalized) {
+        finalized = true;
+        competitor.upsertApproval({
+          id: approval.id,
+          runId: approval.runId,
+          stepId: approval.stepId!,
+          status: "rejected",
+          decision: "reject",
+          decidedBy: "another-reviewer"
+        });
+      }
+      return withRunStateTransaction(runId, callback);
+    }) as typeof store.withRunStateTransaction;
+
+    await expect(executeAgentFlowRunAction(store, "transactional-ui-approval", {
+      action: "approve",
+      guard: snapshot.guard
+    })).rejects.toMatchObject({ code: "AGENT_FLOW_ACTION_STALE" });
+    expect(store.getRun("transactional-ui-approval")?.status).toBe("paused");
+    expect(competitor.listApprovals("transactional-ui-approval")[0]).toMatchObject({
+      status: "rejected",
+      decision: "reject",
+      decidedBy: "another-reviewer"
+    });
+    competitor.close();
+    store.close();
+  });
+
+  test("rechecks action guards before recovering stale execution leases", async () => {
+    for (const action of ["approve", "resume"] as AgentFlowRunAction[]) {
+      const repo = makeRepo();
+      const store = await openAgentFlowRunState({ cwd: repo });
+      const competitor = await openAgentFlowRunState({ cwd: repo });
+      const workflow = parseAgentFlowWorkflowOrThrow(action === "approve" ? `
+name: recovery-guarded-approval
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: gate, type: manual_gate, message: Ship it?, options: [approve, reject] }
+  - { id: done, type: result, status: completed }
+` : `
+name: recovery-guarded-resume
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: done, type: result, status: completed }
+`);
+      const runId = `recovery-guarded-${action}`;
+      createAgentFlowLifecycleRun(store, { id: runId, workflow });
+      if (action === "approve") {
+        expect(await executeAgentFlowCommandPipeline(store, runId, workflow))
+          .toMatchObject({ status: "paused" });
+      } else {
+        transitionAgentFlowLifecycleRun(store, runId, "pause");
+      }
+      const snapshot = buildAgentFlowRunActionSnapshot(store, runId);
+      const withRunLock = store.withRunLock.bind(store);
+      let raced = false;
+      let recoveryCalled = false;
+      store.withRunLock = ((lockedRunId, operation, callback, options) => {
+        if (!raced) {
+          raced = true;
+          competitor.acquireRunLock(lockedRunId, operation, { ttlMs: 60_000 });
+          competitor.transitionRunWithEvent(lockedRunId, {
+            status: "running",
+            allowedFrom: ["paused"],
+            event: { type: "test.concurrent_execution", payload: { action } }
+          });
+          const current = competitor.getRun(lockedRunId)!;
+          const stepId = action === "approve" ? "gate" : "done";
+          competitor.updateRun(lockedRunId, {
+            currentStepId: stepId,
+            context: {
+              ...current.context,
+              executionRouting: {
+                stepAttemptLimits: {},
+                visits: { [stepId]: 1 },
+                recoveryCycles: {},
+                recoveryInvocations: {},
+                disagreementEpisodes: {},
+                disagreementRounds: {},
+                attempts: {}
+              },
+              executionCheckpoint: { stepId, visit: 1, completedAttempts: 0 }
+            }
+          });
+          competitor.close();
+        }
+        return withRunLock(lockedRunId, operation, callback, options);
+      }) as typeof store.withRunLock;
+      const recoverInterruptedRun = store.recoverInterruptedRun.bind(store);
+      store.recoverInterruptedRun = ((lock) => {
+        recoveryCalled = true;
+        return recoverInterruptedRun(lock);
+      }) as typeof store.recoverInterruptedRun;
+
+      await expect(executeAgentFlowRunAction(store, runId, {
+        action,
+        guard: snapshot.guard
+      })).rejects.toMatchObject({ code: "AGENT_FLOW_ACTION_STALE" });
+      expect(recoveryCalled).toBe(false);
+      expect(store.listEvents(runId).map((event) => event.type)).not.toContain("run.execution_recovered");
+      store.close();
+    }
+  });
+
+  test("reports workflow changes raced at lock acquisition as stale actions", async () => {
+    for (const action of ["approve", "resume"] as AgentFlowRunAction[]) {
+      const repo = makeRepo();
+      const store = await openAgentFlowRunState({ cwd: repo });
+      const competitor = await openAgentFlowRunState({ cwd: repo });
+      const workflow = parseAgentFlowWorkflowOrThrow(action === "approve" ? `
+name: workflow-raced-approval
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: gate, type: manual_gate, message: Ship it?, options: [approve, reject] }
+  - { id: done, type: result, status: completed }
+` : `
+name: workflow-raced-resume
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: done, type: result, status: completed }
+`);
+      const runId = `workflow-raced-${action}`;
+      createAgentFlowLifecycleRun(store, { id: runId, workflow });
+      if (action === "approve") {
+        expect(await executeAgentFlowCommandPipeline(store, runId, workflow))
+          .toMatchObject({ status: "paused" });
+      } else {
+        transitionAgentFlowLifecycleRun(store, runId, "pause");
+      }
+      const snapshot = buildAgentFlowRunActionSnapshot(store, runId);
+      const changedWorkflow = { ...workflow, description: "Changed by another writer" };
+      const withRunLock = store.withRunLock.bind(store);
+      let raced = false;
+      store.withRunLock = ((lockedRunId, operation, callback, options) => {
+        if (!raced) {
+          raced = true;
+          const current = competitor.getRun(lockedRunId)!;
+          competitor.updateRun(lockedRunId, {
+            context: {
+              ...current.context,
+              workflow: changedWorkflow as unknown as typeof current.context.workflow
+            }
+          });
+        }
+        return withRunLock(lockedRunId, operation, callback, options);
+      }) as typeof store.withRunLock;
+
+      await expect(executeAgentFlowRunAction(store, runId, {
+        action,
+        guard: snapshot.guard
+      })).rejects.toMatchObject({ code: "AGENT_FLOW_ACTION_STALE" });
+      expect(store.getRun(runId)?.status).toBe("paused");
+      competitor.close();
+      store.close();
+    }
+  });
+
+  test("maps guarded disagreement decisions to supported persisted outcomes", async () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: ui-disagreement
+version: 1
+style: collaborative
+maturity: experimental
+collaboration:
+  enabled: true
+  max_review_cycles: 1
+  on_disagreement: ask_user
+sessions:
+  implementer: { provider: fixture, role: implementer }
+  reviewer:
+    provider: fixture
+    role: reviewer
+    authority: { can_request_changes: true, can_approve: true }
+steps:
+  - id: review
+    type: review
+    reviewer: reviewer
+    subject: implementer
+    artifacts: [implementation.md]
+    outputs: [reviews/review.json]
+    then: route
+  - id: route
+    type: condition
+    branches:
+      - { if: 'artifacts.reviews.review.status == "approved"', then: done }
+      - { if: 'artifacts.reviews.review.status == "changes_requested"', then: revise }
+    else: failed
+  - { id: revise, type: command, command: "true", then: review }
+  - { id: done, type: result, status: completed }
+  - { id: failed, type: result, status: failed }
+`);
+    for (const action of ["approve", "reject"] as const) {
+      const repo = makeRepo();
+      const store = await openAgentFlowRunState({ cwd: repo });
+      const runId = `ui-disagreement-${action}`;
+      createAgentFlowLifecycleRun(store, { id: runId, workflow });
+      store.writeArtifact({
+        id: "implementation",
+        runId,
+        path: "implementation.md",
+        kind: "fixture",
+        contentType: "text/markdown",
+        content: "Implementation"
+      });
+      const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => ({
+        outputs: Object.fromEntries(request.outputs.map((output) => [output, JSON.stringify({
+          status: "changes_requested",
+          findings: [{ summary: "Revise the implementation." }],
+          summary: "Changes requested."
+        })]))
+      }));
+      expect(await executeAgentFlowCommandPipeline(store, runId, workflow, undefined, providers))
+        .toMatchObject({ status: "paused" });
+      const snapshot = buildAgentFlowRunActionSnapshot(store, runId);
+      expect(snapshot.waiting?.kind).toBe("disagreement");
+      expect(snapshot.actions).toContainEqual(expect.objectContaining({ action, enabled: true }));
+
+      const result = await executeAgentFlowRunAction(store, runId, {
+        action,
+        guard: snapshot.guard
+      }, { sessionProviders: providers });
+
+      expect(result.status).toBe(action === "approve" ? "completed" : "paused");
+      expect(store.listEvents(runId)).toContainEqual(expect.objectContaining({
+        type: "collaboration.disagreement.resolved",
+        payload: expect.objectContaining({
+          outcome: action === "approve" ? "approve" : "request_changes",
+          decidedBy: "local-ui"
+        })
+      }));
+      store.close();
+    }
+  });
+
+  test("rejects changed disagreement evidence before mutating the paused run", async () => {
+    const repo = makeRepo();
+    const store = await openAgentFlowRunState({ cwd: repo });
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: stale-ui-disagreement
+version: 1
+style: collaborative
+maturity: experimental
+collaboration:
+  enabled: true
+  max_review_cycles: 1
+  on_disagreement: ask_user
+sessions:
+  implementer: { provider: fixture, role: implementer }
+  reviewer:
+    provider: fixture
+    role: reviewer
+    authority: { can_request_changes: true, can_approve: true }
+steps:
+  - id: review
+    type: review
+    reviewer: reviewer
+    subject: implementer
+    artifacts: [implementation.md]
+    outputs: [reviews/review.json]
+    then: route
+  - id: route
+    type: condition
+    branches:
+      - { if: 'artifacts.reviews.review.status == "approved"', then: done }
+      - { if: 'artifacts.reviews.review.status == "changes_requested"', then: revise }
+    else: failed
+  - { id: revise, type: command, command: "true", then: review }
+  - { id: done, type: result, status: completed }
+  - { id: failed, type: result, status: failed }
+`);
+    const runId = "stale-ui-disagreement";
+    createAgentFlowLifecycleRun(store, { id: runId, workflow });
+    const artifact = store.writeArtifact({
+      id: "implementation",
+      runId,
+      path: "implementation.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Original implementation"
+    });
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => ({
+      outputs: Object.fromEntries(request.outputs.map((output) => [output, JSON.stringify({
+        status: "changes_requested",
+        findings: [{ summary: "Revise the implementation." }],
+        summary: "Changes requested."
+      })]))
+    }));
+    expect(await executeAgentFlowCommandPipeline(store, runId, workflow, undefined, providers))
+      .toMatchObject({ status: "paused" });
+    const snapshot = buildAgentFlowRunActionSnapshot(store, runId);
+
+    fs.writeFileSync(path.join(repo, artifact.storagePath), "Changed implementation");
+    const refreshed = buildAgentFlowRunActionSnapshot(store, runId);
+    expect(refreshed.guard).not.toBe(snapshot.guard);
+    expect(refreshed.warnings).toContainEqual(expect.objectContaining({
+      code: "action.disagreement.evidence_stale"
+    }));
+    expect(refreshed.actions.every((candidate) => !candidate.enabled)).toBe(true);
+
+    await expect(executeAgentFlowRunAction(store, runId, {
+      action: "approve",
+      guard: snapshot.guard
+    }, { sessionProviders: providers })).rejects.toMatchObject({ code: "AGENT_FLOW_ACTION_STALE" });
+    expect(store.getRun(runId)).toMatchObject({
+      status: "paused",
+      context: { waiting: expect.objectContaining({ kind: "disagreement", stepId: "review" }) }
+    });
+    expect(store.listEvents(runId).some((event) => event.type === "collaboration.disagreement.evidence_changed"))
+      .toBe(false);
+    store.close();
+  });
+
+  test("guards the complete persisted workflow even when timestamps do not advance", async () => {
+    const repo = makeRepo();
+    const store = await openAgentFlowRunState({
+      cwd: repo,
+      now: () => "2026-08-23T12:00:00.000Z"
+    });
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: fixed-clock-ui-approval
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: gate, type: manual_gate, message: Ship it?, options: [approve, reject] }
+  - { id: done, type: result, status: completed }
+`);
+    createAgentFlowLifecycleRun(store, { id: "fixed-clock-ui-approval", workflow });
+    expect(await executeAgentFlowCommandPipeline(store, "fixed-clock-ui-approval", workflow))
+      .toMatchObject({ status: "paused" });
+    const initial = buildAgentFlowRunActionSnapshot(store, "fixed-clock-ui-approval");
+    const changedWorkflow = parseAgentFlowWorkflowOrThrow(`
+name: fixed-clock-ui-approval
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: gate, type: manual_gate, message: Ship it?, options: [approve, reject] }
+  - { id: changed, type: result, status: completed }
+`);
+    const run = store.getRun("fixed-clock-ui-approval")!;
+    store.updateRun(run.id, {
+      context: { ...run.context, workflow: changedWorkflow as unknown as typeof run.context.workflow }
+    });
+    const refreshed = buildAgentFlowRunActionSnapshot(store, run.id);
+
+    expect(refreshed.updatedAt).toBe(initial.updatedAt);
+    expect(refreshed.guard).not.toBe(initial.guard);
+    await expect(executeAgentFlowRunAction(store, run.id, {
+      action: "approve",
+      guard: initial.guard
+    })).rejects.toMatchObject({ code: "AGENT_FLOW_ACTION_STALE" });
+    store.close();
+  });
+
+  test("disables actions for malformed or incomplete persisted waiting state", async () => {
+    const repo = makeRepo();
+    const store = await openAgentFlowRunState({ cwd: repo });
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: malformed-ui-waiting
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: details, type: input_request, question: What changed?, save_as: answer.txt }
+`);
+    createAgentFlowLifecycleRun(store, { id: "malformed-ui-waiting", workflow });
+    expect(await executeAgentFlowCommandPipeline(store, "malformed-ui-waiting", workflow))
+      .toMatchObject({ status: "paused" });
+    const run = store.getRun("malformed-ui-waiting")!;
+    const waiting = run.context.waiting as Record<string, unknown>;
+    const { attempt: _attempt, ...incompleteWaiting } = waiting;
+    store.updateRun(run.id, {
+      context: { ...run.context, waiting: incompleteWaiting as typeof run.context.waiting }
+    });
+    const incomplete = buildAgentFlowRunActionSnapshot(store, run.id);
+    expect(incomplete.warnings).toContainEqual(expect.objectContaining({ code: "action.waiting.invalid" }));
+    expect(incomplete.actions.every((candidate) => !candidate.enabled)).toBe(true);
+
+    store.updateRun(run.id, { context: { ...run.context, waiting: "malformed" } });
+    const malformed = buildAgentFlowRunActionSnapshot(store, run.id);
+    expect(malformed.actions).toContainEqual(expect.objectContaining({ action: "resume", enabled: false }));
+    expect(malformed.actions.every((candidate) => !candidate.enabled)).toBe(true);
+    store.close();
+  });
+
+  test("keeps malformed approval evidence inspectable while disabling actions", async () => {
+    const repo = makeRepo();
+    const store = await openAgentFlowRunState({ cwd: repo });
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: malformed-ui-approval
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: approve, type: approval, reviewer: human, artifacts: [release.md] }
+`);
+    createAgentFlowLifecycleRun(store, { id: "malformed-ui-approval", workflow });
+    store.writeArtifact({
+      id: "release",
+      runId: "malformed-ui-approval",
+      path: "release.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Candidate"
+    });
+    expect(await executeAgentFlowCommandPipeline(store, "malformed-ui-approval", workflow))
+      .toMatchObject({ status: "paused" });
+    const active = store.listApprovals("malformed-ui-approval")[0]!;
+    store.upsertApproval({
+      id: active.id,
+      runId: active.runId,
+      stepId: active.stepId!,
+      status: "requested",
+      context: { evidence: [{ path: "../outside", checksum: "invalid" }] }
+    });
+    store.close();
+    const server = await startAgentFlowRunInspectionApi({
+      cwd: repo,
+      port: 0,
+      token: "inspection-token"
+    });
+    const headers = {
+      [AGENT_FLOW_RUN_INSPECTION_TOKEN_HEADER]: "inspection-token",
+      [AGENT_FLOW_RUN_INSPECTION_RUN_ID_HEADER]: encodeURIComponent("malformed-ui-approval")
+    };
+
+    try {
+      const response = await fetch(`${server.url}/api/run/actions`, { headers });
+      expect(response.status).toBe(200);
+      const snapshot = await response.json() as {
+        warnings: Array<{ code: string }>;
+        actions: Array<{ enabled: boolean }>;
+      };
+      expect(snapshot.warnings).toContainEqual(expect.objectContaining({
+        code: "action.approval.evidence_invalid"
+      }));
+      expect(snapshot.actions.every((candidate) => !candidate.enabled)).toBe(true);
+    } finally {
+      await server.close();
+    }
+
+    const malformedStore = await openAgentFlowRunState({ cwd: repo });
+    const malformedActive = malformedStore.listApprovals("malformed-ui-approval")[0]!;
+    malformedStore.upsertApproval({
+      id: malformedActive.id,
+      runId: malformedActive.runId,
+      stepId: malformedActive.stepId!,
+      status: "requested",
+      context: { evidence: "malformed" }
+    });
+    const malformed = buildAgentFlowRunActionSnapshot(malformedStore, "malformed-ui-approval");
+    expect(malformed.warnings).toContainEqual(expect.objectContaining({
+      code: "action.approval.evidence_invalid"
+    }));
+    expect(malformed.actions.every((candidate) => !candidate.enabled)).toBe(true);
+    malformedStore.close();
+  });
+
+  test("supports guarded input, pause, plain resume, and cancel action flows", async () => {
+    const repo = makeRepo();
+    const store = await openAgentFlowRunState({ cwd: repo });
+    const inputWorkflow = parseAgentFlowWorkflowOrThrow(`
+name: ui-input
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: details, type: input_request, question: What changed?, save_as: answer.json }
+  - { id: done, type: result, status: completed }
+`);
+    createAgentFlowLifecycleRun(store, { id: "ui-input", workflow: inputWorkflow });
+    expect(await executeAgentFlowCommandPipeline(store, "ui-input", inputWorkflow))
+      .toMatchObject({ status: "paused" });
+    createAgentFlowLifecycleRun(store, { id: "ui-nonfinite-input", workflow: inputWorkflow });
+    expect(await executeAgentFlowCommandPipeline(store, "ui-nonfinite-input", inputWorkflow))
+      .toMatchObject({ status: "paused" });
+    createAgentFlowLifecycleRun(store, { id: "ui-direct-nonfinite-input", workflow: inputWorkflow });
+    expect(await executeAgentFlowCommandPipeline(store, "ui-direct-nonfinite-input", inputWorkflow))
+      .toMatchObject({ status: "paused" });
+    const directSnapshot = buildAgentFlowRunActionSnapshot(store, "ui-direct-nonfinite-input");
+    await expect(executeAgentFlowRunAction(store, "ui-direct-nonfinite-input", {
+      action: "provide_input",
+      guard: directSnapshot.guard,
+      answer: { nested: [Number.POSITIVE_INFINITY] }
+    })).rejects.toMatchObject({ code: "AGENT_FLOW_ACTION_BODY_INVALID", status: 400 });
+    expect(store.getRun("ui-direct-nonfinite-input")?.status).toBe("paused");
+    expect(store.getArtifact("ui-direct-nonfinite-input", "answer.json")).toBeNull();
+    const lifecycleWorkflow = parseAgentFlowWorkflowOrThrow(`
+name: ui-lifecycle
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: done, type: result, status: completed }
+`);
+    createAgentFlowLifecycleRun(store, { id: "ui-lifecycle", workflow: lifecycleWorkflow });
+    createAgentFlowLifecycleRun(store, { id: "ui-cancel", workflow: lifecycleWorkflow });
+    store.close();
+    const server = await startAgentFlowRunInspectionApi({
+      cwd: repo,
+      port: 0,
+      token: "inspection-token"
+    });
+    const tokenHeader = { [AGENT_FLOW_RUN_INSPECTION_TOKEN_HEADER]: "inspection-token" };
+    const action = async (runId: string, actionName: string, extra: Record<string, unknown> = {}) => {
+      const headers = {
+        ...tokenHeader,
+        [AGENT_FLOW_RUN_INSPECTION_RUN_ID_HEADER]: encodeURIComponent(runId)
+      };
+      const snapshot = await (await fetch(`${server.url}/api/run/actions`, { headers })).json() as { guard: string };
+      return fetch(`${server.url}/api/run/actions`, {
+        method: "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        body: JSON.stringify({ action: actionName, guard: snapshot.guard, ...extra })
+      });
+    };
+
+    try {
+      const provided = await action("ui-input", "provide_input", { answer: { ticket: "AF-68" } });
+      expect(provided.status).toBe(200);
+      expect(await provided.json()).toMatchObject({ status: "completed" });
+
+      const nonFiniteHeaders = {
+        ...tokenHeader,
+        [AGENT_FLOW_RUN_INSPECTION_RUN_ID_HEADER]: encodeURIComponent("ui-nonfinite-input")
+      };
+      const nonFiniteSnapshot = await (await fetch(`${server.url}/api/run/actions`, {
+        headers: nonFiniteHeaders
+      })).json() as { guard: string };
+      const nonFinite = await fetch(`${server.url}/api/run/actions`, {
+        method: "POST",
+        headers: { ...nonFiniteHeaders, "content-type": "application/json" },
+        body: `{"action":"provide_input","guard":${JSON.stringify(nonFiniteSnapshot.guard)},"answer":{"nested":[1e400]}}`
+      });
+      expect(nonFinite.status).toBe(400);
+      expect(await nonFinite.json()).toMatchObject({ code: "AGENT_FLOW_ACTION_BODY_INVALID" });
+
+      const deeplyNested = `${"[".repeat(64)}null${"]".repeat(64)}`;
+      const excessiveDepth = await fetch(`${server.url}/api/run/actions`, {
+        method: "POST",
+        headers: { ...nonFiniteHeaders, "content-type": "application/json" },
+        body: `{"action":"provide_input","guard":${JSON.stringify(nonFiniteSnapshot.guard)},"answer":${deeplyNested}}`
+      });
+      expect(excessiveDepth.status).toBe(400);
+      expect(await excessiveDepth.json()).toMatchObject({ code: "AGENT_FLOW_ACTION_BODY_INVALID" });
+
+      const paused = await action("ui-lifecycle", "pause");
+      expect(paused.status).toBe(200);
+      expect(await paused.json()).toMatchObject({ status: "paused" });
+      const resumed = await action("ui-lifecycle", "resume");
+      expect(resumed.status).toBe(200);
+      expect(await resumed.json()).toMatchObject({ status: "completed", completedSteps: ["done"] });
+      const cancelled = await action("ui-cancel", "cancel");
+      expect(cancelled.status).toBe(200);
+      expect(await cancelled.json()).toMatchObject({ status: "cancelled" });
+
+      const inspected = await openAgentFlowRunState({ cwd: repo });
+      expect(JSON.parse(inspected.readArtifact("ui-input", "answer.json").content.toString()))
+        .toEqual({ ticket: "AF-68" });
+      expect(inspected.getRun("ui-nonfinite-input")?.status).toBe("paused");
+      expect(inspected.getArtifact("ui-nonfinite-input", "answer.json")).toBeNull();
+      expect(inspected.listEvents("ui-lifecycle").map((event) => event.type)).toEqual(expect.arrayContaining([
+        "run.pause", "run.resume", "run.started", "run.completed"
+      ]));
+      expect(inspected.listEvents("ui-cancel").map((event) => event.type)).toContain("run.cancel");
+      inspected.close();
+    } finally {
+      await server.close();
+    }
+  });
+
+  test("rechecks plain resume freshness inside its transition transaction", async () => {
+    const repo = makeRepo();
+    const store = await openAgentFlowRunState({ cwd: repo });
+    const competitor = await openAgentFlowRunState({ cwd: repo });
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: transactional-ui-resume
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: done, type: result, status: completed }
+`);
+    createAgentFlowLifecycleRun(store, { id: "transactional-ui-resume", workflow });
+    transitionAgentFlowLifecycleRun(store, "transactional-ui-resume", "pause");
+    const snapshot = buildAgentFlowRunActionSnapshot(store, "transactional-ui-resume");
+    const withRunStateTransaction = store.withRunStateTransaction.bind(store);
+    let cancelled = false;
+    store.withRunStateTransaction = ((runId, callback) => {
+      if (!cancelled) {
+        cancelled = true;
+        transitionAgentFlowLifecycleRun(competitor, runId, "cancel");
+      }
+      return withRunStateTransaction(runId, callback);
+    }) as typeof store.withRunStateTransaction;
+
+    await expect(executeAgentFlowRunAction(store, "transactional-ui-resume", {
+      action: "resume",
+      guard: snapshot.guard
+    })).rejects.toMatchObject({ code: "AGENT_FLOW_ACTION_STALE" });
+    expect(store.getRun("transactional-ui-resume")?.status).toBe("cancelled");
+    competitor.close();
+    store.close();
+  });
+
   test("serves a secure run inspection UI with fragment-held credentials", async () => {
     const repo = makeRepo();
     const store = await openAgentFlowRunState({ cwd: repo });
@@ -476,6 +1548,7 @@ steps:
       expect(stylesheet.headers.get("content-type")).toBe("text/css; charset=utf-8");
       const css = await stylesheet.text();
       expect(css).toContain(".timeline-entry");
+      expect(css).toContain(".action-panel");
       expect(css).toContain(".token-panel #token-form { max-width: 520px; }");
       expect(css).not.toContain(".token-panel form { max-width: 520px; }");
       expect(css).toContain(".code-toolbar { display: flex; justify-content: flex-end;");
@@ -490,6 +1563,19 @@ steps:
       expect(javascript).toContain("EVENT_PAGE_SIZE = 100");
       expect(javascript).toContain("requestId !== state.detailRequestId");
       expect(javascript).toContain('api("/api/run?section=overview"');
+      expect(javascript).toContain('api("/api/run/actions"');
+      expect(javascript).toContain("async function performAction(snapshot");
+      expect(javascript).toContain("window.confirm(availability.confirmation)");
+      const actionParserSource = javascript.slice(
+        javascript.indexOf("function assertFiniteActionAnswer"),
+        javascript.indexOf("function summaryGrid")
+      );
+      const parseActionAnswer = vm.runInNewContext(
+        `(function () { ${actionParserSource}; return parseActionAnswer; })()`
+      ) as (value: string) => unknown;
+      expect(parseActionAnswer('{"nested":[42]}')).toEqual({ nested: [42] });
+      expect(parseActionAnswer("not JSON")).toBe("not JSON");
+      expect(() => parseActionAnswer('{"nested":[1e400]}')).toThrow("Input answer JSON numbers must be finite.");
       expect(javascript).toContain("async function loadSection(id)");
       expect(javascript).toContain("appendSectionPage(id, view");
       expect(javascript).not.toContain("model.events");
