@@ -30,6 +30,29 @@ Installation refuses to replace an existing skill directory. The skills only
 author, inspect, review, debug, simplify, or policy-harden workflow YAML; they
 do not invoke workflow lifecycle commands.
 
+## Create a workflow with an agent
+
+After installing the skills, give your coding agent a concrete process and ask
+it to use the workflow designer. For example:
+
+```text
+Use $workflow-designer to create workflows/pr-check.yml for this repository.
+
+The workflow should run the repository's formatter, tests, and type checker in
+that order. If a check fails, preserve useful failure evidence and stop; do not
+attempt an automatic fix. Keep generated run state out of version control,
+choose the simplest supported workflow style, and add explicit limits and
+least-authority policies wherever they apply.
+
+After writing the YAML, run agent-flow validate, lint, explain, and graph.
+Do not run the workflow. Summarize any assumptions I need to review.
+```
+
+Replace the process and filename with your own. Add requirements such as a
+local model, a cloud model, recovery, review, or human approval only when the
+workflow needs them. The [quickstart](docs/quickstart.md#have-an-agent-author-a-workflow)
+contains a reusable prompt template.
+
 ## CLI
 
 ```bash
@@ -98,6 +121,30 @@ Session providers are registered through typed fixture, local, frontier,
 named Codex-profile, or custom boundaries. Live providers are disabled by
 default and require explicit enabled configuration; see
 [Session provider boundaries](docs/session-providers.md).
+
+The workflow chooses a provider boundary, not a model name:
+
+```yaml
+sessions:
+  writer:
+    provider: local # or frontier, codex:<profile>, or a custom provider name
+
+policies:
+  model_usage:
+    allowed_providers: [local]
+
+limits:
+  max_model_calls: 2
+```
+
+The application hosting Agent Flow configures the endpoint, model, and
+credentials in its provider adapter and explicitly registers that adapter with
+`enabled: true`. The installed CLI does not discover live models or credentials;
+it executes session steps only when the workflow declares `provider: fixture`
+and the run supplies `--fixture`. There is no built-in model environment
+variable or YAML `model` field. See
+[Configure local or cloud models](docs/quickstart.md#configure-local-or-cloud-models)
+for the complete configuration path and an adapter example.
 
 Pass the workflow registry as the final `executeAgentFlowCommandPipeline`
 argument when a workflow uses `route_to.workflow`. Recovery session providers

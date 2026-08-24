@@ -23,6 +23,77 @@ local, frontier, and Codex-profile adapters additionally require
 `enabled: true`. Agent Flow never discovers credentials, starts a provider, or
 selects a live model implicitly.
 
+## Where model configuration lives
+
+Workflow YAML selects a provider boundary through `sessions.<name>.provider`.
+It does not select a vendor model or endpoint. The host application owns:
+
+- the model name and endpoint;
+- credentials and secret loading;
+- vendor SDK calls, retries, and rate-limit behavior inside the adapter; and
+- translation from the provider response into the exact output paths declared
+  by the workflow step.
+
+This separation lets the same workflow use a different local or cloud model
+without embedding credentials or vendor-specific configuration in durable
+workflow state. It also means setting a model-related environment variable does
+nothing by itself: the host application must read it and use it while building
+the adapter.
+
+For example, a local and a cloud registration can close over different clients
+and model settings:
+
+```ts
+import {
+  createAgentFlowSessionProviderRegistry,
+  type AgentFlowSessionProviderAdapter
+} from "@jurgen1c/agent-flow";
+
+const adapterFor = (
+  model: string,
+  generateOutputs: (request: {
+    model: string;
+    prompt: string;
+    inputs: readonly unknown[];
+    outputPaths: readonly string[];
+    signal: AbortSignal;
+  }) => Promise<Record<string, string>>
+): AgentFlowSessionProviderAdapter => async (request) => ({
+  outputs: await generateOutputs({
+    model,
+    prompt: request.prompt.content,
+    inputs: request.inputs,
+    outputPaths: request.outputs,
+    signal: request.signal
+  }),
+  metadata: { model }
+});
+
+const providers = createAgentFlowSessionProviderRegistry([
+  {
+    kind: "local",
+    enabled: true,
+    adapter: adapterFor(process.env.MY_APP_LOCAL_MODEL!, localClient.generateOutputs)
+  },
+  {
+    kind: "frontier",
+    enabled: true,
+    adapter: adapterFor(process.env.MY_APP_CLOUD_MODEL!, cloudClient.generateOutputs)
+  }
+]);
+```
+
+The client functions above are application-defined. Validate configuration
+before constructing the registry, bind methods when required by the client
+library, and keep credentials out of prompts, inputs, metadata, and output
+artifacts. Pass `providers` to both `executeAgentFlowCommandPipeline` and
+`resumeAgentFlowCommandPipeline`.
+
+The packaged CLI only constructs a fixture adapter for `run` and `resume`.
+Consequently, it executes session steps only when their workflow sessions
+declare `provider: fixture` and the command supplies `--fixture`. Local,
+frontier, Codex-profile, and custom live adapters require a programmatic host.
+
 The compatibility `register(name, adapter, options)` API routes reserved live
 names through the same boundary, so `local`, `frontier`, and `codex:<profile>`
 also require `{ enabled: true }`. Custom registrations cannot claim those
