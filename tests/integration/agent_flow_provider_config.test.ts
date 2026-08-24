@@ -5,13 +5,17 @@ import { runCli } from "../../src/cli/router";
 import {
   createAgentFlowConfiguredProviderRegistry,
   createAgentFlowLifecycleRun,
+  createAgentFlowWorkflowRegistry,
   doctorAgentFlowProviderCatalog,
   executeAgentFlowCommandPipeline,
+  hashAgentFlowProviderModel,
   loadAgentFlowProviderCatalog,
+  providerBindingsForWorkflow,
   renderAgentFlowProviderCatalog,
   openAgentFlowRunState,
   parseAgentFlowWorkflowOrThrow,
   resumeAgentFlowCommandPipeline,
+  serializeAgentFlowProviderBindings,
   validateAgentFlowWorkflow,
   type AgentFlowSessionProviderRequest
 } from "../../src/runtime";
@@ -121,6 +125,14 @@ providers:
     const doctor = await captureCli(["providers", "doctor", "--config", globalConfig], repo);
     expect(doctor.exitCode).toBe(2);
     expect(doctor.stderr).toContain("planner: missing credential environment variable ANTHROPIC_TEST_KEY");
+
+    fs.writeFileSync(globalConfig, fs.readFileSync(globalConfig, "utf8")
+      .replace("model: qwen3", "model: API_TOKEN=diagnostic-secret"));
+    const secretList = await captureCli(["providers", "list", "--config", globalConfig], repo);
+    const secretDoctor = await captureCli(["providers", "doctor", "--config", globalConfig], repo);
+    expect(secretList.stdout).toContain("[REDACTED]");
+    expect(secretDoctor.stderr).toContain("[REDACTED]");
+    expect(`${secretList.stdout}\n${secretDoctor.stderr}`).not.toContain("diagnostic-secret");
   });
 
   test("keeps offline authoring independent of machine-local target configuration", async () => {
@@ -751,6 +763,168 @@ limits: { max_model_calls: 1 }
     } finally {
       globalThis.fetch = originalFetch;
       store.close();
+    }
+  });
+
+  test("pins configured providers used only by a nested recovery workflow", async () => {
+    const { repo, home } = configuredRepo();
+    fs.writeFileSync(path.join(repo, "prompt.md"), "Repair the failure.\n");
+    const child = parseAgentFlowWorkflowOrThrow(`name: configured-nested-recovery
+version: 1
+style: recovery_pipeline
+maturity: experimental
+inputs: { request: { required: true } }
+sessions: { writer: { provider: drafter } }
+steps:
+  - { id: repair, type: session_request, session: writer, prompt: prompt.md, inputs: ["{{ inputs.request }}"], outputs: [repair.md] }
+  - { id: remediated, type: result, status: remediated }
+limits: { max_model_calls: 1 }
+`);
+    const parent = parseAgentFlowWorkflowOrThrow(`name: configured-nested-parent
+version: 1
+style: recovery_pipeline
+maturity: experimental
+inputs: { request: { required: true } }
+steps:
+  - id: check
+    type: command
+    command: "false"
+    on_failure:
+      route_to:
+        workflow: nested
+        inputs: { request: "{{ inputs.request }}" }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+  - { id: complete, type: result, status: completed }
+  - { id: pause, type: result, status: paused }
+`);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, {
+      id: "configured-nested-parent",
+      workflow: parent,
+      inputs: { request: "request.md" }
+    });
+    store.writeArtifact({
+      id: "configured-nested-input",
+      runId: "configured-nested-parent",
+      stepId: "fixture",
+      path: "request.md",
+      kind: "fixture",
+      contentType: "text/plain; charset=utf-8",
+      content: "Repair this request."
+    });
+    const providers = createAgentFlowConfiguredProviderRegistry(
+      loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} })
+    );
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => Response.json({
+      choices: [{ finish_reason: "stop", message: { content: '{"outputs":{"repair.md":"Repaired\\n"}}' } }]
+    })) as typeof fetch;
+    try {
+      const nestedResult = await executeAgentFlowCommandPipeline(
+        store,
+        "configured-nested-parent",
+        parent,
+        undefined,
+        providers,
+        undefined,
+        undefined,
+        createAgentFlowWorkflowRegistry().register("nested", child)
+      );
+      expect(nestedResult).toMatchObject({ status: "completed" });
+      const recoveryRunId = store.listEvents("configured-nested-parent")
+        .find((event) => event.type === "recovery.completed")?.payload.recoveryRunId;
+      expect(typeof recoveryRunId).toBe("string");
+      const bindings = store.getRun(recoveryRunId as string)?.context.providerBindings;
+      expect(bindings).toMatchObject({
+        drafter: {
+          target: "qwen-local",
+          kind: "local",
+          driver: "openai-compatible",
+          modelHash: hashAgentFlowProviderModel("qwen3")
+        }
+      });
+      expect(JSON.stringify(bindings)).not.toContain("qwen3");
+    } finally {
+      globalThis.fetch = originalFetch;
+      store.close();
+    }
+  });
+
+  test("recovers an interrupted CLI run with its pinned provider override", async () => {
+    const { repo, home, globalConfig } = configuredRepo();
+    fs.writeFileSync(path.join(repo, "prompt.md"), "Draft.\n");
+    fs.writeFileSync(path.join(repo, "inputs.json"), JSON.stringify({
+      artifacts: { "request.md": "Request" }
+    }));
+    fs.writeFileSync(path.join(repo, "workflow.yml"), `name: interrupted-provider-override
+version: 1
+style: pipeline
+maturity: experimental
+sessions: { writer: { provider: drafter } }
+steps:
+  - { id: draft, type: session_request, session: writer, prompt: prompt.md, inputs: [request.md], outputs: [draft.md] }
+limits: { max_model_calls: 1 }
+`);
+    const workflow = parseAgentFlowWorkflowOrThrow(fs.readFileSync(path.join(repo, "workflow.yml"), "utf8"));
+    const overriddenCatalog = loadAgentFlowProviderCatalog({
+      cwd: repo,
+      homeDir: home,
+      env: {},
+      overrides: ["drafter=gemma-local"]
+    });
+    const providerBindings = serializeAgentFlowProviderBindings(
+      providerBindingsForWorkflow(workflow, overriddenCatalog)
+    );
+    const interrupted = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(interrupted, {
+      id: "interrupted-provider-override",
+      workflow,
+      context: { providerBindings }
+    });
+    interrupted.writeArtifact({
+      id: "interrupted-provider-input",
+      runId: "interrupted-provider-override",
+      stepId: "fixture",
+      path: "request.md",
+      kind: "fixture",
+      contentType: "text/plain; charset=utf-8",
+      content: "Request"
+    });
+    interrupted.acquireRunLock("interrupted-provider-override", "run", { ttlMs: 60_000 });
+    interrupted.transitionRunWithEvent("interrupted-provider-override", {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    interrupted.close();
+
+    const models: string[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      models.push((JSON.parse(String(init?.body)) as { model: string }).model);
+      return Response.json({
+        choices: [{ finish_reason: "stop", message: { content: '{"outputs":{"draft.md":"Draft\\n"}}' } }]
+      });
+    }) as typeof fetch;
+    try {
+      const conflicting = await captureCli([
+        "run", "workflow.yml", "--id", "interrupted-provider-override", "--config", globalConfig,
+        "--provider", "drafter=qwen-local", "--fixture", "inputs.json"
+      ], repo);
+      expect(conflicting).toMatchObject({ exitCode: 2 });
+      expect(conflicting.stderr).toContain("cannot replace pinned provider");
+      expect(models).toEqual([]);
+
+      const recovered = await captureCli([
+        "run", "workflow.yml", "--id", "interrupted-provider-override", "--config", globalConfig,
+        "--fixture", "inputs.json"
+      ], repo);
+      expect(recovered).toMatchObject({ exitCode: 0 });
+      expect(recovered.stdout).toContain("Reused Agent Flow run interrupted-provider-override");
+      expect(models).toEqual(["gemma4"]);
+    } finally {
+      globalThis.fetch = originalFetch;
     }
   });
 

@@ -4262,6 +4262,8 @@ async function executeNestedRecoveryWorkflow(
       try {
         result = await store.withRunLock(recoveryRunId, "run", (lock) => {
           terminalizeChildOnError = true;
+          const childRun = assertPersistedWorkflowIdentity(store, recoveryRunId, nestedWorkflow);
+          assertOrPersistConfiguredProviderBindings(store, childRun, nestedWorkflow, sessionProviders);
           const recoveredAttempts = recoverInterruptedExecution(store, lock);
           return runAgentFlowCommandPipeline(
             store,

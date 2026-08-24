@@ -4,6 +4,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { findGitRepositoryRoot } from "@jurgen1c/agent-core/repository";
 import { parseYamlDocument, type JsonValue } from "@jurgen1c/agent-core/yaml";
+import { redactAgentFlowSensitiveText } from "./failure_payload";
 
 export type AgentFlowConfiguredProviderKind = "local" | "frontier";
 export type AgentFlowProviderDriver =
@@ -206,7 +207,7 @@ export function renderAgentFlowProviderCatalog(catalog: AgentFlowProviderCatalog
       binding.target,
       binding.kind,
       binding.config.driver,
-      binding.config.model,
+      redactAgentFlowSensitiveText(binding.config.model),
       binding.config.api_key_env ?? "none"
     ].join("\t"))
   ].join("\n");
@@ -225,7 +226,7 @@ export function doctorAgentFlowProviderCatalog(
         ok = false;
         return `${binding.alias}: missing credential environment variable ${keyName}`;
       }
-      return `${binding.alias}: ready (${binding.config.driver}, ${binding.config.model})`;
+      return `${binding.alias}: ready (${binding.config.driver}, ${redactAgentFlowSensitiveText(binding.config.model)})`;
     });
   return { ok, lines };
 }

@@ -394,12 +394,20 @@ async function runLifecycleCommand(
       const requiredProviders = collectRequiredWorkflowProviders(workflowResult!.workflow, sessionRequestSteps);
       const usesFixtureProvider = requiredProviders.includes("fixture");
       const repositoryAliases = loadAgentFlowRepositoryProviderAliases({ cwd: options.cwd });
+      const existingRun = store.getRun(runArgs.runId);
+      const providerOverrides = existingRun === null
+        ? runArgs.providerOverrides
+        : reconcilePinnedProviderOverrides(
+            persistedProviderOverrides(existingRun.context.providerBindings, runArgs.runId),
+            runArgs.providerOverrides,
+            runArgs.runId
+          );
       const catalog = loadAgentFlowProviderCatalog({
         cwd: options.cwd,
         env: options.env,
         homeDir: options.homeDir,
         ...(runArgs.configPath === undefined ? {} : { configPath: runArgs.configPath }),
-        overrides: runArgs.providerOverrides,
+        overrides: providerOverrides,
         aliases: requiredProviders.filter((provider) => provider !== "fixture")
       });
       const configuredValidation = validateAgentFlowWorkflow(
@@ -761,6 +769,37 @@ function persistedProviderOverrides(
     }
     return `${alias}=${binding.target}`;
   });
+}
+
+function reconcilePinnedProviderOverrides(
+  pinned: string[],
+  requested: string[],
+  runId: string
+): string[] {
+  if (pinned.length === 0) return requested;
+  if (requested.length === 0) return pinned;
+  const pinnedTargets = new Map(pinned.map((override) => {
+    const separator = override.indexOf("=");
+    return [override.slice(0, separator), override.slice(separator + 1)] as const;
+  }));
+  const requestedAliases = new Set<string>();
+  for (const override of requested) {
+    const separator = override.indexOf("=");
+    if (separator <= 0 || separator === override.length - 1) return [...pinned, ...requested];
+    const alias = override.slice(0, separator);
+    const target = override.slice(separator + 1);
+    if (alias !== alias.trim() || target !== target.trim() || requestedAliases.has(alias)) {
+      return [...pinned, ...requested];
+    }
+    requestedAliases.add(alias);
+    if (pinnedTargets.get(alias) !== target) {
+      throw new AgentFlowRunStateError(
+        `Agent Flow run ${runId} cannot replace pinned provider ${JSON.stringify(alias)} with a different target. Start a new run ID to change providers.`,
+        "AGENT_FLOW_PROVIDER_CONFIG_DRIFT"
+      );
+    }
+  }
+  return pinned;
 }
 
 function validLifecycleArgs(command: ActiveLifecycleCommand, args: string[]): boolean {
