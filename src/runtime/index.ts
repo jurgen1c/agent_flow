@@ -48,10 +48,25 @@ export {
 export {
   AGENT_FLOW_RUN_INSPECTION_RUN_ID_HEADER,
   AGENT_FLOW_RUN_INSPECTION_TOKEN_HEADER,
+  MAX_AGENT_FLOW_RUN_ACTION_BODY_BYTES,
   DEFAULT_AGENT_FLOW_RUN_INSPECTION_API_HOST,
   DEFAULT_AGENT_FLOW_RUN_INSPECTION_API_PORT,
   startAgentFlowRunInspectionApi
 } from "./run_inspection_api";
+export {
+  AGENT_FLOW_RUN_ACTIONS,
+  AgentFlowRunActionError,
+  buildAgentFlowRunActionSnapshot,
+  executeAgentFlowRunAction
+} from "./run_actions";
+export type {
+  AgentFlowRunAction,
+  AgentFlowRunActionAvailability,
+  AgentFlowRunActionResult,
+  AgentFlowRunActionRuntime,
+  AgentFlowRunActionSnapshot,
+  ExecuteAgentFlowRunActionInput
+} from "./run_actions";
 export {
   AGENT_FLOW_AMBIGUOUS_SUCCESS_TARGET_CODE,
   AgentFlowAmbiguousSuccessTargetError

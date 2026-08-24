@@ -41,8 +41,8 @@ does not replace Agent Memory or depend on it.
 - [Workflow specifications](specifications/) define the supported workflow
   styles and runtime behavior in detail.
 - [Release checklist](releasing.md) documents the maintainer release process.
-- [Run inspection API](run-inspection-api.md) defines the loopback and token
-  boundary for read-only persisted run data.
+- [Run inspection API](run-inspection-api.md) defines the loopback, token, and
+  freshness-guard boundaries for persisted run data and guarded UI actions.
 
 Documentation in this directory is versioned with the runtime. That keeps
 commands, schemas, examples, and operational guidance reviewable at the same
