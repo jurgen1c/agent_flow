@@ -34,6 +34,28 @@ export const DEFAULT_AGENT_FLOW_RUN_INSPECTION_API_PORT = 4318;
 export const AGENT_FLOW_RUN_INSPECTION_TOKEN_HEADER = "x-agent-flow-token";
 export const AGENT_FLOW_RUN_INSPECTION_RUN_ID_HEADER = "x-agent-flow-run-id";
 export const MAX_AGENT_FLOW_RUN_ACTION_BODY_BYTES = 64 * 1024;
+const AGENT_FLOW_ACTION_CONFLICT_CODES = new Set([
+  "AGENT_FLOW_APPROVAL_INVALID",
+  "AGENT_FLOW_APPROVAL_STALE",
+  "AGENT_FLOW_ARTIFACT_COLLISION",
+  "AGENT_FLOW_ARTIFACT_NOT_FOUND",
+  "AGENT_FLOW_ARTIFACT_OVERWRITE",
+  "AGENT_FLOW_ARTIFACT_RUN_STATUS",
+  "AGENT_FLOW_ARTIFACT_STALE",
+  "AGENT_FLOW_ARTIFACT_UNAVAILABLE",
+  "AGENT_FLOW_CONCURRENT_MUTATION",
+  "AGENT_FLOW_GATE_OUTCOME_INVALID",
+  "AGENT_FLOW_GATE_OUTCOME_REQUIRED",
+  "AGENT_FLOW_INPUT_ANSWER_REQUIRED",
+  "AGENT_FLOW_INTERACTION_INVALID",
+  "AGENT_FLOW_INTERACTION_REQUIRED",
+  "AGENT_FLOW_RESUME_STATE",
+  "AGENT_FLOW_RUN_COLLISION",
+  "AGENT_FLOW_RUN_LOCKED",
+  "AGENT_FLOW_RUN_LOCK_LOST",
+  "AGENT_FLOW_RUN_LOCK_RECOVERY",
+  "AGENT_FLOW_RUN_TRANSITION"
+]);
 
 export interface AgentFlowRunInspectionApiOptions {
   cwd?: string;
@@ -224,7 +246,7 @@ async function handleInspectionRequest(
       sendJson(response, 404, { error: error.message, code: error.code });
       return;
     }
-    if (error instanceof AgentFlowRunStateError) {
+    if (error instanceof AgentFlowRunStateError && AGENT_FLOW_ACTION_CONFLICT_CODES.has(error.code)) {
       sendJson(response, 409, { error: error.message, code: error.code });
       return;
     }

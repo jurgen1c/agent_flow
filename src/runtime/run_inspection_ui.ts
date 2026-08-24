@@ -635,15 +635,29 @@ export const AGENT_FLOW_RUN_INSPECTION_UI_JAVASCRIPT = String.raw`(function () {
   }
 
   function assertFiniteActionAnswer(value) {
-    if (typeof value === "number" && !Number.isFinite(value)) {
-      var error = new Error("Input answer JSON numbers must be finite.");
-      error.code = "AGENT_FLOW_ACTION_BODY_INVALID";
-      throw error;
-    }
-    if (Array.isArray(value)) {
-      value.forEach(assertFiniteActionAnswer);
-    } else if (value !== null && typeof value === "object") {
-      Object.values(value).forEach(assertFiniteActionAnswer);
+    var maxDepth = 50;
+    var pending = [{ value: value, depth: 0 }];
+    while (pending.length > 0) {
+      var current = pending.pop();
+      if (current.depth > maxDepth) {
+        var depthError = new Error("Input answer JSON cannot exceed " + maxDepth + " nested levels.");
+        depthError.code = "AGENT_FLOW_ACTION_BODY_INVALID";
+        throw depthError;
+      }
+      if (typeof current.value === "number" && !Number.isFinite(current.value)) {
+        var numberError = new Error("Input answer JSON numbers must be finite.");
+        numberError.code = "AGENT_FLOW_ACTION_BODY_INVALID";
+        throw numberError;
+      }
+      if (Array.isArray(current.value)) {
+        current.value.forEach(function (entry) {
+          pending.push({ value: entry, depth: current.depth + 1 });
+        });
+      } else if (current.value !== null && typeof current.value === "object") {
+        Object.values(current.value).forEach(function (entry) {
+          pending.push({ value: entry, depth: current.depth + 1 });
+        });
+      }
     }
     return value;
   }

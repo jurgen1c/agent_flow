@@ -1576,6 +1576,8 @@ steps:
       expect(parseActionAnswer('{"nested":[42]}')).toEqual({ nested: [42] });
       expect(parseActionAnswer("not JSON")).toBe("not JSON");
       expect(() => parseActionAnswer('{"nested":[1e400]}')).toThrow("Input answer JSON numbers must be finite.");
+      expect(() => parseActionAnswer(`${"[".repeat(51)}null${"]".repeat(51)}`))
+        .toThrow("Input answer JSON cannot exceed 50 nested levels.");
       expect(javascript).toContain("async function loadSection(id)");
       expect(javascript).toContain("appendSectionPage(id, view");
       expect(javascript).not.toContain("model.events");
@@ -1901,6 +1903,38 @@ steps:
     } finally {
       fs.chmodSync(unreadablePath, 0o600);
       store.close();
+    }
+  });
+
+  test("reports request-time schema failures as internal errors instead of conflicts", async () => {
+    const repo = makeRepo();
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createInspectableRun(store, "unsupported-request-schema");
+    const databasePath = store.databasePath;
+    store.close();
+    const server = await startAgentFlowRunInspectionApi({
+      cwd: repo,
+      port: 0,
+      token: "inspection-token"
+    });
+    const database = new Database(databasePath);
+    database.query("UPDATE run_state_metadata SET value = '999' WHERE key = 'schema_version'").run();
+    database.close();
+
+    try {
+      const response = await fetch(`${server.url}/api/run/actions`, {
+        headers: {
+          [AGENT_FLOW_RUN_INSPECTION_TOKEN_HEADER]: "inspection-token",
+          [AGENT_FLOW_RUN_INSPECTION_RUN_ID_HEADER]: encodeURIComponent("unsupported-request-schema")
+        }
+      });
+      expect(response.status).toBe(500);
+      expect(await response.json()).toEqual({
+        error: "Could not inspect Agent Flow run state.",
+        code: "AGENT_FLOW_INSPECTION_ERROR"
+      });
+    } finally {
+      await server.close();
     }
   });
 

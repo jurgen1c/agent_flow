@@ -333,7 +333,7 @@ export async function executeAgentFlowRunAction(
   }
   if (input.action === "provide_input" && !isValidActionAnswer(input.answer)) {
     throw new AgentFlowRunActionError(
-      "Input answers must contain only finite JSON values.",
+      `Input answers must contain only finite JSON values nested no more than ${MAX_AGENT_FLOW_RUN_ACTION_ANSWER_DEPTH} levels.`,
       "AGENT_FLOW_ACTION_BODY_INVALID",
       400
     );
