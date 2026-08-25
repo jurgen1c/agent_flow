@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from "node:util";
 import type { AgentFlowWorkflow } from "./workflow";
 import { formatAgentFlowWorkflowIssues, validateAgentFlowWorkflow } from "./validation";
+import type { AgentFlowProviderKindResolver } from "./policy_utils";
 import {
   createAgentFlowNotificationRegistry,
   deliverAgentFlowNotifications,
@@ -40,7 +41,10 @@ export function createAgentFlowLifecycleRun(
   input: CreateAgentFlowLifecycleRunInput
 ): AgentFlowRunMutationResult {
   const initialContext = normalizedInitialContext(input.context);
-  const validation = validateAgentFlowWorkflow(input.workflow);
+  const validation = validateAgentFlowWorkflow(
+    input.workflow,
+    providerKindResolverFromBindings(initialContext.providerBindings)
+  );
   if (!validation.valid) {
     throw new AgentFlowRunStateError(
       `Agent Flow run ${input.id} cannot start because workflow validation failed:\n${formatAgentFlowWorkflowIssues(validation.errors)}`,
@@ -135,7 +139,10 @@ export function transitionAgentFlowLifecycleRun(
   const workflow = persistedWorkflow as unknown as AgentFlowWorkflow;
   let validation: ReturnType<typeof validateAgentFlowWorkflow>;
   try {
-    validation = validateAgentFlowWorkflow(workflow);
+    validation = validateAgentFlowWorkflow(
+      workflow,
+      providerKindResolverFromBindings(current.context.providerBindings)
+    );
   } catch (error) {
     throw new AgentFlowRunStateError(
       `Agent Flow run ${runId} cannot transition because its persisted workflow definition is malformed: ${error instanceof Error ? error.message : String(error)}`,
@@ -517,4 +524,16 @@ function normalizedInitialContext(
     );
   }
   return Object.fromEntries(Object.entries(context ?? {}).filter(([key]) => key !== "workflow"));
+}
+
+function providerKindResolverFromBindings(
+  value: AgentFlowRunStateValue | undefined
+): AgentFlowProviderKindResolver | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  return (provider) => {
+    if (!Object.hasOwn(value, provider)) return undefined;
+    const binding = value[provider];
+    if (binding === null || typeof binding !== "object" || Array.isArray(binding)) return undefined;
+    return binding.kind === "local" || binding.kind === "frontier" ? binding.kind : undefined;
+  };
 }

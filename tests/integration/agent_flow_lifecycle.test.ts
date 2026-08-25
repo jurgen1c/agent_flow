@@ -122,6 +122,39 @@ describe("Agent Flow run lifecycle", () => {
     store.close();
   });
 
+  test("validates configured frontier budgets from pinned provider bindings", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: configured-frontier-lifecycle
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  planner: { provider: planning }
+steps:
+  - { id: plan, type: session_request, session: planner, prompt: prompt.md, inputs: [request.md], outputs: [plan.md] }
+limits: { max_model_calls: 1 }
+`);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    const providerBindings = {
+      planning: {
+        target: "claude-main",
+        kind: "frontier",
+        driver: "anthropic-messages",
+        modelHash: "sha256:model",
+        fingerprint: "sha256:target"
+      }
+    };
+
+    expect(() => createAgentFlowLifecycleRun(store, {
+      id: "configured-frontier-budget",
+      workflow,
+      context: { providerBindings }
+    })).toThrow("require a positive limits.max_frontier_calls budget");
+    expect(store.getRun("configured-frontier-budget")).toBeNull();
+    store.close();
+  });
+
   test("reuses a matching running execution when interrupted recovery races with creation", async () => {
     const repoRoot = temporaryRepo();
     const workflow = parseAgentFlowWorkflowOrThrow(WORKFLOW_SOURCE);
