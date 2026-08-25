@@ -15,7 +15,10 @@ versioned, tested, and released as `@jurgen1c/agent-flow`.
 Agent Flow consumes shared YAML, repository/path-containment, and SQLite APIs
 from Agent Core. Agent Flow owns workflow parsing, schemas, validation,
 simulation, persistent run state, policies, lifecycle transitions, command and
-artifact execution, notifications, retention, failure payloads, and its CLI.
+artifact execution, configured provider targets and aliases, notifications,
+retention, failure payloads, and its CLI. Vendor SDKs remain outside the
+dependency graph: built-in HTTP providers use the platform Fetch API, while
+native coding CLIs remain an application-defined adapter boundary.
 
 Agent Flow has no Agent Memory dependency and contains no Agent Memory adapter.
 The optional Memory-to-Flow adapter belongs to

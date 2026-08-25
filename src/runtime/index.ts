@@ -128,8 +128,33 @@ export {
   executeAgentFlowApproval,
   executeAgentFlowConsult,
   executeAgentFlowReview,
-  executeAgentFlowSessionRequest
+  executeAgentFlowSessionRequest,
+  invokeAgentFlowSessionProvider
 } from "./session_request";
+export {
+  AgentFlowProviderConfigError,
+  doctorAgentFlowProviderCatalog,
+  hashAgentFlowProviderModel,
+  loadAgentFlowProviderCatalog,
+  loadAgentFlowRepositoryProviderAliases,
+  parseAgentFlowProviderConfig,
+  providerBindingsForWorkflow,
+  renderAgentFlowProviderCatalog,
+  serializeAgentFlowProviderBindings
+} from "./provider_config";
+export type {
+  AgentFlowConfiguredProviderKind,
+  AgentFlowConfiguredTarget,
+  AgentFlowProviderAlias,
+  AgentFlowProviderCatalog,
+  AgentFlowProviderDriver,
+  AgentFlowResolvedProviderBinding,
+  LoadAgentFlowProviderCatalogOptions
+} from "./provider_config";
+export {
+  createAgentFlowConfiguredProviderAdapter,
+  createAgentFlowConfiguredProviderRegistry
+} from "./provider_drivers";
 export {
   AGENT_FLOW_APPROVAL_STATUSES,
   AgentFlowApprovalError,
@@ -297,6 +322,7 @@ export type {
 } from "./artifact_transform";
 export type {
   AgentFlowCodexProfileSessionProviderRegistration,
+  AgentFlowConfiguredSessionProviderDescriptor,
   AgentFlowCustomSessionProviderRegistration,
   AgentFlowFixtureSessionProviderRegistration,
   AgentFlowFrontierSessionProviderRegistration,
@@ -325,6 +351,7 @@ export type {
   AgentFlowPolicyRequest,
   AgentFlowPolicyStatus
 } from "./policy";
+export type { AgentFlowProviderKindResolver } from "./policy_utils";
 export type {
   AgentFlowApprovalRecord,
   AgentFlowApprovalStatus,

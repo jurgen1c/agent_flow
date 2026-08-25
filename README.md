@@ -24,11 +24,37 @@ repository's `.agents/skills` directory or into the Codex user skill directory
 agent-flow skills list
 agent-flow skills install --destination agents
 agent-flow skills install --destination codex
+agent-flow config validate
+agent-flow providers list
+agent-flow providers doctor
 ```
 
 Installation refuses to replace an existing skill directory. The skills only
 author, inspect, review, debug, simplify, or policy-harden workflow YAML; they
 do not invoke workflow lifecycle commands.
+
+## Create a workflow with an agent
+
+After installing the skills, give your coding agent a concrete process and ask
+it to use the workflow designer. For example:
+
+```text
+Use $workflow-designer to create workflows/pr-check.yml for this repository.
+
+The workflow should run the repository's formatter, tests, and type checker in
+that order. If a check fails, preserve useful failure evidence and stop; do not
+attempt an automatic fix. Keep generated run state out of version control,
+choose the simplest supported workflow style, and add explicit limits and
+least-authority policies wherever they apply.
+
+After writing the YAML, run agent-flow validate, lint, explain, and graph.
+Do not run the workflow. Summarize any assumptions I need to review.
+```
+
+Replace the process and filename with your own. Add requirements such as a
+local model, a cloud model, recovery, review, or human approval only when the
+workflow needs them. The [quickstart](docs/quickstart.md#have-an-agent-author-a-workflow)
+contains a reusable prompt template.
 
 ## CLI
 
@@ -41,7 +67,8 @@ agent-flow lint workflow.yml
 agent-flow explain workflow.yml
 agent-flow graph workflow.yml
 agent-flow simulate workflow.yml --fixture fixture.json
-agent-flow run workflow.yml --id example-run --fixture fixture.json
+agent-flow run workflow.yml --id example-run
+agent-flow run workflow.yml --id alternate-model --provider drafter=gemma-local
 agent-flow inject example-run fixer "Additional remediation context"
 agent-flow status example-run
 agent-flow logs example-run
@@ -94,10 +121,71 @@ const recoveryWorkflows = createAgentFlowWorkflowRegistry()
 // injectAgentFlowRecoveryContext(store, runId, "fixer", "New user context");
 ```
 
-Session providers are registered through typed fixture, local, frontier,
-named Codex-profile, or custom boundaries. Live providers are disabled by
-default and require explicit enabled configuration; see
-[Session provider boundaries](docs/session-providers.md).
+The CLI loads concrete model targets from the user config and portable aliases
+from the repository. Programmatic registration remains available for custom
+integrations; see [Session provider boundaries](docs/session-providers.md).
+The configuration layer is additive: the original fixture, local, frontier,
+named Codex-profile, and custom registry APIs remain supported. A workflow
+host can continue registering `kind: "custom"` adapters without either config
+file. The installed CLI cannot load arbitrary application code, so those
+providers still run through the programmatic API.
+
+Put concrete models and endpoints in
+`${XDG_CONFIG_HOME:-~/.config}/agent-flow/config.yml`:
+
+```yaml
+version: 1
+targets:
+  codex-main:
+    kind: frontier
+    driver: openai-responses
+    model: YOUR_CODEX_MODEL
+    api_key_env: OPENAI_API_KEY
+    enabled: true
+  qwen-local:
+    kind: local
+    driver: openai-compatible
+    base_url: http://127.0.0.1:11434/v1
+    model: qwen3
+    enabled: true
+```
+
+Map stable workflow aliases in the committed `.agent-flow.yml`:
+
+```yaml
+version: 1
+providers:
+  implementer: { kind: frontier, target: codex-main }
+  drafter: { kind: local, target: qwen-local }
+```
+
+Steps select sessions, and sessions select those aliases:
+
+```yaml
+sessions:
+  writer: { provider: drafter }
+
+policies:
+  model_usage:
+    allowed_providers: [drafter]
+
+limits:
+  max_model_calls: 2
+```
+
+API targets name a credential environment variable with `api_key_env`; secrets
+never belong in either YAML file. Use `--provider alias=target` on a new run to
+swap Qwen for Gemma, Claude for Codex, or another same-kind target. See
+[Configure local or cloud models](docs/quickstart.md#configure-local-or-cloud-models)
+for all three built-in HTTP drivers and a multi-model workflow. Native coding
+CLIs remain available only through application-defined custom adapters because
+the built-in boundary sends declared prompt and artifact content only.
+
+Ordinary custom registrations preserve the previous behavior: Agent Flow pins
+the provider name in the workflow but cannot fingerprint changes inside
+application-owned adapter code. Applications that want configured-provider
+drift protection for their own adapter can use `registerConfigured` with a
+complete local/frontier descriptor and a privacy-safe target fingerprint.
 
 Pass the workflow registry as the final `executeAgentFlowCommandPipeline`
 argument when a workflow uses `route_to.workflow`. Recovery session providers

@@ -207,6 +207,12 @@ steps:
       session: "writer",
       usage: { frontier_calls: 2, model_calls: 3 }
     })).toMatchObject({ status: "pause", code: "policy.budget.exhausted" });
+    expect(evaluateAgentFlowPolicy(workflow, {
+      kind: "model_usage",
+      session: "writer",
+      providerKind: "local",
+      usage: { frontier_calls: 2, model_calls: 3 }
+    })).toMatchObject({ status: "pause", code: "policy.budget.exhausted" });
 
     const denied = parseAgentFlowWorkflowOrThrow(POLICY_WORKFLOW.replace(
       "allowed_providers: [local, frontier]",

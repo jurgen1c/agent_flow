@@ -8,6 +8,7 @@ import {
   isNormalizedStaticAgentFlowArtifactPath,
   normalizeAgentFlowArtifactPath,
   type AgentFlowRunLockRecord,
+  type AgentFlowRunRecord,
   type AgentFlowRunStateValue,
   type AgentFlowRunStateStore,
   type AgentFlowRunStopStatus,
@@ -46,6 +47,7 @@ import {
   executeAgentFlowSessionRequest,
   invokeAgentFlowSessionProvider,
   persistAgentFlowSessionProviderEvidence,
+  preflightAgentFlowSessionProvider,
   preflightAgentFlowSessionProviderEvidence,
   readAgentFlowSessionInput,
   readAgentFlowSessionPrompt,
@@ -139,6 +141,7 @@ import {
   type AgentFlowDisagreementPolicy,
   type AgentFlowDisagreementResult
 } from "./disagreement";
+import { hashAgentFlowProviderModel } from "./provider_config";
 
 const MAX_CAPTURE_BYTES = 10 * 1024 * 1024;
 const MAX_RECOVERY_WORKSPACE_SNAPSHOT_BYTES = 64 * 1024 * 1024;
@@ -208,7 +211,8 @@ export async function executeAgentFlowCommandPipeline(
 ): Promise<AgentFlowCommandPipelineResult> {
   return store.withRunLock(runId, "run", (lock) => {
     beforeRecovery?.();
-    assertPersistedWorkflowIdentity(store, runId, workflow);
+    const run = assertPersistedWorkflowIdentity(store, runId, workflow);
+    assertOrPersistConfiguredProviderBindings(store, run, workflow, sessionProviders);
     const recoveredExecution = recoverInterruptedExecution(store, lock);
     prepareExecution?.();
     return runAgentFlowCommandPipeline(
@@ -232,7 +236,8 @@ export async function resumeAgentFlowCommandPipeline(
 ): Promise<AgentFlowCommandPipelineResult> {
   return store.withRunLock(runId, "resume", (lock) => {
     prepareResume?.();
-    assertPersistedWorkflowIdentity(store, runId, workflow);
+    const run = assertPersistedWorkflowIdentity(store, runId, workflow);
+    assertOrPersistConfiguredProviderBindings(store, run, workflow, sessionProviders);
     const recoveredExecution = recoverInterruptedExecution(store, lock);
     const effectiveResponse = recoveredExecution === undefined ? response : undefined;
     return runAgentFlowCommandPipeline(
@@ -242,11 +247,48 @@ export async function resumeAgentFlowCommandPipeline(
   });
 }
 
+function assertOrPersistConfiguredProviderBindings(
+  store: AgentFlowRunStateStore,
+  run: AgentFlowRunRecord,
+  workflow: AgentFlowWorkflow,
+  providers: AgentFlowSessionProviderRegistry
+): void {
+  const bindings: Record<string, AgentFlowRunStateValue> = {};
+  for (const session of Object.values(workflow.sessions ?? {})) {
+    if (session === null || typeof session !== "object" || Array.isArray(session)) continue;
+    const provider = normalizedTarget((session as AgentFlowYamlMapping).provider);
+    if (provider === undefined || Object.hasOwn(bindings, provider)) continue;
+    const descriptor = providers.describe(provider);
+    if (descriptor?.target === undefined || descriptor.driver === undefined
+        || descriptor.model === undefined || descriptor.fingerprint === undefined) continue;
+    bindings[provider] = {
+      target: descriptor.target,
+      kind: descriptor.kind,
+      driver: descriptor.driver,
+      modelHash: hashAgentFlowProviderModel(descriptor.model),
+      fingerprint: descriptor.fingerprint
+    };
+  }
+
+  const persisted = run.context.providerBindings;
+  if (persisted === undefined) {
+    if (Object.keys(bindings).length === 0) return;
+    store.updateRun(run.id, { context: { ...run.context, providerBindings: bindings } });
+    return;
+  }
+  if (!isDeepStrictEqual(persisted, bindings)) {
+    throw new AgentFlowRunStateError(
+      `Agent Flow run ${run.id} provider configuration changed after the run was created. Restore the pinned targets or start a new run ID.`,
+      "AGENT_FLOW_PROVIDER_CONFIG_DRIFT"
+    );
+  }
+}
+
 function assertPersistedWorkflowIdentity(
   store: AgentFlowRunStateStore,
   runId: string,
   workflow: AgentFlowWorkflow
-): void {
+): AgentFlowRunRecord {
   const run = store.getRun(runId);
   if (run === null) throw new Error(`Agent Flow run ${runId} was not found.`);
   if (!isDeepStrictEqual(run.context.workflow, workflow)) {
@@ -255,6 +297,7 @@ function assertPersistedWorkflowIdentity(
       "AGENT_FLOW_RUN_COLLISION"
     );
   }
+  return run;
 }
 
 function recoverInterruptedExecution(
@@ -3492,10 +3535,10 @@ async function routeAfterFailedStep(
       const sessionResult = resumingInterruptedRoute
         ? recoveredRecoverySessionResult(store, runId, stepId, failure.id, target)
           ?? await executeRecoverySession(
-            store, runId, workflow, stepId, failure.id, failure.payloadPath, route, sessionProviders
+            store, runId, workflow, stepId, step, failure.id, failure.payloadPath, route, sessionProviders
           )
         : await executeRecoverySession(
-          store, runId, workflow, stepId, failure.id, failure.payloadPath, route, sessionProviders
+          store, runId, workflow, stepId, step, failure.id, failure.payloadPath, route, sessionProviders
         );
       status = sessionResult.status;
       message = sessionResult.message;
@@ -4219,6 +4262,8 @@ async function executeNestedRecoveryWorkflow(
       try {
         result = await store.withRunLock(recoveryRunId, "run", (lock) => {
           terminalizeChildOnError = true;
+          const childRun = assertPersistedWorkflowIdentity(store, recoveryRunId, nestedWorkflow);
+          assertOrPersistConfiguredProviderBindings(store, childRun, nestedWorkflow, sessionProviders);
           const recoveredAttempts = recoverInterruptedExecution(store, lock);
           return runAgentFlowCommandPipeline(
             store,
@@ -4466,6 +4511,7 @@ async function executeRecoverySession(
   runId: string,
   workflow: AgentFlowWorkflow,
   stepId: string,
+  failedStep: AgentFlowWorkflowStep,
   failureId: string,
   failurePath: string | null,
   route: AgentFlowYamlMapping,
@@ -4650,6 +4696,18 @@ async function executeRecoverySession(
     ...(providerDescriptor.profile === undefined
       ? []
       : [["Recovery adapter provider profile", providerDescriptor.profile] as [string, string]]),
+    ...(providerDescriptor.target === undefined
+      ? []
+      : [["Recovery adapter provider target", providerDescriptor.target] as [string, string]]),
+    ...(providerDescriptor.driver === undefined
+      ? []
+      : [["Recovery adapter provider driver", providerDescriptor.driver] as [string, string]]),
+    ...(providerDescriptor.model === undefined
+      ? []
+      : [["Recovery adapter provider model", providerDescriptor.model] as [string, string]]),
+    ...(providerDescriptor.fingerprint === undefined
+      ? []
+      : [["Recovery adapter provider fingerprint", providerDescriptor.fingerprint] as [string, string]]),
     ["Recovery adapter prompt path", prompt.path, true],
     ...inputs.flatMap((input): Array<[string, string, boolean?]> => [
       ["Recovery adapter input path", input.path, true],
@@ -4659,6 +4717,46 @@ async function executeRecoverySession(
       ? []
       : [["Recovery adapter external session ID", priorExternalSessionId] as [string, string]])
   ]);
+  const routeFileScope = mapping(route.file_scope);
+  const authorityScopes = [
+    mapping(mapping(workflow.policies)?.file_scope),
+    mapping(session.file_scope),
+    ...recoveryOperationFileScopes(workflow.steps, failedStep),
+    routeFileScope
+  ].filter((scope): scope is AgentFlowYamlMapping => scope !== undefined);
+  preflightAgentFlowSessionProvider(adapter, {
+    runId,
+    stepId: recoveryStepId,
+    sessionId,
+    provider,
+    providerKind: providerDescriptor.kind,
+    kind: "recovery",
+    ...(providerDescriptor.profile === undefined ? {} : { providerProfile: providerDescriptor.profile }),
+    ...(providerDescriptor.target === undefined ? {} : { providerTarget: providerDescriptor.target }),
+    ...(providerDescriptor.driver === undefined ? {} : { providerDriver: providerDescriptor.driver }),
+    ...(providerDescriptor.model === undefined
+      ? {}
+      : { providerModel: hashAgentFlowProviderModel(providerDescriptor.model) }),
+    ...(providerDescriptor.fingerprint === undefined ? {} : { providerFingerprint: providerDescriptor.fingerprint }),
+    resume,
+    ...(priorExternalSessionId === undefined ? {} : { externalSessionId: priorExternalSessionId }),
+    prompt: { ...prompt },
+    inputs: inputs.map((input) => ({ ...input, content: Uint8Array.from(input.content) })),
+    outputs: [],
+    repoRoot: store.repoRoot,
+    canModifyFiles: mapping(session.authority)?.can_modify_files === true,
+    fileScope: {
+      layers: authorityScopes.map((scope) => ({
+        include: Array.isArray(scope.include)
+          ? scope.include.filter((value): value is string => typeof value === "string")
+          : [],
+        exclude: Array.isArray(scope.exclude)
+          ? scope.exclude.filter((value): value is string => typeof value === "string")
+          : []
+      }))
+    },
+    signal: new AbortController().signal
+  });
   store.claimSession({
     id: sessionId,
     runId,
@@ -4729,7 +4827,7 @@ async function executeRecoverySession(
         appliedContextRevision
       );
       reserveAgentFlowSessionModelCallBudgets(
-        store, runId, workflow, recoveryStepId, sessionId, provider
+        store, runId, workflow, recoveryStepId, sessionId, provider, providerDescriptor.kind
       );
       if (rerunRevision !== undefined) {
         store.appendRunEvent(runId, {
@@ -4776,9 +4874,16 @@ async function executeRecoverySession(
           sessionId,
           provider,
           providerKind: providerDescriptor.kind,
+          kind: "recovery",
           ...(providerDescriptor.profile === undefined
             ? {}
             : { providerProfile: providerDescriptor.profile }),
+          ...(providerDescriptor.target === undefined ? {} : { providerTarget: providerDescriptor.target }),
+          ...(providerDescriptor.driver === undefined ? {} : { providerDriver: providerDescriptor.driver }),
+          ...(providerDescriptor.model === undefined
+            ? {}
+            : { providerModel: hashAgentFlowProviderModel(providerDescriptor.model) }),
+          ...(providerDescriptor.fingerprint === undefined ? {} : { providerFingerprint: providerDescriptor.fingerprint }),
           resume,
           ...(externalSessionId === undefined ? {} : { externalSessionId }),
           prompt: { ...prompt },
@@ -4787,6 +4892,18 @@ async function executeRecoverySession(
             content: Uint8Array.from(input.content)
           })),
           outputs: [],
+          repoRoot: store.repoRoot,
+          canModifyFiles: mapping(session.authority)?.can_modify_files === true,
+          fileScope: {
+            layers: authorityScopes.map((scope) => ({
+              include: Array.isArray(scope.include)
+                ? scope.include.filter((value): value is string => typeof value === "string")
+                : [],
+              exclude: Array.isArray(scope.exclude)
+                ? scope.exclude.filter((value): value is string => typeof value === "string")
+                : []
+            }))
+          },
           signal: new AbortController().signal
         }, () => activeStopStatus(store, runId), () => store.runLockInterruption());
       } catch (error) {
@@ -4859,6 +4976,10 @@ async function executeRecoverySession(
           ...(providerDescriptor.profile === undefined
             ? {}
             : { providerProfile: providerDescriptor.profile }),
+          ...(providerDescriptor.target === undefined ? {} : { providerTarget: providerDescriptor.target }),
+          ...(providerDescriptor.driver === undefined ? {} : { providerDriver: providerDescriptor.driver }),
+          ...(providerDescriptor.model === undefined ? {} : { providerModel: providerDescriptor.model }),
+          ...(providerDescriptor.fingerprint === undefined ? {} : { providerFingerprint: providerDescriptor.fingerprint }),
           resume,
           prompt: evidencePrompt,
           inputs: evidenceInputs,

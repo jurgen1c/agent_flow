@@ -21,6 +21,7 @@ or execution-specific state:
 ```text
 repository/
 ├── workflows/                       # committed Agent Flow YAML
+├── .agent-flow.yml                  # committed provider aliases
 ├── docs/agent-memory/               # committed Agent Memory Markdown/YAML
 ├── agent-memory.config.yaml         # committed Memory configuration
 ├── .agent-flow/                     # generated Flow execution state
@@ -34,7 +35,8 @@ Agent Memory global-mode SQLite caches live outside the repository. Whether
 Memory uses global or local cache mode, canonical files under
 `docs/agent-memory/` remain committed and generated SQLite state does not.
 Agent Flow's `.agent-flow/` directory is always repository-local generated
-state and must be ignored by Git.
+state and must be ignored by Git. The similarly named `.agent-flow.yml` file is
+intentional configuration and should be committed.
 
 ## Run state and artifacts
 
@@ -85,7 +87,8 @@ fixtures, prompts, artifacts, events, and portable archives.
 Before a live run:
 
 1. Review the YAML and every referenced prompt or script.
-2. Run `validate`, `lint`, `explain`, and `graph`.
+2. Run `config validate`, `providers doctor`, `validate`, `lint`, `explain`,
+   and `graph`.
 3. Exercise important branches with bounded, non-secret simulation fixtures.
 4. Confirm file scopes, policies, approvals, limits, notifications, and
    retention behavior.

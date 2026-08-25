@@ -1,0 +1,53 @@
+name: multi-provider-feature
+version: 1
+style: pipeline
+maturity: experimental
+
+description: Route planning, implementation, drafting, and review to different configured targets.
+
+sessions:
+  planner:
+    provider: planner
+  implementer:
+    provider: implementer
+  drafter:
+    provider: local-drafter
+  reviewer:
+    provider: local-reviewer
+
+steps:
+  - id: draft
+    type: session_request
+    session: drafter
+    prompt: examples/prompts/create-spec.md
+    inputs: [request.md]
+    outputs: [draft.md]
+
+  - id: plan
+    type: session_request
+    session: planner
+    prompt: examples/prompts/create-spec.md
+    inputs: [request.md, draft.md]
+    outputs: [plan.md]
+
+  - id: implementation-design
+    type: session_request
+    session: implementer
+    prompt: examples/prompts/create-spec.md
+    inputs: [plan.md]
+    outputs: [implementation-design.md]
+
+  - id: review
+    type: session_request
+    session: reviewer
+    prompt: examples/prompts/review-implementation.md
+    inputs: [plan.md, implementation-design.md]
+    outputs: [review.md]
+
+policies:
+  model_usage:
+    allowed_providers: [planner, implementer, local-drafter, local-reviewer]
+
+limits:
+  max_model_calls: 8
+  max_frontier_calls: 4

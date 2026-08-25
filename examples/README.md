@@ -13,6 +13,7 @@ These examples show how Agent Flow workflows can start simple and grow into reco
 | `workflows/pr-feedback-loop.yml` | Recovery pipeline | Poll PR comments and route actionable feedback to FM |
 | `workflows/implement-review-collab.yml` | Collaborative | Implementer/reviewer loop with decision records |
 | `workflows/content-review-collab.yml` | Collaborative | Marketing copy with product approval |
+| `workflows/multi-provider.yml` | Pipeline | Claude/Codex planning and implementation plus swappable Qwen/Gemma local steps |
 
 ## Suggested Demo Order
 
@@ -43,6 +44,30 @@ bun run dist/agent-flow.js run examples/workflows/implement-review-collab.yml \
 `implement-review-collab.yml` demonstrates formal code review, a bounded revision loop, explicit implementation approval, a retained decision record, and human escalation. `content-review-collab.yml` adds advisory product feedback before formal review, explicit product approval, and a retained content decision record.
 
 Use the corresponding fixture directories to substitute `changes-requested.json` or `unresolved.json`. Fixture runs create `.agent-flow/` state in the current repository; use a unique run ID for each run.
+
+## Configured Multi-Provider Example
+
+Copy `config/global-providers.yml` to your user Agent Flow config and replace
+the cloud model placeholders. Copy `config/repository-providers.yml` to the
+repository root as `.agent-flow.yml`, then validate before running:
+
+```sh
+agent-flow config validate
+agent-flow providers doctor
+agent-flow validate examples/workflows/multi-provider.yml
+agent-flow run examples/workflows/multi-provider.yml \
+  --id multi-provider-demo \
+  --fixture examples/fixtures/multi-provider/inputs.json
+```
+
+To send the drafting step to Gemma instead of Qwen for a new run:
+
+```sh
+agent-flow run examples/workflows/multi-provider.yml \
+  --id multi-provider-gemma \
+  --fixture examples/fixtures/multi-provider/inputs.json \
+  --provider local-drafter=gemma-local
+```
 
 ## Notes
 

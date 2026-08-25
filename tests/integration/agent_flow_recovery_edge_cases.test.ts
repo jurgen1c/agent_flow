@@ -134,7 +134,14 @@ steps:
 `);
     const store = await openAgentFlowRunState({ cwd: root });
     createAgentFlowLifecycleRun(store, { id: "inherited-scope", workflow });
-    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => {
+      expect(request.fileScope).toEqual({
+        layers: [
+          { include: ["src/**"], exclude: [] },
+          { include: ["src/narrow/**"], exclude: [] },
+          { include: ["src/**"], exclude: [] }
+        ]
+      });
       fs.writeFileSync(path.join(root, "src/outside.ts"), "outside inherited scope\n");
       return remediated();
     });
@@ -566,6 +573,39 @@ steps:
       providerChecksum,
       redacted: true
     });
+    store.close();
+  });
+
+  test("rejects secret-bearing configured provider metadata before recovery invocation", async () => {
+    const root = temporaryRepo();
+    writePrompt(root);
+    const workflow = recoverySessionWorkflow(`
+policies: { sensitive_inputs: deny }
+sessions:
+  fixer: { provider: configured }
+steps:
+  - id: check
+    type: command
+    command: "false"
+    on_failure:
+      route_to: { session: fixer, prompt: prompts/fix.md }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+limits: { max_model_calls: 1 }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "blocked-recovery-provider-metadata", workflow });
+    expect(() => createAgentFlowSessionProviderRegistry().registerConfigured({
+      name: "configured",
+      kind: "local",
+      target: "API_TOKEN=configured-recovery-secret",
+      driver: "openai-compatible",
+      model: "model",
+      fingerprint: "sha256:test"
+    }, () => ({ outputs: {}, metadata: { recovery_status: "unresolved" } })))
+      .toThrow("non-secret identifier");
+    expect(store.getRun("blocked-recovery-provider-metadata")?.context.providerBindings).toBeUndefined();
+    expect(store.getBudget("blocked-recovery-provider-metadata", "model:model_calls")).toBeNull();
     store.close();
   });
 

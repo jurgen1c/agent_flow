@@ -2,10 +2,15 @@ import fs from "node:fs";
 import path from "node:path";
 import type { AgentFlowYamlMapping, AgentFlowYamlValue } from "./workflow";
 
-export function isAgentFlowFrontierProvider(value: unknown): boolean {
+export type AgentFlowProviderKindResolver = (provider: string) => "local" | "frontier" | undefined;
+
+export function isAgentFlowFrontierProvider(
+  value: unknown,
+  resolver?: AgentFlowProviderKindResolver
+): boolean {
   if (typeof value !== "string") return false;
   const provider = value.trim();
-  return provider === "frontier"
+  return resolver?.(provider) === "frontier" || provider === "frontier"
     || (provider.startsWith("codex:") && provider.slice("codex:".length).trim().length > 0);
 }
 

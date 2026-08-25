@@ -69,12 +69,21 @@ export interface AgentFlowSessionProviderRequest {
   provider: string;
   providerKind?: AgentFlowSessionProviderKind;
   providerProfile?: string;
-  kind?: "review" | "consult" | "challenge" | "approval" | "disagreement" | "session_request";
+  providerTarget?: string;
+  providerDriver?: string;
+  providerModel?: string;
+  providerFingerprint?: string;
+  kind?: "review" | "consult" | "challenge" | "approval" | "disagreement" | "session_request" | "recovery";
   resume: boolean;
   externalSessionId?: string;
   prompt: { path: string; content: string; checksum: string };
   inputs: AgentFlowSessionRequestArtifact[];
   outputs: string[];
+  repoRoot?: string;
+  canModifyFiles?: boolean;
+  fileScope?: {
+    layers: Array<{ include: string[]; exclude: string[] }>;
+  };
   signal: AbortSignal;
 }
 
@@ -89,9 +98,12 @@ export interface AgentFlowSessionProviderResponse {
   metadata?: Record<string, AgentFlowRunStateValue>;
 }
 
-export type AgentFlowSessionProviderAdapter = (
+export type AgentFlowSessionProviderAdapter = ((
   request: AgentFlowSessionProviderRequest
-) => AgentFlowSessionProviderResponse | Promise<AgentFlowSessionProviderResponse>;
+) => AgentFlowSessionProviderResponse | Promise<AgentFlowSessionProviderResponse>) & {
+  preflight?: (request: AgentFlowSessionProviderRequest) => void;
+  waitForAbort?: boolean;
+};
 
 export type AgentFlowSessionProviderKind =
   | "fixture"
@@ -145,6 +157,19 @@ export interface AgentFlowSessionProviderDescriptor {
   name: string;
   kind: AgentFlowSessionProviderKind;
   profile?: string;
+  target?: string;
+  driver?: string;
+  model?: string;
+  fingerprint?: string;
+}
+
+export interface AgentFlowConfiguredSessionProviderDescriptor
+  extends AgentFlowSessionProviderDescriptor {
+  kind: "local" | "frontier";
+  target: string;
+  driver: string;
+  model: string;
+  fingerprint: string;
 }
 
 export interface PersistAgentFlowSessionProviderEvidenceInput {
@@ -155,6 +180,10 @@ export interface PersistAgentFlowSessionProviderEvidenceInput {
   provider: string;
   providerKind: AgentFlowSessionProviderKind;
   providerProfile?: string;
+  providerTarget?: string;
+  providerDriver?: string;
+  providerModel?: string;
+  providerFingerprint?: string;
   resume: boolean;
   prompt: { path: string; checksum: string; providerChecksum?: string; redacted?: true };
   inputs: Array<{
@@ -314,6 +343,32 @@ export class AgentFlowSessionProviderRegistry {
     return [...this.providers.keys()].sort();
   }
 
+  registerConfigured(
+    descriptor: AgentFlowConfiguredSessionProviderDescriptor,
+    adapter: AgentFlowSessionProviderAdapter
+  ): this {
+    const name = requiredName(descriptor.name, "Configured session provider name");
+    if (isReservedSessionProviderName(name)) {
+      throw invalidProviderRegistration(`Configured session provider name ${name} is reserved.`);
+    }
+    if (descriptor.kind !== "local" && descriptor.kind !== "frontier") {
+      throw invalidProviderRegistration("Configured session providers must declare local or frontier kind.");
+    }
+    const target = requiredConfiguredIdentity(descriptor.target, "Configured session provider target");
+    const driver = requiredConfiguredIdentity(descriptor.driver, "Configured session provider driver");
+    const fingerprint = requiredConfiguredIdentity(
+      descriptor.fingerprint,
+      "Configured session provider fingerprint"
+    );
+    const model = requiredName(descriptor.model, "Configured session provider model");
+    if (model !== descriptor.model || /[\u0000-\u001F\u007F-\u009F]/u.test(model)) {
+      throw invalidProviderRegistration(
+        "Configured session provider model must not have surrounding whitespace or control characters."
+      );
+    }
+    return this.add(name, adapter, { ...descriptor, name, target, driver, model, fingerprint });
+  }
+
   private add(
     name: string,
     adapter: AgentFlowSessionProviderAdapter,
@@ -359,6 +414,10 @@ export function persistAgentFlowSessionProviderEvidence(
     provider: input.provider,
     providerKind: input.providerKind,
     ...(input.providerProfile === undefined ? {} : { providerProfile: input.providerProfile }),
+    ...(input.providerTarget === undefined ? {} : { providerTarget: input.providerTarget }),
+    ...(input.providerDriver === undefined ? {} : { providerDriver: input.providerDriver }),
+    ...(input.providerModel === undefined ? {} : { providerModel: `sha256:${digest(input.providerModel)}` }),
+    ...(input.providerFingerprint === undefined ? {} : { providerFingerprint: input.providerFingerprint }),
     resume: input.resume,
     recoveryFailureId: input.recoveryFailureId,
     recoveryContextRevision: input.recoveryContextRevision,
@@ -656,7 +715,19 @@ async function executeAgentFlowSessionStep(
       ["Session adapter provider", provider],
       ...(providerDescriptor?.profile === undefined
         ? []
-        : [["Session adapter provider profile", providerDescriptor.profile]])
+        : [["Session adapter provider profile", providerDescriptor.profile]]),
+      ...(providerDescriptor?.target === undefined
+        ? []
+        : [["Session adapter provider target", providerDescriptor.target]]),
+      ...(providerDescriptor?.driver === undefined
+        ? []
+        : [["Session adapter provider driver", providerDescriptor.driver]]),
+      ...(providerDescriptor?.model === undefined
+        ? []
+        : [["Session adapter provider model", providerDescriptor.model]]),
+      ...(providerDescriptor?.fingerprint === undefined
+        ? []
+        : [["Session adapter provider fingerprint", providerDescriptor.fingerprint]])
     ] as const) {
       assertAgentFlowAdapterStringSafe(workflow, label, value);
     }
@@ -918,6 +989,12 @@ async function executeAgentFlowSessionStep(
     provider,
     providerKind: providerDescriptor.kind,
     ...(providerDescriptor.profile === undefined ? {} : { providerProfile: providerDescriptor.profile }),
+    ...(providerDescriptor.target === undefined ? {} : { providerTarget: providerDescriptor.target }),
+    ...(providerDescriptor.driver === undefined ? {} : { providerDriver: providerDescriptor.driver }),
+    ...(providerDescriptor.model === undefined
+      ? {}
+      : { providerModel: `sha256:${digest(providerDescriptor.model)}` }),
+    ...(providerDescriptor.fingerprint === undefined ? {} : { providerFingerprint: providerDescriptor.fingerprint }),
     kind,
     resume,
     ...(priorExternalSessionId === undefined
@@ -926,9 +1003,13 @@ async function executeAgentFlowSessionStep(
     prompt: { ...prompt },
     inputs: inputs.map((input) => ({ ...input, content: Uint8Array.from(input.content) })),
     outputs: [...outputPaths],
+    repoRoot: store.repoRoot,
+    canModifyFiles: mapping(session.authority)?.can_modify_files === true,
+    fileScope: effectiveSessionFileScope(workflow, session, stepId),
     signal: new AbortController().signal
   };
 
+  preflightAgentFlowSessionProvider(adapter, request);
   store.claimSession({
     id: sessionId,
     runId,
@@ -939,7 +1020,15 @@ async function executeAgentFlowSessionStep(
     state: { resume, lastStepId: stepId }
   });
   try {
-    reserveAgentFlowSessionModelCallBudgets(store, runId, workflow, stepId, sessionId, provider);
+    reserveAgentFlowSessionModelCallBudgets(
+      store,
+      runId,
+      workflow,
+      stepId,
+      sessionId,
+      provider,
+      providerDescriptor.kind
+    );
   } catch (error) {
     const status = error instanceof AgentFlowSessionPolicyError && error.status === "fail" ? "failed" : "paused";
     store.upsertSession({
@@ -1054,6 +1143,12 @@ async function executeAgentFlowSessionStep(
     provider,
     providerKind: providerDescriptor.kind,
     ...(providerDescriptor.profile === undefined ? {} : { providerProfile: providerDescriptor.profile }),
+    ...(providerDescriptor.target === undefined ? {} : { providerTarget: providerDescriptor.target }),
+    ...(providerDescriptor.driver === undefined ? {} : { providerDriver: providerDescriptor.driver }),
+    ...(providerDescriptor.model === undefined
+      ? {}
+      : { providerModel: `sha256:${digest(providerDescriptor.model)}` }),
+    ...(providerDescriptor.fingerprint === undefined ? {} : { providerFingerprint: providerDescriptor.fingerprint }),
     resume,
     prompt: {
       path: prompt.path,
@@ -1225,6 +1320,8 @@ export async function invokeAgentFlowSessionProvider(
   stopStatus: ExecuteAgentFlowSessionRequestOptions["stopStatus"],
   interruptError?: () => Error | undefined
 ): Promise<AgentFlowSessionProviderResponse> {
+  // Pipeline callers run adapter preflight before claiming a session or reserving budget.
+  // Keep invocation side-effect free beyond the provider call so stateful preflights run once.
   const initialStatus = stopStatus?.();
   if (initialStatus !== undefined) throw new AgentFlowSessionRequestInterruptedError(initialStatus);
   const initialError = interruptError?.();
@@ -1234,8 +1331,10 @@ export async function invokeAgentFlowSessionProvider(
   const controller = new AbortController();
   request.signal = controller.signal;
   let timer: ReturnType<typeof setInterval> | undefined;
+  let monitoring = true;
   const interrupted = new Promise<never>((_resolve, reject) => {
     timer = setInterval(() => {
+      if (!monitoring) return;
       try {
         const status = stopStatus?.();
         const error = status === undefined ? interruptError?.() : new AgentFlowSessionRequestInterruptedError(status);
@@ -1248,11 +1347,25 @@ export async function invokeAgentFlowSessionProvider(
       }
     }, 25);
   });
+  const adapterResult = Promise.resolve().then(() => adapter(request));
   try {
-    return await Promise.race([Promise.resolve(adapter(request)), interrupted]);
+    return await Promise.race([adapterResult, interrupted]);
+  } catch (error) {
+    if (controller.signal.aborted && adapter.waitForAbort === true) {
+      try { await adapterResult; } catch { /* The interruption remains authoritative. */ }
+    }
+    throw error;
   } finally {
+    monitoring = false;
     if (timer !== undefined) clearInterval(timer);
   }
+}
+
+export function preflightAgentFlowSessionProvider(
+  adapter: AgentFlowSessionProviderAdapter,
+  request: AgentFlowSessionProviderRequest
+): void {
+  adapter.preflight?.(request);
 }
 
 export function reserveAgentFlowSessionModelCallBudgets(
@@ -1261,11 +1374,20 @@ export function reserveAgentFlowSessionModelCallBudgets(
   workflow: AgentFlowWorkflow,
   stepId: string,
   sessionId: string,
-  provider: string
+  provider: string,
+  providerKind?: AgentFlowSessionProviderKind
 ): void {
-  const kinds = ["model_calls", ...(isAgentFlowFrontierProvider(provider) ? ["frontier_calls"] : [])];
+  const frontier = isAgentFlowFrontierProvider(provider)
+    || providerKind === "frontier"
+    || providerKind === "codex_profile";
+  const kinds = ["model_calls", ...(frontier ? ["frontier_calls"] : [])];
   const usage = Object.fromEntries(kinds.map((kind) => [kind, store.getBudget(runId, `model:${kind}`)?.used ?? 0]));
-  const decision = evaluateAgentFlowPolicy(workflow, { kind: "model_usage", session: sessionId, usage });
+  const decision = evaluateAgentFlowPolicy(workflow, {
+    kind: "model_usage",
+    session: sessionId,
+    usage,
+    ...(frontier ? { providerKind: "frontier" as const } : {})
+  });
   if (decision.status !== "allow") {
     throw new AgentFlowSessionPolicyError(decision.message, decision.code, decision.status);
   }
@@ -1612,6 +1734,17 @@ function invalidProviderRegistration(message: string): AgentFlowSessionRequestEr
   return new AgentFlowSessionRequestError(message, "AGENT_FLOW_SESSION_PROVIDER_REGISTRATION_INVALID");
 }
 
+function requiredConfiguredIdentity(value: unknown, label: string): string {
+  const normalized = requiredName(value, label);
+  if (normalized !== value || /[\s=\u0000-\u001F\u007F-\u009F]/u.test(normalized)
+      || redactAgentFlowSensitiveText(normalized) !== normalized) {
+    throw invalidProviderRegistration(
+      `${label} must be a non-secret identifier without whitespace, equals signs, or control characters.`
+    );
+  }
+  return normalized;
+}
+
 function requiredCodexProfile(value: unknown): string {
   if (typeof value !== "string" || value.length === 0) {
     throw invalidProviderRegistration("Codex session provider profile must be a non-empty string.");
@@ -1655,6 +1788,46 @@ function mapping(value: unknown): AgentFlowYamlMapping | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? value as AgentFlowYamlMapping
     : undefined;
+}
+
+function effectiveSessionFileScope(
+  workflow: AgentFlowWorkflow,
+  session: AgentFlowYamlMapping,
+  stepId: string
+): NonNullable<AgentFlowSessionProviderRequest["fileScope"]> {
+  const scopes = [
+    mapping(mapping(workflow.policies)?.file_scope),
+    mapping(session.file_scope),
+    ...(operationFileScopes(workflow.steps, stepId) ?? [])
+  ].filter((scope): scope is AgentFlowYamlMapping => scope !== undefined);
+  return { layers: scopes.map((scope) => ({
+    include: Array.isArray(scope.include)
+      ? scope.include.filter((value): value is string => typeof value === "string")
+      : [],
+    exclude: Array.isArray(scope.exclude)
+      ? scope.exclude.filter((value): value is string => typeof value === "string")
+      : []
+  })) };
+}
+
+function operationFileScopes(
+  steps: AgentFlowWorkflowStep[],
+  targetStepId: string,
+  inherited: AgentFlowYamlMapping[] = []
+): AgentFlowYamlMapping[] | undefined {
+  for (const step of steps) {
+    const ownScope = mapping(step.file_scope);
+    const scopes = ownScope === undefined ? inherited : [...inherited, ownScope];
+    if (typeof step.id === "string" && step.id.trim() === targetStepId) return scopes;
+    for (const field of ["body", "steps", "branches"] as const) {
+      const nested = Array.isArray(step[field])
+        ? (step[field] as unknown[]).filter((entry): entry is AgentFlowWorkflowStep => mapping(entry) !== undefined)
+        : [];
+      const found = operationFileScopes(nested, targetStepId, scopes);
+      if (found !== undefined) return found;
+    }
+  }
+  return undefined;
 }
 
 function findWorkflowStep(steps: AgentFlowWorkflowStep[], stepId: string): AgentFlowWorkflowStep | undefined {

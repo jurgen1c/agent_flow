@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from "node:util";
 import type { AgentFlowWorkflow } from "./workflow";
 import { formatAgentFlowWorkflowIssues, validateAgentFlowWorkflow } from "./validation";
+import type { AgentFlowProviderKindResolver } from "./policy_utils";
 import {
   createAgentFlowNotificationRegistry,
   deliverAgentFlowNotifications,
@@ -23,10 +24,13 @@ import {
 
 export type AgentFlowLifecycleAction = "pause" | "resume" | "cancel";
 
+const INITIAL_CONTEXT_KEY = "agentFlowInitialContext";
+
 export interface CreateAgentFlowLifecycleRunInput {
   id: string;
   workflow: AgentFlowWorkflow;
   inputs?: Record<string, AgentFlowRunStateValue>;
+  context?: Record<string, AgentFlowRunStateValue>;
   parentRunId?: string;
   recoveryOfRunId?: string;
   allowInterruptedRecovery?: boolean;
@@ -36,7 +40,11 @@ export function createAgentFlowLifecycleRun(
   store: AgentFlowRunStateStore,
   input: CreateAgentFlowLifecycleRunInput
 ): AgentFlowRunMutationResult {
-  const validation = validateAgentFlowWorkflow(input.workflow);
+  const initialContext = normalizedInitialContext(input.context);
+  const validation = validateAgentFlowWorkflow(
+    input.workflow,
+    providerKindResolverFromBindings(initialContext.providerBindings)
+  );
   if (!validation.valid) {
     throw new AgentFlowRunStateError(
       `Agent Flow run ${input.id} cannot start because workflow validation failed:\n${formatAgentFlowWorkflowIssues(validation.errors)}`,
@@ -51,6 +59,7 @@ export function createAgentFlowLifecycleRun(
       existing,
       input.workflow,
       input.inputs ?? {},
+      initialContext,
       input.parentRunId ?? null,
       input.recoveryOfRunId ?? null
     )) {
@@ -77,7 +86,11 @@ export function createAgentFlowLifecycleRun(
         style: input.workflow.style,
         maturity: input.workflow.maturity
       },
-      context: { workflow: input.workflow as unknown as AgentFlowRunStateValue },
+      context: {
+        ...input.context,
+        workflow: input.workflow as unknown as AgentFlowRunStateValue,
+        [INITIAL_CONTEXT_KEY]: initialContext
+      },
       inputs: input.inputs,
       ...(input.parentRunId === undefined ? {} : { parentRunId: input.parentRunId }),
       ...(input.recoveryOfRunId === undefined ? {} : { recoveryOfRunId: input.recoveryOfRunId })
@@ -90,6 +103,7 @@ export function createAgentFlowLifecycleRun(
         raced,
         input.workflow,
         input.inputs ?? {},
+        initialContext,
         input.parentRunId ?? null,
         input.recoveryOfRunId ?? null
       )) {
@@ -125,7 +139,10 @@ export function transitionAgentFlowLifecycleRun(
   const workflow = persistedWorkflow as unknown as AgentFlowWorkflow;
   let validation: ReturnType<typeof validateAgentFlowWorkflow>;
   try {
-    validation = validateAgentFlowWorkflow(workflow);
+    validation = validateAgentFlowWorkflow(
+      workflow,
+      providerKindResolverFromBindings(current.context.providerBindings)
+    );
   } catch (error) {
     throw new AgentFlowRunStateError(
       `Agent Flow run ${runId} cannot transition because its persisted workflow definition is malformed: ${error instanceof Error ? error.message : String(error)}`,
@@ -482,6 +499,7 @@ function matchesWorkflow(
   run: AgentFlowRunRecord,
   workflow: AgentFlowWorkflow,
   inputs: Record<string, AgentFlowRunStateValue>,
+  initialContext: Record<string, AgentFlowRunStateValue>,
   parentRunId: string | null,
   recoveryOfRunId: string | null
 ): boolean {
@@ -492,5 +510,30 @@ function matchesWorkflow(
     && run.parentRunId === parentRunId
     && run.recoveryOfRunId === recoveryOfRunId
     && isDeepStrictEqual(run.context.workflow, workflow)
+    && isDeepStrictEqual(run.context[INITIAL_CONTEXT_KEY] ?? {}, initialContext)
     && isDeepStrictEqual(run.inputs, inputs);
+}
+
+function normalizedInitialContext(
+  context: Record<string, AgentFlowRunStateValue> | undefined
+): Record<string, AgentFlowRunStateValue> {
+  if (context !== undefined && Object.hasOwn(context, INITIAL_CONTEXT_KEY)) {
+    throw new AgentFlowRunStateError(
+      `Agent Flow lifecycle context key ${INITIAL_CONTEXT_KEY} is reserved.`,
+      "AGENT_FLOW_RUN_CONTEXT_INVALID"
+    );
+  }
+  return Object.fromEntries(Object.entries(context ?? {}).filter(([key]) => key !== "workflow"));
+}
+
+function providerKindResolverFromBindings(
+  value: AgentFlowRunStateValue | undefined
+): AgentFlowProviderKindResolver | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  return (provider) => {
+    if (!Object.hasOwn(value, provider)) return undefined;
+    const binding = value[provider];
+    if (binding === null || typeof binding !== "object" || Array.isArray(binding)) return undefined;
+    return binding.kind === "local" || binding.kind === "frontier" ? binding.kind : undefined;
+  };
 }

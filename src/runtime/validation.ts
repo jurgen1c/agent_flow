@@ -6,7 +6,7 @@ import type {
   AgentFlowYamlValue
 } from "./workflow";
 import { validateAgentFlowPolicyPrimitives } from "./policy";
-import { isAgentFlowFrontierProvider, policyGlobLayersHaveWritablePath } from "./policy_utils";
+import { isAgentFlowFrontierProvider, policyGlobLayersHaveWritablePath, type AgentFlowProviderKindResolver } from "./policy_utils";
 import { normalizeAgentFlowArtifactPath } from "./run_state";
 import { MAX_AGENT_FLOW_SESSION_INPUTS } from "./session_request";
 import {
@@ -119,7 +119,10 @@ const STEP_REQUIREMENTS: Readonly<Record<string, ReadonlyArray<readonly [string,
   workflow: [["workflow", "string"]]
 };
 
-export function validateAgentFlowWorkflow(workflow: AgentFlowWorkflow): AgentFlowWorkflowValidationResult {
+export function validateAgentFlowWorkflow(
+  workflow: AgentFlowWorkflow,
+  providerKind?: AgentFlowProviderKindResolver
+): AgentFlowWorkflowValidationResult {
   const errors: AgentFlowWorkflowIssue[] = [];
   const contexts = collectStepContexts(workflow.steps);
   const directBranchContexts = collectDirectParallelBranchContexts(workflow.steps);
@@ -131,7 +134,7 @@ export function validateAgentFlowWorkflow(workflow: AgentFlowWorkflow): AgentFlo
   const ids = new Set(executableContexts.flatMap((context) => context.id === undefined ? [] : [context.id]));
 
   validateSessionDefinitions(workflow, errors);
-  errors.push(...validateAgentFlowPolicyPrimitives(workflow));
+  errors.push(...validateAgentFlowPolicyPrimitives(workflow, providerKind));
   validateRecoveryLimits(workflow, runtimeContexts, errors);
   errors.push(...validateAgentFlowNotifications(workflow));
   validateStepShapes(executableContexts, errors);
@@ -373,11 +376,14 @@ function validateConditionExpressions(
   }
 }
 
-export function lintAgentFlowWorkflow(workflow: AgentFlowWorkflow): AgentFlowWorkflowLintResult {
+export function lintAgentFlowWorkflow(
+  workflow: AgentFlowWorkflow,
+  providerKind?: AgentFlowProviderKindResolver
+): AgentFlowWorkflowLintResult {
   const warnings: AgentFlowWorkflowIssue[] = [];
   const contexts = collectStepContexts(workflow.steps);
 
-  lintFrontierBudgets(workflow, warnings);
+  lintFrontierBudgets(workflow, warnings, providerKind);
   lintReviewCycles(workflow, warnings);
   lintCommands(contexts, warnings);
   lintComplexity(contexts, warnings);
@@ -2684,9 +2690,13 @@ function validateCollaborativeReviewBounds(
   }
 }
 
-function lintFrontierBudgets(workflow: AgentFlowWorkflow, warnings: AgentFlowWorkflowIssue[]): void {
+function lintFrontierBudgets(
+  workflow: AgentFlowWorkflow,
+  warnings: AgentFlowWorkflowIssue[],
+  providerKind?: AgentFlowProviderKindResolver
+): void {
   const frontierSessions = Object.entries(workflow.sessions ?? {})
-    .filter(([, session]) => isRecord(session) && isAgentFlowFrontierProvider(session.provider))
+    .filter(([, session]) => isRecord(session) && isAgentFlowFrontierProvider(session.provider, providerKind))
     .map(([name]) => name);
   const limits = isRecord(workflow.limits) ? workflow.limits : undefined;
 
