@@ -277,6 +277,74 @@ preserve native conversational state.
 See [session provider boundaries](session-providers.md) for registration kinds,
 the programmatic extension API, permission behavior, and evidence handling.
 
+### Use the original programmatic registrations
+
+The original provider names are reserved registration paths, not automatically
+configured defaults. They work when an application constructs a registry and
+passes it to Agent Flow; they do not require the global target config or the
+repository `.agent-flow.yml` alias file.
+
+```ts
+import { createAgentFlowSessionProviderRegistry } from "@jurgen1c/agent-flow";
+
+const providers = createAgentFlowSessionProviderRegistry([
+  { kind: "fixture", adapter: fixtureAdapter },
+  { kind: "local", enabled: true, adapter: localAdapter },
+  { kind: "frontier", enabled: true, adapter: frontierAdapter },
+  {
+    kind: "codex_profile",
+    profile: "reviewer",
+    enabled: true,
+    adapter: codexReviewerAdapter
+  },
+  {
+    kind: "custom",
+    name: "private-control-plane",
+    adapter: privateControlPlaneAdapter
+  }
+]);
+```
+
+Workflow sessions name those registered providers, and model-backed steps name
+the session they should use:
+
+```yaml
+sessions:
+  drafter:
+    provider: local
+  reviewer:
+    provider: codex:reviewer
+
+steps:
+  - id: draft
+    type: session_request
+    session: drafter
+    prompt: prompts/draft.md
+    inputs: [request.md]
+    outputs: [draft.md]
+
+  - id: review
+    type: session_request
+    session: reviewer
+    prompt: prompts/review.md
+    inputs: [request.md, draft.md]
+    outputs: [review.md]
+
+policies:
+  model_usage:
+    allowed_providers: [local, codex:reviewer]
+
+limits:
+  max_model_calls: 2
+  max_frontier_calls: 1
+```
+
+Use `provider: fixture`, `provider: frontier`, or
+`provider: private-control-plane` the same way when the corresponding adapter is
+registered. The packaged CLI can supply `fixture` with `--fixture`; the other
+programmatic registrations require an application host to pass `providers` to
+`executeAgentFlowCommandPipeline` and `resumeAgentFlowCommandPipeline`.
+
 ### Keep using a custom provider
 
 The YAML configuration path does not replace the original provider registry.

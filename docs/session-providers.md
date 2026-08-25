@@ -192,6 +192,10 @@ existing registrations:
 | Configured built-in | Global target plus repository alias | Yes | Target, kind, driver, model hash, endpoint settings, and fingerprint |
 | Programmatic configured | `.registerConfigured(descriptor, adapter)` | No | Complete descriptor and fingerprint |
 
+These are registration paths, not automatically configured defaults. See the
+[original programmatic registration example](quickstart.md#use-the-original-programmatic-registrations)
+for a complete registry, session, and step definition.
+
 Workflows using a custom registration name it directly:
 
 ```yaml
