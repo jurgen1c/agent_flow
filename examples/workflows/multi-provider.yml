@@ -8,8 +8,10 @@ description: Route planning, implementation, drafting, and review to different c
 sessions:
   planner:
     provider: planner
+    resume: true
   implementer:
     provider: implementer
+    resume: true
   drafter:
     provider: local-drafter
   reviewer:

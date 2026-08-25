@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   AgentFlowRunStateError,
+  AgentFlowSessionRequestError,
   createAgentFlowLifecycleRun,
   createAgentFlowSessionProviderRegistry,
   executeAgentFlowCommandPipeline,
@@ -25,6 +26,77 @@ import {
 } from "../../src/runtime/disagreement";
 
 describe("Agent Flow collaborative disagreement handling", () => {
+  test("routes a missing resumable disagreement session through explicit reset", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-flow-disagreement-session-reset-"));
+    fs.mkdirSync(path.join(root, ".git"));
+    const workflow = reviewLoopWorkflow(`
+    strategy: arbiter
+    arbiter: reviewer
+    max_rounds: 1`);
+    (workflow.sessions!.reviewer as Record<string, unknown>).resume = true;
+    expect(validateAgentFlowWorkflow(workflow)).toEqual({ valid: true, errors: [] });
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "disagreement-session-reset", workflow });
+    store.writeArtifact({
+      id: "implementation",
+      runId: "disagreement-session-reset",
+      path: "implementation.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Implementation"
+    });
+    let reviewCalls = 0;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => {
+      if (request.kind === "disagreement" && request.externalSessionId !== undefined) {
+        throw new AgentFlowSessionRequestError(
+          "The persisted native reviewer session is gone.",
+          "AGENT_FLOW_PROVIDER_SESSION_UNAVAILABLE"
+        );
+      }
+      if (request.kind === "disagreement") {
+        request.reportExternalSessionId?.("review-thread-reset");
+        const result = { status: "resolved", decision: "approved", rationale: "Approved after reset." };
+        return {
+          outputs: Object.fromEntries(request.outputs.map((output) => [output, JSON.stringify(result)])),
+          externalSessionId: "review-thread-reset"
+        };
+      }
+      reviewCalls += 1;
+      request.reportExternalSessionId?.(`review-thread-${reviewCalls}`);
+      const result = reviewCalls === 1
+        ? reviewResult("changes_requested", "Needs another revision.")
+        : reviewResult("approved", "Approved after reset.");
+      return {
+        outputs: Object.fromEntries(request.outputs.map((output) => [output, JSON.stringify(result)])),
+        externalSessionId: `review-thread-${reviewCalls}`
+      };
+    });
+
+    const paused = await executeAgentFlowCommandPipeline(
+      store, "disagreement-session-reset", workflow, undefined, providers
+    );
+    expect(paused).toMatchObject({ status: "paused", failedStep: "review" });
+    expect(store.getRun("disagreement-session-reset")?.context.waiting).toMatchObject({
+      kind: "provider_session",
+      stepId: "review",
+      sessionId: "reviewer"
+    });
+
+    const completed = await resumeAgentFlowCommandPipeline(
+      store,
+      "disagreement-session-reset",
+      workflow,
+      { resetSession: "reviewer" },
+      undefined,
+      providers
+    );
+    expect(completed).toMatchObject({ status: "completed" });
+    expect(store.listEvents("disagreement-session-reset").map((event) => event.type))
+      .toContain("session.external_reset");
+    store.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
   test("caps reviewer loops, persists user escalation, and resumes from a human resolution", async () => {
     const { root, store, workflow } = await disagreementRun("ask_user", "ask-user");
     const providers = reviewProvider(() => reviewResult("changes_requested", "Needs another revision."));

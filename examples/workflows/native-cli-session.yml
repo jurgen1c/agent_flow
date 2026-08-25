@@ -1,0 +1,46 @@
+name: native-cli-session
+version: 1
+style: pipeline
+maturity: experimental
+
+description: Reuse one Codex CLI or Claude Code session to implement, review, and fix a task.
+
+sessions:
+  coder:
+    provider: implementer
+    resume: true
+    authority:
+      can_modify_files: true
+    file_scope:
+      include: [src/**, tests/**, docs/**, examples/**, package.json]
+
+steps:
+  - id: implement
+    type: session_request
+    session: coder
+    prompt: examples/prompts/implement-ticket.md
+    inputs: [spec.md]
+    outputs: [implementation-summary.md]
+
+  - id: review
+    type: session_request
+    session: coder
+    prompt: examples/prompts/review-implementation.md
+    inputs: [spec.md, implementation-summary.md]
+    outputs: [fm-review.md]
+
+  - id: fix
+    type: session_request
+    session: coder
+    prompt: examples/prompts/address-review.md
+    inputs: [implementation-summary.md, fm-review.md]
+    outputs: [implementation-summary.md]
+    overwrite: true
+
+policies:
+  model_usage:
+    allowed_providers: [implementer]
+
+limits:
+  max_model_calls: 3
+  max_frontier_calls: 3

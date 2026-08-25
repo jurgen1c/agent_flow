@@ -66,12 +66,13 @@ export interface AgentFlowRunActionAvailability {
 }
 
 export interface AgentFlowRunActionWaitingState {
-  kind: "approval" | "manual_gate" | "input_request" | "disagreement";
+  kind: "approval" | "manual_gate" | "input_request" | "disagreement" | "provider_session";
   stepId: string;
   prompt: string;
   validOutcomes: string[];
   saveAs: string | null;
   approvalId: string | null;
+  sessionId?: string;
 }
 
 export interface AgentFlowRunActionSnapshot {
@@ -588,7 +589,11 @@ function actionAvailability(
     action("approve", "Approve", canApprove, unavailable ?? activeApprovalBlockReason ?? outcomeReason ?? "Approve is not a valid outcome for this gate.", "Confirm approval after reviewing the warnings and evidence shown above."),
     action("reject", "Reject", canReject, unavailable ?? activeApprovalBlockReason ?? outcomeReason ?? "Reject is not a valid outcome for this gate.", "Reject this gate and continue along its configured rejection path?"),
     action("provide_input", "Provide input", canInput, unavailable ?? "This run is not waiting for input.", null),
-    action("resume", "Resume", canResume, unavailable ?? (waiting === null ? "Only a paused run can resume." : "Respond to the waiting interaction instead of using plain resume."), null),
+    action("resume", "Resume", canResume, unavailable ?? (waiting === null
+      ? "Only a paused run can resume."
+      : waiting.kind === "provider_session"
+        ? `Reset the unavailable provider session with agent-flow resume ${run.id} --reset-session ${waiting.sessionId}.`
+        : "Respond to the waiting interaction instead of using plain resume."), null),
     action("pause", "Pause", canPause, unavailable ?? "Only a pending, running, or waiting run can pause.", null),
     action("cancel", "Cancel run", canCancel, unavailable ?? "This run is already terminal.", "Cancel this run? This stops further workflow execution."),
   ];
@@ -616,10 +621,11 @@ function parseWaitingState(value: AgentFlowRunStateValue | undefined): {
   const stepId = value.stepId;
   const prompt = value.prompt;
   const validOutcomes = value.validOutcomes;
-  if (!["approval", "manual_gate", "input_request", "disagreement"].includes(String(kind))
+  if (!["approval", "manual_gate", "input_request", "disagreement", "provider_session"].includes(String(kind))
       || typeof stepId !== "string" || stepId.length === 0
       || typeof prompt !== "string" || prompt.length === 0
-      || !Array.isArray(validOutcomes) || validOutcomes.some((outcome) => typeof outcome !== "string")) {
+      || !Array.isArray(validOutcomes) || validOutcomes.some((outcome) => typeof outcome !== "string")
+      || (kind === "provider_session" && (typeof value.sessionId !== "string" || value.sessionId.length === 0))) {
     return { waiting: null, error: "The persisted waiting state is malformed, so interaction actions are disabled." };
   }
   return {
@@ -629,7 +635,8 @@ function parseWaitingState(value: AgentFlowRunStateValue | undefined): {
       prompt,
       validOutcomes: validOutcomes as string[],
       saveAs: typeof value.saveAs === "string" ? value.saveAs : null,
-      approvalId: typeof value.approvalId === "string" ? value.approvalId : null
+      approvalId: typeof value.approvalId === "string" ? value.approvalId : null,
+      ...(kind === "provider_session" ? { sessionId: value.sessionId as string } : {})
     },
     error: null
   };

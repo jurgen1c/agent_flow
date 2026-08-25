@@ -32,6 +32,7 @@ lifecycle commands.
 | `agent-flow run <workflow> --id <run-id> [--fixture <file>] [--config <file>] [--provider <alias=target>]...` | Create or reuse a persistent run, load configured providers, and execute supported steps. Overrides are repeatable and new-run only. |
 | `agent-flow resume <run-id> --outcome <choice> [--fixture <file>] [--config <file>]` | Continue a paused approval or other choice-based interaction after verifying pinned provider bindings. |
 | `agent-flow resume <run-id> --answer <value> [--fixture <file>] [--config <file>]` | Continue a paused input request after verifying pinned provider bindings. JSON scalar, array, and object values are parsed; other input remains text. |
+| `agent-flow resume <run-id> --reset-session <session-name> [--config <file>]` | Explicitly discard a missing native CLI session ID and retry the waiting step in a fresh Codex or Claude session. |
 | `agent-flow inject <run-id> <session-name> <context>` | Persist additional context for an active recovery session and mark it dirty for rerun. |
 | `agent-flow status <run-id>` | Print the durable run status and current lifecycle details. |
 | `agent-flow logs <run-id>` | Print ordered events with sequence, timestamp, event type, and JSON payload. |

@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { findGitRepositoryRoot } from "@jurgen1c/agent-core/repository";
 import { parseYamlDocument, type JsonValue } from "@jurgen1c/agent-core/yaml";
 import { redactAgentFlowSensitiveText } from "./failure_payload";
@@ -10,16 +11,19 @@ export type AgentFlowConfiguredProviderKind = "local" | "frontier";
 export type AgentFlowProviderDriver =
   | "openai-responses"
   | "anthropic-messages"
-  | "openai-compatible";
+  | "openai-compatible"
+  | "codex-cli"
+  | "claude-code";
 
 export interface AgentFlowConfiguredTarget {
   kind: AgentFlowConfiguredProviderKind;
   driver: AgentFlowProviderDriver;
-  model: string;
+  model?: string;
   enabled: boolean;
   base_url?: string;
   api_key_env?: string;
   max_output_tokens?: number;
+  profile?: string;
 }
 
 export interface AgentFlowProviderAlias {
@@ -62,14 +66,14 @@ export class AgentFlowProviderConfigError extends Error {
 }
 
 const TARGET_FIELDS = new Set([
-  "kind", "driver", "model", "enabled", "base_url", "api_key_env", "max_output_tokens"
+  "kind", "driver", "model", "enabled", "base_url", "api_key_env", "max_output_tokens", "profile"
 ]);
 const ROOT_FIELDS = new Set(["version", "workflows", "prompts", "templates", "runs", "targets", "providers"]);
 const ALIAS_FIELDS = new Set(["kind", "target"]);
 const RESERVED_ALIASES = new Set(["fixture", "local", "frontier"]);
 const RESERVED_OBJECT_NAMES = new Set(["__proto__", "prototype", "constructor"]);
 const DRIVERS = new Set<AgentFlowProviderDriver>([
-  "openai-responses", "anthropic-messages", "openai-compatible"
+  "openai-responses", "anthropic-messages", "openai-compatible", "codex-cli", "claude-code"
 ]);
 
 export function loadAgentFlowProviderCatalog(
@@ -188,7 +192,7 @@ export function serializeAgentFlowProviderBindings(
     target: binding.target,
     kind: binding.kind,
     driver: binding.config.driver,
-    modelHash: hashAgentFlowProviderModel(binding.config.model),
+    ...(binding.config.model === undefined ? {} : { modelHash: hashAgentFlowProviderModel(binding.config.model) }),
     fingerprint: binding.fingerprint
   }]));
 }
@@ -207,7 +211,7 @@ export function renderAgentFlowProviderCatalog(catalog: AgentFlowProviderCatalog
       binding.target,
       binding.kind,
       binding.config.driver,
-      redactAgentFlowSensitiveText(binding.config.model),
+      binding.config.model === undefined ? "cli-default" : redactAgentFlowSensitiveText(binding.config.model),
       binding.config.api_key_env ?? "none"
     ].join("\t"))
   ].join("\n");
@@ -226,7 +230,52 @@ export function doctorAgentFlowProviderCatalog(
         ok = false;
         return `${binding.alias}: missing credential environment variable ${keyName}`;
       }
-      return `${binding.alias}: ready (${binding.config.driver}, ${redactAgentFlowSensitiveText(binding.config.model)})`;
+      if (binding.config.driver === "codex-cli" || binding.config.driver === "claude-code") {
+        if (process.platform !== "linux" || !fs.existsSync("/usr/bin/bwrap") || !fs.existsSync("/usr/bin/flock")) {
+          ok = false;
+          return `${binding.alias}: native CLI filesystem sandbox is unavailable (bubblewrap and flock are required on Linux)`;
+        }
+        const sandboxProbe = spawnSync("/usr/bin/bwrap", [
+          "--die-with-parent",
+          "--new-session",
+          "--unshare-pid",
+          "--ro-bind", "/usr", "/usr",
+          "--symlink", "usr/bin", "/bin",
+          "--symlink", "usr/lib", "/lib",
+          ...(fs.existsSync("/usr/lib64") ? ["--symlink", "usr/lib64", "/lib64"] : []),
+          "--proc", "/proc",
+          "--dev", "/dev",
+          "--",
+          "/usr/bin/true"
+        ], { encoding: "utf8", env: { PATH: "/usr/bin:/bin" } });
+        if (sandboxProbe.error !== undefined || sandboxProbe.status !== 0) {
+          ok = false;
+          return `${binding.alias}: native CLI filesystem sandbox cannot create the required bubblewrap namespace`;
+        }
+        const command = binding.config.driver === "codex-cli" ? "codex" : "claude";
+        const version = spawnSync(command, ["--version"], {
+          encoding: "utf8",
+          env: { ...process.env, ...env }
+        });
+        if (version.error !== undefined || version.status !== 0) {
+          ok = false;
+          return `${binding.alias}: ${command} executable is unavailable`;
+        }
+        const authArguments = binding.config.driver === "codex-cli"
+          ? ["login", "status"]
+          : ["auth", "status"];
+        const auth = spawnSync(command, authArguments, {
+          encoding: "utf8",
+          env: { ...process.env, ...env }
+        });
+        if (auth.error !== undefined || auth.status !== 0) {
+          ok = false;
+          return `${binding.alias}: ${command} is not authenticated`;
+        }
+        const normalizedVersion = String(version.stdout || version.stderr).trim().split(/\r?\n/, 1)[0] ?? "unknown version";
+        return `${binding.alias}: ready (${binding.config.driver}, ${redactAgentFlowSensitiveText(normalizedVersion)})`;
+      }
+      return `${binding.alias}: ready (${binding.config.driver}, ${redactAgentFlowSensitiveText(binding.config.model!)})`;
     });
   return { ok, lines };
 }
@@ -278,8 +327,10 @@ function parseTargets(
     rejectUnknownFields(value, TARGET_FIELDS, sourcePath, `targets.${name}`);
     const kind = requiredEnum(value.kind, ["local", "frontier"] as const, sourcePath, `targets.${name}.kind`);
     const driver = requiredEnum(value.driver, [...DRIVERS] as AgentFlowProviderDriver[], sourcePath, `targets.${name}.driver`);
-    const model = requiredString(value.model, sourcePath, `targets.${name}.model`);
-    if (/[\u0000-\u001F\u007F-\u009F]/.test(model)) {
+    const model = value.model === undefined
+      ? undefined
+      : requiredString(value.model, sourcePath, `targets.${name}.model`);
+    if (model !== undefined && /[\u0000-\u001F\u007F-\u009F]/.test(model)) {
       throw configError(sourcePath, `targets.${name}.model`, "Model identifiers must not contain control characters.");
     }
     if (value.enabled !== true && value.enabled !== false) {
@@ -288,11 +339,12 @@ function parseTargets(
     const target: AgentFlowConfiguredTarget = {
       kind,
       driver,
-      model,
+      ...(model === undefined ? {} : { model }),
       enabled: value.enabled,
       ...optionalStringField(value, "base_url", sourcePath, `targets.${name}.base_url`),
       ...optionalStringField(value, "api_key_env", sourcePath, `targets.${name}.api_key_env`),
-      ...optionalPositiveIntegerField(value, "max_output_tokens", sourcePath, `targets.${name}.max_output_tokens`)
+      ...optionalPositiveIntegerField(value, "max_output_tokens", sourcePath, `targets.${name}.max_output_tokens`),
+      ...optionalStringField(value, "profile", sourcePath, `targets.${name}.profile`)
     };
     validateTargetShape(name, target, sourcePath);
     targets[name] = Object.freeze(target);
@@ -326,6 +378,13 @@ function parseProviders(
 
 function validateTargetShape(name: string, target: AgentFlowConfiguredTarget, sourcePath: string): void {
   const field = `targets.${name}`;
+  const nativeCli = target.driver === "codex-cli" || target.driver === "claude-code";
+  if (!nativeCli && target.model === undefined) {
+    throw configError(sourcePath, `${field}.model`, `${target.driver} requires model.`);
+  }
+  if (nativeCli && target.kind !== "frontier") {
+    throw configError(sourcePath, `${field}.kind`, `${target.driver} targets must be frontier.`);
+  }
   if (target.api_key_env !== undefined && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(target.api_key_env)) {
     throw configError(sourcePath, `${field}.api_key_env`, "api_key_env must be an environment variable name.");
   }
@@ -341,6 +400,12 @@ function validateTargetShape(name: string, target: AgentFlowConfiguredTarget, so
   }
   if (target.max_output_tokens !== undefined && target.driver !== "anthropic-messages") {
     throw configError(sourcePath, `${field}.max_output_tokens`, "max_output_tokens is supported only by anthropic-messages targets.");
+  }
+  if (target.profile !== undefined && target.driver !== "codex-cli") {
+    throw configError(sourcePath, `${field}.profile`, "profile is supported only by codex-cli targets.");
+  }
+  if (target.profile !== undefined && /[\u0000-\u001F\u007F-\u009F]/.test(target.profile)) {
+    throw configError(sourcePath, `${field}.profile`, "Codex profile names must not contain control characters.");
   }
   if (target.api_key_env !== undefined
       && target.driver !== "openai-responses"
@@ -392,7 +457,8 @@ function fingerprintTarget(target: AgentFlowConfiguredTarget): string {
   const stable = JSON.stringify({
     kind: target.kind,
     driver: target.driver,
-    model: target.model,
+    model: target.model ?? null,
+    profile: target.profile ?? null,
     api_key_env: target.api_key_env ?? null,
     endpoint: target.base_url === undefined ? null : createHash("sha256").update(target.base_url).digest("hex"),
     max_output_tokens: target.max_output_tokens ?? null

@@ -19,12 +19,25 @@ persisted definition before invoking an adapter or shell.
   normalized repository-contained artifact paths.
 - API provider credentials are read only from the named `api_key_env` variable.
   The three built-in HTTP drivers are artifact-only, cannot write or inspect the
-  checkout, and receive only declared prompt and input artifact content. Native
-  coding CLIs require a custom programmatic adapter with a host-enforced
-  filesystem and process boundary.
+  checkout, and receive only declared prompt and input artifact content. The
+  built-in Codex and Claude CLI drivers run without a shell at the repository
+  root, inherit their CLI login, and use read-only/plan mode unless explicit
+  session authority permits writes. Other coding CLIs require a custom
+  programmatic adapter with a host-enforced filesystem and process boundary.
+  Built-in native drivers currently require Linux with `bubblewrap` and
+  `flock`. The host sandbox keeps `.git` read-only, hides `.agent-flow`, and
+  leaves unrelated host paths unmounted. It exposes only the native CLI state
+  directory and invocation temp directory as additional writable locations;
+  the selected executable and required interpreter/toolchain files are
+  read-only. Audited invocations are serialized per repository. Native children receive a
+  driver-specific environment allowlist instead of the full Agent Flow process
+  environment.
 - Workflow and session file writes require explicit authority and effective
   `file_scope` includes. Artifact, prompt, cleanup, archive, and export paths
   reject absolute, escaping, non-canonical, and unsafe symlink paths.
+  Native CLI executions are snapshot-audited after success or failure. An
+  out-of-scope change fails the step but remains in the checkout for inspection;
+  Agent Flow does not attempt a potentially destructive rollback.
 - Cleanup is limited by the persisted workflow retention rule. Protected run
   state, summaries, failure evidence, decisions, and approved evidence are not
   removed by broad artifact rules.

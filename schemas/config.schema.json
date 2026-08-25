@@ -26,11 +26,11 @@
   "$defs": {
     "target": {
       "type": "object",
-      "required": ["kind", "driver", "model", "enabled"],
+      "required": ["kind", "driver", "enabled"],
       "properties": {
         "kind": { "enum": ["local", "frontier"] },
         "driver": {
-          "enum": ["openai-responses", "anthropic-messages", "openai-compatible"]
+          "enum": ["openai-responses", "anthropic-messages", "openai-compatible", "codex-cli", "claude-code"]
         },
         "model": {
           "type": "string",
@@ -41,22 +41,36 @@
         "enabled": { "type": "boolean" },
         "base_url": { "type": "string", "format": "uri" },
         "api_key_env": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
-        "max_output_tokens": { "type": "integer", "minimum": 1 }
+        "max_output_tokens": { "type": "integer", "minimum": 1 },
+        "profile": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^\\S(?:.*\\S)?$",
+          "not": { "pattern": "[\\u0000-\\u001F\\u007F-\\u009F]" }
+        }
       },
       "additionalProperties": false,
       "allOf": [
         {
           "if": { "properties": { "driver": { "enum": ["openai-responses", "anthropic-messages"] } }, "required": ["driver"] },
-          "then": { "properties": { "kind": { "const": "frontier" } }, "required": ["api_key_env"] }
+          "then": { "properties": { "kind": { "const": "frontier" } }, "required": ["api_key_env", "model"] }
         },
         {
           "if": { "properties": { "driver": { "const": "openai-compatible" } }, "required": ["driver"] },
-          "then": { "required": ["base_url"] },
+          "then": { "required": ["base_url", "model"] },
           "else": { "not": { "required": ["base_url"] } }
         },
         {
           "if": { "properties": { "driver": { "const": "anthropic-messages" } }, "required": ["driver"] },
           "else": { "not": { "required": ["max_output_tokens"] } }
+        },
+        {
+          "if": { "properties": { "driver": { "enum": ["codex-cli", "claude-code"] } }, "required": ["driver"] },
+          "then": { "properties": { "kind": { "const": "frontier" } } }
+        },
+        {
+          "if": { "properties": { "driver": { "const": "codex-cli" } }, "required": ["driver"] },
+          "else": { "not": { "required": ["profile"] } }
         },
         {
           "if": {

@@ -15,17 +15,13 @@ version: 1
 targets:
   codex-main:
     kind: frontier
-    driver: openai-responses
-    model: YOUR_CODEX_MODEL
-    api_key_env: OPENAI_API_KEY
+    driver: codex-cli
+    # Optional: profile: work
     enabled: true
 
   claude-main:
     kind: frontier
-    driver: anthropic-messages
-    model: YOUR_CLAUDE_MODEL
-    api_key_env: ANTHROPIC_API_KEY
-    max_output_tokens: 4096
+    driver: claude-code
     enabled: true
 
   openai-api:
@@ -123,12 +119,16 @@ settings drift; credential rotation is intentionally excluded.
 | `openai-responses` | `frontier` | `api_key_env` | Non-resumable |
 | `anthropic-messages` | `frontier` | `api_key_env` | Non-resumable |
 | `openai-compatible` | `local` or `frontier` | Optional `api_key_env` | Non-resumable |
+| `codex-cli` | `frontier` | Existing Codex CLI login | Native thread ID |
+| `claude-code` | `frontier` | Existing Claude Code login | Native session ID |
 
 Driver request shapes follow the official
 [OpenAI Responses API](https://developers.openai.com/api/reference/cli/resources/responses/methods/create),
 [Anthropic Messages API](https://platform.claude.com/docs/en/api/messages/create),
 and [Ollama structured output](https://docs.ollama.com/capabilities/structured-outputs)
-references.
+references. Codex execution follows the official
+[non-interactive `codex exec` contract](https://learn.chatgpt.com/docs/non-interactive-mode),
+including JSONL thread IDs and explicit resume.
 
 OpenAI-compatible local targets must use an HTTP(S) loopback URL.
 Frontier-compatible targets require HTTPS. URLs containing
@@ -139,10 +139,44 @@ Built-in drivers accept UTF-8 text only and request structured JSON containing
 exactly the declared output paths. Missing, extra, malformed, or oversized
 outputs fail before artifact publication. Drivers add no hidden retries.
 
-Built-in configured drivers generate artifacts only, reject file-modification
-authority, and send only the declared prompt and input artifact content.
-Applications that need a native coding CLI or file-writing provider must
-register a custom adapter and enforce its filesystem and process boundary.
+The HTTP drivers generate artifacts only, reject file-modification authority,
+and send only the declared prompt and input artifact content. The native CLI
+drivers run with the repository root as their working directory. They use
+read-only/plan mode unless the session grants `can_modify_files`; writers also
+need a non-empty effective file scope. Agent Flow audits the workspace after
+every native invocation, including failed ones, and rejects any changed path
+not allowed by every scope layer. It preserves those changes for inspection
+rather than attempting rollback.
+
+Built-in native execution currently requires Linux, `bubblewrap`, and `flock`.
+The host sandbox mounts the checkout read-only for read-only sessions and
+writable for authorized writers, keeps `.git` read-only, hides `.agent-flow`,
+and leaves unrelated host paths unmounted. Only a per-invocation temporary
+directory and the selected CLI's own state directory (`CODEX_HOME`/`~/.codex`
+or `CLAUDE_CONFIG_DIR`/`~/.claude`) remain writable so native sessions can
+persist; the selected executable and required interpreter/toolchain files are
+read-only. Audited native invocations are serialized per repository.
+Agent Flow forwards only basic process/locale variables, proxy and certificate
+settings, and authentication/provider variables for the selected CLI. It does
+not pass arbitrary environment variables to the native agent.
+
+`model` is optional for native CLI targets and selects the CLI's configured
+default when omitted. `profile` is optional and supported only by `codex-cli`.
+The CLI receives prompts on standard input, never through a shell, and output
+is bounded and schema-validated before Agent Flow publishes artifacts.
+
+When a workflow session declares `resume: true`, Agent Flow persists the Codex
+thread ID or Claude session ID as soon as the native process reports it. Later
+steps using that same workflow session resume the native conversation. If the
+external conversation is missing, the run pauses; it never silently starts over.
+This applies to ordinary session steps, disagreement resolvers, and recovery
+sessions. After reset, Agent Flow retries the containing workflow step without
+the missing provider context.
+After inspecting the run, explicitly reset it with:
+
+```bash
+agent-flow resume <run-id> --reset-session <session-name>
+```
 
 Configured frontier aliases count against `max_frontier_calls`, and policy
 allowlists continue matching the logical alias rather than the machine-specific
@@ -218,9 +252,10 @@ should also receive:
 - complete target/model identity evidence; and
 - resume rejection when its privacy-safe fingerprint changes.
 
-`registerConfigured` requires `name`, `kind`, `target`, `driver`, `model`, and
-`fingerprint`. Its adapter remains application-defined; registration neither
-loads executable code from YAML nor grants filesystem or process authority.
+`registerConfigured` requires `name`, `kind`, `target`, `driver`, and
+`fingerprint`; `model` is also required unless the descriptor uses a native CLI
+driver. Its adapter remains application-defined; registration neither loads
+executable code from YAML nor grants filesystem or process authority.
 
 `request.fileScope.layers` preserves the global, session, and operation scopes
 separately. A file-writing adapter must require every layer to allow a path;
@@ -230,8 +265,11 @@ combining include globs into one union would broaden authority incorrectly.
 
 Adapters receive bounded prompt and input content, checksums, exact outputs,
 provider identity, repository and authority context, resume state, an optional
-external session ID, and an abort signal. Responses may contain only declared
-outputs, an external session ID, and bounded privacy-safe metadata.
+external session ID, an abort signal, and a `reportExternalSessionId` callback.
+A resumable adapter should call that callback as soon as a new external session
+exists so Agent Flow can preserve it even if the provider later fails. Responses
+may contain only declared outputs, the same external session ID, and bounded
+privacy-safe metadata.
 
 Agent Flow persists the logical alias, resolved target, kind, driver, a model
 identity hash, safe target fingerprint, input evidence, declared outputs, and
@@ -241,6 +279,7 @@ Provider-native transcripts can support resume, but durable Agent Flow state
 remains authoritative.
 
 Built-in HTTP drivers never launch a shell or give the provider ambient
-filesystem access. Native CLI integrations remain a programmatic extension
-boundary so the host application can supply an isolation mechanism appropriate
-to that CLI and platform.
+filesystem access. Built-in Codex and Claude CLI integrations use the authority,
+session, subprocess, and post-execution audit boundary described above. Other
+native CLI integrations remain a programmatic extension boundary so the host
+application can supply isolation appropriate to that CLI and platform.
