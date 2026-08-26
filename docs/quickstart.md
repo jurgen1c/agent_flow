@@ -160,6 +160,8 @@ targets:
     kind: frontier
     driver: codex-cli
     model: YOUR_CODEX_MODEL
+    profile: deep-review
+    reasoning_effort: high
     enabled: true
 
   claude-main:
@@ -201,8 +203,66 @@ targets:
 Do not put API keys in YAML. `api_key_env` names the environment variable to
 read for API drivers. Native drivers use the existing `codex` or `claude`
 executable and its current login. Set `model` to a model identifier accepted by
-that CLI. Agent Flow requires it so resumable runs pin the configured model
-instead of inheriting a mutable CLI default or profile.
+that CLI. For Codex, `profile` is optional and names
+`$CODEX_HOME/<profile>.config.toml`; `reasoning_effort` is optional and accepts
+`minimal`, `low`, `medium`, `high`, or `xhigh`. Agent Flow requires `model`,
+passes model and reasoning as CLI overrides, and hashes both Codex's base
+`config.toml` and the selected profile file so resumable runs fail closed if
+any selected behavior drifts. `providers doctor` strict-loads the profile with
+the installed Codex CLI without sending a model request.
+
+Current Codex profiles use one file per profile rather than a
+`[profiles.<name>]` table. For the target above, create:
+
+```toml
+# ~/.codex/deep-review.config.toml
+model_verbosity = "low"
+```
+
+The explicit Agent Flow `model` and `reasoning_effort` take precedence over
+values in the base or profile file. Targets without `profile` continue to
+ignore ambient Codex user configuration. Repository-local `.codex/config.toml`
+is hidden, and user skills, hooks, MCP servers, apps, plugins, web search,
+analytics/telemetry, notifications, and other ambient hosted tools are disabled
+for both profiled and unprofiled native sessions. Profile and base config layers
+must also be self-contained: Agent Flow rejects settings that reference mutable
+instruction, project-document discovery, model-catalog, sub-agent, skill, or
+SQLite files. If the selected Codex model provider uses `env_key` or
+`env_http_headers`, Agent Flow forwards only those named environment variables
+and both `providers doctor` and workflow preflight report missing values;
+unrelated `OPENAI_*` credentials
+are omitted unless the provider explicitly requires them. Agent Flow owns the
+shell environment policy so model-spawned commands cannot inherit forwarded
+credentials. Profiled endpoints must be credential-free HTTPS URLs without
+queries or fragments. Command-backed provider authentication, the built-in
+`amazon-bedrock` provider, custom shell-environment policies, and overrides of
+the reserved `permissions.agent_flow_native` profile are not supported. See the official Codex
+[profile documentation](https://learn.chatgpt.com/docs/config-file/config-advanced#profiles)
+and [`model_reasoning_effort` reference](https://learn.chatgpt.com/docs/config-file/config-reference).
+
+Define separate targets when workflow roles need different Codex guarantees:
+
+```yaml
+targets:
+  codex-implement:
+    kind: frontier
+    driver: codex-cli
+    model: YOUR_CODEX_MODEL
+    profile: implementation
+    reasoning_effort: high
+    enabled: true
+  codex-review:
+    kind: frontier
+    driver: codex-cli
+    model: YOUR_CODEX_MODEL
+    profile: deep-review
+    reasoning_effort: xhigh
+    enabled: true
+```
+
+Map them to repository aliases and select those aliases from workflow sessions.
+A session with `resume: true` keeps one Codex thread across every step that uses
+that session; a separate Agent Flow run always starts a fresh thread.
 
 Built-in native execution currently requires Linux with `bubblewrap` and
 `flock`; install them with your system package manager, then use

@@ -15,7 +15,9 @@ import {
 } from "./session_request";
 import {
   agentFlowNativeProviderEnvironment,
+  fingerprintAgentFlowCodexProfile,
   hashAgentFlowProviderModel,
+  selectedCodexProviderEnvironment,
   type AgentFlowConfiguredTarget,
   type AgentFlowProviderCatalog,
   type AgentFlowResolvedProviderBinding
@@ -49,6 +51,10 @@ export function createAgentFlowConfiguredProviderRegistry(
       target: binding.target,
       driver: binding.config.driver,
       model: binding.config.model,
+      ...(binding.config.profile === undefined ? {} : { profile: binding.config.profile }),
+      ...(binding.config.reasoning_effort === undefined
+        ? {}
+        : { reasoningEffort: binding.config.reasoning_effort }),
       fingerprint: binding.fingerprint
     }, createAgentFlowConfiguredProviderAdapter(binding, options));
   }
@@ -77,6 +83,12 @@ export function createAgentFlowConfiguredProviderAdapter(
   adapter.preflight = (request) => {
     if (binding.config.driver === "codex-cli" || binding.config.driver === "claude-code") {
       assertNativeAuthority(request, binding);
+      if (binding.config.driver === "codex-cli") {
+        assertCodexProfileIdentity(binding);
+        for (const name of binding.codexProfile?.providerEnvironmentNames ?? []) {
+          requiredNativeCredential(name, env);
+        }
+      }
     } else {
       assertApiAuthority(request, binding);
       if (binding.config.api_key_env !== undefined) requiredCredential(binding.config, env);
@@ -117,17 +129,37 @@ async function invokeCodexCli(
       if (request.resume) request.reportExternalSessionId?.(threadId);
     };
     try {
-      const sandbox = nativeProcessSandbox(request, env, temporaryDirectory, "codex");
+      const sandbox = nativeProcessSandbox(
+        request,
+        env,
+        temporaryDirectory,
+        "codex",
+        binding.codexProfile?.home,
+        binding.codexProfile?.providerEnvironmentNames,
+        binding.codexProfile?.requiresOpenAiAuth !== false
+      );
+      assertCodexProfileIdentity(binding);
       const commonArguments = [
         "--json",
         "--output-schema", schemaPath,
         "--output-last-message", outputPath,
         "--model", binding.config.model
       ];
-      const hardeningArguments = codexHardeningArguments(sandbox);
+      const codexConfigurationArguments = [
+        ...(binding.config.profile === undefined ? [] : ["--profile", binding.config.profile]),
+        ...(binding.config.reasoning_effort === undefined
+          ? []
+          : ["--config", `model_reasoning_effort=${JSON.stringify(binding.config.reasoning_effort)}`])
+      ];
+      const hardeningArguments = codexHardeningArguments(
+        sandbox,
+        binding.codexProfile?.mcpServerIds ?? [],
+        binding.config.profile === undefined
+      );
       const arguments_ = request.externalSessionId === undefined
         ? [
             "exec",
+            ...codexConfigurationArguments,
             ...hardeningArguments,
             ...commonArguments,
             ...(request.resume ? [] : ["--ephemeral"]),
@@ -135,6 +167,7 @@ async function invokeCodexCli(
           ]
         : [
             "exec",
+            ...codexConfigurationArguments,
             ...hardeningArguments,
             "resume",
             ...commonArguments,
@@ -157,6 +190,7 @@ async function invokeCodexCli(
           if (isRecord(event) && event.type === "thread.started") reportThread(event.thread_id);
         }
       );
+      assertCodexProfileIdentity(binding);
       if (observedThreadId === undefined) {
         for (const line of result.stdout.toString("utf8").split(/\r?\n/)) {
           if (line.length === 0) continue;
@@ -181,6 +215,48 @@ async function invokeCodexCli(
       fs.rmSync(temporaryDirectory, { recursive: true, force: true });
     }
   });
+}
+
+function assertCodexProfileIdentity(binding: AgentFlowResolvedProviderBinding): void {
+  if (binding.config.profile === undefined) return;
+  if (binding.codexProfile === undefined) {
+    throw providerError(`Codex profile ${JSON.stringify(binding.config.profile)} has no resolved identity.`);
+  }
+  let fingerprint: string;
+  try {
+    fingerprint = fingerprintAgentFlowCodexProfile(binding.codexProfile.path);
+  } catch (error) {
+    throw providerError(
+      `Could not verify Codex profile ${JSON.stringify(binding.config.profile)}: ${error instanceof Error ? error.message : String(error)}.`
+    );
+  }
+  if (fingerprint !== binding.codexProfile.fingerprint) {
+    throw providerError(
+      `Codex profile ${JSON.stringify(binding.config.profile)} changed after the provider catalog was loaded.`
+    );
+  }
+  assertCodexBaseConfigIdentity(binding);
+}
+
+function assertCodexBaseConfigIdentity(binding: AgentFlowResolvedProviderBinding): void {
+  const profile = binding.codexProfile!;
+  let fingerprint: string | undefined;
+  try {
+    fingerprint = fingerprintAgentFlowCodexProfile(profile.baseConfigPath);
+  } catch (error) {
+    if (error !== null && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      fingerprint = undefined;
+    } else {
+      throw providerError(
+        `Could not verify Codex base config for profile ${JSON.stringify(binding.config.profile)}: ${error instanceof Error ? error.message : String(error)}.`
+      );
+    }
+  }
+  if (fingerprint !== profile.baseConfigFingerprint) {
+    throw providerError(
+      `Codex base config for profile ${JSON.stringify(binding.config.profile)} changed after the provider catalog was loaded.`
+    );
+  }
 }
 
 async function invokeClaudeCode(
@@ -255,7 +331,10 @@ interface NativeProcessSandbox {
   canModifyFiles: boolean;
   temporaryDirectory: string;
   providerStatePaths: string[];
+  providerStateMaskPaths: string[];
   providerStateEnvironment?: { name: "CODEX_HOME" | "CLAUDE_CONFIG_DIR"; value: string };
+  providerCredentialEnvironment: NodeJS.ProcessEnv;
+  includeOpenAiCredentials: boolean;
   certificatePaths: string[];
   certificateEnvironment: Record<string, string>;
   gitMetadataPaths: string[];
@@ -263,15 +342,47 @@ interface NativeProcessSandbox {
   executableMountPaths: string[];
 }
 
-function codexHardeningArguments(sandbox: NativeProcessSandbox): string[] {
+function codexHardeningArguments(
+  sandbox: NativeProcessSandbox,
+  mcpServerIds: readonly string[],
+  ignoreUserConfig: boolean
+): string[] {
   const profile = "agent_flow_native";
   const filesystem = sandbox.providerStatePaths
     .map((statePath) => `${JSON.stringify(statePath)} = "deny"`)
     .join(", ");
   return [
-    "--ignore-user-config",
+    ...(ignoreUserConfig ? ["--ignore-user-config"] : []),
     "--ignore-rules",
+    ...[
+      "apps",
+      "browser_use",
+      "browser_use_external",
+      "browser_use_full_cdp_access",
+      "computer_use",
+      "hooks",
+      "image_generation",
+      "memories",
+      "multi_agent",
+      "plugins",
+      "remote_plugin",
+      "skill_mcp_dependency_install",
+      "skill_search"
+    ].flatMap((feature) => ["--disable", feature]),
     "--strict-config",
+    "--config", "analytics.enabled=false",
+    "--config", "agents.enabled=false",
+    "--config", "apps._default.enabled=false",
+    ...mcpServerIds.flatMap((serverId) => [
+      "--config", `mcp_servers.${serverId}.enabled=false`
+    ]),
+    "--config", "notify=[]",
+    "--config", 'otel.exporter="none"',
+    "--config", 'otel.metrics_exporter="none"',
+    "--config", 'otel.trace_exporter="none"',
+    "--config", 'shell_environment_policy.inherit="core"',
+    "--config", "shell_environment_policy.ignore_default_excludes=false",
+    "--config", 'web_search="disabled"',
     "--config", `default_permissions=${JSON.stringify(profile)}`,
     "--config", `permissions.${profile}.extends=${JSON.stringify(sandbox.canModifyFiles ? ":workspace" : ":read-only")}`,
     "--config", `permissions.${profile}.filesystem={ ${filesystem} }`
@@ -329,10 +440,11 @@ function runNativeProviderProcess(
         shell: false,
         detached: process.platform !== "win32",
         env: {
-          ...agentFlowNativeProviderEnvironment(command, env),
+          ...agentFlowNativeProviderEnvironment(command, env, sandbox.includeOpenAiCredentials),
           ...(sandbox.providerStateEnvironment === undefined
             ? {}
             : { [sandbox.providerStateEnvironment.name]: sandbox.providerStateEnvironment.value }),
+          ...sandbox.providerCredentialEnvironment,
           ...sandbox.certificateEnvironment,
           TMPDIR: sandbox.temporaryDirectory
         },
@@ -407,15 +519,21 @@ function nativeProcessSandbox(
   request: AgentFlowSessionProviderRequest,
   env: Readonly<Record<string, string | undefined>>,
   temporaryDirectory: string,
-  command: "codex" | "claude"
+  command: "codex" | "claude",
+  resolvedCodexHome?: string,
+  codexProviderEnvironmentNames: readonly string[] = [],
+  codexRequiresOpenAiAuth = true
 ): NativeProcessSandbox {
   const home = env.HOME ?? os.homedir();
   const configuredState = command === "codex"
-    ? env.CODEX_HOME ?? path.join(home, ".codex")
+    ? resolvedCodexHome ?? env.CODEX_HOME ?? path.join(home, ".codex")
     : env.CLAUDE_CONFIG_DIR ?? path.join(home, ".claude");
   const repoRoot = fs.realpathSync(request.repoRoot!);
   const executablePath = resolveNativeExecutable(command, env.PATH);
   const statePath = nativeStateDirectory(configuredState, repoRoot, command);
+  const providerStateMaskPaths = command === "codex"
+    ? [nativeCodexSkillsDirectory(statePath)]
+    : [];
   const defaultClaudeStateFile = command === "claude" && env.CLAUDE_CONFIG_DIR === undefined
     ? nativeStateFile(path.join(home, ".claude.json"), repoRoot)
     : undefined;
@@ -425,18 +543,40 @@ function nativeProcessSandbox(
     canModifyFiles: request.canModifyFiles === true,
     temporaryDirectory: fs.realpathSync(temporaryDirectory),
     providerStatePaths: [statePath, ...(defaultClaudeStateFile === undefined ? [] : [defaultClaudeStateFile])],
+    providerStateMaskPaths,
     providerStateEnvironment: command === "codex" || env.CLAUDE_CONFIG_DIR !== undefined
       ? {
           name: command === "codex" ? "CODEX_HOME" as const : "CLAUDE_CONFIG_DIR" as const,
           value: statePath
         }
       : undefined,
+    providerCredentialEnvironment: command === "codex"
+      ? selectedCodexProviderEnvironment(env, codexProviderEnvironmentNames)
+      : {},
+    includeOpenAiCredentials: command !== "codex" || codexRequiresOpenAiAuth,
     certificatePaths: certificates.paths,
     certificateEnvironment: certificates.environment,
     gitMetadataPaths: nativeGitMetadataPaths(repoRoot),
     executablePath,
     executableMountPaths: nativeExecutableMountPaths(command, executablePath, env.PATH, home)
   };
+}
+
+function nativeCodexSkillsDirectory(statePath: string): string {
+  const skillsPath = path.join(statePath, "skills");
+  try {
+    if (!fs.existsSync(skillsPath)) fs.mkdirSync(skillsPath, { mode: 0o700 });
+    const stat = fs.lstatSync(skillsPath);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw providerError("Codex skills state must be a regular non-symlink directory.");
+    }
+    return fs.realpathSync(skillsPath);
+  } catch (error) {
+    if (error instanceof AgentFlowSessionRequestError) throw error;
+    throw providerError(
+      `Could not prepare Codex skills state: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
 }
 
 function nativeStateFile(candidate: string, repoRoot: string): string {
@@ -679,12 +819,14 @@ function sandboxedNativeInvocation(
     const repoRoot = path.resolve(sandbox.repoRoot);
     const gitPath = path.join(repoRoot, ".git");
     const runtimePath = path.join(repoRoot, ".agent-flow");
+    const projectCodexPath = command === "codex" ? path.join(repoRoot, ".codex") : undefined;
     const writablePaths = [sandbox.temporaryDirectory, ...sandbox.providerStatePaths]
       .filter((candidate, index, values) => values.indexOf(candidate) === index);
     const mountedPaths = [
       repoRoot,
       sandbox.temporaryDirectory,
       ...sandbox.providerStatePaths,
+      ...sandbox.providerStateMaskPaths,
       ...sandbox.certificatePaths,
       ...sandbox.gitMetadataPaths,
       ...sandbox.executableMountPaths
@@ -710,8 +852,12 @@ function sandboxedNativeInvocation(
         ...sandbox.gitMetadataPaths.flatMap((candidate) => ["--ro-bind", candidate, candidate]),
         ...sandbox.certificatePaths.flatMap((candidate) => ["--ro-bind", candidate, candidate]),
         ...(fs.existsSync(runtimePath) ? ["--tmpfs", runtimePath, "--chmod", "000", runtimePath] : []),
+        ...(projectCodexPath !== undefined && fs.existsSync(projectCodexPath)
+          ? ["--tmpfs", projectCodexPath, "--chmod", "555", projectCodexPath]
+          : []),
         ...sandbox.executableMountPaths.flatMap((candidate) => ["--ro-bind", candidate, candidate]),
         ...writablePaths.flatMap((candidate) => ["--bind", candidate, candidate]),
+        ...sandbox.providerStateMaskPaths.flatMap((candidate) => ["--tmpfs", candidate]),
         "--chdir", repoRoot,
         "--",
         sandbox.executablePath,
@@ -1013,6 +1159,10 @@ function responseFromStructuredText(
       target: binding.target,
       driver: binding.config.driver,
       ...(binding.config.model === undefined ? {} : { modelHash: hashAgentFlowProviderModel(binding.config.model) }),
+      ...(binding.config.profile === undefined ? {} : { profile: binding.config.profile }),
+      ...(binding.config.reasoning_effort === undefined
+        ? {}
+        : { reasoningEffort: binding.config.reasoning_effort }),
       fingerprint: binding.fingerprint,
       ...(request.kind === "recovery" && (parsed.recovery_status === "remediated" || parsed.recovery_status === "unresolved")
         ? { recovery_status: parsed.recovery_status }
@@ -1097,6 +1247,16 @@ function requiredCredential(
   const candidate = name !== undefined && Object.hasOwn(env, name) ? env[name] : undefined;
   const value = typeof candidate === "string" ? candidate.trim() : undefined;
   if (name === undefined || !value) throw providerError(`Credential environment variable ${name ?? "(missing api_key_env)"} is not set.`);
+  return value;
+}
+
+function requiredNativeCredential(
+  name: string,
+  env: Readonly<Record<string, string | undefined>>
+): string {
+  const candidate = Object.hasOwn(env, name) ? env[name] : undefined;
+  const value = typeof candidate === "string" ? candidate.trim() : undefined;
+  if (!value) throw providerError(`Credential environment variable ${name} is not set.`);
   return value;
 }
 

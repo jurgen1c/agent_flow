@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { runCli } from "../../src/cli/router";
 import {
@@ -111,6 +112,16 @@ describe("Agent Flow configured providers", () => {
 
     expect(catalog.bindings.planner).toMatchObject({ target: "claude-main", kind: "frontier" });
     expect(catalog.bindings.drafter).toMatchObject({ target: "qwen-local", kind: "local" });
+    const legacyTargetIdentity = JSON.stringify({
+      kind: "local",
+      driver: "openai-compatible",
+      model: "qwen3",
+      api_key_env: null,
+      endpoint: createHash("sha256").update("http://127.0.0.1:11434/v1").digest("hex"),
+      max_output_tokens: null
+    });
+    expect(catalog.bindings.drafter.fingerprint)
+      .toBe(`sha256:${createHash("sha256").update(legacyTargetIdentity).digest("hex")}`);
     expect(renderAgentFlowProviderCatalog(catalog)).toContain("drafter\tqwen-local\tlocal\topenai-compatible\tqwen3");
     const nested = path.join(repo, "nested", "directory");
     fs.mkdirSync(nested, { recursive: true });
@@ -172,6 +183,220 @@ providers:
     expect(Object.hasOwn(prototypeNamed.bindings, "toString")).toBe(true);
     expect(prototypeNamed.bindings.toString.target).toBe("gemma-local");
     expect(Object.hasOwn(prototypeNamed.bindings, "hasOwnProperty")).toBe(false);
+  });
+
+  test("pins Codex profiles and reasoning effort in configured target fingerprints", () => {
+    const { repo, home, globalConfig } = configuredRepo();
+    const codexHome = path.join(home, ".codex");
+    const profilePath = path.join(codexHome, "deep-review.config.toml");
+    fs.mkdirSync(codexHome);
+    fs.writeFileSync(path.join(codexHome, "config.toml"), 'model_provider = "openai"\n');
+    fs.writeFileSync(profilePath, 'model_verbosity = "low"\n');
+    fs.writeFileSync(globalConfig, `version: 1
+targets:
+  codex:
+    kind: frontier
+    driver: codex-cli
+    model: codex-test
+    profile: deep-review
+    reasoning_effort: xhigh
+    enabled: true
+`);
+    fs.writeFileSync(path.join(repo, ".agent-flow.yml"), `version: 1
+providers:
+  reviewer: { kind: frontier, target: codex }
+`);
+
+    const catalog = loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} });
+    expect(loadAgentFlowProviderCatalog({
+      cwd: repo,
+      homeDir: home,
+      env: { CODEX_HOME: undefined }
+    }).bindings.reviewer.codexProfile?.home).toBe(codexHome);
+    expect(catalog.bindings.reviewer).toMatchObject({
+      config: { profile: "deep-review", reasoning_effort: "xhigh" },
+      codexProfile: {
+        home: codexHome,
+        path: profilePath,
+        fingerprint: expect.stringMatching(/^sha256:/),
+        baseConfigPath: path.join(codexHome, "config.toml"),
+        baseConfigFingerprint: expect.stringMatching(/^sha256:/),
+        mcpServerIds: [],
+        providerEnvironmentNames: [],
+        requiresOpenAiAuth: true
+      }
+    });
+    expect(serializeAgentFlowProviderBindings([catalog.bindings.reviewer!])).toMatchObject({
+      reviewer: { profile: "deep-review", reasoningEffort: "xhigh" }
+    });
+
+    fs.writeFileSync(profilePath, 'model_verbosity = "high"\n');
+    const registry = createAgentFlowConfiguredProviderRegistry(catalog, { env: { CODEX_HOME: codexHome } });
+    expect(() => registry.get("reviewer")!.preflight!({
+      ...providerRequest(repo),
+      provider: "reviewer",
+      providerKind: "frontier"
+    })).toThrow('Codex profile "deep-review" changed after the provider catalog was loaded');
+    const profileChanged = loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} });
+    expect(profileChanged.bindings.reviewer.fingerprint).not.toBe(catalog.bindings.reviewer.fingerprint);
+
+    fs.writeFileSync(profilePath, 'model_verbosity = "low"\n');
+    const restoredCatalog = loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} });
+    const restoredRegistry = createAgentFlowConfiguredProviderRegistry(
+      restoredCatalog,
+      { env: { CODEX_HOME: codexHome } }
+    );
+    fs.writeFileSync(path.join(codexHome, "config.toml"), 'model_provider = "custom"\n');
+    expect(() => restoredRegistry.get("reviewer")!.preflight!({
+      ...providerRequest(repo),
+      provider: "reviewer",
+      providerKind: "frontier"
+    })).toThrow('Codex base config for profile "deep-review" changed after the provider catalog was loaded');
+    const baseConfigChanged = loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} });
+    expect(baseConfigChanged.bindings.reviewer.fingerprint).not.toBe(catalog.bindings.reviewer.fingerprint);
+
+    fs.writeFileSync(path.join(codexHome, "config.toml"), 'model_provider = "openai"\n');
+    fs.writeFileSync(globalConfig, fs.readFileSync(globalConfig, "utf8")
+      .replace("reasoning_effort: xhigh", "reasoning_effort: high"));
+    const effortChanged = loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} });
+    expect(effortChanged.bindings.reviewer.fingerprint).not.toBe(catalog.bindings.reviewer.fingerprint);
+
+    fs.writeFileSync(profilePath, 'model_instructions_file = "instructions.md"\n');
+    expect(() => loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} }))
+      .toThrow("path-referenced Codex settings are not supported");
+
+    fs.writeFileSync(profilePath, '[agents.reviewer]\nconfig_file = "reviewer.toml"\n');
+    expect(() => loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} }))
+      .toThrow("path-referenced Codex agent configs are not supported");
+
+    fs.writeFileSync(profilePath, 'project_doc_fallback_filenames = ["CUSTOM.md"]\n');
+    expect(() => loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} }))
+      .toThrow("path-referenced Codex settings are not supported");
+
+    fs.writeFileSync(profilePath, '[profiles.legacy]\nmodel_reasoning_effort = "high"\n');
+    expect(() => loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} }))
+      .toThrow("legacy Codex profile selectors and [profiles.*] tables are not supported");
+
+    fs.writeFileSync(profilePath, '[permissions.agent_flow_native.network]\nenabled = true\n');
+    expect(() => loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} }))
+      .toThrow("reserved permissions.agent_flow_native profile cannot be configured");
+
+    fs.writeFileSync(profilePath, '[shell_environment_policy]\ninherit = "all"\n');
+    expect(() => loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} }))
+      .toThrow("shell_environment_policy is managed by Agent Flow");
+
+    fs.writeFileSync(profilePath, '[mcp_servers."unsafe.id"]\ncommand = "/bin/false"\n');
+    expect(() => loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} }))
+      .toThrow("MCP server IDs must contain only letters");
+
+    fs.writeFileSync(profilePath, 'model_provider = "custom"\n[model_providers.custom.auth]\ncommand = "/bin/token"\n');
+    expect(() => loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} }))
+      .toThrow("command-backed Codex provider authentication is not supported");
+
+    fs.writeFileSync(profilePath, 'openai_base_url = "http://openai.example.test/v1"\n');
+    expect(() => loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} }))
+      .toThrow("Codex openai_base_url must use HTTPS");
+
+    fs.writeFileSync(profilePath, 'model_provider = "custom"\n[model_providers.custom]\nbase_url = "https://user:secret@custom.example.test/v1"\n');
+    expect(() => loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} }))
+      .toThrow("Codex model provider base_url must not contain credentials");
+
+    fs.writeFileSync(profilePath, 'model_provider = "amazon-bedrock"\n');
+    expect(() => loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} }))
+      .toThrow("amazon-bedrock Codex provider is not supported");
+
+    fs.writeFileSync(profilePath, Buffer.alloc(1024 * 1024 + 1, 0x20));
+    expect(() => loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} }))
+      .toThrow("profile exceeds 1048576 bytes");
+
+    fs.writeFileSync(profilePath, 'api_key = "profile-parser-secret\n');
+    let parseMessage = "";
+    try {
+      loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} });
+    } catch (error) {
+      parseMessage = error instanceof Error ? error.message : String(error);
+    }
+    expect(parseMessage).toContain("config is not valid TOML");
+    expect(parseMessage).toContain("[REDACTED]");
+    expect(parseMessage).not.toContain("profile-parser-secret");
+
+    fs.rmSync(profilePath);
+    expect(() => loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} }))
+      .toThrow('Could not read Codex profile "deep-review"');
+  });
+
+  test("executes a Codex profile from the same home that was fingerprinted", async () => {
+    const { repo, home, globalConfig } = configuredRepo();
+    const fake = installFakeAgentClis(path.dirname(repo));
+    const codexHome = path.join(home, ".codex");
+    fs.mkdirSync(codexHome);
+    fs.writeFileSync(path.join(codexHome, "config.toml"), `model_provider = "mistral"
+[model_providers.mistral]
+base_url = "https://mistral.example.test/v1"
+env_key = "MISTRAL_API_KEY"
+env_http_headers = { X-Org = "MISTRAL_ORG" }
+`);
+    fs.writeFileSync(path.join(codexHome, "deep-review.config.toml"), 'model_verbosity = "low"\n');
+    fs.writeFileSync(globalConfig, `version: 1
+targets:
+  codex:
+    kind: frontier
+    driver: codex-cli
+    model: codex-test
+    profile: deep-review
+    enabled: true
+`);
+    fs.writeFileSync(path.join(repo, ".agent-flow.yml"), `version: 1
+providers:
+  reviewer: { kind: frontier, target: codex }
+`);
+    const env = {
+      PATH: `${fake.bin}:${process.env.PATH ?? ""}`,
+      OPENAI_API_KEY: "unrelated-openai-key",
+      MISTRAL_API_KEY: "provider-key",
+      MISTRAL_ORG: "provider-org"
+    };
+    const catalog = loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env });
+    expect(catalog.bindings.reviewer.codexProfile).toMatchObject({
+      providerEnvironmentNames: ["MISTRAL_API_KEY", "MISTRAL_ORG"],
+      requiresOpenAiAuth: false
+    });
+    fs.writeFileSync(path.join(fake.bin, "expected-codex-home"), `${codexHome}\n`);
+    expect(doctorAgentFlowProviderCatalog(catalog, { PATH: env.PATH }).lines.join("\n"))
+      .toContain("missing credential environment variable MISTRAL_API_KEY");
+    expect(doctorAgentFlowProviderCatalog(catalog, env)).toEqual({
+      ok: true,
+      lines: [expect.stringContaining("reviewer: ready")]
+    });
+    const missingCredentialRegistry = createAgentFlowConfiguredProviderRegistry(catalog, {
+      env: { PATH: env.PATH }
+    });
+    expect(() => missingCredentialRegistry.get("reviewer")!.preflight!({
+      ...providerRequest(repo),
+      provider: "reviewer",
+      providerKind: "frontier"
+    })).toThrow("Credential environment variable MISTRAL_API_KEY is not set");
+    const registry = createAgentFlowConfiguredProviderRegistry(catalog, { env });
+
+    await expect(registry.get("reviewer")!({
+      ...providerRequest(repo),
+      provider: "reviewer",
+      providerKind: "frontier"
+    })).resolves.toMatchObject({ outputs: { "draft.md": "codex output\n" } });
+    expect(JSON.parse(fs.readFileSync(path.join(codexHome, "invocations.jsonl"), "utf8").trim()))
+      .toMatchObject({
+        providerKey: "provider-key",
+        providerOrg: "provider-org",
+        openAiKey: null
+      });
+    expect(fs.existsSync(fake.log)).toBe(false);
+
+    fs.writeFileSync(path.join(codexHome, "deep-review.config.toml"), "model_verbosity = 42\n");
+    const incompatibleCatalog = loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env });
+    expect(doctorAgentFlowProviderCatalog(incompatibleCatalog, env)).toEqual({
+      ok: false,
+      lines: ["reviewer: codex profile deep-review is incompatible with the installed CLI"]
+    });
   });
 
   test("requires complete safe identities for programmatic configured providers", () => {
@@ -429,7 +654,47 @@ providers:
   reviewer: { kind: frontier, target: claude }
 `);
     expect(() => loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} }))
-      .toThrow("Unknown field: profile");
+      .toThrow("profile is supported only by codex-cli targets");
+
+    fs.writeFileSync(globalConfig, `version: 1
+targets:
+  claude:
+    kind: frontier
+    driver: claude-code
+    model: claude-test
+    reasoning_effort: high
+    enabled: true
+`);
+    expect(() => loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} }))
+      .toThrow("reasoning_effort is supported only by codex-cli targets");
+
+    fs.writeFileSync(globalConfig, `version: 1
+targets:
+  codex:
+    kind: frontier
+    driver: codex-cli
+    model: codex-test
+    profile: ../unsafe
+    enabled: true
+`);
+    fs.writeFileSync(path.join(repo, ".agent-flow.yml"), `version: 1
+providers:
+  coder: { kind: frontier, target: codex }
+`);
+    expect(() => loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} }))
+      .toThrow("Codex profile names must be non-secret");
+
+    fs.writeFileSync(globalConfig, `version: 1
+targets:
+  codex:
+    kind: frontier
+    driver: codex-cli
+    model: codex-test
+    reasoning_effort: extreme
+    enabled: true
+`);
+    expect(() => loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} }))
+      .toThrow("Expected one of: minimal, low, medium, high, xhigh");
 
     fs.writeFileSync(globalConfig, `version: 1
 targets:
@@ -506,9 +771,21 @@ limits: { max_model_calls: 2, max_frontier_calls: 1 }
       path.join(import.meta.dir, "../../schemas/config.schema.json"),
       "utf8"
     )) as {
-      $defs: { target: { required: string[]; allOf: Array<Record<string, unknown>> } };
+      $defs: {
+        target: {
+          required: string[];
+          properties: {
+            profile: { pattern: string };
+            reasoning_effort: { enum: string[] };
+          };
+          allOf: Array<Record<string, unknown>>;
+        };
+      };
     };
     expect(schema.$defs.target.required).toEqual(["kind", "driver", "model", "enabled"]);
+    expect(schema.$defs.target.properties.profile.pattern).toBe("^[A-Za-z0-9_-]+$");
+    expect(schema.$defs.target.properties.reasoning_effort.enum)
+      .toEqual(["minimal", "low", "medium", "high", "xhigh"]);
     const constraints = schema.$defs.target.allOf.filter((entry) => {
       const condition = entry.if as { properties?: { kind?: { const?: string } } } | undefined;
       return condition?.properties?.kind?.const === "local" || condition?.properties?.kind?.const === "frontier";
@@ -534,6 +811,12 @@ limits: { max_model_calls: 2, max_frontier_calls: 1 }
       return condition?.properties?.driver?.enum?.includes("codex-cli") === true;
     }) as { then?: { not?: { required?: string[] } } } | undefined;
     expect(nativeConstraint?.then?.not?.required).toEqual(["api_key_env"]);
+    const codexConstraint = schema.$defs.target.allOf.find((entry) => {
+      const condition = entry.if as { properties?: { driver?: { const?: string } } } | undefined;
+      return condition?.properties?.driver?.const === "codex-cli";
+    }) as { else?: { not?: { anyOf?: Array<{ required?: string[] }> } } } | undefined;
+    expect(codexConstraint?.else?.not?.anyOf?.map((entry) => entry.required))
+      .toEqual([["profile"], ["reasoning_effort"]]);
   });
 
   test("invokes OpenAI-compatible local targets with exact structured outputs", async () => {
@@ -727,12 +1010,22 @@ providers:
   test("invokes Codex CLI and Claude Code with durable native sessions", async () => {
     const { repo, home, globalConfig } = configuredRepo();
     const fake = installFakeAgentClis(path.dirname(repo));
+    fs.writeFileSync(path.join(fake.root, "config.toml"), `notify = ["ambient-notifier"]
+[mcp_servers.ambient]
+command = "ambient-mcp"
+`);
+    const ambientSkill = path.join(fake.root, "skills", "ambient", "SKILL.md");
+    fs.mkdirSync(path.dirname(ambientSkill), { recursive: true });
+    fs.writeFileSync(ambientSkill, "ambient skill\n");
+    fs.writeFileSync(path.join(fake.root, "deep-review.config.toml"), 'model_verbosity = "low"\n');
     fs.writeFileSync(globalConfig, `version: 1
 targets:
   codex:
     kind: frontier
     driver: codex-cli
     model: codex-test
+    profile: deep-review
+    reasoning_effort: xhigh
     enabled: true
   claude:
     kind: frontier
@@ -745,6 +1038,9 @@ providers:
   coder: { kind: frontier, target: codex }
   reviewer: { kind: frontier, target: claude }
 `);
+    const projectCodexConfig = path.join(repo, ".codex", "config.toml");
+    fs.mkdirSync(path.dirname(projectCodexConfig));
+    fs.writeFileSync(projectCodexConfig, 'model = "repository-controlled"\n');
     const env = {
       PATH: `${fake.bin}:${process.env.PATH ?? ""}`,
       CODEX_HOME: fake.root,
@@ -753,7 +1049,10 @@ providers:
     };
     const catalog = loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env });
     const doctor = doctorAgentFlowProviderCatalog(catalog, env);
-    expect(doctor.ok).toBe(true);
+    expect(doctor).toEqual({
+      ok: true,
+      lines: [expect.stringContaining("coder: ready"), expect.stringContaining("reviewer: ready")]
+    });
     expect(doctor.lines.join("\n")).toContain("coder: ready (codex-cli");
     expect(doctor.lines.join("\n")).toContain("reviewer: ready (claude-code");
     const doctorWithoutConfiguredEnvironment = doctorAgentFlowProviderCatalog(catalog, {});
@@ -764,6 +1063,7 @@ providers:
     const codexIds: string[] = [];
     const splitUtf8Marker = path.join(fake.root, "split-utf8-thread");
     fs.writeFileSync(splitUtf8Marker, "split\n");
+    fs.writeFileSync(path.join(fake.root, "read-path"), `${projectCodexConfig}\n${ambientSkill}\n`);
     const codexRequest = {
       ...providerRequest(repo),
       provider: "coder",
@@ -775,9 +1075,18 @@ providers:
     expect(firstCodex).toMatchObject({
       outputs: { "draft.md": "codex output\n" },
       externalSessionId: "codex-thread-🚀",
-      metadata: { driver: "codex-cli", cli: "codex" }
+      metadata: {
+        driver: "codex-cli",
+        cli: "codex",
+        profile: "deep-review",
+        reasoningEffort: "xhigh"
+      }
     });
     expect(firstCodex.metadata).toHaveProperty("modelHash", hashAgentFlowProviderModel("codex-test"));
+    expect(JSON.parse(fs.readFileSync(fake.log, "utf8").trim())).toMatchObject({
+      hostReads: [null, null]
+    });
+    fs.rmSync(path.join(fake.root, "read-path"));
     fs.rmSync(splitUtf8Marker);
     await registry.get("coder")!({ ...codexRequest, externalSessionId: "codex-thread-🚀" });
     expect(codexIds).toEqual(["codex-thread-🚀", "codex-thread-🚀"]);
@@ -817,14 +1126,30 @@ providers:
     const invocations = fs.readFileSync(fake.log, "utf8").trim().split("\n")
       .map((line) => JSON.parse(line) as { cli: string; args: string[]; unrelatedSecret?: string });
     expect(invocations[0]).toMatchObject({ cli: "codex" });
-    expect(invocations[0]!.args).toContain("--ignore-user-config");
+    expect(invocations[0]!.args).not.toContain("--ignore-user-config");
     expect(invocations[0]!.args).toContain("--ignore-rules");
+    expect(invocations[0]!.args).toContain("--disable");
+    expect(invocations[0]!.args).toContain("hooks");
+    expect(invocations[0]!.args).toContain("apps");
+    expect(invocations[0]!.args).toContain("plugins");
+    expect(invocations[0]!.args).not.toContain("mcp_servers={}");
+    expect(invocations[0]!.args).toContain("mcp_servers.ambient.enabled=false");
+    expect(invocations[0]!.args).toContain("notify=[]");
+    expect(invocations[0]!.args).toContain('web_search="disabled"');
+    expect(invocations[0]!.args).toContain("analytics.enabled=false");
+    expect(invocations[0]!.args).toContain('shell_environment_policy.inherit="core"');
+    expect(invocations[0]!.args).toContain("shell_environment_policy.ignore_default_excludes=false");
     expect(invocations[0]!.args).toContain("--model");
     expect(invocations[0]!.args).toContain("codex-test");
+    expect(invocations[0]!.args).toContain("--profile");
+    expect(invocations[0]!.args).toContain("deep-review");
+    expect(invocations[0]!.args).toContain('model_reasoning_effort="xhigh"');
     expect(invocations[0]!.args.join(" ")).toContain("default_permissions=\"agent_flow_native\"");
     expect(invocations[0]!.args.join(" ")).toContain(`${JSON.stringify(fake.root)} = "deny"`);
     expect(invocations[1]!.args).toContain("resume");
     expect(invocations[1]!.args).toContain("codex-test");
+    expect(invocations[1]!.args.indexOf("--profile")).toBeLessThan(invocations[1]!.args.indexOf("resume"));
+    expect(invocations[1]!.args).toContain('model_reasoning_effort="xhigh"');
     expect(invocations[3]!.args).toContain("--session-id");
     expect(invocations[4]!.args).toContain("--resume");
     expect(invocations[3]!.args).toContain("--setting-sources");
@@ -841,6 +1166,29 @@ providers:
       }
     });
     expect(invocations.every((invocation) => invocation.unrelatedSecret === undefined)).toBe(true);
+
+    const unprofiledCodex = createAgentFlowConfiguredProviderAdapter({
+      alias: "unprofiled",
+      target: "unprofiled",
+      kind: "frontier",
+      fingerprint: "sha256:unprofiled",
+      config: {
+        kind: "frontier",
+        driver: "codex-cli",
+        model: "codex-test",
+        enabled: true
+      }
+    }, { env });
+    await unprofiledCodex({
+      ...providerRequest(repo),
+      provider: "unprofiled",
+      providerKind: "frontier"
+    });
+    const unprofiledInvocation = JSON.parse(
+      fs.readFileSync(fake.log, "utf8").trim().split("\n").at(-1)!
+    ) as { args: string[] };
+    expect(unprofiledInvocation.args).toContain("--ignore-user-config");
+    expect(unprofiledInvocation.args).not.toContain("--profile");
 
     fs.writeFileSync(fake.failClaudeResumeOnce, "fail\n");
     await expect(registry.get("reviewer")!({
@@ -1237,9 +1585,10 @@ limits: { max_model_calls: 3, max_frontier_calls: 3 }
   test("routes a missing native recovery session through explicit reset", async () => {
     const { repo, globalConfig } = configuredRepo();
     const fake = installFakeAgentClis(path.dirname(repo));
+    fs.writeFileSync(path.join(fake.root, "recovery.config.toml"), 'model_verbosity = "low"\n');
     fs.writeFileSync(globalConfig, `version: 1
 targets:
-  codex: { kind: frontier, driver: codex-cli, model: codex-test, enabled: true }
+  codex: { kind: frontier, driver: codex-cli, model: codex-test, profile: recovery, reasoning_effort: high, enabled: true }
 `);
     fs.writeFileSync(path.join(repo, ".agent-flow.yml"), `version: 1
 providers:
@@ -1278,6 +1627,16 @@ limits:
       kind: "provider_session",
       stepId: "check",
       sessionId: "fixer"
+    });
+    const recoveryRequestPath = pausedStore.listArtifacts("native-recovery-reset")
+      .find((artifact) => artifact.kind === "session_request"
+        && artifact.declaredPath.startsWith("session-requests/recovery/"))!.declaredPath;
+    expect(JSON.parse(pausedStore.readArtifact(
+      "native-recovery-reset",
+      recoveryRequestPath
+    ).content.toString("utf8"))).toMatchObject({
+      providerProfile: "recovery",
+      providerReasoningEffort: "high"
     });
     pausedStore.close();
 
@@ -1968,8 +2327,37 @@ const fs = require("node:fs");
 const path = require("node:path");
 const args = process.argv.slice(2);
 if (args[0] === "--version") { console.log("codex-cli 0.test"); process.exit(0); }
-if (args[0] === "login" && args[1] === "status") { console.log("Logged in"); process.exit(0); }
+if (args[0] === "login" && args[1] === "status") {
+  const expectedHomeMarker = path.join(__dirname, "expected-codex-home");
+  if (fs.existsSync(expectedHomeMarker)
+      && process.env.CODEX_HOME !== fs.readFileSync(expectedHomeMarker, "utf8").trim()) {
+    process.exit(1);
+  }
+  console.log("Logged in");
+  process.exit(0);
+}
 const root = process.env.CODEX_HOME;
+if (args[0] === "exec" && args.includes("--strict-config") && !args.includes("--output-schema")) {
+  const profileIndex = args.indexOf("--profile");
+  const profile = profileIndex < 0 ? undefined : args[profileIndex + 1];
+  const profilePath = profile === undefined ? undefined : path.join(root, profile + ".config.toml");
+  if (profilePath === undefined || !fs.existsSync(profilePath)
+      || /model_verbosity\s*=\s*42/.test(fs.readFileSync(profilePath, "utf8"))) {
+    console.error("Error loading config.toml");
+    process.exit(1);
+  }
+  console.log("{}\n");
+  process.exit(0);
+}
+const projectCodexDirectory = path.join(process.cwd(), ".codex");
+if (fs.existsSync(projectCodexDirectory)) {
+  try {
+    fs.accessSync(projectCodexDirectory, fs.constants.R_OK | fs.constants.X_OK);
+  } catch {
+    console.error("Repository .codex directory is not traversable");
+    process.exit(1);
+  }
+}
 let certificateContent;
 if (process.env.NODE_EXTRA_CA_CERTS) {
   try { certificateContent = fs.readFileSync(process.env.NODE_EXTRA_CA_CERTS, "utf8"); } catch {}
@@ -1987,10 +2375,25 @@ if (fs.existsSync(gitMarker)) {
 }
 const readMarker = path.join(root, "read-path");
 let hostRead;
+let hostReads;
 if (fs.existsSync(readMarker)) {
-  try { hostRead = fs.readFileSync(fs.readFileSync(readMarker, "utf8").trim(), "utf8"); } catch {}
+  const readPaths = fs.readFileSync(readMarker, "utf8").split(/\r?\n/).filter(Boolean);
+  hostReads = readPaths.map((readPath) => {
+    try { return fs.readFileSync(readPath, "utf8"); } catch { return undefined; }
+  });
+  hostRead = hostReads[0];
 }
-fs.appendFileSync(path.join(root, "invocations.jsonl"), JSON.stringify({ cli: "codex", args, unrelatedSecret: process.env.UNRELATED_SECRET, hostRead, certificateContent }) + "\n");
+fs.appendFileSync(path.join(root, "invocations.jsonl"), JSON.stringify({
+  cli: "codex",
+  args,
+  unrelatedSecret: process.env.UNRELATED_SECRET,
+  providerKey: process.env.MISTRAL_API_KEY,
+  providerOrg: process.env.MISTRAL_ORG,
+  openAiKey: process.env.OPENAI_API_KEY || null,
+  hostRead,
+  hostReads,
+  certificateContent
+}) + "\n");
 const concurrencyMarker = path.join(root, "concurrency-path");
 if (fs.existsSync(concurrencyMarker)) {
   const started = path.join(root, "concurrency-started");

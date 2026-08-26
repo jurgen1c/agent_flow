@@ -4,6 +4,8 @@ targets:
     kind: frontier
     driver: codex-cli
     model: YOUR_CODEX_MODEL
+    profile: YOUR_CODEX_PROFILE
+    reasoning_effort: high
     enabled: true
 
   claude-main:

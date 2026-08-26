@@ -145,9 +145,11 @@ export {
 export type {
   AgentFlowConfiguredProviderKind,
   AgentFlowConfiguredTarget,
+  AgentFlowCodexReasoningEffort,
   AgentFlowProviderAlias,
   AgentFlowProviderCatalog,
   AgentFlowProviderDriver,
+  AgentFlowResolvedCodexProfile,
   AgentFlowResolvedProviderBinding,
   LoadAgentFlowProviderCatalogOptions
 } from "./provider_config";

@@ -17,6 +17,8 @@ targets:
     kind: frontier
     driver: codex-cli
     model: YOUR_CODEX_MODEL
+    profile: deep-review
+    reasoning_effort: high
     enabled: true
 
   claude-main:
@@ -110,8 +112,10 @@ agent-flow run workflow.yml --id alternate \
 
 An override must preserve the alias kind. Resumes do not accept overrides.
 Each run persists a fingerprint of its target, driver, model, endpoint
-identity, and permission-relevant settings. Resume fails closed if those
-settings drift; credential rotation is intentionally excluded.
+identity, and permission-relevant settings. Codex base configuration, selected
+profile contents, and reasoning effort are included when a profile is used.
+Resume fails closed if those settings drift; credential rotation is
+intentionally excluded.
 
 ## Built-in drivers
 
@@ -164,10 +168,51 @@ Agent Flow forwards only basic process/locale variables, proxy and certificate
 settings, and authentication/provider variables for the selected CLI. It does
 not pass arbitrary environment variables to the native agent.
 
-`model` is required for native CLI targets. Agent Flow disables ambient Codex
-user config/rules and Claude user/project/local settings, then passes the model
-explicitly. This keeps the persisted target fingerprint independent of mutable
-CLI defaults and profile contents.
+`model` is required for native CLI targets. A `codex-cli` target may additionally
+set `profile` and `reasoning_effort`. Profile names contain only letters,
+numbers, hyphens, and underscores and resolve to
+`$CODEX_HOME/<profile>.config.toml` (or `~/.codex/<profile>.config.toml`). The
+profile must be a regular file no larger than 1 MiB. Agent Flow fingerprints
+its contents plus the base `$CODEX_HOME/config.toml` when present, and verifies
+both identities before and after each invocation. `providers doctor` also asks
+the installed Codex CLI to strict-load the selected profile without starting a
+model request, catching unsupported profile fields or CLI versions early.
+
+Agent Flow disables ambient Codex user config for targets without a profile.
+Profile targets load Codex's base-plus-profile layers. Agent Flow still disables
+repository-local `.codex/config.toml`, user/project rules, user skills, hooks,
+MCP servers, apps, plugins, web search, analytics/telemetry, notifications, and
+other ambient hosted tools. It also owns Codex's shell environment policy so
+model-spawned commands inherit only core process variables, not the credentials
+forwarded to the Codex process. Agent Flow then passes `--profile`, `--model`, and
+`--config model_reasoning_effort=...` explicitly. Model and reasoning CLI
+overrides therefore take precedence over base and profile values. Allowed
+reasoning values are `minimal`, `low`, `medium`, `high`, and `xhigh`; Codex
+still enforces whether the selected model supports a particular value. Current
+Codex versions use separate profile files instead of legacy
+`[profiles.<name>]` tables. See the official Codex
+[profile documentation](https://learn.chatgpt.com/docs/config-file/config-advanced#profiles)
+and [`model_reasoning_effort` reference](https://learn.chatgpt.com/docs/config-file/config-reference).
+
+Keep Agent Flow profiles self-contained. Agent Flow rejects Codex config layers
+that reference mutable instruction, project-document discovery, model-catalog,
+sub-agent, skill, or SQLite files because changing those files would otherwise
+bypass resumable-run drift detection. Put prompt context in workflow inputs and
+prompts instead. For a selected custom model provider, only environment
+variables named by `env_key` or `env_http_headers` are forwarded; doctor and
+workflow execution preflight fail closed when one is missing, and unrelated `OPENAI_*` credentials are omitted
+unless that provider declares `requires_openai_auth = true`. Profiled
+`openai_base_url` and selected model-provider `base_url` values must be HTTPS
+URLs without embedded credentials, queries, or fragments. Command-backed
+provider authentication, the built-in `amazon-bedrock` provider, custom
+`shell_environment_policy`, and configuration of Agent Flow's reserved
+`permissions.agent_flow_native` profile are rejected. MCP server IDs must use
+letters, numbers, hyphens, or underscores so Agent Flow can reliably disable
+each inherited server before startup.
+
+Claude user/project/local settings remain disabled, and its model is passed
+explicitly. These controls keep persisted target identity independent of
+unselected CLI defaults.
 The CLI receives prompts on standard input, never through a shell, and output
 is bounded and schema-validated before Agent Flow publishes artifacts.
 
