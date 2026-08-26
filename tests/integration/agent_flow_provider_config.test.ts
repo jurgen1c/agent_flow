@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { runCli } from "../../src/cli/router";
@@ -23,6 +24,7 @@ import {
   validateAgentFlowWorkflow,
   type AgentFlowSessionProviderRequest
 } from "../../src/runtime";
+import { nativeExecutableMountPaths } from "../../src/runtime/provider_drivers";
 
 describe("Agent Flow configured providers", () => {
   test("fails closed when programmatic bindings contain an unsupported driver", () => {
@@ -38,6 +40,71 @@ describe("Agent Flow configured providers", () => {
         enabled: true
       }
     } as never)).toThrow("Unsupported configured provider driver");
+  });
+
+  test("bounds native CLI doctor probes", () => {
+    if (process.platform !== "linux" || !fs.existsSync("/usr/bin/bwrap") || !fs.existsSync("/usr/bin/flock")) return;
+
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-flow-doctor-timeout-"));
+    try {
+      const bin = path.join(root, "bin");
+      fs.mkdirSync(bin);
+      const codex = path.join(bin, "codex");
+      fs.writeFileSync(codex, "#!/bin/sh\nexec /bin/sleep 30\n");
+      fs.chmodSync(codex, 0o755);
+      const startedAt = Date.now();
+      const result = doctorAgentFlowProviderCatalog({
+        globalConfigPath: "global.yml",
+        repoConfigPath: ".agent-flow.yml",
+        targets: {},
+        providers: {},
+        bindings: {
+          coder: {
+            alias: "coder",
+            target: "codex",
+            kind: "frontier",
+            fingerprint: "sha256:test",
+            config: { kind: "frontier", driver: "codex-cli", model: "codex", enabled: true }
+          }
+        }
+      }, { PATH: `${bin}:/usr/bin:/bin` });
+
+      const elapsed = Date.now() - startedAt;
+      expect(elapsed).toBeGreaterThanOrEqual(4_500);
+      expect(elapsed).toBeLessThan(9_000);
+      expect(result).toEqual({ ok: false, lines: ["coder: codex executable is unavailable"] });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 10_000);
+
+  test("uses the configured HOME for asdf tool-version mounts", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-flow-asdf-home-"));
+    try {
+      const home = path.join(root, "configured-home");
+      const bin = path.join(root, "bin");
+      const shims = path.join(home, ".asdf", "shims");
+      fs.mkdirSync(bin);
+      fs.mkdirSync(shims, { recursive: true });
+      const executable = path.join(bin, "codex");
+      const interpreter = path.join(shims, "node");
+      const asdf = path.join(bin, "asdf");
+      const toolVersions = path.join(home, ".tool-versions");
+      fs.writeFileSync(executable, "#!/usr/bin/env node\n");
+      fs.writeFileSync(interpreter, "#!/bin/sh\n");
+      fs.writeFileSync(asdf, "#!/bin/sh\n");
+      fs.writeFileSync(toolVersions, "nodejs 24.0.0\n");
+      for (const candidate of [executable, interpreter, asdf]) fs.chmodSync(candidate, 0o755);
+
+      expect(nativeExecutableMountPaths(
+        "codex",
+        executable,
+        `${shims}${path.delimiter}${bin}`,
+        home
+      )).toContain(toolVersions);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("loads global targets, resolves repo aliases, and applies kind-safe overrides", () => {

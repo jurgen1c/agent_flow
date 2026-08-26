@@ -7,6 +7,8 @@ import { findGitRepositoryRoot } from "@jurgen1c/agent-core/repository";
 import { parseYamlDocument, type JsonValue } from "@jurgen1c/agent-core/yaml";
 import { redactAgentFlowSensitiveText } from "./failure_payload";
 
+const NATIVE_PROVIDER_DOCTOR_TIMEOUT_MS = 5_000;
+
 export type AgentFlowConfiguredProviderKind = "local" | "frontier";
 export type AgentFlowProviderDriver =
   | "openai-responses"
@@ -252,7 +254,12 @@ export function doctorAgentFlowProviderCatalog(
           "--dev", "/dev",
           "--",
           "/usr/bin/true"
-        ], { encoding: "utf8", env: { PATH: "/usr/bin:/bin" } });
+        ], {
+          encoding: "utf8",
+          env: { PATH: "/usr/bin:/bin" },
+          timeout: NATIVE_PROVIDER_DOCTOR_TIMEOUT_MS,
+          killSignal: "SIGKILL"
+        });
         if (sandboxProbe.error !== undefined || sandboxProbe.status !== 0) {
           ok = false;
           return `${binding.alias}: native CLI filesystem sandbox cannot create the required bubblewrap namespace`;
@@ -261,7 +268,9 @@ export function doctorAgentFlowProviderCatalog(
         const probeEnvironment = agentFlowNativeProviderEnvironment(command, env);
         const version = spawnSync(command, ["--version"], {
           encoding: "utf8",
-          env: probeEnvironment
+          env: probeEnvironment,
+          timeout: NATIVE_PROVIDER_DOCTOR_TIMEOUT_MS,
+          killSignal: "SIGKILL"
         });
         if (version.error !== undefined || version.status !== 0) {
           ok = false;
@@ -272,7 +281,9 @@ export function doctorAgentFlowProviderCatalog(
           : ["auth", "status"];
         const auth = spawnSync(command, authArguments, {
           encoding: "utf8",
-          env: probeEnvironment
+          env: probeEnvironment,
+          timeout: NATIVE_PROVIDER_DOCTOR_TIMEOUT_MS,
+          killSignal: "SIGKILL"
         });
         if (auth.error !== undefined || auth.status !== 0) {
           ok = false;

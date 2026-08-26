@@ -430,7 +430,7 @@ function nativeProcessSandbox(
     certificateEnvironment: certificates.environment,
     gitMetadataPaths: nativeGitMetadataPaths(repoRoot),
     executablePath,
-    executableMountPaths: nativeExecutableMountPaths(command, executablePath, env.PATH)
+    executableMountPaths: nativeExecutableMountPaths(command, executablePath, env.PATH, home)
   };
 }
 
@@ -591,7 +591,12 @@ function resolveNativeExecutable(command: string, pathValue: string | undefined)
   throw providerError(`Could not resolve the ${command} executable from PATH.`);
 }
 
-function nativeExecutableMountPaths(command: string, executablePath: string, pathValue: string | undefined): string[] {
+export function nativeExecutableMountPaths(
+  command: string,
+  executablePath: string,
+  pathValue: string | undefined,
+  home: string
+): string[] {
   const paths: string[] = [];
   if (executablePath !== "/usr" && !executablePath.startsWith("/usr/")) {
     paths.push(command === "codex" && path.basename(executablePath) === "codex.js"
@@ -611,7 +616,7 @@ function nativeExecutableMountPaths(command: string, executablePath: string, pat
   if (homeToolRoot?.endsWith("/.asdf")) {
     const asdfPath = resolveNativeExecutable("asdf", pathValue);
     if (asdfPath !== "/usr" && !asdfPath.startsWith("/usr/")) paths.push(asdfPath);
-    const toolVersionsPath = path.join(os.homedir(), ".tool-versions");
+    const toolVersionsPath = path.join(home, ".tool-versions");
     if (fs.existsSync(toolVersionsPath)) paths.push(toolVersionsPath);
   }
   return paths.filter((candidate, index, values) => values.indexOf(candidate) === index);
