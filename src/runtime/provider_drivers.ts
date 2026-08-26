@@ -632,12 +632,21 @@ export function nativeExecutableMountPaths(
   const homeToolRoot = /^(.*\/(?:\.asdf|\.bun|\.nvm|\.rbenv|\.pyenv))(?:\/|$)/.exec(interpreterPath)?.[1];
   paths.push(homeToolRoot ?? interpreterPath);
   if (homeToolRoot?.endsWith("/.asdf")) {
-    const asdfPath = resolveNativeExecutable("asdf", pathValue);
-    if (asdfPath !== "/usr" && !asdfPath.startsWith("/usr/")) paths.push(asdfPath);
+    const asdfPath = optionalNativeExecutable("asdf", pathValue);
+    if (asdfPath !== undefined && asdfPath !== "/usr" && !asdfPath.startsWith("/usr/")) paths.push(asdfPath);
     const toolVersionsPath = path.join(home, ".tool-versions");
     if (fs.existsSync(toolVersionsPath)) paths.push(toolVersionsPath);
   }
   return paths.filter((candidate, index, values) => values.indexOf(candidate) === index);
+}
+
+function optionalNativeExecutable(command: string, pathValue: string | undefined): string | undefined {
+  try { return resolveNativeExecutable(command, pathValue); } catch (error) {
+    if (error instanceof AgentFlowSessionRequestError && error.code === "AGENT_FLOW_CONFIGURED_PROVIDER") {
+      return undefined;
+    }
+    throw error;
+  }
 }
 
 function codexLauncherMountPath(executablePath: string): string {

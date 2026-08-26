@@ -94,6 +94,12 @@ describe("Agent Flow configured providers", () => {
         `${shims}${path.delimiter}${bin}`,
         home
       )).toContain(toolVersions);
+      expect(nativeExecutableMountPaths(
+        "codex",
+        executable,
+        shims,
+        home
+      )).toEqual([executable, path.join(home, ".asdf"), toolVersions]);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
