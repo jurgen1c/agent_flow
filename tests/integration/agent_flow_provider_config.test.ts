@@ -667,6 +667,57 @@ providers:
     }
   });
 
+  test("hardens native state and classifies certificate and workspace preparation failures", async () => {
+    if (process.platform !== "linux" || !fs.existsSync("/usr/bin/flock")) return;
+
+    const { repo, home, globalConfig } = configuredRepo();
+    try {
+      const fake = installFakeAgentClis(path.dirname(repo));
+      fs.chmodSync(fake.root, 0o755);
+      fs.writeFileSync(globalConfig, `version: 1
+targets:
+  codex: { kind: frontier, driver: codex-cli, model: codex-test, enabled: true }
+`);
+      fs.writeFileSync(path.join(repo, ".agent-flow.yml"), `version: 1
+providers:
+  coder: { kind: frontier, target: codex }
+`);
+      const env = {
+        PATH: `${fake.bin}:${process.env.PATH ?? ""}`,
+        CODEX_HOME: fake.root,
+        NODE_EXTRA_CA_CERTS: path.join(path.dirname(repo), "missing-ca.pem")
+      };
+      const registry = createAgentFlowConfiguredProviderRegistry(
+        loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env }),
+        { env }
+      );
+      const request = {
+        ...providerRequest(repo),
+        provider: "coder",
+        providerKind: "frontier" as const
+      };
+
+      await expect(registry.get("coder")!(request)).rejects.toMatchObject({
+        code: "AGENT_FLOW_CONFIGURED_PROVIDER",
+        message: "Could not resolve NODE_EXTRA_CA_CERTS certificate path."
+      });
+      expect(fs.statSync(fake.root).mode & 0o7777).toBe(0o700);
+      expect(fs.existsSync(fake.log)).toBe(false);
+
+      const runtimeDirectory = path.join(repo, ".agent-flow");
+      const lockTarget = path.join(path.dirname(repo), "unsafe-lock-target");
+      fs.rmSync(runtimeDirectory, { recursive: true, force: true });
+      fs.mkdirSync(lockTarget);
+      fs.symlinkSync(lockTarget, runtimeDirectory, "dir");
+      await expect(registry.get("coder")!(request)).rejects.toMatchObject({
+        code: "AGENT_FLOW_CONFIGURED_PROVIDER",
+        message: expect.stringContaining("Could not secure the native provider workspace")
+      });
+    } finally {
+      fs.rmSync(path.dirname(repo), { recursive: true, force: true });
+    }
+  });
+
   test("invokes Codex CLI and Claude Code with durable native sessions", async () => {
     const { repo, home, globalConfig } = configuredRepo();
     const fake = installFakeAgentClis(path.dirname(repo));

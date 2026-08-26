@@ -487,13 +487,21 @@ function nativeStateDirectory(configuredState: string, repoRoot: string, command
     }
     if (!fs.existsSync(candidate)) fs.mkdirSync(candidate, { recursive: true, mode: 0o700 });
     const resolved = fs.realpathSync(candidate);
-    if (!fs.lstatSync(resolved).isDirectory()) {
+    let stateStat = fs.lstatSync(resolved);
+    if (!stateStat.isDirectory()) {
       throw providerError(`${environmentName} must resolve to a directory.`);
     }
     if (pathsOverlap(resolved, repoRoot) || resolved === path.parse(resolved).root) {
       throw providerError(
         `Native CLI state directory ${resolved} must be separate from the repository and cannot be a filesystem root.`
       );
+    }
+    if ((stateStat.mode & 0o7777) !== 0o700) {
+      fs.chmodSync(resolved, 0o700);
+      stateStat = fs.lstatSync(resolved);
+    }
+    if (!stateStat.isDirectory() || (stateStat.mode & 0o7777) !== 0o700) {
+      throw providerError(`${environmentName} must resolve to an owner-only directory.`);
     }
     return resolved;
   } catch (error) {
@@ -534,12 +542,17 @@ function nativeCertificatePath(value: string, repoRoot: string, directory: boole
   if (!value || value !== value.trim() || /[\u0000-\u001F\u007F-\u009F]/u.test(value)) {
     throw providerError(`${name} must contain canonical filesystem paths.`);
   }
-  const resolved = fs.realpathSync(path.isAbsolute(value) ? value : path.resolve(repoRoot, value));
-  const stat = fs.lstatSync(resolved);
-  if (resolved === path.parse(resolved).root || (directory ? !stat.isDirectory() : !stat.isFile())) {
-    throw providerError(`${name} must resolve to ${directory ? "a non-root directory" : "a regular file"}.`);
+  try {
+    const resolved = fs.realpathSync(path.isAbsolute(value) ? value : path.resolve(repoRoot, value));
+    const stat = fs.lstatSync(resolved);
+    if (resolved === path.parse(resolved).root || (directory ? !stat.isDirectory() : !stat.isFile())) {
+      throw providerError(`${name} must resolve to ${directory ? "a non-root directory" : "a regular file"}.`);
+    }
+    return resolved;
+  } catch (error) {
+    if (error instanceof AgentFlowSessionRequestError) throw error;
+    throw providerError(`Could not resolve ${name} certificate path.`);
   }
-  return resolved;
 }
 
 function nativeGitMetadataPaths(repoRoot: string): string[] {
@@ -752,23 +765,31 @@ async function auditNativeWorkspace(
   binding: AgentFlowResolvedProviderBinding,
   invoke: () => Promise<AgentFlowSessionProviderResponse>
 ): Promise<AgentFlowSessionProviderResponse> {
-  return withAgentFlowWorkspaceWriteLock(request.repoRoot!, request.signal, async () => {
-    const before = captureAgentFlowWorkspaceSnapshot(request.repoRoot!);
-    let response: AgentFlowSessionProviderResponse | undefined;
-    let invocationError: unknown;
-    try { response = await invoke(); } catch (error) { invocationError = error; }
-    const changedPaths = changedAgentFlowWorkspacePaths(before, captureAgentFlowWorkspaceSnapshot(request.repoRoot!));
-    const deniedPaths = changedPaths.filter((candidate) => !nativeWriteAllowed(request, candidate));
-    if (deniedPaths.length > 0) {
-      const displayed = deniedPaths.slice(0, 20);
-      const suffix = deniedPaths.length > displayed.length ? ` (and ${deniedPaths.length - displayed.length} more)` : "";
-      throw providerError(
-        `${binding.config.driver} target ${binding.alias} changed files outside its authorized scope: ${displayed.join(", ")}${suffix}.`
-      );
-    }
-    if (invocationError !== undefined) throw invocationError;
-    return response!;
-  }, { required: true });
+  try {
+    return await withAgentFlowWorkspaceWriteLock(request.repoRoot!, request.signal, async () => {
+      const before = captureAgentFlowWorkspaceSnapshot(request.repoRoot!);
+      let response: AgentFlowSessionProviderResponse | undefined;
+      let invocationError: unknown;
+      try { response = await invoke(); } catch (error) { invocationError = error; }
+      const changedPaths = changedAgentFlowWorkspacePaths(before, captureAgentFlowWorkspaceSnapshot(request.repoRoot!));
+      const deniedPaths = changedPaths.filter((candidate) => !nativeWriteAllowed(request, candidate));
+      if (deniedPaths.length > 0) {
+        const displayed = deniedPaths.slice(0, 20);
+        const suffix = deniedPaths.length > displayed.length ? ` (and ${deniedPaths.length - displayed.length} more)` : "";
+        throw providerError(
+          `${binding.config.driver} target ${binding.alias} changed files outside its authorized scope: ${displayed.join(", ")}${suffix}.`
+        );
+      }
+      if (invocationError !== undefined) throw invocationError;
+      return response!;
+    }, { required: true });
+  } catch (error) {
+    if (error instanceof AgentFlowSessionRequestError) throw error;
+    if (request.signal.aborted && request.signal.reason instanceof Error) throw request.signal.reason;
+    throw providerError(
+      `Could not secure the native provider workspace: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
 }
 
 function nativeWriteAllowed(request: AgentFlowSessionProviderRequest, candidate: string): boolean {
