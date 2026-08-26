@@ -500,8 +500,9 @@ limits: { max_model_calls: 2, max_frontier_calls: 1 }
       path.join(import.meta.dir, "../../schemas/config.schema.json"),
       "utf8"
     )) as {
-      $defs: { target: { allOf: Array<Record<string, unknown>> } };
+      $defs: { target: { required: string[]; allOf: Array<Record<string, unknown>> } };
     };
+    expect(schema.$defs.target.required).toEqual(["kind", "driver", "model", "enabled"]);
     const constraints = schema.$defs.target.allOf.filter((entry) => {
       const condition = entry.if as { properties?: { kind?: { const?: string } } } | undefined;
       return condition?.properties?.kind?.const === "local" || condition?.properties?.kind?.const === "frontier";
@@ -704,6 +705,8 @@ providers:
     const registry = createAgentFlowConfiguredProviderRegistry(catalog, { env });
 
     const codexIds: string[] = [];
+    const splitUtf8Marker = path.join(fake.root, "split-utf8-thread");
+    fs.writeFileSync(splitUtf8Marker, "split\n");
     const codexRequest = {
       ...providerRequest(repo),
       provider: "coder",
@@ -714,12 +717,13 @@ providers:
     const firstCodex = await registry.get("coder")!(codexRequest);
     expect(firstCodex).toMatchObject({
       outputs: { "draft.md": "codex output\n" },
-      externalSessionId: "codex-thread-1",
+      externalSessionId: "codex-thread-🚀",
       metadata: { driver: "codex-cli", cli: "codex" }
     });
     expect(firstCodex.metadata).toHaveProperty("modelHash", hashAgentFlowProviderModel("codex-test"));
-    await registry.get("coder")!({ ...codexRequest, externalSessionId: "codex-thread-1" });
-    expect(codexIds).toEqual(["codex-thread-1", "codex-thread-1"]);
+    fs.rmSync(splitUtf8Marker);
+    await registry.get("coder")!({ ...codexRequest, externalSessionId: "codex-thread-🚀" });
+    expect(codexIds).toEqual(["codex-thread-🚀", "codex-thread-🚀"]);
 
     const claudeIds: string[] = [];
     fs.writeFileSync(fake.failClaudeCreateOnce, "fail\n");
@@ -1943,6 +1947,7 @@ if (fs.existsSync(concurrencyMarker)) {
 }
 const resumeIndex = args.indexOf("resume");
 const resume = args[0] === "exec" && resumeIndex > 0;
+const splitUtf8 = fs.existsSync(path.join(root, "split-utf8-thread"));
 const failureMarker = path.join(root, "fail-resume-once");
 if (resume && fs.existsSync(failureMarker)) {
   fs.unlinkSync(failureMarker);
@@ -1952,6 +1957,8 @@ if (resume && fs.existsSync(failureMarker)) {
 let threadId;
 if (resume) {
   threadId = args[args.length - 2];
+} else if (splitUtf8) {
+  threadId = "codex-thread-🚀";
 } else {
   const counterPath = path.join(root, "counter");
   const count = fs.existsSync(counterPath) ? Number(fs.readFileSync(counterPath, "utf8")) + 1 : 1;
@@ -1968,8 +1975,18 @@ for (const name of schema.properties.outputs.required) outputs[name] = "codex ou
 const result = { outputs };
 if (schema.required.includes("recovery_status")) result.recovery_status = "remediated";
 fs.writeFileSync(outputPath, JSON.stringify(result));
-fs.writeSync(1, JSON.stringify({ type: "thread.started", thread_id: threadId }) + "\n");
-fs.writeSync(1, JSON.stringify({ type: "turn.completed" }) + "\n");
+const threadEvent = Buffer.from(JSON.stringify({ type: "thread.started", thread_id: threadId }) + "\n");
+if (splitUtf8) {
+  const emojiOffset = threadEvent.indexOf(Buffer.from("🚀"));
+  fs.writeSync(1, threadEvent.subarray(0, emojiOffset + 2));
+  setTimeout(() => {
+    fs.writeSync(1, threadEvent.subarray(emojiOffset + 2));
+    fs.writeSync(1, JSON.stringify({ type: "turn.completed" }) + "\n");
+  }, 20);
+} else {
+  fs.writeSync(1, threadEvent);
+  fs.writeSync(1, JSON.stringify({ type: "turn.completed" }) + "\n");
+}
 `, { mode: 0o755 });
   fs.writeFileSync(path.join(bin, "claude"), String.raw`#!/usr/bin/env bun
 const fs = require("node:fs");

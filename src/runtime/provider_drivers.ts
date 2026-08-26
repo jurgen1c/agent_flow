@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 
 import {
   AgentFlowSessionRequestError,
@@ -316,6 +317,7 @@ function runNativeProviderProcess(
     let stdoutBytes = 0;
     let stderrBytes = 0;
     let lineBuffer = "";
+    const stdoutLineDecoder = onStdoutLine === undefined ? undefined : new StringDecoder("utf8");
     let settled = false;
     let terminationTimer: ReturnType<typeof setTimeout> | undefined;
     let failure: Error | undefined;
@@ -356,8 +358,8 @@ function runNativeProviderProcess(
         return;
       }
       target.push(content);
-      if (stream === "stdout" && onStdoutLine !== undefined) {
-        lineBuffer += content.toString("utf8");
+      if (stream === "stdout" && onStdoutLine !== undefined && stdoutLineDecoder !== undefined) {
+        lineBuffer += stdoutLineDecoder.write(content);
         const lines = lineBuffer.split(/\r?\n/);
         lineBuffer = lines.pop() ?? "";
         try {
@@ -381,6 +383,9 @@ function runNativeProviderProcess(
       if (failure !== undefined) {
         reject(failure);
         return;
+      }
+      if (onStdoutLine !== undefined && stdoutLineDecoder !== undefined) {
+        lineBuffer += stdoutLineDecoder.end();
       }
       if (onStdoutLine !== undefined && lineBuffer.length > 0) {
         try { onStdoutLine(lineBuffer); } catch (error) {
