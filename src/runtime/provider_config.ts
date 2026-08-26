@@ -266,12 +266,7 @@ export function doctorAgentFlowProviderCatalog(
         }
         const command = binding.config.driver === "codex-cli" ? "codex" : "claude";
         const probeEnvironment = agentFlowNativeProviderEnvironment(command, env);
-        const version = spawnSync(command, ["--version"], {
-          encoding: "utf8",
-          env: probeEnvironment,
-          timeout: NATIVE_PROVIDER_DOCTOR_TIMEOUT_MS,
-          killSignal: "SIGKILL"
-        });
+        const version = runAgentFlowNativeProviderDoctorProbe(command, ["--version"], probeEnvironment);
         if (version.error !== undefined || version.status !== 0) {
           ok = false;
           return `${binding.alias}: ${command} executable is unavailable`;
@@ -279,12 +274,7 @@ export function doctorAgentFlowProviderCatalog(
         const authArguments = binding.config.driver === "codex-cli"
           ? ["login", "status"]
           : ["auth", "status"];
-        const auth = spawnSync(command, authArguments, {
-          encoding: "utf8",
-          env: probeEnvironment,
-          timeout: NATIVE_PROVIDER_DOCTOR_TIMEOUT_MS,
-          killSignal: "SIGKILL"
-        });
+        const auth = runAgentFlowNativeProviderDoctorProbe(command, authArguments, probeEnvironment);
         if (auth.error !== undefined || auth.status !== 0) {
           ok = false;
           return `${binding.alias}: ${command} is not authenticated`;
@@ -295,6 +285,20 @@ export function doctorAgentFlowProviderCatalog(
       return `${binding.alias}: ready (${binding.config.driver}, ${redactAgentFlowSensitiveText(binding.config.model)})`;
     });
   return { ok, lines };
+}
+
+export function runAgentFlowNativeProviderDoctorProbe(
+  command: string,
+  arguments_: readonly string[],
+  env: NodeJS.ProcessEnv,
+  timeout = NATIVE_PROVIDER_DOCTOR_TIMEOUT_MS
+) {
+  return spawnSync(command, [...arguments_], {
+    encoding: "utf8",
+    env,
+    timeout,
+    killSignal: "SIGKILL"
+  });
 }
 
 export function agentFlowNativeProviderEnvironment(

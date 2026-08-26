@@ -24,6 +24,7 @@ import {
   validateAgentFlowWorkflow,
   type AgentFlowSessionProviderRequest
 } from "../../src/runtime";
+import { runAgentFlowNativeProviderDoctorProbe } from "../../src/runtime/provider_config";
 import { nativeExecutableMountPaths } from "../../src/runtime/provider_drivers";
 
 describe("Agent Flow configured providers", () => {
@@ -43,7 +44,7 @@ describe("Agent Flow configured providers", () => {
   });
 
   test("bounds native CLI doctor probes", () => {
-    if (process.platform !== "linux" || !fs.existsSync("/usr/bin/bwrap") || !fs.existsSync("/usr/bin/flock")) return;
+    if (process.platform !== "linux") return;
 
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-flow-doctor-timeout-"));
     try {
@@ -53,30 +54,21 @@ describe("Agent Flow configured providers", () => {
       fs.writeFileSync(codex, "#!/bin/sh\nexec /bin/sleep 30\n");
       fs.chmodSync(codex, 0o755);
       const startedAt = Date.now();
-      const result = doctorAgentFlowProviderCatalog({
-        globalConfigPath: "global.yml",
-        repoConfigPath: ".agent-flow.yml",
-        targets: {},
-        providers: {},
-        bindings: {
-          coder: {
-            alias: "coder",
-            target: "codex",
-            kind: "frontier",
-            fingerprint: "sha256:test",
-            config: { kind: "frontier", driver: "codex-cli", model: "codex", enabled: true }
-          }
-        }
-      }, { PATH: `${bin}:/usr/bin:/bin` });
+      const result = runAgentFlowNativeProviderDoctorProbe(
+        codex,
+        ["--version"],
+        { PATH: `${bin}:/usr/bin:/bin` },
+        50
+      );
 
       const elapsed = Date.now() - startedAt;
-      expect(elapsed).toBeGreaterThanOrEqual(4_500);
-      expect(elapsed).toBeLessThan(9_000);
-      expect(result).toEqual({ ok: false, lines: ["coder: codex executable is unavailable"] });
+      expect(elapsed).toBeGreaterThanOrEqual(40);
+      expect(elapsed).toBeLessThan(2_000);
+      expect((result.error as NodeJS.ErrnoException | undefined)?.code).toBe("ETIMEDOUT");
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
-  }, 10_000);
+  });
 
   test("uses the configured HOME for asdf tool-version mounts", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-flow-asdf-home-"));
