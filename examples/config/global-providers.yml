@@ -2,15 +2,27 @@ version: 1
 targets:
   codex-main:
     kind: frontier
-    driver: openai-responses
+    driver: codex-cli
     model: YOUR_CODEX_MODEL
-    api_key_env: OPENAI_API_KEY
     enabled: true
 
   claude-main:
     kind: frontier
-    driver: anthropic-messages
+    driver: claude-code
     model: YOUR_CLAUDE_MODEL
+    enabled: true
+
+  openai-api:
+    kind: frontier
+    driver: openai-responses
+    model: YOUR_OPENAI_MODEL
+    api_key_env: OPENAI_API_KEY
+    enabled: true
+
+  anthropic-api:
+    kind: frontier
+    driver: anthropic-messages
+    model: YOUR_ANTHROPIC_MODEL
     api_key_env: ANTHROPIC_API_KEY
     max_output_tokens: 4096
     enabled: true

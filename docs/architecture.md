@@ -18,7 +18,9 @@ simulation, persistent run state, policies, lifecycle transitions, command and
 artifact execution, configured provider targets and aliases, notifications,
 retention, failure payloads, and its CLI. Vendor SDKs remain outside the
 dependency graph: built-in HTTP providers use the platform Fetch API, while
-native coding CLIs remain an application-defined adapter boundary.
+the native Codex and Claude drivers spawn argument arrays without a shell and
+audit their repository workspace after execution. Other native tools remain an
+application-defined adapter boundary.
 
 Agent Flow has no Agent Memory dependency and contains no Agent Memory adapter.
 The optional Memory-to-Flow adapter belongs to

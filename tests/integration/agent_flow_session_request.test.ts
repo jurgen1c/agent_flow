@@ -2914,6 +2914,60 @@ steps:
     store.close();
   });
 
+  test("rejects reported and returned identity switches for resumable provider sessions", async () => {
+    for (const mode of ["report", "return"] as const) {
+      const root = temporaryRepo();
+      fs.mkdirSync(path.join(root, "prompts"), { recursive: true });
+      fs.writeFileSync(path.join(root, "prompts", "draft.md"), "Draft.\n");
+      const workflow = parseAgentFlowWorkflowOrThrow(`name: reject-${mode}-session-switch
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  writer: { provider: fixture, resume: true }
+steps:
+  - { id: first, type: session_request, session: writer, prompt: prompts/draft.md, inputs: [request.md], outputs: [first.md] }
+  - { id: second, type: session_request, session: writer, prompt: prompts/draft.md, inputs: [request.md], outputs: [second.md] }
+limits: { max_model_calls: 2 }
+`);
+      const runId = `reject-${mode}-session-switch`;
+      const store = await openAgentFlowRunState({ cwd: root });
+      createAgentFlowLifecycleRun(store, { id: runId, workflow });
+      store.writeArtifact({
+        id: "request",
+        runId,
+        path: "request.md",
+        kind: "fixture",
+        contentType: "text/plain",
+        content: "Request"
+      });
+      const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => {
+        if (request.stepId === "first") {
+          return { externalSessionId: "provider-session", outputs: { "first.md": "First" } };
+        }
+        expect(request.externalSessionId).toBe("provider-session");
+        if (mode === "report") request.reportExternalSessionId!("switched-session");
+        return {
+          ...(mode === "return" ? { externalSessionId: "switched-session" } : {}),
+          outputs: { "second.md": "Second" }
+        };
+      });
+
+      const result = await executeAgentFlowCommandPipeline(store, runId, workflow, undefined, providers);
+
+      expect(result).toMatchObject({
+        status: "paused",
+        completedSteps: ["first"],
+        message: expect.stringContaining("differs from the persisted ID")
+      });
+      expect(store.getSession(runId, "writer")).toMatchObject({
+        status: "paused",
+        externalSessionId: "provider-session"
+      });
+      store.close();
+    }
+  });
+
   test("rolls back a partially published response before continuing", async () => {
     const root = temporaryRepo();
     fs.mkdirSync(path.join(root, "prompts"), { recursive: true });
@@ -3261,7 +3315,7 @@ steps:
     store.close();
   });
 
-  test("clears stale external IDs for non-resumable sessions", async () => {
+  test("rejects persistent external IDs from non-resumable sessions", async () => {
     const root = temporaryRepo();
     fs.mkdirSync(path.join(root, "prompts"), { recursive: true });
     fs.writeFileSync(path.join(root, "prompts", "draft.md"), "Draft.\n");
@@ -3283,9 +3337,13 @@ steps:
       : { outputs: { "second.md": "Second" } });
 
     await expect(executeAgentFlowCommandPipeline(store, "non-resumable", workflow, undefined, providers))
-      .resolves.toMatchObject({ status: "completed" });
+      .resolves.toMatchObject({
+        status: "paused",
+        completedSteps: [],
+        message: expect.stringContaining("non-resumable session writer")
+      });
     expect(store.getSession("non-resumable", "writer")).toMatchObject({
-      status: "waiting",
+      status: "paused",
       externalSessionId: null
     });
     store.close();

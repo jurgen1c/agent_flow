@@ -207,6 +207,7 @@ function renderHelp(topic?: string): string {
     "  agent-flow run <workflow> --id <run-id> --fixture <file>",
     "  agent-flow resume <run-id> --outcome <choice> [--fixture <file>]",
     "  agent-flow resume <run-id> --answer <value> [--fixture <file>]",
+    "  agent-flow resume <run-id> --reset-session <session-name> [--fixture <file>] [--config <file>]",
     "  agent-flow inject <run-id> <session-name> <context>",
     "  agent-flow status <run-id>",
     "  agent-flow logs <run-id>",
@@ -230,7 +231,7 @@ function renderHelp(topic?: string): string {
     "  graph <workflow>     Print a deterministic workflow graph.",
     "  simulate <workflow> --fixture <file>  Traverse a workflow from fixture data without executing steps.",
     "  run <workflow> --id <run-id> [--fixture <file>]  Execute command, artifact-transform, session-request, and review steps.",
-    "  resume <run-id> (--outcome <choice> | --answer <value>) [--fixture <file>]  Resume a paused interaction.",
+    "  resume <run-id> (--outcome <choice> | --answer <value> | --reset-session <name>) [--fixture <file>]  Resume a paused interaction.",
     "  inject <run-id> <session-name> <context>  Inject context into active recovery remediation.",
     "  status <run-id>       Inspect persistent run state.",
     "  logs <run-id>         List ordered lifecycle events.",
@@ -567,7 +568,9 @@ async function runLifecycleCommand(
       }
       const response = resumeArgs.responseKind === "outcome"
         ? { outcome: resumeArgs.responseValue }
-        : { answer: parseCliAnswer(resumeArgs.responseValue) };
+        : resumeArgs.responseKind === "answer"
+          ? { answer: parseCliAnswer(resumeArgs.responseValue) }
+          : { resetSession: resumeArgs.responseValue };
       const persistedFixturePath = typeof run.context.cliFixturePath === "string"
         ? run.context.cliFixturePath
         : undefined;
@@ -694,7 +697,7 @@ interface ParsedRunLifecycleArgs {
 
 interface ParsedResumeLifecycleArgs {
   runId: string;
-  responseKind: "outcome" | "answer";
+  responseKind: "outcome" | "answer" | "reset_session";
   responseValue: string;
   fixturePath?: string;
   configPath?: string;
@@ -727,8 +730,8 @@ function parseRunLifecycleArgs(args: string[]): ParsedRunLifecycleArgs | AgentFl
 }
 
 function parseResumeLifecycleArgs(args: string[]): ParsedResumeLifecycleArgs | AgentFlowCliResult {
-  if (!args[0] || (args[1] !== "--outcome" && args[1] !== "--answer") || args[2] === undefined) return { exitCode: 1 };
-  if (args[1] === "--outcome" && args[2].length === 0) return { exitCode: 1 };
+  if (!args[0] || (args[1] !== "--outcome" && args[1] !== "--answer" && args[1] !== "--reset-session") || args[2] === undefined) return { exitCode: 1 };
+  if ((args[1] === "--outcome" || args[1] === "--reset-session") && args[2].length === 0) return { exitCode: 1 };
   let fixturePath: string | undefined;
   let configPath: string | undefined;
   for (let index = 3; index < args.length; index += 2) {
@@ -741,7 +744,7 @@ function parseResumeLifecycleArgs(args: string[]): ParsedResumeLifecycleArgs | A
   }
   return {
     runId: args[0],
-    responseKind: args[1] === "--outcome" ? "outcome" : "answer",
+    responseKind: args[1] === "--outcome" ? "outcome" : args[1] === "--answer" ? "answer" : "reset_session",
     responseValue: args[2],
     ...(fixturePath === undefined ? {} : { fixturePath }),
     ...(configPath === undefined ? {} : { configPath })
@@ -813,7 +816,7 @@ function validLifecycleArgs(command: ActiveLifecycleCommand, args: string[]): bo
 
 function lifecycleUsage(topic: string): string | null {
   if (topic === "run") return "Usage: agent-flow run <workflow> --id <run-id> [--fixture <file>]";
-  if (topic === "resume") return "Usage: agent-flow resume <run-id> (--outcome <choice> | --answer <value>) [--fixture <file>] [--config <file>]";
+  if (topic === "resume") return "Usage: agent-flow resume <run-id> (--outcome <choice> | --answer <value> | --reset-session <session-name>) [--fixture <file>] [--config <file>]";
   if (topic === "inject") return "Usage: agent-flow inject <run-id> <session-name> <context>";
   if (topic === "cleanup") return "Usage: agent-flow cleanup ([--] <run-id> | --older-than <duration> [--status <status>]) [--approve]";
   if (topic === "archive") return "Usage: agent-flow archive [--] <run-id> [--output <file>]";

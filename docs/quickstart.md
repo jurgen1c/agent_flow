@@ -158,17 +158,14 @@ version: 1
 targets:
   codex-main:
     kind: frontier
-    driver: openai-responses
+    driver: codex-cli
     model: YOUR_CODEX_MODEL
-    api_key_env: OPENAI_API_KEY
     enabled: true
 
   claude-main:
     kind: frontier
-    driver: anthropic-messages
+    driver: claude-code
     model: YOUR_CLAUDE_MODEL
-    api_key_env: ANTHROPIC_API_KEY
-    max_output_tokens: 4096
     enabled: true
 
   openai-api:
@@ -202,9 +199,15 @@ targets:
 ```
 
 Do not put API keys in YAML. `api_key_env` names the environment variable to
-read. Built-in drivers send only the declared prompt and input artifact content;
-native coding CLIs require an application-defined custom adapter with its own
-filesystem and process boundary.
+read for API drivers. Native drivers use the existing `codex` or `claude`
+executable and its current login. Set `model` to a model identifier accepted by
+that CLI. Agent Flow requires it so resumable runs pin the configured model
+instead of inheriting a mutable CLI default or profile.
+
+Built-in native execution currently requires Linux with `bubblewrap` and
+`flock`; install them with your system package manager, then use
+`agent-flow providers doctor` to verify the CLI, login, and sandbox
+prerequisites.
 
 Commit a repository-root `.agent-flow.yml` containing portable aliases:
 
@@ -235,9 +238,10 @@ can use Claude, another Codex, and local steps can use Qwen and Gemma:
 
 ```yaml
 sessions:
-  planner: { provider: planner }
+  planner: { provider: planner, resume: true }
   implementer:
     provider: implementer
+    resume: true
   drafter: { provider: local-drafter }
   reviewer: { provider: local-reviewer }
 
@@ -263,16 +267,56 @@ Overrides are repeatable and apply only when creating a run. Agent Flow pins a
 privacy-safe target fingerprint; resume rejects model, endpoint, driver, kind,
 or permission drift. Credential rotation does not change the fingerprint.
 
-All built-in configured drivers return declared artifacts without
-file-modification authority and receive only the declared prompt and input
-artifacts. Native coding CLIs and file-writing providers require a custom
-adapter with an application-enforced execution boundary.
-
 All built-in drivers accept UTF-8 text inputs and require one structured JSON
 response with exactly the declared output paths. Provider retries are not
-hidden: the workflow's retry policy remains authoritative. All three built-in
-HTTP drivers are non-resumable; use a custom adapter when a provider needs to
-preserve native conversational state.
+hidden: the workflow's retry policy remains authoritative. The three HTTP
+drivers are artifact-only and non-resumable. `codex-cli` and `claude-code` run
+at the repository root and preserve native context when their workflow session
+declares `resume: true`.
+
+Native read-only sessions use Codex read-only or Claude plan mode. To let a CLI
+edit the checkout, grant `authority.can_modify_files: true` and a non-empty
+`file_scope` on the session. Agent Flow snapshots the checkout before and after
+the process, rejects changes not allowed by every scope layer, and leaves those
+changes in place for inspection rather than attempting an unsafe rollback. Its
+host sandbox keeps `.git` read-only, hides `.agent-flow`, and leaves unrelated
+host paths unmounted. Audited native invocations share a per-repository write
+lock with command steps and file-writing custom adapters
+so concurrent Agent Flow runs cannot be attributed to one another. Native
+agents receive only the selected CLI's authentication/provider
+variables plus basic process, locale, proxy, and certificate variables—not the
+parent process's arbitrary secrets. Only the selected CLI, its required
+read-only interpreter/toolchain files, system runtime files, its own state, and
+the repository are visible.
+
+If Codex or Claude no longer has a persisted external session, the run pauses
+instead of silently losing context. Start a fresh native session explicitly:
+
+```bash
+agent-flow status <run-id>
+agent-flow resume <run-id> --reset-session <session-name> [--fixture <file>] [--config <file>]
+```
+
+For an implement-review-fix sequence that deliberately keeps one native
+conversation, use one resumable workflow session for all three steps:
+
+```yaml
+sessions:
+  coder:
+    provider: implementer
+    resume: true
+    authority: { can_modify_files: true }
+    file_scope:
+      include: [src/**, tests/**, docs/**]
+
+steps:
+  - { id: implement, type: session_request, session: coder, prompt: prompts/implement.md, inputs: [task.md], outputs: [implementation-summary.md] }
+  - { id: review, type: session_request, session: coder, prompt: prompts/review.md, inputs: [implementation-summary.md], outputs: [review.md] }
+  - { id: fix, type: session_request, session: coder, prompt: prompts/fix.md, inputs: [review.md], outputs: [implementation-summary.md], overwrite: true }
+```
+
+The complete checked example is
+[`examples/workflows/native-cli-session.yml`](../examples/workflows/native-cli-session.yml).
 
 See [session provider boundaries](session-providers.md) for registration kinds,
 the programmatic extension API, permission behavior, and evidence handling.
@@ -349,7 +393,7 @@ programmatic registrations require an application host to pass `providers` to
 
 The YAML configuration path does not replace the original provider registry.
 Use a custom provider when an application already owns the model client, needs
-a native coding CLI, supports provider-native resume, or must enforce a custom
+a different coding CLI, a provider-specific resume protocol, or a custom
 filesystem/process sandbox:
 
 ```ts

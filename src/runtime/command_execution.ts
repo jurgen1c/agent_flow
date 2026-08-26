@@ -95,6 +95,7 @@ import {
   writeAgentFlowFinalSummary
 } from "./retention";
 import { withAgentFlowPipelineFinalization } from "./finalization";
+import { withAgentFlowWorkspaceWriteLock } from "./workspace_lock";
 import {
   agentFlowInputKeyLooksSensitive,
   persistAgentFlowFailurePayload,
@@ -162,17 +163,19 @@ export interface AgentFlowCommandPipelineResult {
 
 export type AgentFlowPipelineResumeInput =
   | { outcome: string; decidedBy?: string }
-  | { answer: AgentFlowRunStateValue };
+  | { answer: AgentFlowRunStateValue }
+  | { resetSession: string };
 
 interface AgentFlowPipelineWaitingState {
-  kind: "approval" | "manual_gate" | "input_request" | "disagreement";
+  kind: "approval" | "manual_gate" | "input_request" | "disagreement" | "provider_session";
   stepId: string;
   attempt: number;
-  reason: "approval" | "manual_approval" | "missing_input" | "disagreement";
+  reason: "approval" | "manual_approval" | "missing_input" | "disagreement" | "external_session_unavailable";
   prompt: string;
   validOutcomes: string[];
   saveAs?: string;
   approvalId?: string;
+  sessionId?: string;
   evidence?: AgentFlowWaitingEvidence[];
   completedSteps: string[];
   routing: SerializedSuccessfulRoutingBudget;
@@ -260,12 +263,12 @@ function assertOrPersistConfiguredProviderBindings(
     if (provider === undefined || Object.hasOwn(bindings, provider)) continue;
     const descriptor = providers.describe(provider);
     if (descriptor?.target === undefined || descriptor.driver === undefined
-        || descriptor.model === undefined || descriptor.fingerprint === undefined) continue;
+        || descriptor.fingerprint === undefined) continue;
     bindings[provider] = {
       target: descriptor.target,
       kind: descriptor.kind,
       driver: descriptor.driver,
-      modelHash: hashAgentFlowProviderModel(descriptor.model),
+      ...(descriptor.model === undefined ? {} : { modelHash: hashAgentFlowProviderModel(descriptor.model) }),
       fingerprint: descriptor.fingerprint
     };
   }
@@ -1038,6 +1041,16 @@ async function runAgentFlowCommandPipeline(
             store.appendRunEvent(runId, { type: "step.interrupted", stepId, payload: output });
             return stoppedPipelineResult(store, runId, completedSteps)!;
           }
+          if (error instanceof AgentFlowSessionRequestError
+              && error.code === "AGENT_FLOW_PROVIDER_SESSION_UNAVAILABLE") {
+            failure = error.message;
+            persistSessionRequestFailure(
+              store, runId, stepId, sessionId, failure, false, "pause", false, attempt
+            );
+            return pauseForUnavailableProviderSession(
+              store, runId, step, sessionId, attempt, completedSteps, routingBudget, failure
+            );
+          }
           if (error instanceof AgentFlowSessionPolicyError) {
             failure = error.message;
             const outcome = error.status === "pause" ? "pause" : "fail";
@@ -1309,7 +1322,7 @@ async function runAgentFlowCommandPipeline(
       store.upsertStep({ runId, stepId, attempt, status: "running", input: { command: step.command as string } });
       store.appendRunEvent(runId, { type: "step.started", stepId, payload: { attempt, command: step.command as string } });
 
-      lastResult = await runCommand(
+      lastResult = await runWorkspaceLockedCommand(
         store.repoRoot,
         step.command as string,
         timeoutMilliseconds(step),
@@ -1735,6 +1748,18 @@ async function resolveReviewDisagreement(
       const lockError = store.runLockInterruption();
       if (lockError !== undefined) throw lockError;
       const message = redactAgentFlowSensitiveText(error instanceof Error ? error.message : String(error));
+      if (error instanceof AgentFlowSessionRequestError
+          && error.code === "AGENT_FLOW_PROVIDER_SESSION_UNAVAILABLE") {
+        const attempt = completedReviewCycles + round;
+        persistSessionRequestFailure(
+          store, runId, stepId, resolver, message, false, "pause", false, attempt
+        );
+        return {
+          result: pauseForUnavailableProviderSession(
+            store, runId, reviewStep, resolver, attempt, completedSteps, routingBudget, message
+          )
+        };
+      }
       if (error instanceof AgentFlowSessionPolicyError) {
         const attempt = completedReviewCycles + round;
         const outcome = error.status === "pause" ? "pause" : "fail";
@@ -2255,10 +2280,99 @@ function pauseForInteraction(
     : persistWaiting();
 }
 
+function pauseForUnavailableProviderSession(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  step: AgentFlowWorkflowStep,
+  sessionId: string,
+  attempt: number,
+  completedSteps: string[],
+  routingBudget: SuccessfulRoutingBudget,
+  providerMessage: string
+): AgentFlowCommandPipelineResult {
+  const stepId = requiredStepId(step);
+  const prompt = `Provider session ${sessionId} is unavailable. Reset it explicitly to retry ${stepId} without the prior provider context.`;
+  const waiting: AgentFlowPipelineWaitingState = {
+    kind: "provider_session",
+    stepId,
+    sessionId,
+    attempt,
+    reason: "external_session_unavailable",
+    prompt,
+    validOutcomes: [],
+    completedSteps: [...completedSteps],
+    routing: serializeRoutingBudget(routingBudget)
+  };
+  const run = store.getRun(runId)!;
+  store.updateRun(runId, {
+    currentStepId: stepId,
+    context: { ...run.context, waiting: waiting as unknown as AgentFlowRunStateValue },
+    error: { code: "AGENT_FLOW_PROVIDER_SESSION_UNAVAILABLE", message: providerMessage }
+  });
+  store.upsertStep({
+    runId,
+    stepId,
+    attempt,
+    sessionId,
+    status: "waiting",
+    input: { attempt, type: "provider_session", session: sessionId, prompt }
+  });
+  store.appendRunEvent(runId, {
+    type: "session.external_unavailable",
+    stepId,
+    payload: { sessionId, attempt }
+  });
+  const failWaitingProviderSession = (failureMessage: string): void => {
+    const persisted = persistAgentFlowFailurePayload(store, {
+      id: `session-request:${safeId(stepId)}:attempt-${attempt}:notification`,
+      runId,
+      stepId,
+      sessionId,
+      stepType: "session_request",
+      attempt,
+      exitCode: null,
+      summary: failureMessage,
+      classification: "notification_failure",
+      retryable: false,
+      outcome: "fail",
+      indexPayload: { attempt, message: failureMessage, outcome: "fail" }
+    });
+    const indexedError = { ...persisted.indexPayload, ...failureReference(persisted) };
+    store.upsertStep({ runId, stepId, attempt, sessionId, status: "failed", error: indexedError });
+    const provider = store.getSession(runId, sessionId)?.provider;
+    if (provider !== undefined) {
+      store.upsertSession({ id: sessionId, runId, stepId, provider, status: "failed" });
+    }
+    store.appendRunEvent(runId, { type: "step.failed", stepId, payload: indexedError });
+  };
+  const finalized = finalizePipelineRun(store, runId, routingBudget.terminalEffects, {
+    intendedStatus: "paused",
+    completedSteps,
+    currentStepId: stepId,
+    message: prompt,
+    eventPayload: { stepId, reason: "external_session_unavailable", sessionId },
+    eventStepId: stepId,
+    failureContext: run.context,
+    beforeFinalTransition: (status, message) => {
+      if (status === "failed") {
+        failWaitingProviderSession(message ?? "Required paused notification failed.");
+      }
+    }
+  });
+  return { status: finalized.status, completedSteps, failedStep: stepId, failureOutcome: "pause", message: finalized.message ?? prompt };
+}
+
 interface PersistedResumeDecision {
   persisted: true;
   location: RuntimeStepLocation;
   selectedTarget?: string;
+  completedSteps: string[];
+  routingBudget: SuccessfulRoutingBudget;
+}
+
+interface ResetProviderSessionDecision {
+  reset: true;
+  location: RuntimeStepLocation;
   completedSteps: string[];
   routingBudget: SuccessfulRoutingBudget;
 }
@@ -2288,6 +2402,14 @@ function resumeWaitingStep(
     return persisted;
   });
   if ("resumeError" in decision) throw decision.resumeError;
+  if ("reset" in decision) {
+    return {
+      steps: decision.location.steps,
+      nextIndex: decision.location.index,
+      completedSteps: decision.completedSteps,
+      routingBudget: decision.routingBudget
+    };
+  }
   if (!("persisted" in decision)) return decision;
 
   const completedSteps = [...decision.completedSteps, requiredStepId(
@@ -2317,7 +2439,7 @@ function persistWaitingStepResume(
   response: AgentFlowPipelineResumeInput,
   stepLocations: Map<string, RuntimeStepLocation>,
   notifications: AgentFlowNotificationRegistry
-): ResumedWaitingStep | PersistedResumeDecision | FailedResumeDecision {
+): ResumedWaitingStep | PersistedResumeDecision | ResetProviderSessionDecision | FailedResumeDecision {
   const waiting = parseWaitingState(context.waiting);
   const location = stepLocations.get(waiting.stepId);
   if (location === undefined) {
@@ -2328,11 +2450,22 @@ function persistWaitingStepResume(
   }
   const step = location.steps[location.index]!;
   const waitingStepType = waiting.kind === "disagreement" ? "review" : waiting.kind;
-  if (normalizedTarget(step.type) !== waitingStepType) {
+  if (waiting.kind !== "provider_session" && normalizedTarget(step.type) !== waitingStepType) {
     throw new AgentFlowRunStateError(
       `Agent Flow run ${runId} waiting state does not match workflow step ${waiting.stepId}.`,
       "AGENT_FLOW_RESUME_STATE"
     );
+  }
+  if (waiting.kind === "provider_session") {
+    const declaredSession = mapping(workflow.sessions?.[waiting.sessionId!]);
+    const persistedSession = store.getSession(runId, waiting.sessionId!);
+    if (declaredSession === undefined || persistedSession === null
+        || persistedSession.externalSessionId === null) {
+      throw new AgentFlowRunStateError(
+        `Agent Flow run ${runId} provider-session waiting state does not match a persisted resumable workflow session.`,
+        "AGENT_FLOW_RESUME_STATE"
+      );
+    }
   }
   if (waiting.kind === "approval") {
     const declaredEvidence = Array.isArray(step.artifacts)
@@ -2371,7 +2504,56 @@ function persistWaitingStepResume(
   let selectedTarget: string | undefined;
   let output: Record<string, AgentFlowRunStateValue>;
 
-  if (waiting.kind === "disagreement") {
+  if (waiting.kind === "provider_session") {
+    if (!("resetSession" in response) || response.resetSession.trim() !== waiting.sessionId) {
+      throw new AgentFlowRunStateError(
+        `Provider session ${waiting.sessionId} requires --reset-session ${waiting.sessionId}.`,
+        "AGENT_FLOW_SESSION_RESET_REQUIRED"
+      );
+    }
+    const currentSession = store.getSession(runId, waiting.sessionId!);
+    if (currentSession === null || currentSession.externalSessionId === null) {
+      throw new AgentFlowRunStateError(
+        `Provider session ${waiting.sessionId} has no persisted external session ID to reset.`,
+        "AGENT_FLOW_SESSION_RESET_INVALID"
+      );
+    }
+    store.transitionRunWithEvent(runId, {
+      status: "running",
+      allowedFrom: ["paused"],
+      event: { type: "run.resume", stepId: waiting.stepId, payload: { resetSession: waiting.sessionId } }
+    });
+    store.upsertSession({
+      id: waiting.sessionId!,
+      runId,
+      stepId: currentSession.stepId ?? waiting.stepId,
+      provider: currentSession.provider,
+      status: "waiting",
+      externalSessionId: null,
+      state: {
+        ...currentSession.state,
+        resume: true,
+        lastStepId: waiting.stepId,
+        externalSessionReset: true
+      }
+    });
+    store.upsertStep({
+      runId,
+      stepId: waiting.stepId,
+      attempt: waiting.attempt,
+      sessionId: waiting.sessionId,
+      status: "cancelled",
+      output: { reason: "external_session_reset" }
+    });
+    store.appendRunEvent(runId, {
+      type: "session.external_reset",
+      stepId: waiting.stepId,
+      payload: { sessionId: waiting.sessionId, attempt: waiting.attempt }
+    });
+    const { waiting: _waiting, ...resetContext } = store.getRun(runId)!.context;
+    store.updateRun(runId, { context: resetContext, error: null });
+    return { reset: true, location, completedSteps, routingBudget };
+  } else if (waiting.kind === "disagreement") {
     if (!("outcome" in response)) {
       throw new AgentFlowRunStateError(
         `Disagreement ${waiting.stepId} requires an explicit --outcome value.`,
@@ -2996,7 +3178,7 @@ function parseWaitingState(value: AgentFlowRunStateValue | undefined): AgentFlow
   const record = mapping(value);
   if (record === undefined) {
     throw new AgentFlowRunStateError(
-      "Paused Agent Flow run does not have a persisted approval, manual gate, or input request.",
+      "Paused Agent Flow run does not have a persisted interaction or provider-session reset.",
       "AGENT_FLOW_RESUME_STATE"
     );
   }
@@ -3011,8 +3193,9 @@ function parseWaitingState(value: AgentFlowRunStateValue | undefined): AgentFlow
   const reasonMatchesKind = kind === "approval" ? reason === "approval"
     : kind === "manual_gate" ? reason === "manual_approval"
       : kind === "input_request" ? reason === "missing_input"
-        : kind === "disagreement" ? reason === "disagreement" : false;
-  if ((kind !== "approval" && kind !== "manual_gate" && kind !== "input_request" && kind !== "disagreement")
+        : kind === "disagreement" ? reason === "disagreement"
+          : kind === "provider_session" ? reason === "external_session_unavailable" : false;
+  if ((kind !== "approval" && kind !== "manual_gate" && kind !== "input_request" && kind !== "disagreement" && kind !== "provider_session")
       || stepId === undefined
       || !Number.isSafeInteger(attempt)
       || (attempt as number) < 1
@@ -3027,6 +3210,9 @@ function parseWaitingState(value: AgentFlowRunStateValue | undefined): AgentFlow
   const serialized = parseSerializedRoutingBudget(routing);
   const saveAs = typeof record.saveAs === "string" ? record.saveAs : undefined;
   const approvalId = typeof record.approvalId === "string" ? record.approvalId : undefined;
+  const sessionId = typeof record.sessionId === "string" && record.sessionId.trim().length > 0
+    ? record.sessionId.trim()
+    : undefined;
   const evidence = Array.isArray(record.evidence)
     ? record.evidence.flatMap((entry) => {
       const candidate = mapping(entry);
@@ -3046,7 +3232,8 @@ function parseWaitingState(value: AgentFlowRunStateValue | undefined): AgentFlow
       || (kind === "approval" && (evidence.length === 0 || evidence.length !== (record.evidence as unknown[] | undefined)?.length))
       || (kind === "disagreement" && !isDeepStrictEqual(validOutcomes, ["approve", "request_changes", "fail", "cancel"]))
       || (kind === "disagreement" && (evidence.length === 0 || evidence.length !== (record.evidence as unknown[] | undefined)?.length))
-      || (kind === "input_request" && saveAs === undefined)) {
+      || (kind === "input_request" && saveAs === undefined)
+      || (kind === "provider_session" && (sessionId === undefined || validOutcomes.length !== 0))) {
     throw new AgentFlowRunStateError(
       "Paused Agent Flow run has incomplete persisted interaction state.",
       "AGENT_FLOW_RESUME_STATE"
@@ -3058,11 +3245,13 @@ function parseWaitingState(value: AgentFlowRunStateValue | undefined): AgentFlow
     attempt: attempt as number,
     reason: kind === "approval" ? "approval"
       : kind === "manual_gate" ? "manual_approval"
-        : kind === "input_request" ? "missing_input" : "disagreement",
+        : kind === "input_request" ? "missing_input"
+          : kind === "disagreement" ? "disagreement" : "external_session_unavailable",
     prompt,
     validOutcomes,
     ...(saveAs === undefined ? {} : { saveAs }),
     ...(approvalId === undefined ? {} : { approvalId }),
+    ...(sessionId === undefined ? {} : { sessionId }),
     ...(kind === "approval" || kind === "disagreement" ? { evidence } : {}),
     completedSteps,
     routing: serialized
@@ -3522,6 +3711,7 @@ async function routeAfterFailedStep(
   let recoveryRunId: string | undefined;
   let message: string | undefined;
   let recoveryPolicyError: AgentFlowSessionPolicyError | undefined;
+  let unavailableSessionError: AgentFlowSessionRequestError | undefined;
   try {
     if (routeKind === "workflow") {
       const nested = await executeNestedRecoveryWorkflow(
@@ -3551,7 +3741,10 @@ async function routeAfterFailedStep(
     if (["AGENT_FLOW_RUN_LOCKED", "AGENT_FLOW_RUN_LOCK_LOST"].includes(agentFlowErrorCode(error) ?? "")) {
       throw error;
     }
-    if (error instanceof AgentFlowSessionPolicyError) {
+    if (error instanceof AgentFlowSessionRequestError
+        && error.code === "AGENT_FLOW_PROVIDER_SESSION_UNAVAILABLE") {
+      unavailableSessionError = error;
+    } else if (error instanceof AgentFlowSessionPolicyError) {
       recoveryPolicyError = error;
     } else {
       status = "unresolved";
@@ -3616,6 +3809,18 @@ async function routeAfterFailedStep(
         payload: { changedPaths, deniedPaths, route: routeKind, target },
         forcePause: true
       })
+    };
+  }
+  if (unavailableSessionError !== undefined) {
+    const providerMessage = redactAgentFlowSensitiveText(unavailableSessionError.message);
+    const attempt = Math.max(1, failure.attempt ?? 1);
+    persistSessionRequestFailure(
+      store, runId, stepId, target, providerMessage, false, "pause", false, attempt
+    );
+    return {
+      result: pauseForUnavailableProviderSession(
+        store, runId, step, target, attempt, completedSteps, budget, providerMessage
+      )
     };
   }
   if (recoveryPolicyError !== undefined) {
@@ -4848,6 +5053,8 @@ async function executeRecoverySession(
             ])
       ]);
       const providerInputs = contextInput === undefined ? inputs : [...inputs, contextInput];
+      const invokedExternalSessionId = externalSessionId;
+      let reportedExternalSessionId: string | undefined;
       const evidencePrompt = {
         path: prompt.path,
         checksum: sourcePromptChecksum,
@@ -4904,7 +5111,39 @@ async function executeRecoverySession(
                 : []
             }))
           },
-          signal: new AbortController().signal
+          signal: new AbortController().signal,
+          reportExternalSessionId: (candidate) => {
+            const reported = normalizedTarget(candidate);
+            if (!resume || reported === undefined) {
+              throw new AgentFlowSessionRequestError(
+                `Recovery provider ${provider} reported an invalid persistent external session ID.`,
+                "AGENT_FLOW_SESSION_RESPONSE_INVALID"
+              );
+            }
+            assertRecoveryAdapterStringsSafe(workflow, [["Recovery provider external session ID", reported]]);
+            if (invokedExternalSessionId !== undefined && reported !== invokedExternalSessionId) {
+              throw new AgentFlowSessionRequestError(
+                `Recovery provider ${provider} reported an external session ID that differs from the persisted ID for session ${sessionId}.`,
+                "AGENT_FLOW_SESSION_RESPONSE_INVALID"
+              );
+            }
+            if (reportedExternalSessionId !== undefined && reportedExternalSessionId !== reported) {
+              throw new AgentFlowSessionRequestError(
+                `Recovery provider ${provider} reported more than one external session ID for session ${sessionId}.`,
+                "AGENT_FLOW_SESSION_RESPONSE_INVALID"
+              );
+            }
+            reportedExternalSessionId = reported;
+            externalSessionId = reported;
+            store.upsertSession({
+              id: sessionId,
+              runId,
+              stepId: recoveryStepId,
+              provider,
+              status: "running",
+              externalSessionId: reported
+            });
+          }
         }, () => activeStopStatus(store, runId), () => store.runLockInterruption());
       } catch (error) {
         if (activeStopStatus(store, runId) === undefined
@@ -4924,13 +5163,33 @@ async function executeRecoverySession(
           returnedSessionId
         ]]);
       }
+      if (returnedSessionId !== undefined && reportedExternalSessionId !== undefined
+          && returnedSessionId !== reportedExternalSessionId) {
+        throw new AgentFlowSessionRequestError(
+          `Recovery provider ${provider} returned an external session ID that differs from the ID reported during execution.`,
+          "AGENT_FLOW_SESSION_RESPONSE_INVALID"
+        );
+      }
+      if (returnedSessionId !== undefined && invokedExternalSessionId !== undefined
+          && returnedSessionId !== invokedExternalSessionId) {
+        throw new AgentFlowSessionRequestError(
+          `Recovery provider ${provider} returned an external session ID that differs from the persisted ID for session ${sessionId}.`,
+          "AGENT_FLOW_SESSION_RESPONSE_INVALID"
+        );
+      }
       if (stoppedAfterResponse !== undefined) {
-        externalSessionId = returnedSessionId ?? externalSessionId;
+        if (resume) externalSessionId = returnedSessionId ?? externalSessionId;
         throw new AgentFlowSessionRequestInterruptedError(stoppedAfterResponse);
       }
       if (recoveryContextRevision(store.getSession(runId, sessionId)?.state ?? {}) !== appliedContextRevision) {
         if (resume) externalSessionId = returnedSessionId ?? externalSessionId;
         continue;
+      }
+      if (returnedSessionId !== undefined && !resume) {
+        throw new AgentFlowSessionRequestError(
+          `Recovery provider ${provider} returned a persistent external session ID for non-resumable session ${sessionId}.`,
+          "AGENT_FLOW_SESSION_RESPONSE_INVALID"
+        );
       }
       const returnedExternalSessionId = response.externalSessionId;
       if (returnedExternalSessionId !== undefined &&
@@ -7185,6 +7444,31 @@ function runCommand(
     child.on("error", (error) => finish({ exitCode: null, signal: null, message: `Could not start command: ${error.message}` }));
     child.on("close", (exitCode, signal) => finish({ exitCode, signal }));
   });
+}
+
+async function runWorkspaceLockedCommand(
+  repoRoot: string,
+  command: string,
+  timeoutMs: number | undefined,
+  stopStatus: () => AgentFlowRunStopStatus | undefined,
+  interruptError: () => Error | undefined
+): Promise<CommandAttemptResult> {
+  const controller = new AbortController();
+  const timer = setInterval(() => {
+    const interruption = interruptError();
+    if (interruption !== undefined) controller.abort(interruption);
+    else {
+      const status = stopStatus();
+      if (status !== undefined) controller.abort(new AgentFlowSessionRequestInterruptedError(status));
+    }
+  }, 25);
+  try {
+    return await withAgentFlowWorkspaceWriteLock(repoRoot, controller.signal, () =>
+      runCommand(repoRoot, command, timeoutMs, stopStatus, interruptError)
+    );
+  } finally {
+    clearInterval(timer);
+  }
 }
 
 function terminateChild(pid: number | undefined, signal: NodeJS.Signals): void {

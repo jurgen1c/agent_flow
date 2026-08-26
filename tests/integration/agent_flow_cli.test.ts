@@ -35,6 +35,7 @@ describe("Agent Flow CLI", () => {
     expect(result.stdout).toContain("graph <workflow>");
     expect(result.stdout).toContain("simulate <workflow> --fixture <file>");
     expect(result.stdout).toContain("run <workflow> --id <run-id>");
+    expect(result.stdout).toContain("resume <run-id> --reset-session <session-name> [--fixture <file>] [--config <file>]");
     expect(result.stdout).toContain("pause <run-id>");
     expect(result.stdout).toContain("cleanup <run-id>");
     expect(result.stdout).toContain("archive <run-id>");

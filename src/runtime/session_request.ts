@@ -12,6 +12,10 @@ import {
   type AgentFlowRunStateValue
 } from "./run_state";
 import { evaluateAgentFlowPolicy } from "./policy";
+import {
+  isAgentFlowWorkspaceWriteLockManaged,
+  withAgentFlowWorkspaceWriteLock
+} from "./workspace_lock";
 import type { AgentFlowWorkflow, AgentFlowWorkflowStep, AgentFlowYamlMapping } from "./workflow";
 import { createAgentFlowReviewPrompt, parseAgentFlowReviewResult } from "./review";
 import {
@@ -85,6 +89,7 @@ export interface AgentFlowSessionProviderRequest {
     layers: Array<{ include: string[]; exclude: string[] }>;
   };
   signal: AbortSignal;
+  reportExternalSessionId?: (externalSessionId: string) => void;
 }
 
 export interface AgentFlowSessionProviderOutput {
@@ -360,13 +365,24 @@ export class AgentFlowSessionProviderRegistry {
       descriptor.fingerprint,
       "Configured session provider fingerprint"
     );
+    const nativeCli = driver === "codex-cli" || driver === "claude-code";
+    if (nativeCli && descriptor.kind !== "frontier") {
+      throw invalidProviderRegistration("Native CLI configured session providers must declare frontier kind.");
+    }
     const model = requiredName(descriptor.model, "Configured session provider model");
     if (model !== descriptor.model || /[\u0000-\u001F\u007F-\u009F]/u.test(model)) {
       throw invalidProviderRegistration(
         "Configured session provider model must not have surrounding whitespace or control characters."
       );
     }
-    return this.add(name, adapter, { ...descriptor, name, target, driver, model, fingerprint });
+    return this.add(name, adapter, {
+      ...descriptor,
+      name,
+      target,
+      driver,
+      model,
+      fingerprint
+    });
   }
 
   private add(
@@ -1019,6 +1035,41 @@ async function executeAgentFlowSessionStep(
     externalSessionId: priorExternalSessionId ?? null,
     state: { resume, lastStepId: stepId }
   });
+  let effectiveExternalSessionId = priorExternalSessionId;
+  let reportedExternalSessionId: string | undefined;
+  request.reportExternalSessionId = (candidate) => {
+    if (!resume) {
+      throw new AgentFlowSessionRequestError(
+        `Session provider ${provider} reported a persistent external session ID for non-resumable session ${sessionId}.`,
+        "AGENT_FLOW_SESSION_RESPONSE_INVALID"
+      );
+    }
+    const externalSessionId = requiredName(candidate, `Session provider external session ID for step ${stepId}`);
+    assertAgentFlowAdapterStringSafe(workflow, "Session provider external session ID", externalSessionId);
+    if (priorExternalSessionId !== undefined && externalSessionId !== priorExternalSessionId) {
+      throw new AgentFlowSessionRequestError(
+        `Session provider ${provider} reported an external session ID that differs from the persisted ID for resumable session ${sessionId}.`,
+        "AGENT_FLOW_SESSION_RESPONSE_INVALID"
+      );
+    }
+    if (reportedExternalSessionId !== undefined && reportedExternalSessionId !== externalSessionId) {
+      throw new AgentFlowSessionRequestError(
+        `Session provider ${provider} reported more than one external session ID for resumable session ${sessionId}.`,
+        "AGENT_FLOW_SESSION_RESPONSE_INVALID"
+      );
+    }
+    reportedExternalSessionId = externalSessionId;
+    effectiveExternalSessionId = externalSessionId;
+    store.upsertSession({
+      id: sessionId,
+      runId,
+      stepId,
+      provider,
+      status: "running",
+      externalSessionId,
+      state: { resume, lastStepId: stepId, externalSessionEstablished: true }
+    });
+  };
   try {
     reserveAgentFlowSessionModelCallBudgets(
       store,
@@ -1037,14 +1088,13 @@ async function executeAgentFlowSessionStep(
       stepId,
       provider,
       status,
-      externalSessionId: priorExternalSessionId ?? null,
+      externalSessionId: effectiveExternalSessionId ?? null,
       state: { resume, lastStepId: stepId, error: persistedErrorMessage(error) }
     });
     throw error;
   }
 
   let response: AgentFlowSessionProviderResponse;
-  let effectiveExternalSessionId = priorExternalSessionId;
   try {
     response = await invokeAgentFlowSessionProvider(
       adapter,
@@ -1065,7 +1115,7 @@ async function executeAgentFlowSessionStep(
         stepId,
         provider,
         status: stopped,
-        externalSessionId: priorExternalSessionId ?? null,
+        externalSessionId: effectiveExternalSessionId ?? null,
         state: { resume, lastStepId: stepId, interrupted: stopped }
       });
       throw error instanceof AgentFlowSessionRequestInterruptedError
@@ -1078,7 +1128,7 @@ async function executeAgentFlowSessionStep(
       stepId,
       provider,
       status: "paused",
-      externalSessionId: priorExternalSessionId ?? null,
+      externalSessionId: effectiveExternalSessionId ?? null,
       state: { resume, lastStepId: stepId, error: persistedErrorMessage(error) }
     });
     if (error instanceof AgentFlowSessionRequestError) {
@@ -1105,8 +1155,26 @@ async function executeAgentFlowSessionStep(
       "Session provider external session ID",
       returnedExternalSessionId
     );
+    if (!resume) {
+      throw new AgentFlowSessionRequestError(
+        `Session provider ${provider} returned a persistent external session ID for non-resumable session ${sessionId}.`,
+        "AGENT_FLOW_SESSION_RESPONSE_INVALID"
+      );
+    }
+    if (priorExternalSessionId !== undefined && returnedExternalSessionId !== priorExternalSessionId) {
+      throw new AgentFlowSessionRequestError(
+        `Session provider ${provider} returned an external session ID that differs from the persisted ID for resumable session ${sessionId}.`,
+        "AGENT_FLOW_SESSION_RESPONSE_INVALID"
+      );
+    }
+    if (reportedExternalSessionId !== undefined && returnedExternalSessionId !== reportedExternalSessionId) {
+      throw new AgentFlowSessionRequestError(
+        `Session provider ${provider} returned an external session ID that differs from the ID reported during execution.`,
+        "AGENT_FLOW_SESSION_RESPONSE_INVALID"
+      );
+    }
   }
-  const externalSessionId = returnedExternalSessionId ?? priorExternalSessionId;
+  const externalSessionId = returnedExternalSessionId ?? effectiveExternalSessionId;
   effectiveExternalSessionId = externalSessionId;
   store.upsertSession({
     id: sessionId,
@@ -1326,7 +1394,12 @@ export async function invokeAgentFlowSessionProvider(
   if (initialStatus !== undefined) throw new AgentFlowSessionRequestInterruptedError(initialStatus);
   const initialError = interruptError?.();
   if (initialError !== undefined) throw initialError;
-  if (stopStatus === undefined && interruptError === undefined) return adapter(request);
+  const invokeAdapter = (): Promise<AgentFlowSessionProviderResponse> => Promise.resolve(
+    request.canModifyFiles === true && !isAgentFlowWorkspaceWriteLockManaged(adapter)
+      ? withAgentFlowWorkspaceWriteLock(request.repoRoot!, request.signal, () => Promise.resolve(adapter(request)))
+      : adapter(request)
+  );
+  if (stopStatus === undefined && interruptError === undefined) return invokeAdapter();
 
   const controller = new AbortController();
   request.signal = controller.signal;
@@ -1347,7 +1420,7 @@ export async function invokeAgentFlowSessionProvider(
       }
     }, 25);
   });
-  const adapterResult = Promise.resolve().then(() => adapter(request));
+  const adapterResult = Promise.resolve().then(invokeAdapter);
   try {
     return await Promise.race([adapterResult, interrupted]);
   } catch (error) {

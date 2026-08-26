@@ -69,6 +69,7 @@ agent-flow graph workflow.yml
 agent-flow simulate workflow.yml --fixture fixture.json
 agent-flow run workflow.yml --id example-run
 agent-flow run workflow.yml --id alternate-model --provider drafter=gemma-local
+agent-flow resume example-run --reset-session coder
 agent-flow inject example-run fixer "Additional remediation context"
 agent-flow status example-run
 agent-flow logs example-run
@@ -138,9 +139,13 @@ version: 1
 targets:
   codex-main:
     kind: frontier
-    driver: openai-responses
+    driver: codex-cli
     model: YOUR_CODEX_MODEL
-    api_key_env: OPENAI_API_KEY
+    enabled: true
+  claude-main:
+    kind: frontier
+    driver: claude-code
+    model: YOUR_CLAUDE_MODEL
     enabled: true
   qwen-local:
     kind: local
@@ -177,9 +182,30 @@ API targets name a credential environment variable with `api_key_env`; secrets
 never belong in either YAML file. Use `--provider alias=target` on a new run to
 swap Qwen for Gemma, Claude for Codex, or another same-kind target. See
 [Configure local or cloud models](docs/quickstart.md#configure-local-or-cloud-models)
-for all three built-in HTTP drivers and a multi-model workflow. Native coding
-CLIs remain available only through application-defined custom adapters because
-the built-in boundary sends declared prompt and artifact content only.
+for native CLI and HTTP drivers plus a multi-model workflow. `codex-cli` and
+`claude-code` use the developer's existing CLI installation and login. Native
+targets require an explicit `model`, which Agent Flow fingerprints for safe
+resume instead of inheriting mutable CLI defaults or profiles. Sessions with
+`resume: true` persist the native Codex thread or Claude session across steps.
+If that external session disappears, inspect the paused run and explicitly
+start a fresh native session with
+`agent-flow resume <run-id> --reset-session <session-name>`.
+
+Native CLIs run at the repository root. Read-only sessions use the CLI's
+read-only mode. File-writing sessions require `authority.can_modify_files: true`
+and a non-empty effective `file_scope`; Agent Flow audits all resulting changes
+against every scope layer and fails closed on out-of-scope writes. It does not
+roll those filesystem changes back. Built-in native execution currently
+requires Linux with `bubblewrap` and `flock`; the host sandbox makes the
+checkout read-only unless write authority is granted, keeps `.git` read-only,
+hides `.agent-flow`, and leaves unrelated host paths unmounted. Audited native
+invocations share a per-repository write lock with Agent Flow command steps and
+file-writing custom adapters. The child receives a minimal environment:
+CLI authentication/provider variables, proxy and certificate settings, locale,
+and basic process variables such as `PATH` and `HOME`; unrelated secrets are not
+inherited. The CLI's agent-facing sandbox also denies access to its mounted
+login and session-state directory, and ambient user/project CLI configuration
+is disabled for deterministic execution.
 
 Ordinary custom registrations preserve the previous behavior: Agent Flow pins
 the provider name in the workflow but cannot fingerprint changes inside

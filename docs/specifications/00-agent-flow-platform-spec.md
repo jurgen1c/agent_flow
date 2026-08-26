@@ -354,6 +354,7 @@ agent-flow simulate <workflow>
 agent-flow run <workflow> --input key=value
 agent-flow resume <run-id> --outcome <choice> [--fixture <file>]
 agent-flow resume <run-id> --answer <value> [--fixture <file>]
+agent-flow resume <run-id> --reset-session <session-name> [--fixture <file>] [--config <file>]
 agent-flow status <run-id>
 agent-flow logs <run-id>
 agent-flow artifacts <run-id>

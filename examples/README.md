@@ -14,6 +14,7 @@ These examples show how Agent Flow workflows can start simple and grow into reco
 | `workflows/implement-review-collab.yml` | Collaborative | Implementer/reviewer loop with decision records |
 | `workflows/content-review-collab.yml` | Collaborative | Marketing copy with product approval |
 | `workflows/multi-provider.yml` | Pipeline | Claude/Codex planning and implementation plus swappable Qwen/Gemma local steps |
+| `workflows/native-cli-session.yml` | Pipeline | One durable Codex CLI or Claude Code session implementing, reviewing, and fixing a task |
 
 ## Suggested Demo Order
 
@@ -47,9 +48,11 @@ Use the corresponding fixture directories to substitute `changes-requested.json`
 
 ## Configured Multi-Provider Example
 
-Copy `config/global-providers.yml` to your user Agent Flow config and replace
-the cloud model placeholders. Copy `config/repository-providers.yml` to the
-repository root as `.agent-flow.yml`, then validate before running:
+Copy `config/global-providers.yml` to your user Agent Flow config. Its default
+cloud targets use your existing authenticated Codex CLI and Claude Code
+installations; the same file also shows API-key-backed alternatives. Copy
+`config/repository-providers.yml` to the repository root as `.agent-flow.yml`,
+then validate before running:
 
 ```sh
 agent-flow config validate
@@ -68,6 +71,12 @@ agent-flow run examples/workflows/multi-provider.yml \
   --fixture examples/fixtures/multi-provider/inputs.json \
   --provider local-drafter=gemma-local
 ```
+
+`native-cli-session.yml` uses the `implementer` alias and `resume: true`, so its
+implement, review, and fix steps reuse one native CLI conversation. Point that
+alias at `codex-main` or `claude-main` in `.agent-flow.yml`. The session can edit
+only its declared file scope; customize those paths before using it in another
+repository.
 
 ## Notes
 

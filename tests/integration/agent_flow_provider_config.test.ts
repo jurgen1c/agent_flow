@@ -1,10 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { runCli } from "../../src/cli/router";
 import {
+  buildAgentFlowRunActionSnapshot,
+  createAgentFlowConfiguredProviderAdapter,
   createAgentFlowConfiguredProviderRegistry,
   createAgentFlowLifecycleRun,
+  createAgentFlowSessionProviderRegistry,
   createAgentFlowWorkflowRegistry,
   doctorAgentFlowProviderCatalog,
   executeAgentFlowCommandPipeline,
@@ -19,8 +24,87 @@ import {
   validateAgentFlowWorkflow,
   type AgentFlowSessionProviderRequest
 } from "../../src/runtime";
+import { runAgentFlowNativeProviderDoctorProbe } from "../../src/runtime/provider_config";
+import { nativeExecutableMountPaths } from "../../src/runtime/provider_drivers";
 
 describe("Agent Flow configured providers", () => {
+  test("fails closed when programmatic bindings contain an unsupported driver", () => {
+    expect(() => createAgentFlowConfiguredProviderAdapter({
+      alias: "future",
+      target: "future",
+      kind: "frontier",
+      fingerprint: "sha256:test",
+      config: {
+        kind: "frontier",
+        driver: "future-driver",
+        model: "future-model",
+        enabled: true
+      }
+    } as never)).toThrow("Unsupported configured provider driver");
+  });
+
+  test("bounds native CLI doctor probes", () => {
+    if (process.platform !== "linux") return;
+
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-flow-doctor-timeout-"));
+    try {
+      const bin = path.join(root, "bin");
+      fs.mkdirSync(bin);
+      const codex = path.join(bin, "codex");
+      fs.writeFileSync(codex, "#!/bin/sh\nexec /bin/sleep 30\n");
+      fs.chmodSync(codex, 0o755);
+      const startedAt = Date.now();
+      const result = runAgentFlowNativeProviderDoctorProbe(
+        codex,
+        ["--version"],
+        { PATH: `${bin}:/usr/bin:/bin` },
+        50
+      );
+
+      const elapsed = Date.now() - startedAt;
+      expect(elapsed).toBeGreaterThanOrEqual(40);
+      expect(elapsed).toBeLessThan(2_000);
+      expect((result.error as NodeJS.ErrnoException | undefined)?.code).toBe("ETIMEDOUT");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("uses the configured HOME for asdf tool-version mounts", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-flow-asdf-home-"));
+    try {
+      const home = path.join(root, "configured-home");
+      const bin = path.join(root, "bin");
+      const shims = path.join(home, ".asdf", "shims");
+      fs.mkdirSync(bin);
+      fs.mkdirSync(shims, { recursive: true });
+      const executable = path.join(bin, "codex");
+      const interpreter = path.join(shims, "node");
+      const asdf = path.join(bin, "asdf");
+      const toolVersions = path.join(home, ".tool-versions");
+      fs.writeFileSync(executable, "#!/usr/bin/env node\n");
+      fs.writeFileSync(interpreter, "#!/bin/sh\n");
+      fs.writeFileSync(asdf, "#!/bin/sh\n");
+      fs.writeFileSync(toolVersions, "nodejs 24.0.0\n");
+      for (const candidate of [executable, interpreter, asdf]) fs.chmodSync(candidate, 0o755);
+
+      expect(nativeExecutableMountPaths(
+        "codex",
+        executable,
+        `${shims}${path.delimiter}${bin}`,
+        home
+      )).toContain(toolVersions);
+      expect(nativeExecutableMountPaths(
+        "codex",
+        executable,
+        shims,
+        home
+      )).toEqual([executable, path.join(home, ".asdf"), toolVersions]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("loads global targets, resolves repo aliases, and applies kind-safe overrides", () => {
     const { repo, home, globalConfig } = configuredRepo();
     const catalog = loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} });
@@ -110,6 +194,20 @@ providers:
       model: "model",
       fingerprint: "sha256:test"
     }, async () => ({ outputs: {} }))).toThrow("non-secret identifier");
+    expect(() => registry.registerConfigured({
+      name: "local-native",
+      kind: "local",
+      target: "codex",
+      driver: "codex-cli",
+      fingerprint: "sha256:test"
+    }, async () => ({ outputs: {} }))).toThrow("must declare frontier kind");
+    expect(() => registry.registerConfigured({
+      name: "native-without-model",
+      kind: "frontier",
+      target: "codex",
+      driver: "codex-cli",
+      fingerprint: "sha256:test"
+    } as never, async () => ({ outputs: {} }))).toThrow("Configured session provider model must be a non-empty string");
   });
 
   test("exposes config validation and redacted provider inspection through the CLI", async () => {
@@ -293,11 +391,14 @@ targets:
   codex:
     kind: frontier
     driver: codex-cli
-    model: gpt-test
     enabled: true
 `);
+    fs.writeFileSync(path.join(repo, ".agent-flow.yml"), `version: 1
+providers:
+  coder: { kind: frontier, target: codex }
+`);
     expect(() => loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} }))
-      .toThrow("Expected one of: openai-responses, anthropic-messages, openai-compatible");
+      .toThrow("Value must be a canonical non-empty string");
 
     fs.writeFileSync(globalConfig, `version: 1
 targets:
@@ -312,7 +413,23 @@ providers:
   local-coder: { kind: local, target: codex-local }
 `);
     expect(() => loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} }))
-      .toThrow("Expected one of: openai-responses, anthropic-messages, openai-compatible");
+      .toThrow("codex-cli targets must be frontier");
+
+    fs.writeFileSync(globalConfig, `version: 1
+targets:
+  claude:
+    kind: frontier
+    driver: claude-code
+    model: claude-test
+    profile: unsupported
+    enabled: true
+`);
+    fs.writeFileSync(path.join(repo, ".agent-flow.yml"), `version: 1
+providers:
+  reviewer: { kind: frontier, target: claude }
+`);
+    expect(() => loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} }))
+      .toThrow("Unknown field: profile");
 
     fs.writeFileSync(globalConfig, `version: 1
 targets:
@@ -389,8 +506,9 @@ limits: { max_model_calls: 2, max_frontier_calls: 1 }
       path.join(import.meta.dir, "../../schemas/config.schema.json"),
       "utf8"
     )) as {
-      $defs: { target: { allOf: Array<Record<string, unknown>> } };
+      $defs: { target: { required: string[]; allOf: Array<Record<string, unknown>> } };
     };
+    expect(schema.$defs.target.required).toEqual(["kind", "driver", "model", "enabled"]);
     const constraints = schema.$defs.target.allOf.filter((entry) => {
       const condition = entry.if as { properties?: { kind?: { const?: string } } } | undefined;
       return condition?.properties?.kind?.const === "local" || condition?.properties?.kind?.const === "frontier";
@@ -411,6 +529,11 @@ limits: { max_model_calls: 2, max_frontier_calls: 1 }
     expect(patterns.frontier?.test("https://user:secret@api.example.com/v1")).toBe(false);
     expect(patterns.frontier?.test("https://api.example.com/v1?token=secret")).toBe(false);
     expect(patterns.frontier?.test("https://api.example.com/v1#secret")).toBe(false);
+    const nativeConstraint = schema.$defs.target.allOf.find((entry) => {
+      const condition = entry.if as { properties?: { driver?: { enum?: string[] } } } | undefined;
+      return condition?.properties?.driver?.enum?.includes("codex-cli") === true;
+    }) as { then?: { not?: { required?: string[] } } } | undefined;
+    expect(nativeConstraint?.then?.not?.required).toEqual(["api_key_env"]);
   });
 
   test("invokes OpenAI-compatible local targets with exact structured outputs", async () => {
@@ -548,6 +671,624 @@ providers:
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+
+  test("hardens native state and classifies certificate and workspace preparation failures", async () => {
+    if (process.platform !== "linux" || !fs.existsSync("/usr/bin/flock")) return;
+
+    const { repo, home, globalConfig } = configuredRepo();
+    try {
+      const fake = installFakeAgentClis(path.dirname(repo));
+      fs.chmodSync(fake.root, 0o755);
+      fs.writeFileSync(globalConfig, `version: 1
+targets:
+  codex: { kind: frontier, driver: codex-cli, model: codex-test, enabled: true }
+`);
+      fs.writeFileSync(path.join(repo, ".agent-flow.yml"), `version: 1
+providers:
+  coder: { kind: frontier, target: codex }
+`);
+      const env = {
+        PATH: `${fake.bin}:${process.env.PATH ?? ""}`,
+        CODEX_HOME: fake.root,
+        NODE_EXTRA_CA_CERTS: path.join(path.dirname(repo), "missing-ca.pem")
+      };
+      const registry = createAgentFlowConfiguredProviderRegistry(
+        loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env }),
+        { env }
+      );
+      const request = {
+        ...providerRequest(repo),
+        provider: "coder",
+        providerKind: "frontier" as const
+      };
+
+      await expect(registry.get("coder")!(request)).rejects.toMatchObject({
+        code: "AGENT_FLOW_CONFIGURED_PROVIDER",
+        message: "Could not resolve NODE_EXTRA_CA_CERTS certificate path."
+      });
+      expect(fs.statSync(fake.root).mode & 0o7777).toBe(0o700);
+      expect(fs.existsSync(fake.log)).toBe(false);
+
+      const runtimeDirectory = path.join(repo, ".agent-flow");
+      const lockTarget = path.join(path.dirname(repo), "unsafe-lock-target");
+      fs.rmSync(runtimeDirectory, { recursive: true, force: true });
+      fs.mkdirSync(lockTarget);
+      fs.symlinkSync(lockTarget, runtimeDirectory, "dir");
+      await expect(registry.get("coder")!(request)).rejects.toMatchObject({
+        code: "AGENT_FLOW_CONFIGURED_PROVIDER",
+        message: expect.stringContaining("Could not secure the native provider workspace")
+      });
+    } finally {
+      fs.rmSync(path.dirname(repo), { recursive: true, force: true });
+    }
+  });
+
+  test("invokes Codex CLI and Claude Code with durable native sessions", async () => {
+    const { repo, home, globalConfig } = configuredRepo();
+    const fake = installFakeAgentClis(path.dirname(repo));
+    fs.writeFileSync(globalConfig, `version: 1
+targets:
+  codex:
+    kind: frontier
+    driver: codex-cli
+    model: codex-test
+    enabled: true
+  claude:
+    kind: frontier
+    driver: claude-code
+    model: claude-test
+    enabled: true
+`);
+    fs.writeFileSync(path.join(repo, ".agent-flow.yml"), `version: 1
+providers:
+  coder: { kind: frontier, target: codex }
+  reviewer: { kind: frontier, target: claude }
+`);
+    const env = {
+      PATH: `${fake.bin}:${process.env.PATH ?? ""}`,
+      CODEX_HOME: fake.root,
+      CLAUDE_CONFIG_DIR: fake.root,
+      UNRELATED_SECRET: "must-not-reach-native-agents"
+    };
+    const catalog = loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env });
+    const doctor = doctorAgentFlowProviderCatalog(catalog, env);
+    expect(doctor.ok).toBe(true);
+    expect(doctor.lines.join("\n")).toContain("coder: ready (codex-cli");
+    expect(doctor.lines.join("\n")).toContain("reviewer: ready (claude-code");
+    const doctorWithoutConfiguredEnvironment = doctorAgentFlowProviderCatalog(catalog, {});
+    expect(doctorWithoutConfiguredEnvironment.ok).toBe(false);
+    expect(doctorWithoutConfiguredEnvironment.lines.join("\n")).toContain("executable is unavailable");
+    const registry = createAgentFlowConfiguredProviderRegistry(catalog, { env });
+
+    const codexIds: string[] = [];
+    const splitUtf8Marker = path.join(fake.root, "split-utf8-thread");
+    fs.writeFileSync(splitUtf8Marker, "split\n");
+    const codexRequest = {
+      ...providerRequest(repo),
+      provider: "coder",
+      providerKind: "frontier" as const,
+      resume: true,
+      reportExternalSessionId: (id: string) => codexIds.push(id)
+    };
+    const firstCodex = await registry.get("coder")!(codexRequest);
+    expect(firstCodex).toMatchObject({
+      outputs: { "draft.md": "codex output\n" },
+      externalSessionId: "codex-thread-🚀",
+      metadata: { driver: "codex-cli", cli: "codex" }
+    });
+    expect(firstCodex.metadata).toHaveProperty("modelHash", hashAgentFlowProviderModel("codex-test"));
+    fs.rmSync(splitUtf8Marker);
+    await registry.get("coder")!({ ...codexRequest, externalSessionId: "codex-thread-🚀" });
+    expect(codexIds).toEqual(["codex-thread-🚀", "codex-thread-🚀"]);
+
+    const claudeIds: string[] = [];
+    fs.writeFileSync(fake.failClaudeCreateOnce, "fail\n");
+    await expect(registry.get("reviewer")!({
+      ...providerRequest(repo),
+      provider: "reviewer",
+      providerKind: "frontier",
+      resume: true,
+      reportExternalSessionId: (id) => claudeIds.push(id)
+    })).rejects.toThrow("Claude Code exited with status 1");
+    expect(claudeIds).toEqual([]);
+    const firstClaude = await registry.get("reviewer")!({
+      ...providerRequest(repo),
+      provider: "reviewer",
+      providerKind: "frontier",
+      resume: true,
+      reportExternalSessionId: (id) => claudeIds.push(id)
+    });
+    expect(firstClaude).toMatchObject({
+      outputs: { "draft.md": "claude output\n" },
+      metadata: { driver: "claude-code", cli: "claude" }
+    });
+    expect(firstClaude.externalSessionId).toMatch(/^[0-9a-f-]{36}$/);
+    await registry.get("reviewer")!({
+      ...providerRequest(repo),
+      provider: "reviewer",
+      providerKind: "frontier",
+      resume: true,
+      externalSessionId: firstClaude.externalSessionId,
+      reportExternalSessionId: (id) => claudeIds.push(id)
+    });
+    expect(claudeIds).toEqual([firstClaude.externalSessionId, firstClaude.externalSessionId]);
+
+    const invocations = fs.readFileSync(fake.log, "utf8").trim().split("\n")
+      .map((line) => JSON.parse(line) as { cli: string; args: string[]; unrelatedSecret?: string });
+    expect(invocations[0]).toMatchObject({ cli: "codex" });
+    expect(invocations[0]!.args).toContain("--ignore-user-config");
+    expect(invocations[0]!.args).toContain("--ignore-rules");
+    expect(invocations[0]!.args).toContain("--model");
+    expect(invocations[0]!.args).toContain("codex-test");
+    expect(invocations[0]!.args.join(" ")).toContain("default_permissions=\"agent_flow_native\"");
+    expect(invocations[0]!.args.join(" ")).toContain(`${JSON.stringify(fake.root)} = "deny"`);
+    expect(invocations[1]!.args).toContain("resume");
+    expect(invocations[1]!.args).toContain("codex-test");
+    expect(invocations[3]!.args).toContain("--session-id");
+    expect(invocations[4]!.args).toContain("--resume");
+    expect(invocations[3]!.args).toContain("--setting-sources");
+    expect(invocations[3]!.args).toContain("");
+    expect(invocations[3]!.args).toContain("claude-test");
+    expect(invocations[3]!.args).toContain("--strict-mcp-config");
+    const claudeSettings = JSON.parse(invocations[3]!.args[invocations[3]!.args.indexOf("--settings") + 1]!);
+    expect(claudeSettings).toMatchObject({
+      sandbox: {
+        enabled: true,
+        failIfUnavailable: true,
+        allowUnsandboxedCommands: false,
+        filesystem: { denyRead: [fake.root], denyWrite: [fake.root] }
+      }
+    });
+    expect(invocations.every((invocation) => invocation.unrelatedSecret === undefined)).toBe(true);
+
+    fs.writeFileSync(fake.failClaudeResumeOnce, "fail\n");
+    await expect(registry.get("reviewer")!({
+      ...providerRequest(repo),
+      provider: "reviewer",
+      providerKind: "frontier",
+      resume: true,
+      externalSessionId: firstClaude.externalSessionId
+    })).rejects.toMatchObject({ code: "AGENT_FLOW_PROVIDER_SESSION_UNAVAILABLE" });
+  });
+
+  test("preserves Claude Code's default login file while isolating it from model tools", async () => {
+    const { repo, home, globalConfig } = configuredRepo();
+    const fake = installFakeAgentClis(path.dirname(repo));
+    const claudeHome = path.join(path.dirname(repo), "claude-home");
+    const claudeState = path.join(claudeHome, ".claude");
+    const claudeLogin = path.join(claudeHome, ".claude.json");
+    fs.mkdirSync(claudeState, { recursive: true });
+    fs.writeFileSync(claudeLogin, '{"login":"existing"}\n', { mode: 0o600 });
+    fs.writeFileSync(globalConfig, `version: 1
+targets:
+  claude: { kind: frontier, driver: claude-code, model: claude-test, enabled: true }
+`);
+    fs.writeFileSync(path.join(repo, ".agent-flow.yml"), `version: 1
+providers:
+  reviewer: { kind: frontier, target: claude }
+`);
+    const env = {
+      PATH: `${fake.bin}:${process.env.PATH ?? ""}`,
+      HOME: claudeHome
+    };
+    const registry = createAgentFlowConfiguredProviderRegistry(
+      loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env }),
+      { env }
+    );
+
+    const response = await registry.get("reviewer")!({
+      ...providerRequest(repo),
+      provider: "reviewer",
+      providerKind: "frontier"
+    });
+    expect(response).toMatchObject({ outputs: { "draft.md": "claude output\n" } });
+
+    const invocation = JSON.parse(fs.readFileSync(path.join(claudeState, "invocations.jsonl"), "utf8")) as {
+      args: string[];
+      configDir?: string;
+      defaultConfigContent?: string;
+    };
+    expect(invocation.configDir).toBeUndefined();
+    expect(invocation.defaultConfigContent).toBe('{"login":"existing"}\n');
+    const settings = JSON.parse(invocation.args[invocation.args.indexOf("--settings") + 1]!);
+    expect(settings.sandbox.filesystem).toEqual({
+      denyRead: [fs.realpathSync(claudeState), fs.realpathSync(claudeLogin)],
+      denyWrite: [fs.realpathSync(claudeState), fs.realpathSync(claudeLogin)]
+    });
+  });
+
+  test("persists fresh native state and mounts Codex optional platform packages", async () => {
+    const { repo, home, globalConfig } = configuredRepo();
+    const packaged = installPackagedCodex(path.dirname(repo));
+    const state = path.join(path.dirname(repo), "fresh-codex-state");
+    fs.writeFileSync(globalConfig, `version: 1
+targets:
+  codex: { kind: frontier, driver: codex-cli, model: codex-test, enabled: true }
+`);
+    fs.writeFileSync(path.join(repo, ".agent-flow.yml"), `version: 1
+providers:
+  coder: { kind: frontier, target: codex }
+`);
+    const env = {
+      PATH: `${packaged.bin}:${process.env.PATH ?? ""}`,
+      CODEX_HOME: state
+    };
+    const registry = createAgentFlowConfiguredProviderRegistry(
+      loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env }),
+      { env }
+    );
+    const request = {
+      ...providerRequest(repo),
+      provider: "coder",
+      providerKind: "frontier" as const,
+      resume: true
+    };
+
+    const first = await registry.get("coder")!(request);
+    expect(first).toMatchObject({
+      outputs: { "draft.md": "packaged codex output\n" },
+      externalSessionId: "packaged-thread-1"
+    });
+    expect(fs.statSync(state).mode & 0o777).toBe(0o700);
+    expect(fs.readFileSync(path.join(state, "invocations"), "utf8")).toBe("1\n");
+    await expect(registry.get("coder")!({
+      ...request,
+      externalSessionId: "packaged-thread-1"
+    })).resolves.toMatchObject({ externalSessionId: "packaged-thread-1" });
+    expect(fs.readFileSync(path.join(state, "invocations"), "utf8")).toBe("1\n2\n");
+  });
+
+  test("audits native CLI writes against the effective file scope", async () => {
+    const { repo, home, globalConfig } = configuredRepo();
+    const fake = installFakeAgentClis(path.dirname(repo));
+    fs.writeFileSync(globalConfig, `version: 1
+targets:
+  codex: { kind: frontier, driver: codex-cli, model: codex-test, enabled: true }
+`);
+    fs.writeFileSync(path.join(repo, ".agent-flow.yml"), `version: 1
+providers:
+  coder: { kind: frontier, target: codex }
+`);
+    const target = path.join(repo, "outside.txt");
+    fs.writeFileSync(path.join(fake.root, "write-path"), `${target}\n`);
+    const env = {
+      PATH: `${fake.bin}:${process.env.PATH ?? ""}`,
+      CODEX_HOME: fake.root
+    };
+    const registry = createAgentFlowConfiguredProviderRegistry(
+      loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env }),
+      { env }
+    );
+    await expect(registry.get("coder")!({
+      ...providerRequest(repo),
+      provider: "coder",
+      providerKind: "frontier",
+      canModifyFiles: true
+    })).rejects.toThrow("requires a non-empty file scope");
+    expect(fs.existsSync(fake.log)).toBe(false);
+
+    await expect(registry.get("coder")!({
+      ...providerRequest(repo),
+      provider: "coder",
+      providerKind: "frontier",
+      canModifyFiles: true,
+      fileScope: { layers: [{ include: ["src/**"], exclude: [] }] }
+    })).rejects.toThrow("changed files outside its authorized scope: outside.txt");
+    expect(fs.readFileSync(target, "utf8")).toBe("changed by fake CLI\n");
+  });
+
+  test("host-sandboxes native CLI writes outside the checkout and runtime metadata", async () => {
+    const { repo, home, globalConfig } = configuredRepo();
+    const fake = installFakeAgentClis(path.dirname(repo));
+    fs.writeFileSync(globalConfig, `version: 1
+targets:
+  codex: { kind: frontier, driver: codex-cli, model: codex-test, enabled: true }
+`);
+    fs.writeFileSync(path.join(repo, ".agent-flow.yml"), `version: 1
+providers:
+  coder: { kind: frontier, target: codex }
+`);
+    const certificatePath = path.join(path.dirname(repo), "custom-ca.pem");
+    fs.writeFileSync(certificatePath, "custom certificate\n");
+    const env = {
+      PATH: `${fake.bin}:${process.env.PATH ?? ""}`,
+      CODEX_HOME: fake.root,
+      NODE_EXTRA_CA_CERTS: certificatePath
+    };
+    const registry = createAgentFlowConfiguredProviderRegistry(
+      loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env }),
+      { env }
+    );
+    const request = {
+      ...providerRequest(repo),
+      provider: "coder",
+      providerKind: "frontier" as const,
+      canModifyFiles: true,
+      fileScope: { layers: [{ include: ["**"], exclude: [] }] }
+    };
+
+    const outsideTarget = path.join(path.dirname(repo), "outside-checkout.txt");
+    fs.writeFileSync(path.join(fake.root, "write-path"), `${outsideTarget}\n`);
+    await expect(registry.get("coder")!(request)).resolves.toMatchObject({
+      outputs: { "draft.md": "codex output\n" }
+    });
+    expect(fs.existsSync(outsideTarget)).toBe(false);
+    expect(JSON.parse(fs.readFileSync(fake.log, "utf8").trim().split("\n").at(-1)!).certificateContent)
+      .toBe("custom certificate\n");
+
+    const runtimeDirectory = path.join(repo, ".agent-flow");
+    fs.mkdirSync(runtimeDirectory, { recursive: true });
+    const runtimeTarget = path.join(runtimeDirectory, "native-attempt.txt");
+    fs.writeFileSync(path.join(fake.root, "write-path"), `${runtimeTarget}\n`);
+    await expect(registry.get("coder")!(request)).rejects.toThrow(/read-only file system|EROFS|permission denied|EACCES/);
+    expect(fs.existsSync(runtimeTarget)).toBe(false);
+    fs.rmSync(path.join(fake.root, "write-path"), { force: true });
+
+    const hostSecret = path.join(path.dirname(repo), "host-secret.txt");
+    fs.writeFileSync(hostSecret, "must stay hidden\n", { mode: 0o600 });
+    fs.writeFileSync(path.join(runtimeDirectory, "runtime-secret.txt"), "must also stay hidden\n", { mode: 0o600 });
+    for (const hiddenPath of [hostSecret, path.join(runtimeDirectory, "runtime-secret.txt")]) {
+      fs.writeFileSync(path.join(fake.root, "read-path"), `${hiddenPath}\n`);
+      await expect(registry.get("coder")!(request)).resolves.toMatchObject({
+        outputs: { "draft.md": "codex output\n" }
+      });
+      const invocation = JSON.parse(fs.readFileSync(fake.log, "utf8").trim().split("\n").at(-1)!) as {
+        hostRead?: string;
+      };
+      expect(invocation.hostRead).toBeUndefined();
+    }
+    fs.rmSync(path.join(fake.root, "read-path"), { force: true });
+
+    const sharedMemoryTarget = path.join("/dev/shm", `agent-flow-${path.basename(repo)}.txt`);
+    try {
+      fs.writeFileSync(path.join(fake.root, "write-path"), `${sharedMemoryTarget}\n`);
+      await expect(registry.get("coder")!(request)).resolves.toMatchObject({
+        outputs: { "draft.md": "codex output\n" }
+      });
+      expect(fs.existsSync(sharedMemoryTarget)).toBe(false);
+    } finally {
+      fs.rmSync(sharedMemoryTarget, { force: true });
+    }
+  });
+
+  test("supports linked Git worktrees and symlinked native CLI state", async () => {
+    const parent = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-native-paths-"));
+    const main = path.join(parent, "main");
+    const repo = path.join(parent, "worktree");
+    const home = path.join(parent, "home");
+    const globalConfig = path.join(home, ".config", "agent-flow", "config.yml");
+    fs.mkdirSync(main, { recursive: true });
+    fs.mkdirSync(path.dirname(globalConfig), { recursive: true });
+    execFileSync("git", ["init", "--quiet"], { cwd: main });
+    execFileSync("git", ["config", "user.email", "agent-flow@example.test"], { cwd: main });
+    execFileSync("git", ["config", "user.name", "Agent Flow Test"], { cwd: main });
+    fs.writeFileSync(path.join(main, "tracked.txt"), "tracked\n");
+    execFileSync("git", ["add", "tracked.txt"], { cwd: main });
+    execFileSync("git", ["commit", "--quiet", "-m", "Initial"], { cwd: main });
+    execFileSync("git", ["worktree", "add", "--quiet", "-b", "native-test", repo], { cwd: main });
+
+    const fake = installFakeAgentClis(parent);
+    const stateLink = path.join(parent, "codex-state");
+    fs.symlinkSync(fake.root, stateLink, "dir");
+    fs.writeFileSync(path.join(fake.root, "require-git-status"), "required\n");
+    fs.writeFileSync(globalConfig, `version: 1\ntargets:\n  codex: { kind: frontier, driver: codex-cli, model: codex-test, enabled: true }\n`);
+    fs.writeFileSync(path.join(repo, ".agent-flow.yml"), `version: 1\nproviders:\n  coder: { kind: frontier, target: codex }\n`);
+    const env = {
+      PATH: `${fake.bin}:${process.env.PATH ?? ""}`,
+      CODEX_HOME: stateLink
+    };
+    const registry = createAgentFlowConfiguredProviderRegistry(
+      loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env }),
+      { env }
+    );
+
+    await expect(registry.get("coder")!({
+      ...providerRequest(repo),
+      provider: "coder",
+      providerKind: "frontier"
+    })).resolves.toMatchObject({ outputs: { "draft.md": "codex output\n" } });
+    expect(fs.readFileSync(fake.log, "utf8")).toContain('"cli":"codex"');
+  });
+
+  test("serializes native workspace audits with every Agent Flow repository writer", async () => {
+    const { repo, home, globalConfig } = configuredRepo();
+    const fake = installFakeAgentClis(path.dirname(repo));
+    fs.writeFileSync(globalConfig, `version: 1
+targets:
+  codex: { kind: frontier, driver: codex-cli, model: codex-test, enabled: true }
+`);
+    fs.writeFileSync(path.join(repo, ".agent-flow.yml"), `version: 1
+providers:
+  coder: { kind: frontier, target: codex }
+`);
+    const target = path.join(repo, "concurrent-change.txt");
+    fs.writeFileSync(path.join(fake.root, "concurrency-path"), `${target}\n`);
+    fs.writeFileSync(path.join(repo, "custom.md"), "Write another file.\n");
+    const env = { PATH: `${fake.bin}:${process.env.PATH ?? ""}`, CODEX_HOME: fake.root };
+    const registry = createAgentFlowConfiguredProviderRegistry(
+      loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env }),
+      { env }
+    );
+    const writable = registry.get("coder")!({
+      ...providerRequest(repo),
+      provider: "coder",
+      providerKind: "frontier",
+      canModifyFiles: true,
+      fileScope: { layers: [{ include: ["concurrent-change.txt"], exclude: [] }] }
+    });
+    await waitForPath(path.join(fake.root, "concurrency-started"));
+    const commandWorkflow = parseAgentFlowWorkflowOrThrow(`name: concurrent-command
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: write
+    type: command
+    command: "printf 'command output\\n' > command-change.txt"
+    timeout_seconds: 2
+    on_failure: { then: fail }
+`);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, { id: "concurrent-command", workflow: commandWorkflow });
+    const command = executeAgentFlowCommandPipeline(store, "concurrent-command", commandWorkflow);
+    const customWorkflow = parseAgentFlowWorkflowOrThrow(`name: concurrent-custom
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  writer:
+    provider: custom
+    authority: { can_modify_files: true }
+    file_scope: { include: [custom-change.txt] }
+steps:
+  - id: write
+    type: session_request
+    session: writer
+    prompt: custom.md
+    inputs: [request.md]
+    outputs: [custom-summary.md]
+limits: { max_model_calls: 1 }
+`);
+    createAgentFlowLifecycleRun(store, { id: "concurrent-custom", workflow: customWorkflow });
+    store.writeArtifact({
+      id: "concurrent-custom-request",
+      runId: "concurrent-custom",
+      path: "request.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Write it.\n"
+    });
+    const customProviders = createAgentFlowSessionProviderRegistry().register("custom", async () => {
+      fs.writeFileSync(path.join(repo, "custom-change.txt"), "custom output\n");
+      return { outputs: { "custom-summary.md": "done\n" } };
+    });
+    const custom = executeAgentFlowCommandPipeline(
+      store, "concurrent-custom", customWorkflow, undefined, customProviders
+    );
+    const [, commandResult, customResult] = await Promise.all([writable, command, custom]);
+    expect(commandResult.status).toBe("completed");
+    expect(customResult.status).toBe("completed");
+    expect(fs.readFileSync(target, "utf8")).toBe("changed by first fake CLI\n");
+    expect(fs.readFileSync(path.join(repo, "command-change.txt"), "utf8")).toBe("command output\n");
+    expect(fs.readFileSync(path.join(repo, "custom-change.txt"), "utf8")).toBe("custom output\n");
+    store.close();
+  });
+
+  test("pauses for a missing Codex thread and resumes only after an explicit session reset", async () => {
+    const { repo, globalConfig } = configuredRepo();
+    const fake = installFakeAgentClis(path.dirname(repo));
+    fs.writeFileSync(globalConfig, `version: 1
+targets:
+  codex: { kind: frontier, driver: codex-cli, model: codex-test, enabled: true }
+`);
+    fs.writeFileSync(path.join(repo, ".agent-flow.yml"), `version: 1
+providers:
+  coder: { kind: frontier, target: codex }
+`);
+    fs.writeFileSync(path.join(repo, "prompt.md"), "Work on the current task.\n");
+    fs.writeFileSync(path.join(repo, "inputs.json"), JSON.stringify({ artifacts: { "request.md": "Implement this." } }));
+    fs.writeFileSync(path.join(repo, "workflow.yml"), `name: native-session-reset
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  writer: { provider: coder, resume: true }
+steps:
+  - { id: implement, type: session_request, session: writer, prompt: prompt.md, inputs: [request.md], outputs: [implementation.md] }
+  - { id: review, type: session_request, session: writer, prompt: prompt.md, inputs: [implementation.md], outputs: [review.md] }
+limits: { max_model_calls: 3, max_frontier_calls: 3 }
+`);
+    fs.writeFileSync(fake.failResumeOnce, "fail\n");
+    const env = { PATH: `${fake.bin}:${process.env.PATH ?? ""}`, CODEX_HOME: fake.root };
+    const started = await captureCli([
+      "run", "workflow.yml", "--id", "native-reset", "--config", globalConfig, "--fixture", "inputs.json"
+    ], repo, env);
+    expect(started).toMatchObject({ exitCode: 3 });
+    expect(started.stdout).toContain("Status: paused");
+
+    const pausedStore = await openAgentFlowRunState({ cwd: repo });
+    expect(pausedStore.getSession("native-reset", "writer")?.externalSessionId).toBe("codex-thread-1");
+    expect(pausedStore.getRun("native-reset")?.context.waiting).toMatchObject({
+      kind: "provider_session",
+      sessionId: "writer",
+      reason: "external_session_unavailable"
+    });
+    expect(pausedStore.listEvents("native-reset").map((event) => event.type)).toContain("session.external_unavailable");
+    const snapshot = buildAgentFlowRunActionSnapshot(pausedStore, "native-reset");
+    expect(snapshot.waiting).toMatchObject({ kind: "provider_session", sessionId: "writer" });
+    expect(snapshot.actions.find((action) => action.action === "resume")).toMatchObject({
+      enabled: false,
+      reason: expect.stringContaining("--reset-session writer")
+    });
+    pausedStore.close();
+
+    const reset = await captureCli([
+      "resume", "native-reset", "--reset-session", "writer", "--config", globalConfig
+    ], repo, env);
+    expect(reset).toMatchObject({ exitCode: 0 });
+    expect(reset.stdout).toContain("Status: completed");
+    const completedStore = await openAgentFlowRunState({ cwd: repo });
+    expect(completedStore.getSession("native-reset", "writer")?.externalSessionId).toBe("codex-thread-2");
+    expect(completedStore.listEvents("native-reset").map((event) => event.type)).toContain("session.external_reset");
+    completedStore.close();
+  });
+
+  test("routes a missing native recovery session through explicit reset", async () => {
+    const { repo, globalConfig } = configuredRepo();
+    const fake = installFakeAgentClis(path.dirname(repo));
+    fs.writeFileSync(globalConfig, `version: 1
+targets:
+  codex: { kind: frontier, driver: codex-cli, model: codex-test, enabled: true }
+`);
+    fs.writeFileSync(path.join(repo, ".agent-flow.yml"), `version: 1
+providers:
+  coder: { kind: frontier, target: codex }
+`);
+    fs.writeFileSync(path.join(repo, "fix.md"), "Repair the failed check.\n");
+    fs.writeFileSync(path.join(repo, "workflow.yml"), `name: native-recovery-session-reset
+version: 1
+style: recovery_pipeline
+maturity: experimental
+sessions:
+  fixer: { provider: coder, resume: true }
+steps:
+  - id: check
+    type: command
+    command: "false"
+    on_failure:
+      route_to: { session: fixer, prompt: fix.md }
+      on_remediated: { return_to: check }
+      on_unresolved: { then: pause }
+limits:
+  max_model_calls: 3
+  max_frontier_calls: 3
+  max_recovery_cycles: 3
+  max_step_attempts: { check: 3 }
+`);
+    fs.writeFileSync(fake.failResumeOnce, "fail\n");
+    const env = { PATH: `${fake.bin}:${process.env.PATH ?? ""}`, CODEX_HOME: fake.root };
+
+    const started = await captureCli([
+      "run", "workflow.yml", "--id", "native-recovery-reset", "--config", globalConfig
+    ], repo, env);
+    expect(started).toMatchObject({ exitCode: 3 });
+    const pausedStore = await openAgentFlowRunState({ cwd: repo });
+    expect(pausedStore.getRun("native-recovery-reset")?.context.waiting).toMatchObject({
+      kind: "provider_session",
+      stepId: "check",
+      sessionId: "fixer"
+    });
+    pausedStore.close();
+
+    const reset = await captureCli([
+      "resume", "native-recovery-reset", "--reset-session", "fixer", "--config", globalConfig
+    ], repo, env);
+    expect(reset.stderr).not.toContain("waiting state does not match");
+    const resetStore = await openAgentFlowRunState({ cwd: repo });
+    expect(resetStore.listEvents("native-recovery-reset").map((event) => event.type))
+      .toContain("session.external_reset");
+    resetStore.close();
   });
 
   test("resolves aliases for whitespace-normalized review step types", async () => {
@@ -1207,12 +1948,204 @@ function providerRequest(repoRoot: string): AgentFlowSessionProviderRequest {
   };
 }
 
-async function captureCli(args: string[], cwd: string): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+function installFakeAgentClis(parent: string): {
+  root: string;
+  bin: string;
+  log: string;
+  failResumeOnce: string;
+  failClaudeResumeOnce: string;
+  failClaudeCreateOnce: string;
+} {
+  const root = fs.mkdtempSync(path.join(parent, "fake-agent-clis-"));
+  const bin = path.join(root, "bin");
+  const log = path.join(root, "invocations.jsonl");
+  const failResumeOnce = path.join(root, "fail-resume-once");
+  const failClaudeResumeOnce = path.join(root, "fail-claude-resume-once");
+  const failClaudeCreateOnce = path.join(root, "fail-claude-create-once");
+  fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(bin, "codex"), String.raw`#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+const args = process.argv.slice(2);
+if (args[0] === "--version") { console.log("codex-cli 0.test"); process.exit(0); }
+if (args[0] === "login" && args[1] === "status") { console.log("Logged in"); process.exit(0); }
+const root = process.env.CODEX_HOME;
+let certificateContent;
+if (process.env.NODE_EXTRA_CA_CERTS) {
+  try { certificateContent = fs.readFileSync(process.env.NODE_EXTRA_CA_CERTS, "utf8"); } catch {}
+}
+const gitMarker = path.join(root, "require-git-status");
+if (fs.existsSync(gitMarker)) {
+  const git = require("node:child_process").spawnSync("git", ["status", "--short"], {
+    cwd: process.cwd(),
+    encoding: "utf8"
+  });
+  if (git.status !== 0) {
+    fs.writeSync(2, git.stderr || "git status failed\n");
+    process.exit(1);
+  }
+}
+const readMarker = path.join(root, "read-path");
+let hostRead;
+if (fs.existsSync(readMarker)) {
+  try { hostRead = fs.readFileSync(fs.readFileSync(readMarker, "utf8").trim(), "utf8"); } catch {}
+}
+fs.appendFileSync(path.join(root, "invocations.jsonl"), JSON.stringify({ cli: "codex", args, unrelatedSecret: process.env.UNRELATED_SECRET, hostRead, certificateContent }) + "\n");
+const concurrencyMarker = path.join(root, "concurrency-path");
+if (fs.existsSync(concurrencyMarker)) {
+  const started = path.join(root, "concurrency-started");
+  if (!fs.existsSync(started)) {
+    fs.writeFileSync(started, "started\n");
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
+    fs.writeFileSync(fs.readFileSync(concurrencyMarker, "utf8").trim(), "changed by first fake CLI\n");
+  } else {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
+  }
+}
+const resumeIndex = args.indexOf("resume");
+const resume = args[0] === "exec" && resumeIndex > 0;
+const splitUtf8 = fs.existsSync(path.join(root, "split-utf8-thread"));
+const failureMarker = path.join(root, "fail-resume-once");
+if (resume && fs.existsSync(failureMarker)) {
+  fs.unlinkSync(failureMarker);
+  fs.writeSync(2, "thread was not found\n");
+  process.exit(1);
+}
+let threadId;
+if (resume) {
+  threadId = args[args.length - 2];
+} else if (splitUtf8) {
+  threadId = "codex-thread-🚀";
+} else {
+  const counterPath = path.join(root, "counter");
+  const count = fs.existsSync(counterPath) ? Number(fs.readFileSync(counterPath, "utf8")) + 1 : 1;
+  fs.writeFileSync(counterPath, String(count));
+  threadId = "codex-thread-" + String(count);
+}
+const writeMarker = path.join(root, "write-path");
+if (fs.existsSync(writeMarker)) fs.writeFileSync(fs.readFileSync(writeMarker, "utf8").trim(), "changed by fake CLI\n");
+const schemaPath = args[args.indexOf("--output-schema") + 1];
+const outputPath = args[args.indexOf("--output-last-message") + 1];
+const schema = JSON.parse(fs.readFileSync(schemaPath, "utf8"));
+const outputs = {};
+for (const name of schema.properties.outputs.required) outputs[name] = "codex output\n";
+const result = { outputs };
+if (schema.required.includes("recovery_status")) result.recovery_status = "remediated";
+fs.writeFileSync(outputPath, JSON.stringify(result));
+const threadEvent = Buffer.from(JSON.stringify({ type: "thread.started", thread_id: threadId }) + "\n");
+if (splitUtf8) {
+  const emojiOffset = threadEvent.indexOf(Buffer.from("🚀"));
+  fs.writeSync(1, threadEvent.subarray(0, emojiOffset + 2));
+  setTimeout(() => {
+    fs.writeSync(1, threadEvent.subarray(emojiOffset + 2));
+    fs.writeSync(1, JSON.stringify({ type: "turn.completed" }) + "\n");
+  }, 20);
+} else {
+  fs.writeSync(1, threadEvent);
+  fs.writeSync(1, JSON.stringify({ type: "turn.completed" }) + "\n");
+}
+`, { mode: 0o755 });
+  fs.writeFileSync(path.join(bin, "claude"), String.raw`#!/usr/bin/env bun
+const fs = require("node:fs");
+const path = require("node:path");
+const args = process.argv.slice(2);
+if (args[0] === "--version") { console.log("2.test"); process.exit(0); }
+if (args[0] === "auth" && args[1] === "status") { console.log("Authenticated"); process.exit(0); }
+const root = process.env.CLAUDE_CONFIG_DIR || path.join(process.env.HOME, ".claude");
+let defaultConfigContent;
+if (!process.env.CLAUDE_CONFIG_DIR) {
+  try { defaultConfigContent = fs.readFileSync(path.join(process.env.HOME, ".claude.json"), "utf8"); } catch {}
+}
+fs.appendFileSync(path.join(root, "invocations.jsonl"), JSON.stringify({
+  cli: "claude",
+  args,
+  unrelatedSecret: process.env.UNRELATED_SECRET,
+  configDir: process.env.CLAUDE_CONFIG_DIR,
+  defaultConfigContent
+}) + "\n");
+const sessionFlag = args.includes("--resume") ? "--resume" : "--session-id";
+const sessionId = args.includes(sessionFlag) ? args[args.indexOf(sessionFlag) + 1] : undefined;
+const failureMarker = path.join(root, "fail-claude-resume-once");
+const createFailureMarker = path.join(root, "fail-claude-create-once");
+if (!args.includes("--resume") && fs.existsSync(createFailureMarker)) {
+  fs.unlinkSync(createFailureMarker);
+  fs.writeSync(2, "authentication failed\n");
+  process.exit(1);
+}
+if (args.includes("--resume") && fs.existsSync(failureMarker)) {
+  fs.unlinkSync(failureMarker);
+  fs.writeSync(2, "No conversation found with session ID: " + sessionId + "\n");
+  process.exit(1);
+}
+const schema = JSON.parse(args[args.indexOf("--json-schema") + 1]);
+const outputs = {};
+for (const name of schema.properties.outputs.required) outputs[name] = "claude output\n";
+const structured_output = { outputs };
+if (schema.required.includes("recovery_status")) structured_output.recovery_status = "remediated";
+fs.writeSync(1, JSON.stringify({ session_id: sessionId, structured_output }) + "\n");
+`, { mode: 0o755 });
+  return { root, bin, log, failResumeOnce, failClaudeResumeOnce, failClaudeCreateOnce };
+}
+
+function installPackagedCodex(parent: string): { bin: string } {
+  const root = fs.mkdtempSync(path.join(parent, "packaged-codex-"));
+  const scope = path.join(root, "node_modules", "@openai");
+  const packageRoot = path.join(scope, "codex");
+  const platformRoot = path.join(scope, "codex-linux-x64");
+  const bin = path.join(root, "bin");
+  fs.mkdirSync(path.join(packageRoot, "bin"), { recursive: true });
+  fs.mkdirSync(platformRoot, { recursive: true });
+  fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ name: "@openai/codex" }));
+  fs.writeFileSync(path.join(platformRoot, "package.json"), JSON.stringify({
+    name: "@openai/codex-linux-x64",
+    main: "index.js"
+  }));
+  fs.writeFileSync(path.join(packageRoot, "bin", "codex.js"), String.raw`#!/usr/bin/env node
+require("@openai/codex-linux-x64").run();
+`, { mode: 0o755 });
+  fs.writeFileSync(path.join(platformRoot, "index.js"), String.raw`exports.run = () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const args = process.argv.slice(2);
+  const state = process.env.CODEX_HOME;
+  const invocations = path.join(state, "invocations");
+  const count = fs.existsSync(invocations) ? fs.readFileSync(invocations, "utf8").trim().split("\n").length + 1 : 1;
+  fs.appendFileSync(invocations, String(count) + "\n");
+  const schemaPath = args[args.indexOf("--output-schema") + 1];
+  const outputPath = args[args.indexOf("--output-last-message") + 1];
+  const schema = JSON.parse(fs.readFileSync(schemaPath, "utf8"));
+  const outputs = {};
+  for (const name of schema.properties.outputs.required) outputs[name] = "packaged codex output\n";
+  fs.writeFileSync(outputPath, JSON.stringify({ outputs }));
+  const resumeIndex = args.indexOf("resume");
+  const threadId = resumeIndex > 0 ? args[args.length - 2] : "packaged-thread-1";
+  fs.writeSync(1, JSON.stringify({ type: "thread.started", thread_id: threadId }) + "\n");
+  fs.writeSync(1, JSON.stringify({ type: "turn.completed" }) + "\n");
+};
+`);
+  fs.symlinkSync(path.join(packageRoot, "bin", "codex.js"), path.join(bin, "codex"));
+  return { bin };
+}
+
+async function captureCli(
+  args: string[],
+  cwd: string,
+  env: Readonly<Record<string, string | undefined>> = {}
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   let stdout = "";
   let stderr = "";
   const exitCode = await runCli(args, {
     stdout: { write: (value) => { stdout += String(value); return true; } },
     stderr: { write: (value) => { stderr += String(value); return true; } }
-  }, { cwd, env: {} });
+  }, { cwd, env });
   return { exitCode, stdout, stderr };
+}
+
+async function waitForPath(target: string): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (fs.existsSync(target)) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for ${target}.`);
 }

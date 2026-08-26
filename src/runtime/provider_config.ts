@@ -2,15 +2,20 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { findGitRepositoryRoot } from "@jurgen1c/agent-core/repository";
 import { parseYamlDocument, type JsonValue } from "@jurgen1c/agent-core/yaml";
 import { redactAgentFlowSensitiveText } from "./failure_payload";
+
+const NATIVE_PROVIDER_DOCTOR_TIMEOUT_MS = 5_000;
 
 export type AgentFlowConfiguredProviderKind = "local" | "frontier";
 export type AgentFlowProviderDriver =
   | "openai-responses"
   | "anthropic-messages"
-  | "openai-compatible";
+  | "openai-compatible"
+  | "codex-cli"
+  | "claude-code";
 
 export interface AgentFlowConfiguredTarget {
   kind: AgentFlowConfiguredProviderKind;
@@ -61,6 +66,12 @@ export class AgentFlowProviderConfigError extends Error {
   }
 }
 
+const NATIVE_COMMON_ENVIRONMENT = new Set([
+  "HOME", "LANG", "LOGNAME", "NODE_EXTRA_CA_CERTS", "NO_PROXY", "PATH", "SHELL",
+  "SSL_CERT_DIR", "SSL_CERT_FILE", "TERM", "TMPDIR", "USER",
+  "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "no_proxy"
+]);
+
 const TARGET_FIELDS = new Set([
   "kind", "driver", "model", "enabled", "base_url", "api_key_env", "max_output_tokens"
 ]);
@@ -69,7 +80,7 @@ const ALIAS_FIELDS = new Set(["kind", "target"]);
 const RESERVED_ALIASES = new Set(["fixture", "local", "frontier"]);
 const RESERVED_OBJECT_NAMES = new Set(["__proto__", "prototype", "constructor"]);
 const DRIVERS = new Set<AgentFlowProviderDriver>([
-  "openai-responses", "anthropic-messages", "openai-compatible"
+  "openai-responses", "anthropic-messages", "openai-compatible", "codex-cli", "claude-code"
 ]);
 
 export function loadAgentFlowProviderCatalog(
@@ -226,9 +237,94 @@ export function doctorAgentFlowProviderCatalog(
         ok = false;
         return `${binding.alias}: missing credential environment variable ${keyName}`;
       }
+      if (binding.config.driver === "codex-cli" || binding.config.driver === "claude-code") {
+        if (process.platform !== "linux" || !fs.existsSync("/usr/bin/bwrap") || !fs.existsSync("/usr/bin/flock")) {
+          ok = false;
+          return `${binding.alias}: native CLI filesystem sandbox is unavailable (bubblewrap and flock are required on Linux)`;
+        }
+        const sandboxProbe = spawnSync("/usr/bin/bwrap", [
+          "--die-with-parent",
+          "--new-session",
+          "--unshare-pid",
+          "--ro-bind", "/usr", "/usr",
+          "--symlink", "usr/bin", "/bin",
+          "--symlink", "usr/lib", "/lib",
+          ...(fs.existsSync("/usr/lib64") ? ["--symlink", "usr/lib64", "/lib64"] : []),
+          "--proc", "/proc",
+          "--dev", "/dev",
+          "--",
+          "/usr/bin/true"
+        ], {
+          encoding: "utf8",
+          env: { PATH: "/usr/bin:/bin" },
+          timeout: NATIVE_PROVIDER_DOCTOR_TIMEOUT_MS,
+          killSignal: "SIGKILL"
+        });
+        if (sandboxProbe.error !== undefined || sandboxProbe.status !== 0) {
+          ok = false;
+          return `${binding.alias}: native CLI filesystem sandbox cannot create the required bubblewrap namespace`;
+        }
+        const command = binding.config.driver === "codex-cli" ? "codex" : "claude";
+        const probeEnvironment = agentFlowNativeProviderEnvironment(command, env);
+        const version = runAgentFlowNativeProviderDoctorProbe(command, ["--version"], probeEnvironment);
+        if (version.error !== undefined || version.status !== 0) {
+          ok = false;
+          return `${binding.alias}: ${command} executable is unavailable`;
+        }
+        const authArguments = binding.config.driver === "codex-cli"
+          ? ["login", "status"]
+          : ["auth", "status"];
+        const auth = runAgentFlowNativeProviderDoctorProbe(command, authArguments, probeEnvironment);
+        if (auth.error !== undefined || auth.status !== 0) {
+          ok = false;
+          return `${binding.alias}: ${command} is not authenticated`;
+        }
+        const normalizedVersion = String(version.stdout || version.stderr).trim().split(/\r?\n/, 1)[0] ?? "unknown version";
+        return `${binding.alias}: ready (${binding.config.driver}, ${redactAgentFlowSensitiveText(normalizedVersion)})`;
+      }
       return `${binding.alias}: ready (${binding.config.driver}, ${redactAgentFlowSensitiveText(binding.config.model)})`;
     });
   return { ok, lines };
+}
+
+export function runAgentFlowNativeProviderDoctorProbe(
+  command: string,
+  arguments_: readonly string[],
+  env: NodeJS.ProcessEnv,
+  timeout = NATIVE_PROVIDER_DOCTOR_TIMEOUT_MS
+) {
+  return spawnSync(command, [...arguments_], {
+    encoding: "utf8",
+    env,
+    timeout,
+    killSignal: "SIGKILL"
+  });
+}
+
+export function agentFlowNativeProviderEnvironment(
+  command: "codex" | "claude",
+  source: Readonly<Record<string, string | undefined>>
+): NodeJS.ProcessEnv {
+  const result: NodeJS.ProcessEnv = {};
+  const permitted = (name: string): boolean => {
+    if (NATIVE_COMMON_ENVIRONMENT.has(name) || name.startsWith("LC_")) return true;
+    if (command === "codex") {
+      return name === "CODEX_HOME" || name === "OPENAI_API_KEY" || name.startsWith("OPENAI_");
+    }
+    return name === "CLAUDE_CONFIG_DIR"
+      || name === "CLOUD_ML_REGION"
+      || name.startsWith("ANTHROPIC_")
+      || name.startsWith("CLAUDE_CODE_")
+      || name.startsWith("AWS_")
+      || name.startsWith("GOOGLE_")
+      || name.startsWith("VERTEX_");
+  };
+  for (const [name, value] of Object.entries(source)) {
+    if (value !== undefined && permitted(name)) result[name] = value;
+  }
+  if (result.HOME === undefined) result.HOME = os.homedir();
+  if (result.PATH === undefined) result.PATH = "/usr/local/bin:/usr/bin:/bin";
+  return result;
 }
 
 function readConfig(
@@ -326,6 +422,10 @@ function parseProviders(
 
 function validateTargetShape(name: string, target: AgentFlowConfiguredTarget, sourcePath: string): void {
   const field = `targets.${name}`;
+  const nativeCli = target.driver === "codex-cli" || target.driver === "claude-code";
+  if (nativeCli && target.kind !== "frontier") {
+    throw configError(sourcePath, `${field}.kind`, `${target.driver} targets must be frontier.`);
+  }
   if (target.api_key_env !== undefined && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(target.api_key_env)) {
     throw configError(sourcePath, `${field}.api_key_env`, "api_key_env must be an environment variable name.");
   }

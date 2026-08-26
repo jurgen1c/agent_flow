@@ -14,6 +14,7 @@ import {
   parseAgentFlowWorkflowOrThrow,
   resumeAgentFlowCommandPipeline,
   transitionAgentFlowLifecycleRun,
+  AgentFlowSessionRequestError,
   type AgentFlowNotification,
   type AgentFlowNotificationAdapter,
   type AgentFlowRunStateValue,
@@ -2621,6 +2622,61 @@ notify:
       step_type: "manual_gate",
       classification: "notification_failure"
     });
+    store.close();
+  });
+
+  test("settles an unavailable provider session when its required paused notification fails", async () => {
+    const repoRoot = temporaryRepo();
+    fs.writeFileSync(path.join(repoRoot, "prompt.md"), "Continue the task.\n");
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: required-provider-session-notification
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  writer: { provider: frontier, resume: true }
+steps:
+  - { id: write, type: session_request, session: writer, prompt: prompt.md, inputs: [request.md], outputs: [result.md] }
+limits: { max_model_calls: 1, max_frontier_calls: 1 }
+notify:
+  - { on: workflow.paused, channels: [system], required: true }
+`);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: "required-provider-session-notification", workflow });
+    store.writeArtifact({
+      id: "request",
+      runId: "required-provider-session-notification",
+      path: "request.md",
+      kind: "fixture",
+      contentType: "text/markdown",
+      content: "Continue.\n"
+    });
+    const providers = createAgentFlowSessionProviderRegistry().register("frontier", (request) => {
+      request.reportExternalSessionId?.("missing-provider-session");
+      throw new AgentFlowSessionRequestError(
+        "The persisted provider session is unavailable.",
+        "AGENT_FLOW_PROVIDER_SESSION_UNAVAILABLE"
+      );
+    }, { enabled: true });
+    const notifications = createAgentFlowNotificationRegistry({
+      system: () => { throw new Error("unavailable"); }
+    });
+
+    expect((await executeAgentFlowCommandPipeline(
+      store,
+      "required-provider-session-notification",
+      workflow,
+      undefined,
+      providers,
+      undefined,
+      notifications
+    )).status).toBe("failed");
+    expect(store.getRun("required-provider-session-notification")?.context.waiting).toBeUndefined();
+    expect(store.listSteps("required-provider-session-notification")
+      .find((step) => step.stepId === "write")?.status).toBe("failed");
+    expect(store.getSession("required-provider-session-notification", "writer")?.status).toBe("failed");
+    expect(store.listFailures("required-provider-session-notification").at(-1)?.classification)
+      .toBe("notification_failure");
     store.close();
   });
 

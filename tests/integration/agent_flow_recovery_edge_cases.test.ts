@@ -1185,12 +1185,14 @@ steps:
     const store = await openAgentFlowRunState({ cwd: root });
     createAgentFlowLifecycleRun(store, { id: "injected-context", workflow });
     let resolveFirst!: (response: AgentFlowSessionProviderResponse) => void;
+    let reportFirstExternalSessionId!: (externalSessionId: string) => void;
     const firstResponse = new Promise<AgentFlowSessionProviderResponse>((resolve) => {
       resolveFirst = resolve;
     });
     const requests: AgentFlowSessionProviderRequest[] = [];
     const providers = createAgentFlowSessionProviderRegistry().register("frontier", async (request) => {
       requests.push(request);
+      if (requests.length === 1) reportFirstExternalSessionId = request.reportExternalSessionId!;
       return requests.length === 1 ? firstResponse : remediated();
     }, { enabled: true });
     const execution = executeAgentFlowCommandPipeline(
@@ -1207,6 +1209,11 @@ steps:
     );
     expect(dirty.state).toMatchObject({ dirty: true, contextRevision: 1 });
     expect(dirty.state.contextInjections).toContainEqual(expect.objectContaining({ context: injectedText }));
+    reportFirstExternalSessionId("resumable-recovery");
+    expect(store.getSession("injected-context", "fixer")?.state).toMatchObject({
+      dirty: true,
+      contextRevision: 1
+    });
     resolveFirst({ ...remediated(), externalSessionId: "resumable-recovery" });
     const result = await execution;
 

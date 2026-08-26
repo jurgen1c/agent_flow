@@ -18,6 +18,7 @@ const curatedWorkflowFiles = [
   "implement-review-collab.yml",
   "jira-ticket-spec.yml",
   "multi-provider.yml",
+  "native-cli-session.yml",
   "pr-feedback-loop.yml",
   "simple-ci.yml",
   "ticket-lifecycle.yml"

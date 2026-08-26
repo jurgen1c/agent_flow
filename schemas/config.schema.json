@@ -30,7 +30,7 @@
       "properties": {
         "kind": { "enum": ["local", "frontier"] },
         "driver": {
-          "enum": ["openai-responses", "anthropic-messages", "openai-compatible"]
+          "enum": ["openai-responses", "anthropic-messages", "openai-compatible", "codex-cli", "claude-code"]
         },
         "model": {
           "type": "string",
@@ -47,16 +47,23 @@
       "allOf": [
         {
           "if": { "properties": { "driver": { "enum": ["openai-responses", "anthropic-messages"] } }, "required": ["driver"] },
-          "then": { "properties": { "kind": { "const": "frontier" } }, "required": ["api_key_env"] }
+          "then": { "properties": { "kind": { "const": "frontier" } }, "required": ["api_key_env", "model"] }
         },
         {
           "if": { "properties": { "driver": { "const": "openai-compatible" } }, "required": ["driver"] },
-          "then": { "required": ["base_url"] },
+          "then": { "required": ["base_url", "model"] },
           "else": { "not": { "required": ["base_url"] } }
         },
         {
           "if": { "properties": { "driver": { "const": "anthropic-messages" } }, "required": ["driver"] },
           "else": { "not": { "required": ["max_output_tokens"] } }
+        },
+        {
+          "if": { "properties": { "driver": { "enum": ["codex-cli", "claude-code"] } }, "required": ["driver"] },
+          "then": {
+            "properties": { "kind": { "const": "frontier" } },
+            "not": { "required": ["api_key_env"] }
+          }
         },
         {
           "if": {
