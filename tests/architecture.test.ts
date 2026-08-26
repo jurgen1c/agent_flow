@@ -40,6 +40,19 @@ describe("standalone Agent Flow architecture", () => {
     }
   });
 
+  test("provisions the native provider sandbox before release verification", () => {
+    const publishWorkflow = fs.readFileSync(
+      path.join(repositoryRoot, ".github/workflows/publish.yml"),
+      "utf8"
+    );
+    const sandboxInstall = publishWorkflow.indexOf("sudo apt-get install --yes bubblewrap util-linux");
+    const releaseCi = publishWorkflow.indexOf("- run: bun run ci");
+
+    expect(sandboxInstall).toBeGreaterThan(-1);
+    expect(releaseCi).toBeGreaterThan(sandboxInstall);
+    expect(publishWorkflow).toContain("kernel.apparmor_restrict_unprivileged_userns=0");
+  });
+
   test("publishes consult status and blocking pairs consistently", () => {
     const schema = JSON.parse(
       fs.readFileSync(path.join(repositoryRoot, "schemas/consult.schema.json"), "utf8")
