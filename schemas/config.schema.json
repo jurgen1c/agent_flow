@@ -26,7 +26,7 @@
   "$defs": {
     "target": {
       "type": "object",
-      "required": ["kind", "driver", "enabled"],
+      "required": ["kind", "driver", "model", "enabled"],
       "properties": {
         "kind": { "enum": ["local", "frontier"] },
         "driver": {
@@ -41,13 +41,7 @@
         "enabled": { "type": "boolean" },
         "base_url": { "type": "string", "format": "uri" },
         "api_key_env": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
-        "max_output_tokens": { "type": "integer", "minimum": 1 },
-        "profile": {
-          "type": "string",
-          "minLength": 1,
-          "pattern": "^\\S(?:.*\\S)?$",
-          "not": { "pattern": "[\\u0000-\\u001F\\u007F-\\u009F]" }
-        }
+        "max_output_tokens": { "type": "integer", "minimum": 1 }
       },
       "additionalProperties": false,
       "allOf": [
@@ -66,11 +60,10 @@
         },
         {
           "if": { "properties": { "driver": { "enum": ["codex-cli", "claude-code"] } }, "required": ["driver"] },
-          "then": { "properties": { "kind": { "const": "frontier" } } }
-        },
-        {
-          "if": { "properties": { "driver": { "const": "codex-cli" } }, "required": ["driver"] },
-          "else": { "not": { "required": ["profile"] } }
+          "then": {
+            "properties": { "kind": { "const": "frontier" } },
+            "not": { "required": ["api_key_env"] }
+          }
         },
         {
           "if": {

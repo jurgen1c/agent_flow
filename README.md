@@ -140,11 +140,12 @@ targets:
   codex-main:
     kind: frontier
     driver: codex-cli
-    profile: work
+    model: YOUR_CODEX_MODEL
     enabled: true
   claude-main:
     kind: frontier
     driver: claude-code
+    model: YOUR_CLAUDE_MODEL
     enabled: true
   qwen-local:
     kind: local
@@ -182,8 +183,9 @@ never belong in either YAML file. Use `--provider alias=target` on a new run to
 swap Qwen for Gemma, Claude for Codex, or another same-kind target. See
 [Configure local or cloud models](docs/quickstart.md#configure-local-or-cloud-models)
 for native CLI and HTTP drivers plus a multi-model workflow. `codex-cli` and
-`claude-code` use the developer's existing CLI installation and login; `model`
-is optional, so omitting it preserves the CLI default. Sessions with
+`claude-code` use the developer's existing CLI installation and login. Native
+targets require an explicit `model`, which Agent Flow fingerprints for safe
+resume instead of inheriting mutable CLI defaults or profiles. Sessions with
 `resume: true` persist the native Codex thread or Claude session across steps.
 If that external session disappears, inspect the paused run and explicitly
 start a fresh native session with
@@ -197,10 +199,13 @@ roll those filesystem changes back. Built-in native execution currently
 requires Linux with `bubblewrap` and `flock`; the host sandbox makes the
 checkout read-only unless write authority is granted, keeps `.git` read-only,
 hides `.agent-flow`, and leaves unrelated host paths unmounted. Audited native
-invocations are serialized per repository. The child receives a minimal environment:
+invocations share a per-repository write lock with Agent Flow command steps and
+file-writing custom adapters. The child receives a minimal environment:
 CLI authentication/provider variables, proxy and certificate settings, locale,
 and basic process variables such as `PATH` and `HOME`; unrelated secrets are not
-inherited.
+inherited. The CLI's agent-facing sandbox also denies access to its mounted
+login and session-state directory, and ambient user/project CLI configuration
+is disabled for deterministic execution.
 
 Ordinary custom registrations preserve the previous behavior: Agent Flow pins
 the provider name in the workflow but cannot fingerprint changes inside

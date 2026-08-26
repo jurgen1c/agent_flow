@@ -3,11 +3,13 @@ targets:
   codex-main:
     kind: frontier
     driver: codex-cli
+    model: YOUR_CODEX_MODEL
     enabled: true
 
   claude-main:
     kind: frontier
     driver: claude-code
+    model: YOUR_CLAUDE_MODEL
     enabled: true
 
   openai-api:

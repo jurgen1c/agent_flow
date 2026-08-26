@@ -12,6 +12,10 @@ import {
   type AgentFlowRunStateValue
 } from "./run_state";
 import { evaluateAgentFlowPolicy } from "./policy";
+import {
+  isAgentFlowWorkspaceWriteLockManaged,
+  withAgentFlowWorkspaceWriteLock
+} from "./workspace_lock";
 import type { AgentFlowWorkflow, AgentFlowWorkflowStep, AgentFlowYamlMapping } from "./workflow";
 import { createAgentFlowReviewPrompt, parseAgentFlowReviewResult } from "./review";
 import {
@@ -169,7 +173,7 @@ export interface AgentFlowConfiguredSessionProviderDescriptor
   kind: "local" | "frontier";
   target: string;
   driver: string;
-  model?: string;
+  model: string;
   fingerprint: string;
 }
 
@@ -362,13 +366,11 @@ export class AgentFlowSessionProviderRegistry {
       "Configured session provider fingerprint"
     );
     const nativeCli = driver === "codex-cli" || driver === "claude-code";
-    const model = descriptor.model === undefined
-      ? undefined
-      : requiredName(descriptor.model, "Configured session provider model");
-    if (!nativeCli && model === undefined) {
-      throw invalidProviderRegistration("Configured session providers must declare a model unless they use a native CLI driver.");
+    if (nativeCli && descriptor.kind !== "frontier") {
+      throw invalidProviderRegistration("Native CLI configured session providers must declare frontier kind.");
     }
-    if (model !== undefined && (model !== descriptor.model || /[\u0000-\u001F\u007F-\u009F]/u.test(model))) {
+    const model = requiredName(descriptor.model, "Configured session provider model");
+    if (model !== descriptor.model || /[\u0000-\u001F\u007F-\u009F]/u.test(model)) {
       throw invalidProviderRegistration(
         "Configured session provider model must not have surrounding whitespace or control characters."
       );
@@ -378,7 +380,7 @@ export class AgentFlowSessionProviderRegistry {
       name,
       target,
       driver,
-      ...(model === undefined ? {} : { model }),
+      model,
       fingerprint
     });
   }
@@ -1375,7 +1377,12 @@ export async function invokeAgentFlowSessionProvider(
   if (initialStatus !== undefined) throw new AgentFlowSessionRequestInterruptedError(initialStatus);
   const initialError = interruptError?.();
   if (initialError !== undefined) throw initialError;
-  if (stopStatus === undefined && interruptError === undefined) return adapter(request);
+  const invokeAdapter = (): Promise<AgentFlowSessionProviderResponse> => Promise.resolve(
+    request.canModifyFiles === true && !isAgentFlowWorkspaceWriteLockManaged(adapter)
+      ? withAgentFlowWorkspaceWriteLock(request.repoRoot!, request.signal, () => Promise.resolve(adapter(request)))
+      : adapter(request)
+  );
+  if (stopStatus === undefined && interruptError === undefined) return invokeAdapter();
 
   const controller = new AbortController();
   request.signal = controller.signal;
@@ -1396,7 +1403,7 @@ export async function invokeAgentFlowSessionProvider(
       }
     }, 25);
   });
-  const adapterResult = Promise.resolve().then(() => adapter(request));
+  const adapterResult = Promise.resolve().then(invokeAdapter);
   try {
     return await Promise.race([adapterResult, interrupted]);
   } catch (error) {

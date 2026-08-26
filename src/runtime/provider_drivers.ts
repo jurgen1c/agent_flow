@@ -13,6 +13,7 @@ import {
   type AgentFlowSessionProviderRegistry
 } from "./session_request";
 import {
+  agentFlowNativeProviderEnvironment,
   hashAgentFlowProviderModel,
   type AgentFlowConfiguredTarget,
   type AgentFlowProviderCatalog,
@@ -23,14 +24,13 @@ import {
   changedAgentFlowWorkspacePaths
 } from "./workspace";
 import { matchesPolicyGlob } from "./policy_utils";
+import {
+  markAgentFlowWorkspaceWriteLockManaged,
+  withAgentFlowWorkspaceWriteLock
+} from "./workspace_lock";
 
 const MAX_PROVIDER_RESPONSE_BYTES = 12 * 1024 * 1024;
 const NATIVE_SESSION_UNAVAILABLE = "AGENT_FLOW_PROVIDER_SESSION_UNAVAILABLE";
-const NATIVE_COMMON_ENVIRONMENT = new Set([
-  "HOME", "LANG", "LOGNAME", "NODE_EXTRA_CA_CERTS", "NO_PROXY", "PATH", "SHELL",
-  "SSL_CERT_DIR", "SSL_CERT_FILE", "TERM", "TMPDIR", "USER",
-  "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "no_proxy"
-]);
 
 export interface CreateAgentFlowConfiguredProviderRegistryOptions {
   env?: Readonly<Record<string, string | undefined>>;
@@ -47,7 +47,7 @@ export function createAgentFlowConfiguredProviderRegistry(
       kind: binding.kind,
       target: binding.target,
       driver: binding.config.driver,
-      ...(binding.config.model === undefined ? {} : { model: binding.config.model }),
+      model: binding.config.model,
       fingerprint: binding.fingerprint
     }, createAgentFlowConfiguredProviderAdapter(binding, options));
   }
@@ -82,6 +82,7 @@ export function createAgentFlowConfiguredProviderAdapter(
   };
   if (binding.config.driver === "codex-cli" || binding.config.driver === "claude-code") {
     adapter.waitForAbort = true;
+    markAgentFlowWorkspaceWriteLockManaged(adapter);
   }
   return adapter;
 }
@@ -113,25 +114,25 @@ async function invokeCodexCli(
       if (request.resume) request.reportExternalSessionId?.(threadId);
     };
     try {
+      const sandbox = nativeProcessSandbox(request, env, temporaryDirectory, "codex");
       const commonArguments = [
         "--json",
         "--output-schema", schemaPath,
         "--output-last-message", outputPath,
-        ...(binding.config.model === undefined ? [] : ["--model", binding.config.model])
+        "--model", binding.config.model
       ];
+      const hardeningArguments = codexHardeningArguments(sandbox);
       const arguments_ = request.externalSessionId === undefined
         ? [
             "exec",
+            ...hardeningArguments,
             ...commonArguments,
-            "--sandbox", request.canModifyFiles === true ? "workspace-write" : "read-only",
-            ...(binding.config.profile === undefined ? [] : ["--profile", binding.config.profile]),
             ...(request.resume ? [] : ["--ephemeral"]),
             "-"
           ]
         : [
             "exec",
-            "--sandbox", request.canModifyFiles === true ? "workspace-write" : "read-only",
-            ...(binding.config.profile === undefined ? [] : ["--profile", binding.config.profile]),
+            ...hardeningArguments,
             "resume",
             ...commonArguments,
             request.externalSessionId,
@@ -144,7 +145,7 @@ async function invokeCodexCli(
         request.repoRoot!,
         env,
         request.signal,
-        nativeProcessSandbox(request, env, temporaryDirectory, "codex"),
+        sandbox,
         (line) => {
           let event: unknown;
           try { event = JSON.parse(line); } catch {
@@ -189,14 +190,18 @@ async function invokeClaudeCode(
     const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-flow-claude-"));
     try {
       const sessionId = request.externalSessionId ?? (request.resume ? randomUUID() : undefined);
-      if (sessionId !== undefined && request.resume) request.reportExternalSessionId?.(sessionId);
       const displayName = `agent-flow-${safeCliName(request.runId)}-${safeCliName(request.sessionId)}`.slice(0, 120);
+      const sandbox = nativeProcessSandbox(request, env, temporaryDirectory, "claude");
       const arguments_ = [
         "-p",
         "--output-format", "json",
         "--json-schema", JSON.stringify(outputSchema(request)),
+        "--setting-sources", "",
+        "--settings", JSON.stringify(claudeHardeningSettings(sandbox)),
+        "--mcp-config", JSON.stringify({ mcpServers: {} }),
+        "--strict-mcp-config",
         "--permission-mode", request.canModifyFiles === true ? "acceptEdits" : "plan",
-        ...(binding.config.model === undefined ? [] : ["--model", binding.config.model]),
+        "--model", binding.config.model,
         ...(request.externalSessionId !== undefined
           ? ["--resume", request.externalSessionId]
           : sessionId === undefined
@@ -210,7 +215,7 @@ async function invokeClaudeCode(
         request.repoRoot!,
         env,
         request.signal,
-        nativeProcessSandbox(request, env, temporaryDirectory, "claude")
+        sandbox
       );
       assertNativeSuccess("Claude Code", result, request.externalSessionId !== undefined);
       const envelope = parseJsonObject(result.stdout.toString("utf8"), "Claude Code response");
@@ -218,6 +223,7 @@ async function invokeClaudeCode(
       if (sessionId !== undefined && returnedSessionId !== sessionId) {
         throw providerError("Claude Code returned a session ID that does not match the persisted Agent Flow session.");
       }
+      if (sessionId !== undefined && request.resume) request.reportExternalSessionId?.(sessionId);
       if (!isRecord(envelope.structured_output)) {
         throw providerError("Claude Code response did not contain validated structured_output.");
       }
@@ -246,12 +252,54 @@ interface NativeProcessSandbox {
   canModifyFiles: boolean;
   temporaryDirectory: string;
   providerStatePaths: string[];
+  providerStateEnvironment?: { name: "CODEX_HOME" | "CLAUDE_CONFIG_DIR"; value: string };
+  certificatePaths: string[];
+  certificateEnvironment: Record<string, string>;
+  gitMetadataPaths: string[];
   executablePath: string;
   executableMountPaths: string[];
 }
 
+function codexHardeningArguments(sandbox: NativeProcessSandbox): string[] {
+  const profile = "agent_flow_native";
+  const filesystem = sandbox.providerStatePaths
+    .map((statePath) => `${JSON.stringify(statePath)} = "deny"`)
+    .join(", ");
+  return [
+    "--ignore-user-config",
+    "--ignore-rules",
+    "--strict-config",
+    "--config", `default_permissions=${JSON.stringify(profile)}`,
+    "--config", `permissions.${profile}.extends=${JSON.stringify(sandbox.canModifyFiles ? ":workspace" : ":read-only")}`,
+    "--config", `permissions.${profile}.filesystem={ ${filesystem} }`
+  ];
+}
+
+function claudeHardeningSettings(sandbox: NativeProcessSandbox): Record<string, unknown> {
+  const permissionPaths = sandbox.providerStatePaths
+    .map((statePath) => `//${statePath.replace(/^\/+/, "")}`);
+  return {
+    permissions: {
+      deny: permissionPaths.flatMap((permissionPath) => [
+        `Read(${permissionPath})`, `Read(${permissionPath}/**)`,
+        `Edit(${permissionPath})`, `Edit(${permissionPath}/**)`
+      ])
+    },
+    sandbox: {
+      enabled: true,
+      failIfUnavailable: true,
+      allowUnsandboxedCommands: false,
+      excludedCommands: [],
+      filesystem: {
+        denyRead: sandbox.providerStatePaths,
+        denyWrite: sandbox.providerStatePaths
+      }
+    }
+  };
+}
+
 function runNativeProviderProcess(
-  command: string,
+  command: "codex" | "claude",
   arguments_: string[],
   input: string,
   cwd: string,
@@ -277,7 +325,11 @@ function runNativeProviderProcess(
         shell: false,
         detached: process.platform !== "win32",
         env: {
-          ...nativeProviderEnvironment(command, env),
+          ...agentFlowNativeProviderEnvironment(command, env),
+          ...(sandbox.providerStateEnvironment === undefined
+            ? {}
+            : { [sandbox.providerStateEnvironment.name]: sandbox.providerStateEnvironment.value }),
+          ...sandbox.certificateEnvironment,
           TMPDIR: sandbox.temporaryDirectory
         },
         stdio: ["pipe", "pipe", "pipe"]
@@ -356,23 +408,171 @@ function nativeProcessSandbox(
     : env.CLAUDE_CONFIG_DIR ?? path.join(home, ".claude");
   const repoRoot = fs.realpathSync(request.repoRoot!);
   const executablePath = resolveNativeExecutable(command, env.PATH);
-  const statePath = configuredState !== undefined && fs.existsSync(configuredState)
-    ? fs.realpathSync(configuredState)
+  const statePath = nativeStateDirectory(configuredState, repoRoot, command);
+  const defaultClaudeStateFile = command === "claude" && env.CLAUDE_CONFIG_DIR === undefined
+    ? nativeStateFile(path.join(home, ".claude.json"), repoRoot)
     : undefined;
-  if (statePath !== undefined
-      && (pathsOverlap(statePath, repoRoot) || statePath === path.parse(statePath).root)) {
-    throw providerError(
-      `Native CLI state directory ${statePath} must be separate from the repository and cannot be a filesystem root.`
-    );
-  }
+  const certificates = nativeCertificateEnvironment(env, repoRoot);
   return {
     repoRoot,
     canModifyFiles: request.canModifyFiles === true,
     temporaryDirectory: fs.realpathSync(temporaryDirectory),
-    providerStatePaths: statePath === undefined ? [] : [statePath],
+    providerStatePaths: [statePath, ...(defaultClaudeStateFile === undefined ? [] : [defaultClaudeStateFile])],
+    providerStateEnvironment: command === "codex" || env.CLAUDE_CONFIG_DIR !== undefined
+      ? {
+          name: command === "codex" ? "CODEX_HOME" as const : "CLAUDE_CONFIG_DIR" as const,
+          value: statePath
+        }
+      : undefined,
+    certificatePaths: certificates.paths,
+    certificateEnvironment: certificates.environment,
+    gitMetadataPaths: nativeGitMetadataPaths(repoRoot),
     executablePath,
     executableMountPaths: nativeExecutableMountPaths(command, executablePath, env.PATH)
   };
+}
+
+function nativeStateFile(candidate: string, repoRoot: string): string {
+  if (!path.isAbsolute(candidate) || /[\u0000-\u001F\u007F-\u009F]/u.test(candidate)) {
+    throw providerError("Claude Code default state file must have a canonical absolute path.");
+  }
+  try {
+    if (!fs.existsSync(candidate)) fs.writeFileSync(candidate, "{}\n", { mode: 0o600, flag: "wx" });
+    const stat = fs.lstatSync(candidate);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw providerError("Claude Code default state file must be a regular non-symlink file.");
+    }
+    const resolved = fs.realpathSync(candidate);
+    if (pathsOverlap(resolved, repoRoot) || resolved === path.parse(resolved).root) {
+      throw providerError("Claude Code default state file must be separate from the repository.");
+    }
+    return resolved;
+  } catch (error) {
+    if (error instanceof AgentFlowSessionRequestError) throw error;
+    throw providerError(
+      `Could not prepare Claude Code default state file ${candidate}: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
+
+function nativeStateDirectory(configuredState: string, repoRoot: string, command: "codex" | "claude"): string {
+  const environmentName = command === "codex" ? "CODEX_HOME" : "CLAUDE_CONFIG_DIR";
+  if (!configuredState || configuredState !== configuredState.trim()
+      || /[\u0000-\u001F\u007F-\u009F]/u.test(configuredState)) {
+    throw providerError(`${environmentName} must contain a canonical filesystem path.`);
+  }
+  const candidate = path.isAbsolute(configuredState)
+    ? path.normalize(configuredState)
+    : path.resolve(repoRoot, configuredState);
+  try {
+    let existingAncestor = candidate;
+    while (!fs.existsSync(existingAncestor)) {
+      const parent = path.dirname(existingAncestor);
+      if (parent === existingAncestor) break;
+      existingAncestor = parent;
+    }
+    const resolvedAncestor = fs.realpathSync(existingAncestor);
+    const prospective = path.resolve(resolvedAncestor, path.relative(existingAncestor, candidate));
+    if (pathsOverlap(prospective, repoRoot) || prospective === path.parse(prospective).root) {
+      throw providerError(
+        `Native CLI state directory ${prospective} must be separate from the repository and cannot be a filesystem root.`
+      );
+    }
+    if (!fs.existsSync(candidate)) fs.mkdirSync(candidate, { recursive: true, mode: 0o700 });
+    const resolved = fs.realpathSync(candidate);
+    if (!fs.lstatSync(resolved).isDirectory()) {
+      throw providerError(`${environmentName} must resolve to a directory.`);
+    }
+    if (pathsOverlap(resolved, repoRoot) || resolved === path.parse(resolved).root) {
+      throw providerError(
+        `Native CLI state directory ${resolved} must be separate from the repository and cannot be a filesystem root.`
+      );
+    }
+    return resolved;
+  } catch (error) {
+    if (error instanceof AgentFlowSessionRequestError) throw error;
+    throw providerError(
+      `Could not prepare ${environmentName} at ${candidate}: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
+
+function nativeCertificateEnvironment(
+  env: Readonly<Record<string, string | undefined>>,
+  repoRoot: string
+): { paths: string[]; environment: Record<string, string> } {
+  const paths: string[] = [];
+  const environment: Record<string, string> = {};
+  for (const name of ["NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE"] as const) {
+    const value = env[name];
+    if (value === undefined) continue;
+    const resolved = nativeCertificatePath(value, repoRoot, false, name);
+    paths.push(resolved);
+    environment[name] = resolved;
+  }
+  if (env.SSL_CERT_DIR !== undefined) {
+    const directories = env.SSL_CERT_DIR.split(path.delimiter).filter(Boolean)
+      .map((value) => nativeCertificatePath(value, repoRoot, true, "SSL_CERT_DIR"));
+    if (directories.length === 0) throw providerError("SSL_CERT_DIR must name at least one certificate directory.");
+    paths.push(...directories);
+    environment.SSL_CERT_DIR = directories.join(path.delimiter);
+  }
+  return {
+    paths: paths.filter((candidate, index, values) => values.indexOf(candidate) === index),
+    environment
+  };
+}
+
+function nativeCertificatePath(value: string, repoRoot: string, directory: boolean, name: string): string {
+  if (!value || value !== value.trim() || /[\u0000-\u001F\u007F-\u009F]/u.test(value)) {
+    throw providerError(`${name} must contain canonical filesystem paths.`);
+  }
+  const resolved = fs.realpathSync(path.isAbsolute(value) ? value : path.resolve(repoRoot, value));
+  const stat = fs.lstatSync(resolved);
+  if (resolved === path.parse(resolved).root || (directory ? !stat.isDirectory() : !stat.isFile())) {
+    throw providerError(`${name} must resolve to ${directory ? "a non-root directory" : "a regular file"}.`);
+  }
+  return resolved;
+}
+
+function nativeGitMetadataPaths(repoRoot: string): string[] {
+  const markerPath = path.join(repoRoot, ".git");
+  let marker: fs.Stats;
+  try { marker = fs.lstatSync(markerPath); } catch { return []; }
+  if (marker.isDirectory()) return [];
+
+  let gitDirectory: string;
+  if (marker.isSymbolicLink()) {
+    gitDirectory = nativeGitMetadataDirectory(fs.realpathSync(markerPath));
+  } else if (marker.isFile() && marker.size <= 8 * 1024) {
+    const match = /^gitdir:\s*(.+)\s*$/i.exec(fs.readFileSync(markerPath, "utf8"));
+    if (match === null) throw providerError("Repository .git file does not contain a valid Git directory reference.");
+    const referenced = match[1]!;
+    gitDirectory = nativeGitMetadataDirectory(path.isAbsolute(referenced)
+      ? referenced
+      : path.resolve(path.dirname(markerPath), referenced));
+  } else {
+    throw providerError("Repository .git entry is not a supported Git directory reference.");
+  }
+
+  const paths = [gitDirectory];
+  const commonMarker = path.join(gitDirectory, "commondir");
+  if (fs.existsSync(commonMarker)) {
+    const referenced = fs.readFileSync(commonMarker, "utf8").trim();
+    if (!referenced) throw providerError("Repository Git common-directory reference is empty.");
+    paths.push(nativeGitMetadataDirectory(path.isAbsolute(referenced)
+      ? referenced
+      : path.resolve(gitDirectory, referenced)));
+  }
+  return paths.filter((candidate, index, values) => values.indexOf(candidate) === index);
+}
+
+function nativeGitMetadataDirectory(candidate: string): string {
+  const resolved = fs.realpathSync(candidate);
+  if (resolved === path.parse(resolved).root || !fs.lstatSync(resolved).isDirectory()) {
+    throw providerError("Repository Git metadata must resolve to a non-root directory.");
+  }
+  return resolved;
 }
 
 function resolveNativeExecutable(command: string, pathValue: string | undefined): string {
@@ -393,7 +593,7 @@ function nativeExecutableMountPaths(command: string, executablePath: string, pat
   const paths: string[] = [];
   if (executablePath !== "/usr" && !executablePath.startsWith("/usr/")) {
     paths.push(command === "codex" && path.basename(executablePath) === "codex.js"
-      ? path.dirname(path.dirname(executablePath))
+      ? codexLauncherMountPath(executablePath)
       : executablePath);
   }
   let firstLine = "";
@@ -413,6 +613,21 @@ function nativeExecutableMountPaths(command: string, executablePath: string, pat
     if (fs.existsSync(toolVersionsPath)) paths.push(toolVersionsPath);
   }
   return paths.filter((candidate, index, values) => values.indexOf(candidate) === index);
+}
+
+function codexLauncherMountPath(executablePath: string): string {
+  const packageRoot = path.dirname(path.dirname(executablePath));
+  try {
+    const packageJson = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8")) as unknown;
+    if (isRecord(packageJson) && packageJson.name === "@openai/codex") {
+      // The launcher resolves the native executable from a sibling optional
+      // package such as @openai/codex-linux-x64.
+      return path.dirname(packageRoot);
+    }
+  } catch {
+    // A custom launcher only needs its own package tree.
+  }
+  return packageRoot;
 }
 
 function pathsOverlap(left: string, right: string): boolean {
@@ -436,6 +651,8 @@ function sandboxedNativeInvocation(
       repoRoot,
       sandbox.temporaryDirectory,
       ...sandbox.providerStatePaths,
+      ...sandbox.certificatePaths,
+      ...sandbox.gitMetadataPaths,
       ...sandbox.executableMountPaths
     ];
     const directoryArguments = sandboxParentDirectories(mountedPaths)
@@ -456,6 +673,8 @@ function sandboxedNativeInvocation(
         "--dev", "/dev",
         sandbox.canModifyFiles ? "--bind" : "--ro-bind", repoRoot, repoRoot,
         ...(fs.existsSync(gitPath) ? ["--ro-bind", gitPath, gitPath] : []),
+        ...sandbox.gitMetadataPaths.flatMap((candidate) => ["--ro-bind", candidate, candidate]),
+        ...sandbox.certificatePaths.flatMap((candidate) => ["--ro-bind", candidate, candidate]),
         ...(fs.existsSync(runtimePath) ? ["--tmpfs", runtimePath, "--chmod", "000", runtimePath] : []),
         ...sandbox.executableMountPaths.flatMap((candidate) => ["--ro-bind", candidate, candidate]),
         ...writablePaths.flatMap((candidate) => ["--bind", candidate, candidate]),
@@ -521,7 +740,7 @@ async function auditNativeWorkspace(
   binding: AgentFlowResolvedProviderBinding,
   invoke: () => Promise<AgentFlowSessionProviderResponse>
 ): Promise<AgentFlowSessionProviderResponse> {
-  return withNativeWorkspaceLock(request.repoRoot!, request.signal, async () => {
+  return withAgentFlowWorkspaceWriteLock(request.repoRoot!, request.signal, async () => {
     const before = captureAgentFlowWorkspaceSnapshot(request.repoRoot!);
     let response: AgentFlowSessionProviderResponse | undefined;
     let invocationError: unknown;
@@ -537,83 +756,7 @@ async function auditNativeWorkspace(
     }
     if (invocationError !== undefined) throw invocationError;
     return response!;
-  });
-}
-
-async function withNativeWorkspaceLock<T>(
-  repoRoot: string,
-  signal: AbortSignal,
-  callback: () => Promise<T>
-): Promise<T> {
-  const runtimeDirectory = path.join(fs.realpathSync(repoRoot), ".agent-flow");
-  fs.mkdirSync(runtimeDirectory, { recursive: true, mode: 0o700 });
-  const runtimeStat = fs.lstatSync(runtimeDirectory);
-  if (!runtimeStat.isDirectory() || runtimeStat.isSymbolicLink()) {
-    throw providerError("Native provider locking requires a non-symlink .agent-flow directory.");
-  }
-  const lockPath = path.join(runtimeDirectory, "native-provider.lock");
-  fs.closeSync(fs.openSync(
-    lockPath,
-    fs.constants.O_APPEND | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW | fs.constants.O_WRONLY,
-    0o600
-  ));
-  const release = await acquireNativeWorkspaceLock(lockPath, signal);
-  try {
-    return await callback();
-  } finally {
-    await release();
-  }
-}
-
-function acquireNativeWorkspaceLock(lockPath: string, signal: AbortSignal): Promise<() => Promise<void>> {
-  return new Promise((resolve, reject) => {
-    const child = spawn("/usr/bin/flock", [
-      "--exclusive", lockPath, "/bin/sh", "-c", "printf 'locked\\n'; cat >/dev/null"
-    ], {
-      shell: false,
-      detached: true,
-      env: { PATH: "/usr/bin:/bin" },
-      stdio: ["pipe", "pipe", "pipe"]
-    });
-    let settled = false;
-    let stdout = "";
-    let stderr = "";
-    const abort = (): void => {
-      terminateNativeChild(child.pid, "SIGTERM");
-      if (!settled) {
-        settled = true;
-        reject(signal.reason instanceof Error ? signal.reason : providerError("Native provider lock acquisition was aborted."));
-      }
-    };
-    signal.addEventListener("abort", abort, { once: true });
-    child.stderr?.on("data", (chunk: Buffer | string) => { stderr = `${stderr}${String(chunk)}`.slice(-2_000); });
-    child.stdout?.on("data", (chunk: Buffer | string) => {
-      stdout += String(chunk);
-      if (settled || !stdout.includes("locked\n")) return;
-      settled = true;
-      signal.removeEventListener("abort", abort);
-      resolve(async () => {
-        if (child.exitCode !== null) return;
-        child.stdin?.end();
-        await new Promise<void>((done) => child.once("close", () => done()));
-      });
-    });
-    child.once("error", (error) => {
-      if (settled) return;
-      settled = true;
-      signal.removeEventListener("abort", abort);
-      reject(providerError(`Could not acquire native provider workspace lock: ${error.message}.`));
-    });
-    child.once("close", (status) => {
-      if (settled) return;
-      settled = true;
-      signal.removeEventListener("abort", abort);
-      reject(providerError(
-        `Could not acquire native provider workspace lock${status === null ? "" : ` (status ${status})`}${stderr.trim() ? `: ${stderr.trim()}` : "."}`
-      ));
-    });
-    if (signal.aborted) abort();
-  });
+  }, { required: true });
 }
 
 function nativeWriteAllowed(request: AgentFlowSessionProviderRequest, candidate: string): boolean {
@@ -633,6 +776,12 @@ function assertNativeAuthority(
   if (request.repoRoot === undefined || !path.isAbsolute(request.repoRoot)) {
     throw providerError(`Configured ${binding.config.driver} target ${binding.alias} requires an absolute repository root.`);
   }
+  if (request.canModifyFiles === true
+      && !(request.fileScope?.layers ?? []).some((layer) => layer.include.length > 0)) {
+    throw providerError(
+      `Configured ${binding.config.driver} target ${binding.alias} requires a non-empty file scope before it can modify repository files.`
+    );
+  }
 }
 
 function assertNativeSuccess(label: string, result: NativeProviderProcessResult, resuming: boolean): void {
@@ -643,32 +792,6 @@ function assertNativeSuccess(label: string, result: NativeProviderProcessResult,
     `${label} exited ${result.signal === null ? `with status ${String(result.exitCode)}` : `on signal ${result.signal}`}${detail ? `: ${detail}` : "."}`,
     unavailable ? NATIVE_SESSION_UNAVAILABLE : undefined
   );
-}
-
-function nativeProviderEnvironment(
-  command: string,
-  source: Readonly<Record<string, string | undefined>>
-): NodeJS.ProcessEnv {
-  const result: NodeJS.ProcessEnv = {};
-  const permitted = (name: string): boolean => {
-    if (NATIVE_COMMON_ENVIRONMENT.has(name) || name.startsWith("LC_")) return true;
-    if (command === "codex") {
-      return name === "CODEX_HOME" || name === "OPENAI_API_KEY" || name.startsWith("OPENAI_");
-    }
-    return name === "CLAUDE_CONFIG_DIR"
-      || name === "CLOUD_ML_REGION"
-      || name.startsWith("ANTHROPIC_")
-      || name.startsWith("CLAUDE_CODE_")
-      || name.startsWith("AWS_")
-      || name.startsWith("GOOGLE_")
-      || name.startsWith("VERTEX_");
-  };
-  for (const [name, value] of Object.entries(source)) {
-    if (value !== undefined && permitted(name)) result[name] = value;
-  }
-  if (result.HOME === undefined) result.HOME = os.homedir();
-  if (result.PATH === undefined) result.PATH = "/usr/local/bin:/usr/bin:/bin";
-  return result;
 }
 
 function boundedNativeError(content: Buffer): string {

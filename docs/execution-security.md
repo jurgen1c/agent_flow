@@ -29,7 +29,8 @@ persisted definition before invoking an adapter or shell.
   leaves unrelated host paths unmounted. It exposes only the native CLI state
   directory and invocation temp directory as additional writable locations;
   the selected executable and required interpreter/toolchain files are
-  read-only. Audited invocations are serialized per repository. Native children receive a
+  read-only. Audited invocations share a per-repository write lock with command
+  steps and file-writing custom adapters. Native children receive a
   driver-specific environment allowlist instead of the full Agent Flow process
   environment.
 - Workflow and session file writes require explicit authority and effective

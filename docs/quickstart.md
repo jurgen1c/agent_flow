@@ -159,12 +159,13 @@ targets:
   codex-main:
     kind: frontier
     driver: codex-cli
-    # Optional: profile: work
+    model: YOUR_CODEX_MODEL
     enabled: true
 
   claude-main:
     kind: frontier
     driver: claude-code
+    model: YOUR_CLAUDE_MODEL
     enabled: true
 
   openai-api:
@@ -199,8 +200,9 @@ targets:
 
 Do not put API keys in YAML. `api_key_env` names the environment variable to
 read for API drivers. Native drivers use the existing `codex` or `claude`
-executable and its current login. Their `model` is optional; omit it to use the
-CLI default. A Codex target may also select a named CLI `profile`.
+executable and its current login. Set `model` to a model identifier accepted by
+that CLI. Agent Flow requires it so resumable runs pin the configured model
+instead of inheriting a mutable CLI default or profile.
 
 Built-in native execution currently requires Linux with `bubblewrap` and
 `flock`; install them with your system package manager, then use
@@ -278,7 +280,8 @@ edit the checkout, grant `authority.can_modify_files: true` and a non-empty
 the process, rejects changes not allowed by every scope layer, and leaves those
 changes in place for inspection rather than attempting an unsafe rollback. Its
 host sandbox keeps `.git` read-only, hides `.agent-flow`, and leaves unrelated
-host paths unmounted. Audited native invocations are serialized per repository
+host paths unmounted. Audited native invocations share a per-repository write
+lock with command steps and file-writing custom adapters
 so concurrent Agent Flow runs cannot be attributed to one another. Native
 agents receive only the selected CLI's authentication/provider
 variables plus basic process, locale, proxy, and certificate variables—not the

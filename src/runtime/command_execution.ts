@@ -95,6 +95,7 @@ import {
   writeAgentFlowFinalSummary
 } from "./retention";
 import { withAgentFlowPipelineFinalization } from "./finalization";
+import { withAgentFlowWorkspaceWriteLock } from "./workspace_lock";
 import {
   agentFlowInputKeyLooksSensitive,
   persistAgentFlowFailurePayload,
@@ -1321,7 +1322,7 @@ async function runAgentFlowCommandPipeline(
       store.upsertStep({ runId, stepId, attempt, status: "running", input: { command: step.command as string } });
       store.appendRunEvent(runId, { type: "step.started", stepId, payload: { attempt, command: step.command as string } });
 
-      lastResult = await runCommand(
+      lastResult = await runWorkspaceLockedCommand(
         store.repoRoot,
         step.command as string,
         timeoutMilliseconds(step),
@@ -2321,6 +2322,29 @@ function pauseForUnavailableProviderSession(
     stepId,
     payload: { sessionId, attempt }
   });
+  const failWaitingProviderSession = (failureMessage: string): void => {
+    const persisted = persistAgentFlowFailurePayload(store, {
+      id: `session-request:${safeId(stepId)}:attempt-${attempt}:notification`,
+      runId,
+      stepId,
+      sessionId,
+      stepType: "session_request",
+      attempt,
+      exitCode: null,
+      summary: failureMessage,
+      classification: "notification_failure",
+      retryable: false,
+      outcome: "fail",
+      indexPayload: { attempt, message: failureMessage, outcome: "fail" }
+    });
+    const indexedError = { ...persisted.indexPayload, ...failureReference(persisted) };
+    store.upsertStep({ runId, stepId, attempt, sessionId, status: "failed", error: indexedError });
+    const provider = store.getSession(runId, sessionId)?.provider;
+    if (provider !== undefined) {
+      store.upsertSession({ id: sessionId, runId, stepId, provider, status: "failed" });
+    }
+    store.appendRunEvent(runId, { type: "step.failed", stepId, payload: indexedError });
+  };
   const finalized = finalizePipelineRun(store, runId, routingBudget.terminalEffects, {
     intendedStatus: "paused",
     completedSteps,
@@ -2328,7 +2352,12 @@ function pauseForUnavailableProviderSession(
     message: prompt,
     eventPayload: { stepId, reason: "external_session_unavailable", sessionId },
     eventStepId: stepId,
-    failureContext: run.context
+    failureContext: run.context,
+    beforeFinalTransition: (status, message) => {
+      if (status === "failed") {
+        failWaitingProviderSession(message ?? "Required paused notification failed.");
+      }
+    }
   });
   return { status: finalized.status, completedSteps, failedStep: stepId, failureOutcome: "pause", message: finalized.message ?? prompt };
 }
@@ -5105,13 +5134,7 @@ async function executeRecoverySession(
               stepId: recoveryStepId,
               provider,
               status: "running",
-              externalSessionId: reported,
-              state: {
-                resume,
-                recoveryOfStepId: stepId,
-                failureId,
-                externalSessionEstablished: true
-              }
+              externalSessionId: reported
             });
           }
         }, () => activeStopStatus(store, runId), () => store.runLockInterruption());
@@ -7401,6 +7424,31 @@ function runCommand(
     child.on("error", (error) => finish({ exitCode: null, signal: null, message: `Could not start command: ${error.message}` }));
     child.on("close", (exitCode, signal) => finish({ exitCode, signal }));
   });
+}
+
+async function runWorkspaceLockedCommand(
+  repoRoot: string,
+  command: string,
+  timeoutMs: number | undefined,
+  stopStatus: () => AgentFlowRunStopStatus | undefined,
+  interruptError: () => Error | undefined
+): Promise<CommandAttemptResult> {
+  const controller = new AbortController();
+  const timer = setInterval(() => {
+    const interruption = interruptError();
+    if (interruption !== undefined) controller.abort(interruption);
+    else {
+      const status = stopStatus();
+      if (status !== undefined) controller.abort(new AgentFlowSessionRequestInterruptedError(status));
+    }
+  }, 25);
+  try {
+    return await withAgentFlowWorkspaceWriteLock(repoRoot, controller.signal, () =>
+      runCommand(repoRoot, command, timeoutMs, stopStatus, interruptError)
+    );
+  } finally {
+    clearInterval(timer);
+  }
 }
 
 function terminateChild(pid: number | undefined, signal: NodeJS.Signals): void {

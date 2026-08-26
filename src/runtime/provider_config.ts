@@ -18,12 +18,11 @@ export type AgentFlowProviderDriver =
 export interface AgentFlowConfiguredTarget {
   kind: AgentFlowConfiguredProviderKind;
   driver: AgentFlowProviderDriver;
-  model?: string;
+  model: string;
   enabled: boolean;
   base_url?: string;
   api_key_env?: string;
   max_output_tokens?: number;
-  profile?: string;
 }
 
 export interface AgentFlowProviderAlias {
@@ -65,8 +64,14 @@ export class AgentFlowProviderConfigError extends Error {
   }
 }
 
+const NATIVE_COMMON_ENVIRONMENT = new Set([
+  "HOME", "LANG", "LOGNAME", "NODE_EXTRA_CA_CERTS", "NO_PROXY", "PATH", "SHELL",
+  "SSL_CERT_DIR", "SSL_CERT_FILE", "TERM", "TMPDIR", "USER",
+  "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "no_proxy"
+]);
+
 const TARGET_FIELDS = new Set([
-  "kind", "driver", "model", "enabled", "base_url", "api_key_env", "max_output_tokens", "profile"
+  "kind", "driver", "model", "enabled", "base_url", "api_key_env", "max_output_tokens"
 ]);
 const ROOT_FIELDS = new Set(["version", "workflows", "prompts", "templates", "runs", "targets", "providers"]);
 const ALIAS_FIELDS = new Set(["kind", "target"]);
@@ -192,7 +197,7 @@ export function serializeAgentFlowProviderBindings(
     target: binding.target,
     kind: binding.kind,
     driver: binding.config.driver,
-    ...(binding.config.model === undefined ? {} : { modelHash: hashAgentFlowProviderModel(binding.config.model) }),
+    modelHash: hashAgentFlowProviderModel(binding.config.model),
     fingerprint: binding.fingerprint
   }]));
 }
@@ -211,7 +216,7 @@ export function renderAgentFlowProviderCatalog(catalog: AgentFlowProviderCatalog
       binding.target,
       binding.kind,
       binding.config.driver,
-      binding.config.model === undefined ? "cli-default" : redactAgentFlowSensitiveText(binding.config.model),
+      redactAgentFlowSensitiveText(binding.config.model),
       binding.config.api_key_env ?? "none"
     ].join("\t"))
   ].join("\n");
@@ -253,9 +258,10 @@ export function doctorAgentFlowProviderCatalog(
           return `${binding.alias}: native CLI filesystem sandbox cannot create the required bubblewrap namespace`;
         }
         const command = binding.config.driver === "codex-cli" ? "codex" : "claude";
+        const probeEnvironment = agentFlowNativeProviderEnvironment(command, env);
         const version = spawnSync(command, ["--version"], {
           encoding: "utf8",
-          env: { ...process.env, ...env }
+          env: probeEnvironment
         });
         if (version.error !== undefined || version.status !== 0) {
           ok = false;
@@ -266,7 +272,7 @@ export function doctorAgentFlowProviderCatalog(
           : ["auth", "status"];
         const auth = spawnSync(command, authArguments, {
           encoding: "utf8",
-          env: { ...process.env, ...env }
+          env: probeEnvironment
         });
         if (auth.error !== undefined || auth.status !== 0) {
           ok = false;
@@ -275,9 +281,35 @@ export function doctorAgentFlowProviderCatalog(
         const normalizedVersion = String(version.stdout || version.stderr).trim().split(/\r?\n/, 1)[0] ?? "unknown version";
         return `${binding.alias}: ready (${binding.config.driver}, ${redactAgentFlowSensitiveText(normalizedVersion)})`;
       }
-      return `${binding.alias}: ready (${binding.config.driver}, ${redactAgentFlowSensitiveText(binding.config.model!)})`;
+      return `${binding.alias}: ready (${binding.config.driver}, ${redactAgentFlowSensitiveText(binding.config.model)})`;
     });
   return { ok, lines };
+}
+
+export function agentFlowNativeProviderEnvironment(
+  command: "codex" | "claude",
+  source: Readonly<Record<string, string | undefined>>
+): NodeJS.ProcessEnv {
+  const result: NodeJS.ProcessEnv = {};
+  const permitted = (name: string): boolean => {
+    if (NATIVE_COMMON_ENVIRONMENT.has(name) || name.startsWith("LC_")) return true;
+    if (command === "codex") {
+      return name === "CODEX_HOME" || name === "OPENAI_API_KEY" || name.startsWith("OPENAI_");
+    }
+    return name === "CLAUDE_CONFIG_DIR"
+      || name === "CLOUD_ML_REGION"
+      || name.startsWith("ANTHROPIC_")
+      || name.startsWith("CLAUDE_CODE_")
+      || name.startsWith("AWS_")
+      || name.startsWith("GOOGLE_")
+      || name.startsWith("VERTEX_");
+  };
+  for (const [name, value] of Object.entries(source)) {
+    if (value !== undefined && permitted(name)) result[name] = value;
+  }
+  if (result.HOME === undefined) result.HOME = os.homedir();
+  if (result.PATH === undefined) result.PATH = "/usr/local/bin:/usr/bin:/bin";
+  return result;
 }
 
 function readConfig(
@@ -327,10 +359,8 @@ function parseTargets(
     rejectUnknownFields(value, TARGET_FIELDS, sourcePath, `targets.${name}`);
     const kind = requiredEnum(value.kind, ["local", "frontier"] as const, sourcePath, `targets.${name}.kind`);
     const driver = requiredEnum(value.driver, [...DRIVERS] as AgentFlowProviderDriver[], sourcePath, `targets.${name}.driver`);
-    const model = value.model === undefined
-      ? undefined
-      : requiredString(value.model, sourcePath, `targets.${name}.model`);
-    if (model !== undefined && /[\u0000-\u001F\u007F-\u009F]/.test(model)) {
+    const model = requiredString(value.model, sourcePath, `targets.${name}.model`);
+    if (/[\u0000-\u001F\u007F-\u009F]/.test(model)) {
       throw configError(sourcePath, `targets.${name}.model`, "Model identifiers must not contain control characters.");
     }
     if (value.enabled !== true && value.enabled !== false) {
@@ -339,12 +369,11 @@ function parseTargets(
     const target: AgentFlowConfiguredTarget = {
       kind,
       driver,
-      ...(model === undefined ? {} : { model }),
+      model,
       enabled: value.enabled,
       ...optionalStringField(value, "base_url", sourcePath, `targets.${name}.base_url`),
       ...optionalStringField(value, "api_key_env", sourcePath, `targets.${name}.api_key_env`),
-      ...optionalPositiveIntegerField(value, "max_output_tokens", sourcePath, `targets.${name}.max_output_tokens`),
-      ...optionalStringField(value, "profile", sourcePath, `targets.${name}.profile`)
+      ...optionalPositiveIntegerField(value, "max_output_tokens", sourcePath, `targets.${name}.max_output_tokens`)
     };
     validateTargetShape(name, target, sourcePath);
     targets[name] = Object.freeze(target);
@@ -379,9 +408,6 @@ function parseProviders(
 function validateTargetShape(name: string, target: AgentFlowConfiguredTarget, sourcePath: string): void {
   const field = `targets.${name}`;
   const nativeCli = target.driver === "codex-cli" || target.driver === "claude-code";
-  if (!nativeCli && target.model === undefined) {
-    throw configError(sourcePath, `${field}.model`, `${target.driver} requires model.`);
-  }
   if (nativeCli && target.kind !== "frontier") {
     throw configError(sourcePath, `${field}.kind`, `${target.driver} targets must be frontier.`);
   }
@@ -400,12 +426,6 @@ function validateTargetShape(name: string, target: AgentFlowConfiguredTarget, so
   }
   if (target.max_output_tokens !== undefined && target.driver !== "anthropic-messages") {
     throw configError(sourcePath, `${field}.max_output_tokens`, "max_output_tokens is supported only by anthropic-messages targets.");
-  }
-  if (target.profile !== undefined && target.driver !== "codex-cli") {
-    throw configError(sourcePath, `${field}.profile`, "profile is supported only by codex-cli targets.");
-  }
-  if (target.profile !== undefined && /[\u0000-\u001F\u007F-\u009F]/.test(target.profile)) {
-    throw configError(sourcePath, `${field}.profile`, "Codex profile names must not contain control characters.");
   }
   if (target.api_key_env !== undefined
       && target.driver !== "openai-responses"
@@ -457,8 +477,7 @@ function fingerprintTarget(target: AgentFlowConfiguredTarget): string {
   const stable = JSON.stringify({
     kind: target.kind,
     driver: target.driver,
-    model: target.model ?? null,
-    profile: target.profile ?? null,
+    model: target.model,
     api_key_env: target.api_key_env ?? null,
     endpoint: target.base_url === undefined ? null : createHash("sha256").update(target.base_url).digest("hex"),
     max_output_tokens: target.max_output_tokens ?? null

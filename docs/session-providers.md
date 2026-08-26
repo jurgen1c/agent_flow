@@ -16,12 +16,13 @@ targets:
   codex-main:
     kind: frontier
     driver: codex-cli
-    # Optional: profile: work
+    model: YOUR_CODEX_MODEL
     enabled: true
 
   claude-main:
     kind: frontier
     driver: claude-code
+    model: YOUR_CLAUDE_MODEL
     enabled: true
 
   openai-api:
@@ -155,13 +156,18 @@ and leaves unrelated host paths unmounted. Only a per-invocation temporary
 directory and the selected CLI's own state directory (`CODEX_HOME`/`~/.codex`
 or `CLAUDE_CONFIG_DIR`/`~/.claude`) remain writable so native sessions can
 persist; the selected executable and required interpreter/toolchain files are
-read-only. Audited native invocations are serialized per repository.
+read-only. Audited native invocations share a per-repository write lock with
+command steps and file-writing custom adapters. Inside that host boundary, the
+CLI's own agent-facing OS sandbox denies reads and writes to its mounted login
+and session-state directory and fails closed if that sandbox is unavailable.
 Agent Flow forwards only basic process/locale variables, proxy and certificate
 settings, and authentication/provider variables for the selected CLI. It does
 not pass arbitrary environment variables to the native agent.
 
-`model` is optional for native CLI targets and selects the CLI's configured
-default when omitted. `profile` is optional and supported only by `codex-cli`.
+`model` is required for native CLI targets. Agent Flow disables ambient Codex
+user config/rules and Claude user/project/local settings, then passes the model
+explicitly. This keeps the persisted target fingerprint independent of mutable
+CLI defaults and profile contents.
 The CLI receives prompts on standard input, never through a shell, and output
 is bounded and schema-validated before Agent Flow publishes artifacts.
 
@@ -252,9 +258,8 @@ should also receive:
 - complete target/model identity evidence; and
 - resume rejection when its privacy-safe fingerprint changes.
 
-`registerConfigured` requires `name`, `kind`, `target`, `driver`, and
-`fingerprint`; `model` is also required unless the descriptor uses a native CLI
-driver. Its adapter remains application-defined; registration neither loads
+`registerConfigured` requires `name`, `kind`, `target`, `driver`, `model`, and
+`fingerprint`. Its adapter remains application-defined; registration neither loads
 executable code from YAML nor grants filesystem or process authority.
 
 `request.fileScope.layers` preserves the global, session, and operation scopes
