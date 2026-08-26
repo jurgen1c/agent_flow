@@ -68,8 +68,10 @@ export function createAgentFlowConfiguredProviderAdapter(
     adapter = (request) => invokeOpenAiCompatible(binding, request, env);
   } else if (binding.config.driver === "codex-cli") {
     adapter = (request) => invokeCodexCli(binding, request, env);
-  } else {
+  } else if (binding.config.driver === "claude-code") {
     adapter = (request) => invokeClaudeCode(binding, request, env);
+  } else {
+    throw providerError("Unsupported configured provider driver.");
   }
   adapter.preflight = (request) => {
     if (binding.config.driver === "codex-cli" || binding.config.driver === "claude-code") {

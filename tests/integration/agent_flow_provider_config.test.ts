@@ -5,6 +5,7 @@ import { execFileSync } from "node:child_process";
 import { runCli } from "../../src/cli/router";
 import {
   buildAgentFlowRunActionSnapshot,
+  createAgentFlowConfiguredProviderAdapter,
   createAgentFlowConfiguredProviderRegistry,
   createAgentFlowLifecycleRun,
   createAgentFlowSessionProviderRegistry,
@@ -24,6 +25,21 @@ import {
 } from "../../src/runtime";
 
 describe("Agent Flow configured providers", () => {
+  test("fails closed when programmatic bindings contain an unsupported driver", () => {
+    expect(() => createAgentFlowConfiguredProviderAdapter({
+      alias: "future",
+      target: "future",
+      kind: "frontier",
+      fingerprint: "sha256:test",
+      config: {
+        kind: "frontier",
+        driver: "future-driver",
+        model: "future-model",
+        enabled: true
+      }
+    } as never)).toThrow("Unsupported configured provider driver");
+  });
+
   test("loads global targets, resolves repo aliases, and applies kind-safe overrides", () => {
     const { repo, home, globalConfig } = configuredRepo();
     const catalog = loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} });

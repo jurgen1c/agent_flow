@@ -27,9 +27,16 @@ export async function withAgentFlowWorkspaceWriteLock<T>(
   }
   const runtimeDirectory = path.join(fs.realpathSync(repoRoot), ".agent-flow");
   fs.mkdirSync(runtimeDirectory, { recursive: true, mode: 0o700 });
-  const runtimeStat = fs.lstatSync(runtimeDirectory);
+  let runtimeStat = fs.lstatSync(runtimeDirectory);
   if (!runtimeStat.isDirectory() || runtimeStat.isSymbolicLink()) {
     throw new Error("Workspace mutation locking requires a non-symlink .agent-flow directory.");
+  }
+  if ((runtimeStat.mode & 0o022) !== 0) {
+    fs.chmodSync(runtimeDirectory, 0o700);
+    runtimeStat = fs.lstatSync(runtimeDirectory);
+  }
+  if (!runtimeStat.isDirectory() || runtimeStat.isSymbolicLink() || (runtimeStat.mode & 0o022) !== 0) {
+    throw new Error("Workspace mutation locking requires .agent-flow to not be group- or world-writable.");
   }
   const lockPath = path.join(runtimeDirectory, "workspace-write.lock");
   fs.closeSync(fs.openSync(
