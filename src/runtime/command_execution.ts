@@ -5053,6 +5053,7 @@ async function executeRecoverySession(
             ])
       ]);
       const providerInputs = contextInput === undefined ? inputs : [...inputs, contextInput];
+      const invokedExternalSessionId = externalSessionId;
       let reportedExternalSessionId: string | undefined;
       const evidencePrompt = {
         path: prompt.path,
@@ -5120,6 +5121,12 @@ async function executeRecoverySession(
               );
             }
             assertRecoveryAdapterStringsSafe(workflow, [["Recovery provider external session ID", reported]]);
+            if (invokedExternalSessionId !== undefined && reported !== invokedExternalSessionId) {
+              throw new AgentFlowSessionRequestError(
+                `Recovery provider ${provider} reported an external session ID that differs from the persisted ID for session ${sessionId}.`,
+                "AGENT_FLOW_SESSION_RESPONSE_INVALID"
+              );
+            }
             if (reportedExternalSessionId !== undefined && reportedExternalSessionId !== reported) {
               throw new AgentFlowSessionRequestError(
                 `Recovery provider ${provider} reported more than one external session ID for session ${sessionId}.`,
@@ -5163,13 +5170,26 @@ async function executeRecoverySession(
           "AGENT_FLOW_SESSION_RESPONSE_INVALID"
         );
       }
+      if (returnedSessionId !== undefined && invokedExternalSessionId !== undefined
+          && returnedSessionId !== invokedExternalSessionId) {
+        throw new AgentFlowSessionRequestError(
+          `Recovery provider ${provider} returned an external session ID that differs from the persisted ID for session ${sessionId}.`,
+          "AGENT_FLOW_SESSION_RESPONSE_INVALID"
+        );
+      }
       if (stoppedAfterResponse !== undefined) {
-        externalSessionId = returnedSessionId ?? externalSessionId;
+        if (resume) externalSessionId = returnedSessionId ?? externalSessionId;
         throw new AgentFlowSessionRequestInterruptedError(stoppedAfterResponse);
       }
       if (recoveryContextRevision(store.getSession(runId, sessionId)?.state ?? {}) !== appliedContextRevision) {
         if (resume) externalSessionId = returnedSessionId ?? externalSessionId;
         continue;
+      }
+      if (returnedSessionId !== undefined && !resume) {
+        throw new AgentFlowSessionRequestError(
+          `Recovery provider ${provider} returned a persistent external session ID for non-resumable session ${sessionId}.`,
+          "AGENT_FLOW_SESSION_RESPONSE_INVALID"
+        );
       }
       const returnedExternalSessionId = response.externalSessionId;
       if (returnedExternalSessionId !== undefined &&

@@ -1046,6 +1046,12 @@ async function executeAgentFlowSessionStep(
     }
     const externalSessionId = requiredName(candidate, `Session provider external session ID for step ${stepId}`);
     assertAgentFlowAdapterStringSafe(workflow, "Session provider external session ID", externalSessionId);
+    if (priorExternalSessionId !== undefined && externalSessionId !== priorExternalSessionId) {
+      throw new AgentFlowSessionRequestError(
+        `Session provider ${provider} reported an external session ID that differs from the persisted ID for resumable session ${sessionId}.`,
+        "AGENT_FLOW_SESSION_RESPONSE_INVALID"
+      );
+    }
     if (reportedExternalSessionId !== undefined && reportedExternalSessionId !== externalSessionId) {
       throw new AgentFlowSessionRequestError(
         `Session provider ${provider} reported more than one external session ID for resumable session ${sessionId}.`,
@@ -1149,13 +1155,24 @@ async function executeAgentFlowSessionStep(
       "Session provider external session ID",
       returnedExternalSessionId
     );
-  }
-  if (returnedExternalSessionId !== undefined && reportedExternalSessionId !== undefined
-      && returnedExternalSessionId !== reportedExternalSessionId) {
-    throw new AgentFlowSessionRequestError(
-      `Session provider ${provider} returned an external session ID that differs from the ID reported during execution.`,
-      "AGENT_FLOW_SESSION_RESPONSE_INVALID"
-    );
+    if (!resume) {
+      throw new AgentFlowSessionRequestError(
+        `Session provider ${provider} returned a persistent external session ID for non-resumable session ${sessionId}.`,
+        "AGENT_FLOW_SESSION_RESPONSE_INVALID"
+      );
+    }
+    if (priorExternalSessionId !== undefined && returnedExternalSessionId !== priorExternalSessionId) {
+      throw new AgentFlowSessionRequestError(
+        `Session provider ${provider} returned an external session ID that differs from the persisted ID for resumable session ${sessionId}.`,
+        "AGENT_FLOW_SESSION_RESPONSE_INVALID"
+      );
+    }
+    if (reportedExternalSessionId !== undefined && returnedExternalSessionId !== reportedExternalSessionId) {
+      throw new AgentFlowSessionRequestError(
+        `Session provider ${provider} returned an external session ID that differs from the ID reported during execution.`,
+        "AGENT_FLOW_SESSION_RESPONSE_INVALID"
+      );
+    }
   }
   const externalSessionId = returnedExternalSessionId ?? effectiveExternalSessionId;
   effectiveExternalSessionId = externalSessionId;

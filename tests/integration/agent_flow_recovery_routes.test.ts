@@ -1418,7 +1418,7 @@ steps:
       fs.writeFileSync(path.join(root, "fixed.txt"), "fixed\n");
       return {
         outputs: {},
-        externalSessionId: "continued-session",
+        externalSessionId: "existing-session",
         metadata: { recovery_status: "remediated", message: "fixed" }
       };
     });
@@ -1429,7 +1429,7 @@ steps:
     expect(result).toMatchObject({ status: "completed", completedSteps: ["check"] });
     expect(store.getSession("session-recovery", "fixer")).toMatchObject({
       status: "waiting",
-      externalSessionId: "continued-session",
+      externalSessionId: "existing-session",
       state: {
         recoveryStatus: "remediated",
         failureId: expect.any(String),
@@ -1443,7 +1443,7 @@ steps:
       provider: "fixture",
       providerKind: "fixture",
       resume: true,
-      externalSessionId: "continued-session",
+      externalSessionId: "existing-session",
       outputs: [],
       providerMetadata: { recovery_status: "remediated", message: "fixed" }
     });
@@ -1451,10 +1451,62 @@ steps:
     store.close();
   });
 
+  test("rejects reported and returned identity switches for resumable recovery sessions", async () => {
+    for (const mode of ["report", "return"] as const) {
+      const root = temporaryRepo();
+      fs.writeFileSync(path.join(root, "fix.md"), "Fix the failure.\n");
+      const workflow = parseAgentFlowWorkflowOrThrow(`name: reject-${mode}-recovery-session-switch
+version: 1
+style: recovery_pipeline
+maturity: experimental
+sessions:
+  fixer: { provider: fixture, resume: true }
+steps:
+  - id: check
+    type: command
+    command: exit 1
+    on_failure:
+      route_to: { session: fixer, prompt: fix.md }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+      const runId = `reject-${mode}-recovery-session-switch`;
+      const store = await openAgentFlowRunState({ cwd: root });
+      createAgentFlowLifecycleRun(store, { id: runId, workflow });
+      store.upsertSession({
+        id: "fixer",
+        runId,
+        provider: "fixture",
+        status: "waiting",
+        externalSessionId: "provider-session"
+      });
+      const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => {
+        expect(request.externalSessionId).toBe("provider-session");
+        if (mode === "report") request.reportExternalSessionId!("switched-session");
+        return {
+          outputs: {},
+          externalSessionId: mode === "return" ? "switched-session" : "provider-session",
+          metadata: { recovery_status: "remediated" }
+        };
+      });
+
+      const result = await executeAgentFlowCommandPipeline(store, runId, workflow, undefined, providers);
+
+      expect(result.status).toBe("paused");
+      expect(store.getSession(runId, "fixer")).toMatchObject({
+        status: "paused",
+        externalSessionId: "provider-session"
+      });
+      expect(store.listFailures(runId)[0]?.resolvedAt).toBeNull();
+      store.close();
+    }
+  });
+
   test("reuses a settled recovery-session response after lease takeover", async () => {
     const root = temporaryRepo();
     fs.writeFileSync(path.join(root, "fix.md"), "Fix the failure.\n");
     const workflow = sessionRecoveryWorkflow("settled-session-takeover", "fix.md");
+    workflow.sessions!.fixer = { provider: "fixture", resume: true };
     const runId = "settled-session-takeover";
     const store = await openAgentFlowRunState({ cwd: root });
     createAgentFlowLifecycleRun(store, { id: runId, workflow });
@@ -1712,7 +1764,7 @@ steps:
       }
       return {
         outputs: {},
-        externalSessionId: `recovery-session-${calls}`,
+        externalSessionId: "recovery-session-1",
         metadata: { recovery_status: "remediated" }
       };
     });
@@ -1725,7 +1777,7 @@ steps:
     expect(calls).toBe(2);
     expect(store.getSession("repeated-session-recovery", "fixer")).toMatchObject({
       status: "waiting",
-      externalSessionId: "recovery-session-2"
+      externalSessionId: "recovery-session-1"
     });
     const requestArtifacts = store.listArtifacts("repeated-session-recovery")
       .filter((artifact) => artifact.kind === "session_request");
@@ -1737,7 +1789,7 @@ steps:
       recoveryFailureId: string;
     });
     expect(requestEvidence.map((evidence) => evidence.externalSessionId).sort())
-      .toEqual(["recovery-session-1", "recovery-session-2"]);
+      .toEqual(["recovery-session-1", "recovery-session-1"]);
     expect(new Set(requestEvidence.map((evidence) => evidence.recoveryFailureId)).size).toBe(2);
     expect(requestArtifacts.map((artifact) => artifact.declaredPath)).toContain(
       store.getSession("repeated-session-recovery", "fixer")!.state.requestArtifact
@@ -2165,6 +2217,7 @@ steps:
     const root = temporaryRepo();
     fs.writeFileSync(path.join(root, "fix.md"), "fix\n");
     const workflow = sessionRecoveryWorkflow("cancel-on-response", "fix.md");
+    workflow.sessions!.fixer = { provider: "fixture", resume: true };
     const store = await openAgentFlowRunState({ cwd: root });
     createAgentFlowLifecycleRun(store, { id: "cancel-on-response", workflow });
     const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
@@ -2195,6 +2248,7 @@ steps:
     const root = temporaryRepo();
     fs.writeFileSync(path.join(root, "fix.md"), "fix\n");
     const workflow = sessionRecoveryWorkflow("cancel-while-settling", "fix.md");
+    workflow.sessions!.fixer = { provider: "fixture", resume: true };
     const store = await openAgentFlowRunState({ cwd: root });
     createAgentFlowLifecycleRun(store, { id: "cancel-while-settling", workflow });
     const settleRecoverySession = store.settleRecoverySessionForRunAtContextRevision.bind(store);
