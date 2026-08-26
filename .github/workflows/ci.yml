@@ -20,6 +20,8 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 26.7.0
+      - name: Install native provider sandbox dependencies
+        run: sudo apt-get update && sudo apt-get install --yes bubblewrap util-linux
       - run: bun install --frozen-lockfile
       - run: bun run ci
       - run: bun run verify:package

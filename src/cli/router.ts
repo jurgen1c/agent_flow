@@ -207,7 +207,7 @@ function renderHelp(topic?: string): string {
     "  agent-flow run <workflow> --id <run-id> --fixture <file>",
     "  agent-flow resume <run-id> --outcome <choice> [--fixture <file>]",
     "  agent-flow resume <run-id> --answer <value> [--fixture <file>]",
-    "  agent-flow resume <run-id> --reset-session <session-name> [--config <file>]",
+    "  agent-flow resume <run-id> --reset-session <session-name> [--fixture <file>] [--config <file>]",
     "  agent-flow inject <run-id> <session-name> <context>",
     "  agent-flow status <run-id>",
     "  agent-flow logs <run-id>",

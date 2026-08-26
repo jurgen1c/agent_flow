@@ -294,7 +294,7 @@ instead of silently losing context. Start a fresh native session explicitly:
 
 ```bash
 agent-flow status <run-id>
-agent-flow resume <run-id> --reset-session <session-name>
+agent-flow resume <run-id> --reset-session <session-name> [--fixture <file>] [--config <file>]
 ```
 
 For an implement-review-fix sequence that deliberately keeps one native

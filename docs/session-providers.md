@@ -181,7 +181,7 @@ the missing provider context.
 After inspecting the run, explicitly reset it with:
 
 ```bash
-agent-flow resume <run-id> --reset-session <session-name>
+agent-flow resume <run-id> --reset-session <session-name> [--fixture <file>] [--config <file>]
 ```
 
 Configured frontier aliases count against `max_frontier_calls`, and policy
