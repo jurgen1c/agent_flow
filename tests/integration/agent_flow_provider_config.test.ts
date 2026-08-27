@@ -49,9 +49,10 @@ describe("Agent Flow configured providers", () => {
 
   test("copies selected Codex credentials without prototype-bearing names", () => {
     const source = Object.create(null) as Record<string, string>;
-    source.SAFE_PROVIDER_KEY = "provider-secret";
+    source.SAFE_PROVIDER_KEY = "  provider-secret\n";
+    source.EMPTY_PROVIDER_KEY = " \t\n";
     source.__proto__ = "prototype-secret";
-    const selected = selectedCodexProviderEnvironment(source, ["SAFE_PROVIDER_KEY"]);
+    const selected = selectedCodexProviderEnvironment(source, ["SAFE_PROVIDER_KEY", "EMPTY_PROVIDER_KEY"]);
 
     expect(selected).toEqual({ SAFE_PROVIDER_KEY: "provider-secret" });
     expect(Object.getPrototypeOf(selected)).toBeNull();

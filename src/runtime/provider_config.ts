@@ -407,9 +407,8 @@ export function selectedCodexProviderEnvironment(
   const result = Object.create(null) as NodeJS.ProcessEnv;
   for (const name of names) {
     const validatedName = requiredEnvironmentName(name);
-    if (!Object.hasOwn(source, validatedName)) continue;
-    const value = source[validatedName];
-    if (typeof value === "string") result[validatedName] = value;
+    const value = environmentValue(source, validatedName);
+    if (value !== undefined) result[validatedName] = value;
   }
   return result;
 }
