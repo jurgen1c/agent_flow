@@ -1,6 +1,6 @@
 {
   "name": "@jurgen1c/agent-flow",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Standalone workflow runtime and CLI for persistent, policy-aware agent pipelines.",
   "license": "MIT",
   "repository": {
