@@ -172,11 +172,13 @@ not pass arbitrary environment variables to the native agent.
 set `profile` and `reasoning_effort`. Profile names contain only letters,
 numbers, hyphens, and underscores and resolve to
 `$CODEX_HOME/<profile>.config.toml` (or `~/.codex/<profile>.config.toml`). The
-profile must be a regular file no larger than 1 MiB. Agent Flow fingerprints
-its contents plus the base `$CODEX_HOME/config.toml` when present, and verifies
-both identities before and after each invocation. `providers doctor` also asks
-the installed Codex CLI to strict-load the selected profile without starting a
-model request, catching unsupported profile fields or CLI versions early.
+profile must be a regular file no larger than 1 MiB. `CODEX_HOME` must resolve
+outside the repository and cannot be a filesystem root. Agent Flow fingerprints
+the profile contents plus the base `$CODEX_HOME/config.toml` when present, and
+verifies both identities before and after each invocation. `providers doctor`
+also asks the installed Codex CLI to strict-load the selected profile without
+starting a model request, catching unsupported profile fields or CLI versions
+early.
 
 Agent Flow disables ambient Codex user config for targets without a profile.
 Profile targets load Codex's base-plus-profile layers. Agent Flow still disables

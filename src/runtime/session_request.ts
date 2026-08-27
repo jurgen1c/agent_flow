@@ -52,6 +52,9 @@ import {
 } from "./execution_security";
 import { isAgentFlowFrontierProvider } from "./policy_utils";
 
+const CODEX_PROFILE_PATTERN = /^[A-Za-z0-9_-]+$/;
+const CODEX_REASONING_EFFORTS = new Set(["minimal", "low", "medium", "high", "xhigh"]);
+
 export const MAX_AGENT_FLOW_SESSION_PROMPT_BYTES = 1024 * 1024;
 export const MAX_AGENT_FLOW_SESSION_INPUT_BYTES = 10 * 1024 * 1024;
 export const MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES = 10 * 1024 * 1024;
@@ -381,12 +384,22 @@ export class AgentFlowSessionProviderRegistry {
     const profile = descriptor.profile === undefined
       ? undefined
       : requiredConfiguredIdentity(descriptor.profile, "Configured session provider profile");
+    if (profile !== undefined && !CODEX_PROFILE_PATTERN.test(profile)) {
+      throw invalidProviderRegistration(
+        "Configured session provider profile may contain only letters, numbers, hyphens, and underscores."
+      );
+    }
     const reasoningEffort = descriptor.reasoningEffort === undefined
       ? undefined
       : requiredConfiguredIdentity(
           descriptor.reasoningEffort,
           "Configured session provider reasoning effort"
         );
+    if (reasoningEffort !== undefined && !CODEX_REASONING_EFFORTS.has(reasoningEffort)) {
+      throw invalidProviderRegistration(
+        "Configured session provider reasoning effort must be one of: minimal, low, medium, high, xhigh."
+      );
+    }
     if ((profile !== undefined || reasoningEffort !== undefined) && driver !== "codex-cli") {
       throw invalidProviderRegistration(
         "Configured session provider profiles and reasoning effort require the codex-cli driver."

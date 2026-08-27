@@ -25,7 +25,10 @@ import {
   validateAgentFlowWorkflow,
   type AgentFlowSessionProviderRequest
 } from "../../src/runtime";
-import { runAgentFlowNativeProviderDoctorProbe } from "../../src/runtime/provider_config";
+import {
+  runAgentFlowNativeProviderDoctorProbe,
+  selectedCodexProviderEnvironment
+} from "../../src/runtime/provider_config";
 import { nativeExecutableMountPaths } from "../../src/runtime/provider_drivers";
 
 describe("Agent Flow configured providers", () => {
@@ -42,6 +45,18 @@ describe("Agent Flow configured providers", () => {
         enabled: true
       }
     } as never)).toThrow("Unsupported configured provider driver");
+  });
+
+  test("copies selected Codex credentials without prototype-bearing names", () => {
+    const source = Object.create(null) as Record<string, string>;
+    source.SAFE_PROVIDER_KEY = "provider-secret";
+    source.__proto__ = "prototype-secret";
+    const selected = selectedCodexProviderEnvironment(source, ["SAFE_PROVIDER_KEY"]);
+
+    expect(selected).toEqual({ SAFE_PROVIDER_KEY: "provider-secret" });
+    expect(Object.getPrototypeOf(selected)).toBeNull();
+    expect(() => selectedCodexProviderEnvironment(source, ["__proto__"]))
+      .toThrow("credential references must use canonical environment variable names");
   });
 
   test("bounds native CLI doctor probes", () => {
@@ -293,6 +308,14 @@ providers:
     expect(() => loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} }))
       .toThrow("command-backed Codex provider authentication is not supported");
 
+    fs.writeFileSync(profilePath, 'model_provider = "custom"\n[model_providers.custom]\nenv_key = "__proto__"\n');
+    expect(() => loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} }))
+      .toThrow("credential references must use canonical environment variable names");
+
+    fs.writeFileSync(profilePath, 'model_provider = "custom"\n[model_providers.custom]\nenv_http_headers = { X-Org = "constructor" }\n');
+    expect(() => loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} }))
+      .toThrow("credential references must use canonical environment variable names");
+
     fs.writeFileSync(profilePath, 'openai_base_url = "http://openai.example.test/v1"\n');
     expect(() => loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} }))
       .toThrow("Codex openai_base_url must use HTTPS");
@@ -336,6 +359,41 @@ providers:
     fs.rmSync(profilePath);
     expect(() => loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} }))
       .toThrow('Could not read Codex profile "deep-review"');
+  });
+
+  test("rejects Codex profile homes that overlap repository boundaries", () => {
+    const { repo, home, globalConfig } = configuredRepo();
+    fs.writeFileSync(globalConfig, `version: 1
+targets:
+  codex:
+    kind: frontier
+    driver: codex-cli
+    model: codex-test
+    profile: deep-review
+    enabled: true
+`);
+    fs.writeFileSync(path.join(repo, ".agent-flow.yml"), `version: 1
+providers:
+  reviewer: { kind: frontier, target: codex }
+`);
+
+    const repositoryCodexHome = path.join(repo, ".codex");
+    fs.mkdirSync(repositoryCodexHome);
+    expect(() => loadAgentFlowProviderCatalog({
+      cwd: repo,
+      homeDir: home,
+      env: { CODEX_HOME: repositoryCodexHome }
+    })).toThrow("must be separate from the repository and cannot be a filesystem root");
+    expect(() => loadAgentFlowProviderCatalog({
+      cwd: repo,
+      homeDir: home,
+      env: { CODEX_HOME: path.dirname(repo) }
+    })).toThrow("must be separate from the repository and cannot be a filesystem root");
+    expect(() => loadAgentFlowProviderCatalog({
+      cwd: repo,
+      homeDir: home,
+      env: { CODEX_HOME: path.parse(repo).root }
+    })).toThrow("must be separate from the repository and cannot be a filesystem root");
   });
 
   test("executes a Codex profile from the same home that was fingerprinted", async () => {
@@ -446,6 +504,24 @@ providers:
       driver: "codex-cli",
       fingerprint: "sha256:test"
     } as never, async () => ({ outputs: {} }))).toThrow("Configured session provider model must be a non-empty string");
+    expect(() => registry.registerConfigured({
+      name: "unsafe-profile",
+      kind: "frontier",
+      target: "codex",
+      driver: "codex-cli",
+      model: "codex-test",
+      profile: "../unsafe",
+      fingerprint: "sha256:test"
+    }, async () => ({ outputs: {} }))).toThrow("profile may contain only letters");
+    expect(() => registry.registerConfigured({
+      name: "unsupported-effort",
+      kind: "frontier",
+      target: "codex",
+      driver: "codex-cli",
+      model: "codex-test",
+      reasoningEffort: "extreme",
+      fingerprint: "sha256:test"
+    }, async () => ({ outputs: {} }))).toThrow("reasoning effort must be one of");
   });
 
   test("exposes config validation and redacted provider inspection through the CLI", async () => {

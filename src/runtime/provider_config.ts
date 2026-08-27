@@ -404,10 +404,12 @@ export function selectedCodexProviderEnvironment(
   source: Readonly<Record<string, string | undefined>>,
   names: readonly string[]
 ): NodeJS.ProcessEnv {
-  const result: NodeJS.ProcessEnv = {};
+  const result = Object.create(null) as NodeJS.ProcessEnv;
   for (const name of names) {
-    const value = source[name];
-    if (value !== undefined) result[name] = value;
+    const validatedName = requiredEnvironmentName(name);
+    if (!Object.hasOwn(source, validatedName)) continue;
+    const value = source[validatedName];
+    if (typeof value === "string") result[validatedName] = value;
   }
   return result;
 }
@@ -659,6 +661,15 @@ function resolveCodexProfile(
       `Could not resolve CODEX_HOME at ${codexHome}: ${errorMessage(error)}.`
     );
   }
+  const resolvedRepoRoot = fs.realpathSync(repoRoot);
+  if (filesystemPathsOverlap(resolvedCodexHome, resolvedRepoRoot)
+      || resolvedCodexHome === path.parse(resolvedCodexHome).root) {
+    throw configError(
+      sourcePath,
+      `targets.${targetName}.profile`,
+      `CODEX_HOME at ${resolvedCodexHome} must be separate from the repository and cannot be a filesystem root.`
+    );
+  }
   const profilePath = path.join(resolvedCodexHome, `${target.profile}.config.toml`);
   const baseConfigPath = path.join(resolvedCodexHome, "config.toml");
   let profileIdentity: ReturnType<typeof codexConfigIdentity>;
@@ -861,10 +872,16 @@ function tomlStringMap(value: unknown, label: string): Record<string, string> {
 }
 
 function requiredEnvironmentName(value: string): string {
-  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(value) || RESERVED_OBJECT_NAMES.has(value)) {
     throw new Error("Codex provider credential references must use canonical environment variable names");
   }
   return value;
+}
+
+function filesystemPathsOverlap(left: string, right: string): boolean {
+  return left === right
+    || left.startsWith(`${right}${path.sep}`)
+    || right.startsWith(`${left}${path.sep}`);
 }
 
 function readBoundedCodexConfig(configPath: string): Buffer {
