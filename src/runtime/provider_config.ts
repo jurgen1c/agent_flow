@@ -661,11 +661,29 @@ function resolveCodexProfile(
   }
   const profilePath = path.join(resolvedCodexHome, `${target.profile}.config.toml`);
   const baseConfigPath = path.join(resolvedCodexHome, "config.toml");
+  let profileIdentity: ReturnType<typeof codexConfigIdentity>;
   try {
-    const profileIdentity = codexConfigIdentity(profilePath);
-    const baseConfigIdentity = fs.existsSync(baseConfigPath)
+    profileIdentity = codexConfigIdentity(profilePath);
+  } catch (error) {
+    throw configError(
+      sourcePath,
+      `targets.${targetName}.profile`,
+      `Could not read Codex profile ${JSON.stringify(target.profile)} at ${profilePath}: ${errorMessage(error)}.`
+    );
+  }
+  let baseConfigIdentity: ReturnType<typeof codexConfigIdentity> | undefined;
+  try {
+    baseConfigIdentity = fs.existsSync(baseConfigPath)
       ? codexConfigIdentity(baseConfigPath)
       : undefined;
+  } catch (error) {
+    throw configError(
+      sourcePath,
+      `targets.${targetName}.profile`,
+      `Could not read Codex base config at ${baseConfigPath}: ${errorMessage(error)}.`
+    );
+  }
+  try {
     const runtimeConfig = resolveCodexProfileRuntimeConfig(
       baseConfigIdentity?.config,
       profileIdentity.config
@@ -686,7 +704,7 @@ function resolveCodexProfile(
     throw configError(
       sourcePath,
       `targets.${targetName}.profile`,
-      `Could not read Codex profile ${JSON.stringify(target.profile)} at ${profilePath}: ${errorMessage(error)}.`
+      `Could not resolve Codex profile ${JSON.stringify(target.profile)} using ${profilePath} and ${baseConfigPath}: ${errorMessage(error)}.`
     );
   }
 }

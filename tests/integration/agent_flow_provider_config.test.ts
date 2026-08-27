@@ -320,6 +320,19 @@ providers:
     expect(parseMessage).toContain("[REDACTED]");
     expect(parseMessage).not.toContain("profile-parser-secret");
 
+    fs.writeFileSync(profilePath, 'model_verbosity = "low"\n');
+    fs.writeFileSync(path.join(codexHome, "config.toml"), 'api_key = "base-parser-secret\n');
+    let baseParseMessage = "";
+    try {
+      loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} });
+    } catch (error) {
+      baseParseMessage = error instanceof Error ? error.message : String(error);
+    }
+    expect(baseParseMessage).toContain(`Could not read Codex base config at ${path.join(codexHome, "config.toml")}`);
+    expect(baseParseMessage).toContain("[REDACTED]");
+    expect(baseParseMessage).not.toContain("base-parser-secret");
+    expect(baseParseMessage).not.toContain(`Could not read Codex profile "deep-review" at ${profilePath}`);
+
     fs.rmSync(profilePath);
     expect(() => loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} }))
       .toThrow('Could not read Codex profile "deep-review"');
