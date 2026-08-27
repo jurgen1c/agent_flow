@@ -141,6 +141,8 @@ targets:
     kind: frontier
     driver: codex-cli
     model: YOUR_CODEX_MODEL
+    profile: deep-review
+    reasoning_effort: high
     enabled: true
   claude-main:
     kind: frontier
@@ -184,8 +186,13 @@ swap Qwen for Gemma, Claude for Codex, or another same-kind target. See
 [Configure local or cloud models](docs/quickstart.md#configure-local-or-cloud-models)
 for native CLI and HTTP drivers plus a multi-model workflow. `codex-cli` and
 `claude-code` use the developer's existing CLI installation and login. Native
-targets require an explicit `model`, which Agent Flow fingerprints for safe
-resume instead of inheriting mutable CLI defaults or profiles. Sessions with
+targets require an explicit `model`. Codex targets may also select a named
+`profile` and pin `reasoning_effort` to `minimal`, `low`, `medium`, `high`, or
+`xhigh`. Agent Flow passes model and reasoning as CLI overrides, hashes the
+Codex base config and selected profile file into the target fingerprint, and
+rejects resume if any of them drift. Provider doctor also strict-loads the
+selected profile with the installed Codex CLI without starting a model request.
+Sessions with
 `resume: true` persist the native Codex thread or Claude session across steps.
 If that external session disappears, inspect the paused run and explicitly
 start a fresh native session with
@@ -204,8 +211,25 @@ file-writing custom adapters. The child receives a minimal environment:
 CLI authentication/provider variables, proxy and certificate settings, locale,
 and basic process variables such as `PATH` and `HOME`; unrelated secrets are not
 inherited. The CLI's agent-facing sandbox also denies access to its mounted
-login and session-state directory, and ambient user/project CLI configuration
-is disabled for deterministic execution.
+login and session-state directory. Targets without a profile disable ambient
+Codex user configuration. Profile targets load Codex's base-plus-profile
+configuration layers and hash both files for drift detection. Repository-local
+`.codex/config.toml` remains hidden, and user skills, hooks, MCP servers, apps,
+plugins, web search, analytics/telemetry, notifications, and other ambient
+hosted tools remain disabled for native provider invocations. Profile and base
+layers that refer to mutable instruction, project-document discovery,
+model-catalog, sub-agent, skill, or SQLite files are rejected so resumable-run
+drift detection remains complete. Agent Flow owns the shell environment policy,
+so model-spawned commands receive core process variables without inheriting the
+credentials forwarded to Codex. For a selected custom Codex model provider,
+only environment variables named by its `env_key` or `env_http_headers` are
+forwarded, and both provider doctor and execution preflight fail when one is
+missing; unrelated `OPENAI_*` credentials are omitted unless explicitly required.
+Profiled provider endpoints must use HTTPS without embedded
+credentials, queries, or fragments. Command-backed provider authentication,
+the built-in `amazon-bedrock` provider, custom shell-environment policies, and
+overrides of Agent Flow's reserved `permissions.agent_flow_native` profile are
+rejected.
 
 Ordinary custom registrations preserve the previous behavior: Agent Flow pins
 the provider name in the workflow but cannot fingerprint changes inside

@@ -41,7 +41,9 @@
         "enabled": { "type": "boolean" },
         "base_url": { "type": "string", "format": "uri" },
         "api_key_env": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
-        "max_output_tokens": { "type": "integer", "minimum": 1 }
+        "max_output_tokens": { "type": "integer", "minimum": 1 },
+        "profile": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$" },
+        "reasoning_effort": { "enum": ["minimal", "low", "medium", "high", "xhigh"] }
       },
       "additionalProperties": false,
       "allOf": [
@@ -63,6 +65,17 @@
           "then": {
             "properties": { "kind": { "const": "frontier" } },
             "not": { "required": ["api_key_env"] }
+          }
+        },
+        {
+          "if": { "properties": { "driver": { "const": "codex-cli" } }, "required": ["driver"] },
+          "else": {
+            "not": {
+              "anyOf": [
+                { "required": ["profile"] },
+                { "required": ["reasoning_effort"] }
+              ]
+            }
           }
         },
         {

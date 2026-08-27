@@ -52,6 +52,9 @@ import {
 } from "./execution_security";
 import { isAgentFlowFrontierProvider } from "./policy_utils";
 
+const CODEX_PROFILE_PATTERN = /^[A-Za-z0-9_-]+$/;
+const CODEX_REASONING_EFFORTS = new Set(["minimal", "low", "medium", "high", "xhigh"]);
+
 export const MAX_AGENT_FLOW_SESSION_PROMPT_BYTES = 1024 * 1024;
 export const MAX_AGENT_FLOW_SESSION_INPUT_BYTES = 10 * 1024 * 1024;
 export const MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES = 10 * 1024 * 1024;
@@ -73,6 +76,7 @@ export interface AgentFlowSessionProviderRequest {
   provider: string;
   providerKind?: AgentFlowSessionProviderKind;
   providerProfile?: string;
+  providerReasoningEffort?: string;
   providerTarget?: string;
   providerDriver?: string;
   providerModel?: string;
@@ -165,6 +169,7 @@ export interface AgentFlowSessionProviderDescriptor {
   target?: string;
   driver?: string;
   model?: string;
+  reasoningEffort?: string;
   fingerprint?: string;
 }
 
@@ -185,6 +190,7 @@ export interface PersistAgentFlowSessionProviderEvidenceInput {
   provider: string;
   providerKind: AgentFlowSessionProviderKind;
   providerProfile?: string;
+  providerReasoningEffort?: string;
   providerTarget?: string;
   providerDriver?: string;
   providerModel?: string;
@@ -375,12 +381,38 @@ export class AgentFlowSessionProviderRegistry {
         "Configured session provider model must not have surrounding whitespace or control characters."
       );
     }
+    const profile = descriptor.profile === undefined
+      ? undefined
+      : requiredConfiguredIdentity(descriptor.profile, "Configured session provider profile");
+    if (profile !== undefined && !CODEX_PROFILE_PATTERN.test(profile)) {
+      throw invalidProviderRegistration(
+        "Configured session provider profile may contain only letters, numbers, hyphens, and underscores."
+      );
+    }
+    const reasoningEffort = descriptor.reasoningEffort === undefined
+      ? undefined
+      : requiredConfiguredIdentity(
+          descriptor.reasoningEffort,
+          "Configured session provider reasoning effort"
+        );
+    if (reasoningEffort !== undefined && !CODEX_REASONING_EFFORTS.has(reasoningEffort)) {
+      throw invalidProviderRegistration(
+        "Configured session provider reasoning effort must be one of: minimal, low, medium, high, xhigh."
+      );
+    }
+    if ((profile !== undefined || reasoningEffort !== undefined) && driver !== "codex-cli") {
+      throw invalidProviderRegistration(
+        "Configured session provider profiles and reasoning effort require the codex-cli driver."
+      );
+    }
     return this.add(name, adapter, {
       ...descriptor,
       name,
       target,
       driver,
       model,
+      ...(profile === undefined ? {} : { profile }),
+      ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
       fingerprint
     });
   }
@@ -430,6 +462,9 @@ export function persistAgentFlowSessionProviderEvidence(
     provider: input.provider,
     providerKind: input.providerKind,
     ...(input.providerProfile === undefined ? {} : { providerProfile: input.providerProfile }),
+    ...(input.providerReasoningEffort === undefined
+      ? {}
+      : { providerReasoningEffort: input.providerReasoningEffort }),
     ...(input.providerTarget === undefined ? {} : { providerTarget: input.providerTarget }),
     ...(input.providerDriver === undefined ? {} : { providerDriver: input.providerDriver }),
     ...(input.providerModel === undefined ? {} : { providerModel: `sha256:${digest(input.providerModel)}` }),
@@ -732,6 +767,9 @@ async function executeAgentFlowSessionStep(
       ...(providerDescriptor?.profile === undefined
         ? []
         : [["Session adapter provider profile", providerDescriptor.profile]]),
+      ...(providerDescriptor?.reasoningEffort === undefined
+        ? []
+        : [["Session adapter provider reasoning effort", providerDescriptor.reasoningEffort]]),
       ...(providerDescriptor?.target === undefined
         ? []
         : [["Session adapter provider target", providerDescriptor.target]]),
@@ -1005,6 +1043,9 @@ async function executeAgentFlowSessionStep(
     provider,
     providerKind: providerDescriptor.kind,
     ...(providerDescriptor.profile === undefined ? {} : { providerProfile: providerDescriptor.profile }),
+    ...(providerDescriptor.reasoningEffort === undefined
+      ? {}
+      : { providerReasoningEffort: providerDescriptor.reasoningEffort }),
     ...(providerDescriptor.target === undefined ? {} : { providerTarget: providerDescriptor.target }),
     ...(providerDescriptor.driver === undefined ? {} : { providerDriver: providerDescriptor.driver }),
     ...(providerDescriptor.model === undefined
@@ -1211,6 +1252,9 @@ async function executeAgentFlowSessionStep(
     provider,
     providerKind: providerDescriptor.kind,
     ...(providerDescriptor.profile === undefined ? {} : { providerProfile: providerDescriptor.profile }),
+    ...(providerDescriptor.reasoningEffort === undefined
+      ? {}
+      : { providerReasoningEffort: providerDescriptor.reasoningEffort }),
     ...(providerDescriptor.target === undefined ? {} : { providerTarget: providerDescriptor.target }),
     ...(providerDescriptor.driver === undefined ? {} : { providerDriver: providerDescriptor.driver }),
     ...(providerDescriptor.model === undefined

@@ -19,7 +19,8 @@ describe("standalone Agent Flow architecture", () => {
     expect(packageJson.name).toBe("@jurgen1c/agent-flow");
     expect(packageJson.bin).toEqual({ "agent-flow": "dist/agent-flow.js" });
     expect(packageJson.dependencies).toEqual({
-      "@jurgen1c/agent-core": "^0.2.0"
+      "@jurgen1c/agent-core": "^0.2.0",
+      "smol-toml": "^1.8.0"
     });
     expect(packageJson.engines?.node).toBe(">=25.9.0");
     expect(Object.keys(packageJson.exports ?? {}).sort()).toEqual([

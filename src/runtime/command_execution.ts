@@ -269,6 +269,10 @@ function assertOrPersistConfiguredProviderBindings(
       kind: descriptor.kind,
       driver: descriptor.driver,
       ...(descriptor.model === undefined ? {} : { modelHash: hashAgentFlowProviderModel(descriptor.model) }),
+      ...(descriptor.profile === undefined ? {} : { profile: descriptor.profile }),
+      ...(descriptor.reasoningEffort === undefined
+        ? {}
+        : { reasoningEffort: descriptor.reasoningEffort }),
       fingerprint: descriptor.fingerprint
     };
   }
@@ -4901,6 +4905,9 @@ async function executeRecoverySession(
     ...(providerDescriptor.profile === undefined
       ? []
       : [["Recovery adapter provider profile", providerDescriptor.profile] as [string, string]]),
+    ...(providerDescriptor.reasoningEffort === undefined
+      ? []
+      : [["Recovery adapter provider reasoning effort", providerDescriptor.reasoningEffort] as [string, string]]),
     ...(providerDescriptor.target === undefined
       ? []
       : [["Recovery adapter provider target", providerDescriptor.target] as [string, string]]),
@@ -4937,6 +4944,9 @@ async function executeRecoverySession(
     providerKind: providerDescriptor.kind,
     kind: "recovery",
     ...(providerDescriptor.profile === undefined ? {} : { providerProfile: providerDescriptor.profile }),
+    ...(providerDescriptor.reasoningEffort === undefined
+      ? {}
+      : { providerReasoningEffort: providerDescriptor.reasoningEffort }),
     ...(providerDescriptor.target === undefined ? {} : { providerTarget: providerDescriptor.target }),
     ...(providerDescriptor.driver === undefined ? {} : { providerDriver: providerDescriptor.driver }),
     ...(providerDescriptor.model === undefined
@@ -5085,6 +5095,9 @@ async function executeRecoverySession(
           ...(providerDescriptor.profile === undefined
             ? {}
             : { providerProfile: providerDescriptor.profile }),
+          ...(providerDescriptor.reasoningEffort === undefined
+            ? {}
+            : { providerReasoningEffort: providerDescriptor.reasoningEffort }),
           ...(providerDescriptor.target === undefined ? {} : { providerTarget: providerDescriptor.target }),
           ...(providerDescriptor.driver === undefined ? {} : { providerDriver: providerDescriptor.driver }),
           ...(providerDescriptor.model === undefined
@@ -5235,6 +5248,9 @@ async function executeRecoverySession(
           ...(providerDescriptor.profile === undefined
             ? {}
             : { providerProfile: providerDescriptor.profile }),
+          ...(providerDescriptor.reasoningEffort === undefined
+            ? {}
+            : { providerReasoningEffort: providerDescriptor.reasoningEffort }),
           ...(providerDescriptor.target === undefined ? {} : { providerTarget: providerDescriptor.target }),
           ...(providerDescriptor.driver === undefined ? {} : { providerDriver: providerDescriptor.driver }),
           ...(providerDescriptor.model === undefined ? {} : { providerModel: providerDescriptor.model }),
