@@ -8897,9 +8897,6 @@ function codexMcpCallRegistry(
       signal: mcpRequest.signal
     };
     adapter.preflight?.(providerRequest);
-    reserveAgentFlowSessionModelCallBudgets(
-      store, runId, workflow, mcpRequest.stepId, sessionId, provider, descriptor?.kind
-    );
     store.claimSession({
       id: sessionId,
       runId,
@@ -8909,6 +8906,28 @@ function codexMcpCallRegistry(
       externalSessionId: externalSessionId ?? null,
       state: { resume: true, lastStepId: mcpRequest.stepId, mcp: true }
     });
+    try {
+      reserveAgentFlowSessionModelCallBudgets(
+        store, runId, workflow, mcpRequest.stepId, sessionId, provider, descriptor?.kind
+      );
+    } catch (error) {
+      const status = error instanceof AgentFlowSessionPolicyError && error.status === "fail" ? "failed" : "paused";
+      store.upsertSession({
+        id: sessionId,
+        runId,
+        stepId: mcpRequest.stepId,
+        provider,
+        status,
+        externalSessionId: externalSessionId ?? null,
+        state: {
+          resume: true,
+          lastStepId: mcpRequest.stepId,
+          mcp: true,
+          error: redactAgentFlowSensitiveText(error instanceof Error ? error.message : String(error))
+        }
+      });
+      throw error;
+    }
     providerRequest.reportExternalSessionId = (candidate) => {
       const reported = normalizedTarget(candidate);
       if (reported === undefined) {

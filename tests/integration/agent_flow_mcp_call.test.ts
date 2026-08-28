@@ -508,6 +508,51 @@ steps:
     });
   });
 
+  test("does not reserve Codex MCP budgets when the session claim conflicts", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: codex-mcp-claim-conflict
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  agent: { provider: codex, resume: true }
+limits: { max_model_calls: 1, max_frontier_calls: 1 }
+steps:
+  - id: fetch
+    type: mcp_call
+    via: codex
+    session: agent
+    server: jira
+    tool: get
+    arguments: { key: AF-1 }
+    outputs: [ticket.json]
+    on_failure: { then: fail }
+`);
+    let invocations = 0;
+    const providers = createAgentFlowSessionProviderRegistry().register("codex", async () => {
+      invocations += 1;
+      return { outputs: {} };
+    });
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "codex-mcp-claim-conflict", workflow });
+    store.claimSession({
+      id: "agent",
+      runId: "codex-mcp-claim-conflict",
+      stepId: "other",
+      provider: "codex",
+      status: "running",
+      state: {}
+    });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "codex-mcp-claim-conflict", workflow, undefined, providers
+    )).toMatchObject({ status: "failed", failedStep: "fetch" });
+    expect(invocations).toBe(0);
+    expect(store.getBudget("codex-mcp-claim-conflict", "model:model_calls")).toBeNull();
+    expect(store.getBudget("codex-mcp-claim-conflict", "model:frontier_calls")).toBeNull();
+    store.close();
+  });
+
   test("pauses Codex MCP for an unavailable thread and resumes after explicit reset", async () => {
     const root = temporaryRepo();
     const workflow = parseAgentFlowWorkflowOrThrow(`name: codex-mcp-reset
