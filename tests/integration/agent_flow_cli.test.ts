@@ -12,6 +12,7 @@ import {
   createAgentFlowWorkflowRegistry,
   defaultAgentFlowArchivePath,
   defaultAgentFlowExportPath,
+  executeAgentFlowCommandPipeline,
   loadAgentFlowWorkflowRegistry,
   openAgentFlowRunState,
   parseAgentFlowWorkflowOrThrow,
@@ -330,6 +331,41 @@ steps:
     const store = await openAgentFlowRunState({ cwd: repo });
     expect(store.getRun("nested-direct")).toBeNull();
     store.close();
+  });
+
+  test("rejects direct MCP before a CLI resume mutates the paused run", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-resume-direct-mcp-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: resume-direct-mcp
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: approve, type: manual_gate, message: Continue?, options: [approve, cancel] }
+  - id: fetch
+    type: mcp_call
+    server: atlassian
+    tool: get_issue
+    arguments: { key: AF-1 }
+    outputs: [ticket.json]
+`);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, { id: "resume-direct", workflow });
+    expect(await executeAgentFlowCommandPipeline(store, "resume-direct", workflow))
+      .toMatchObject({ status: "paused" });
+    const eventsBefore = store.listEvents("resume-direct");
+    store.close();
+
+    const result = await captureCli(["resume", "resume-direct", "--outcome", "approve"], repo);
+    expect(result).toMatchObject({ exitCode: 1 });
+    expect(result.stderr).toContain("direct MCP step fetch in workflow resume-direct-mcp");
+
+    const inspected = await openAgentFlowRunState({ cwd: repo });
+    expect(inspected.getRun("resume-direct")).toMatchObject({ status: "paused" });
+    expect(inspected.getRun("resume-direct")?.context.waiting).toMatchObject({ stepId: "approve" });
+    expect(inspected.listEvents("resume-direct")).toEqual(eventsBefore);
+    inspected.close();
   });
 
   test("runs input through Codex MCP, a nested workflow, and approval resume end to end", async () => {

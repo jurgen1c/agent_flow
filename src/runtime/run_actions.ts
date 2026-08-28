@@ -303,6 +303,7 @@ export function buildAgentFlowRunActionSnapshot(
   );
   const guardPayload = {
     run,
+    waitingRun,
     approvals,
     waiting,
     disagreementEvidence,

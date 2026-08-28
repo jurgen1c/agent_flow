@@ -379,6 +379,57 @@ steps:
     store.close();
   });
 
+  test("invalidates the parent action guard when a child repeats the same input request", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-input-guard-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: repeated-input-child
+version: 1
+style: recovery_pipeline
+maturity: experimental
+limits:
+  max_recovery_cycles: 3
+steps:
+  - id: ask
+    type: input_request
+    question: Same prompt
+    save_as: answer.txt
+    goto: ask
+`);
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: repeated-input-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: child, type: workflow, workflow: repeated-input-child, inputs: {}, outputs: [never.txt] }
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register(parent.name, parent)
+      .register(child.name, child);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, { id: "repeated-input-parent", workflow: parent });
+    expect(await executeAgentFlowCommandPipeline(
+      store, "repeated-input-parent", parent, undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({ status: "paused" });
+    const childRunId = (store.getRun("repeated-input-parent")!.context.waiting as { childRunId: string }).childRunId;
+    const staleSnapshot = buildAgentFlowRunActionSnapshot(store, "repeated-input-parent");
+
+    expect(await resumeAgentFlowCommandPipeline(
+      store, childRunId, child, { answer: "first" }, undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({ status: "paused" });
+    expect(store.getRun(childRunId)?.context.waiting).toMatchObject({ stepId: "ask" });
+    expect(buildAgentFlowRunActionSnapshot(store, "repeated-input-parent").guard)
+      .not.toBe(staleSnapshot.guard);
+    await expect(executeAgentFlowRunAction(
+      store,
+      "repeated-input-parent",
+      { action: "provide_input", answer: "stale", guard: staleSnapshot.guard },
+      { workflows }
+    )).rejects.toMatchObject({ code: "AGENT_FLOW_ACTION_STALE" });
+    store.close();
+  });
+
   test("cancels a paused child when its parent is cancelled", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-cancel-"));
     fs.mkdirSync(path.join(repo, ".git"));

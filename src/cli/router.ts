@@ -692,6 +692,16 @@ async function runLifecycleCommand(
         persistedWorkflow.name
       );
       const registeredWorkflows = workflows.names().map((name) => workflows.get(name)!);
+      const directMcp = registeredWorkflows.flatMap((registeredWorkflow) =>
+        collectWorkflowSteps(registeredWorkflow.steps).map((step) => ({ workflow: registeredWorkflow, step }))
+      ).find(({ step }) => String(step.type ?? "").trim() === "mcp_call"
+        && (step.via === undefined || String(step.via).trim() === "direct"));
+      if (directMcp !== undefined) {
+        return {
+          exitCode: 1,
+          stderr: `Stock Agent Flow CLI cannot execute direct MCP step ${String(directMcp.step.id)} in workflow ${directMcp.workflow.name}; use via: codex with a named Codex session or run through a host that registers MCP adapters.`
+        };
+      }
       if (fixture !== null) {
         const sessionRequestSteps = registeredWorkflows.flatMap((registeredWorkflow) =>
           collectSessionRequestSteps(registeredWorkflow.steps).map((step) => ({ workflow: registeredWorkflow, step }))
