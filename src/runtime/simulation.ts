@@ -2097,7 +2097,11 @@ function collectSimulationReferencedSensitiveArtifactPaths(
 function checkInputs(step: AgentFlowWorkflowStep, stepId: string, state: SimulationState): void {
   const values: string[] = [];
   if (Array.isArray(step.inputs)) values.push(...step.inputs.flatMap((value) => artifactName(value, state)));
-  if (isRecord(step.inputs)) values.push(...nestedArtifactNames(step.inputs, state));
+  if (isRecord(step.inputs)) {
+    values.push(...(nonEmptyString(step.type) === "workflow"
+      ? workflowInputArtifactNames(step.inputs, state)
+      : nestedArtifactNames(step.inputs, state)));
+  }
   if (Array.isArray(step.artifacts)) values.push(...step.artifacts.flatMap((value) => artifactName(value, state)));
   if (step.type === "artifact_transform") values.push(...transformArtifactName(step.input, state));
 
@@ -2364,6 +2368,23 @@ function nestedArtifactNames(value: AgentFlowYamlValue | undefined, state: Simul
   if (Array.isArray(value)) return value.flatMap((entry) => nestedArtifactNames(entry, state));
   if (isRecord(value)) return Object.values(value).flatMap((entry) => nestedArtifactNames(entry, state));
   return artifactName(value, state);
+}
+
+function workflowInputArtifactNames(value: AgentFlowYamlValue | undefined, state: SimulationState): string[] {
+  if (typeof value === "string") {
+    const reference = /^\{\{\s*artifacts\.([A-Za-z0-9_.-]+)\s*}}$/.exec(value);
+    if (reference === null) return [];
+    const segments = reference[1]!.split(".");
+    const published = [...state.artifacts]
+      .map((artifact) => ({ artifact, alias: agentFlowConditionArtifactAlias(artifact) }))
+      .filter(({ alias }) => alias.length <= segments.length
+        && alias.every((segment, index) => segment === segments[index]))
+      .sort((left, right) => right.alias.length - left.alias.length);
+    return published[0] === undefined ? [segments.join("/")] : [published[0].artifact];
+  }
+  if (Array.isArray(value)) return value.flatMap((entry) => workflowInputArtifactNames(entry, state));
+  if (isRecord(value)) return Object.values(value).flatMap((entry) => workflowInputArtifactNames(entry, state));
+  return [];
 }
 
 function checkTargetBudget(control: Extract<SequenceControl, { kind: "target" }>, state: SimulationState): SequenceControl {

@@ -969,7 +969,8 @@ async function runAgentFlowCommandPipeline(
               message: failure
             }, error.status === "pause" ? "paused" : "failed", routingBudget.terminalEffects);
           }
-          if (error instanceof AgentFlowSessionRequestError
+          if (normalizedTarget(step.via) === "codex"
+              && error instanceof AgentFlowSessionRequestError
               && error.code === "AGENT_FLOW_PROVIDER_SESSION_UNAVAILABLE") {
             failure = redactAgentFlowSensitiveText(error.message);
             const sessionId = normalizedTarget(step.session)!;
@@ -8566,6 +8567,7 @@ function linkedParentWorkflowPromotion(
   workflow: AgentFlowWorkflow
 ): ((resultStatus?: string) => void) | undefined {
   if (child.parentRunId === null || child.recoveryOfRunId !== null) return undefined;
+  if (!isDeepStrictEqual(child.context.workflow, workflow)) return undefined;
   const parent = store.getRun(child.parentRunId);
   if (parent?.status !== "paused") return undefined;
   let waiting: AgentFlowPipelineWaitingState;
@@ -8574,14 +8576,13 @@ function linkedParentWorkflowPromotion(
   } catch {
     return undefined;
   }
-  if (waiting.kind !== "workflow" || waiting.childRunId !== child.id
-      || waiting.workflowName !== workflow.name) return undefined;
+  if (waiting.kind !== "workflow" || waiting.childRunId !== child.id) return undefined;
   const parentWorkflow = mapping(parent.context.workflow) as AgentFlowWorkflow | undefined;
   if (parentWorkflow === undefined) return undefined;
   const location = collectRuntimeStepLocations(parentWorkflow.steps).get(waiting.stepId);
   const step = location?.steps[location.index];
   if (step === undefined || normalizedTarget(step.type) !== "workflow"
-      || normalizedTarget(step.workflow) !== workflow.name) return undefined;
+      || normalizedTarget(step.workflow) !== waiting.workflowName) return undefined;
   return () => {
     promoteWorkflowStepOutputs(store, parent.id, child.id, step, "paused");
   };

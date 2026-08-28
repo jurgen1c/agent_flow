@@ -445,6 +445,46 @@ steps:
     store.close();
   });
 
+  test("promotes retained outputs when a paused child is registered under an alias", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-alias-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: internal-child
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: approve, type: manual_gate, message: Continue?, options: [approve, cancel] }
+  - { id: publish, type: command, command: "printf done > child.txt", outputs: [child.txt] }
+retention:
+  on_success: { delete: [child.txt] }
+`);
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: alias-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: child, type: workflow, workflow: child-alias, inputs: {}, outputs: [child.txt] }
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register(parent.name, parent)
+      .register("child-alias", child);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, { id: "alias-parent", workflow: parent });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "alias-parent", parent, undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({ status: "paused" });
+    const childRunId = (store.getRun("alias-parent")!.context.waiting as { childRunId: string }).childRunId;
+    expect(await resumeAgentFlowCommandPipeline(
+      store, childRunId, child, { outcome: "approve" }, undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({ status: "completed" });
+    expect(store.getArtifact(childRunId, "child.txt")?.status).toBe("missing");
+    expect(store.readArtifact("alias-parent", "child.txt").content.toString("utf8")).toBe("done");
+    store.close();
+  });
+
   test("rechecks a parent action guard after acquiring the nested child lock", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-action-race-"));
     fs.mkdirSync(path.join(repo, ".git"));

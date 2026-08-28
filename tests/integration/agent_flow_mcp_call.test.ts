@@ -2391,6 +2391,36 @@ steps:
     store.close();
   });
 
+  test("routes direct MCP provider-session errors through normal failure handling", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: direct-provider-unavailable
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: fetch, type: mcp_call, server: fixture, tool: get, arguments: {}, outputs: [out.json] }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "direct-provider-unavailable", workflow });
+    const calls = createAgentFlowMcpCallRegistry().register("fixture", () => {
+      throw new AgentFlowSessionRequestError("provider unavailable", "AGENT_FLOW_PROVIDER_SESSION_UNAVAILABLE");
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store, "direct-provider-unavailable", workflow, undefined, undefined, calls
+    );
+
+    expect(result).toMatchObject({
+      status: "paused",
+      failedStep: "fetch",
+      failureOutcome: "pause",
+      message: "provider unavailable"
+    });
+    expect(store.getRun("direct-provider-unavailable")).toMatchObject({ status: "paused" });
+    expect(store.getRun("direct-provider-unavailable")?.context.waiting).toBeUndefined();
+    store.close();
+  });
+
   test("aborts an in-flight adapter and publishes nothing after the run is paused", async () => {
     const root = temporaryRepo();
     const workflow = mcpWorkflow();
