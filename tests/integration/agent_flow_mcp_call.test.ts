@@ -283,7 +283,7 @@ steps:
     store.close();
   });
 
-  test("marks a Codex MCP session failed when its output contract is malformed", async () => {
+  test("leaves a Codex MCP session reclaimable when its output contract is malformed", async () => {
     const root = temporaryRepo();
     const workflow = parseAgentFlowWorkflowOrThrow(`name: codex-mcp-invalid-output
 version: 1
@@ -310,9 +310,56 @@ steps:
       store, "codex-mcp-invalid-output", workflow, undefined, providers
     )).toMatchObject({ status: "paused", failedStep: "fetch" });
     expect(store.getSession("codex-mcp-invalid-output", "agent")).toMatchObject({
-      status: "failed", externalSessionId: "invalid-output-thread"
+      status: "paused", externalSessionId: "invalid-output-thread"
     });
     expect(store.getArtifact("codex-mcp-invalid-output", "ticket.json")).toBeNull();
+    store.close();
+  });
+
+  test("reclaims a Codex MCP session after a retryable response failure", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: codex-mcp-response-retry
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  agent: { provider: codex, resume: true }
+limits: { max_frontier_calls: 2 }
+steps:
+  - id: fetch
+    type: mcp_call
+    via: codex
+    session: agent
+    server: jira
+    tool: get
+    arguments: { key: AF-1 }
+    outputs: [ticket.json]
+    on_failure: { retry: 1 }
+`);
+    let calls = 0;
+    const providers = createAgentFlowSessionProviderRegistry().register("codex", async (request) => {
+      calls += 1;
+      request.reportExternalSessionId?.("retry-thread");
+      return {
+        externalSessionId: "retry-thread",
+        outputs: calls === 1 ? {} : { "ticket.json": '{"key":"AF-1"}\n' },
+        metadata: {
+          mcpCalls: [{ server: "jira", tool: "get", arguments: { key: "AF-1" }, status: "completed" }]
+        }
+      };
+    });
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "codex-mcp-response-retry", workflow });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "codex-mcp-response-retry", workflow, undefined, providers
+    )).toMatchObject({ status: "completed" });
+    expect(calls).toBe(2);
+    expect(store.getSession("codex-mcp-response-retry", "agent")).toMatchObject({
+      status: "waiting", externalSessionId: "retry-thread"
+    });
+    expect(store.readArtifact("codex-mcp-response-retry", "ticket.json").content.toString("utf8"))
+      .toBe('{"key":"AF-1"}\n');
     store.close();
   });
 

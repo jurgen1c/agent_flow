@@ -8856,16 +8856,11 @@ function codexMcpCallRegistry(
     }
     const run = store.getRun(runId)!;
     const previous = store.getSession(runId, sessionId);
-    const stepCodex = mapping(step.codex);
-    const runCodex = mapping(run.context.codexOptions);
-    const sessionCodex = mapping(session.codex);
-    const codexOptions = {
-      profile: normalizedTarget(stepCodex?.profile ?? runCodex?.profile ?? sessionCodex?.profile),
-      model: normalizedTarget(stepCodex?.model ?? runCodex?.model ?? sessionCodex?.model),
-      reasoningEffort: normalizedTarget(
-        stepCodex?.reasoning_effort ?? runCodex?.reasoningEffort ?? sessionCodex?.reasoning_effort
-      )
-    };
+    const codexOptions = resolveAgentFlowCodexOptions(
+      step.codex,
+      run.context.codexOptions,
+      session.codex
+    );
     const promptContent = [
       `Invoke the MCP server ${JSON.stringify(mcpRequest.server)} tool ${JSON.stringify(mcpRequest.tool)} exactly once.`,
       `Use these exact JSON arguments: ${JSON.stringify(mcpRequest.arguments)}.`,
@@ -8879,8 +8874,7 @@ function codexMcpCallRegistry(
       provider,
       ...(descriptor?.kind === undefined ? {} : { providerKind: descriptor.kind }),
       ...(descriptor?.driver === undefined ? {} : { providerDriver: descriptor.driver }),
-      ...(codexOptions.profile === undefined && codexOptions.model === undefined
-          && codexOptions.reasoningEffort === undefined ? {} : { codexOptions }),
+      ...codexOptions,
       kind: "session_request",
       resume: true,
       ...(externalSessionId === undefined ? {} : { externalSessionId }),
@@ -8988,7 +8982,7 @@ function codexMcpCallRegistry(
       }
       if (returned === undefined || externalSessionId !== undefined && returned !== externalSessionId) {
         store.upsertSession({
-          id: sessionId, runId, stepId: mcpRequest.stepId, provider, status: "failed",
+          id: sessionId, runId, stepId: mcpRequest.stepId, provider, status: "paused",
           externalSessionId: externalSessionId ?? null,
           state: { resume: true, lastStepId: mcpRequest.stepId, mcp: true, error: "external_session_identity_mismatch" }
         });
@@ -9028,7 +9022,7 @@ function codexMcpCallRegistry(
     } catch (error) {
       const message = redactAgentFlowSensitiveText(error instanceof Error ? error.message : String(error));
       store.upsertSession({
-        id: sessionId, runId, stepId: mcpRequest.stepId, provider, status: "failed",
+        id: sessionId, runId, stepId: mcpRequest.stepId, provider, status: "paused",
         externalSessionId: externalSessionId ?? null,
         state: { resume: true, lastStepId: mcpRequest.stepId, mcp: true, error: message }
       });

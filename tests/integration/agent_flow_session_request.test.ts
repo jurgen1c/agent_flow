@@ -114,6 +114,52 @@ steps:
     store.close();
   });
 
+  test("rejects restored Codex option values before provider invocation or budget reservation", async () => {
+    for (const codexOptions of [
+      { profile: "../bad" },
+      { reasoningEffort: "extreme" }
+    ]) {
+      const root = temporaryRepo();
+      fs.mkdirSync(path.join(root, "prompts"), { recursive: true });
+      fs.writeFileSync(path.join(root, "prompts", "draft.md"), "Draft.\n");
+      const workflow = parseAgentFlowWorkflowOrThrow(`name: invalid-restored-codex-options
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  writer: { provider: codex, resume: true }
+limits: { max_frontier_calls: 1 }
+steps:
+  - { id: draft, type: session_request, session: writer, prompt: prompts/draft.md, inputs: [request.md], outputs: [response.md] }
+`);
+      const runId = `invalid-restored-codex-${Object.keys(codexOptions)[0]}`;
+      const store = await openAgentFlowRunState({ cwd: root });
+      createAgentFlowLifecycleRun(store, { id: runId, workflow, context: { codexOptions } });
+      store.writeArtifact({
+        id: "request",
+        runId,
+        path: "request.md",
+        kind: "fixture",
+        contentType: "text/plain",
+        content: "Request"
+      });
+      let invocations = 0;
+      const providers = createAgentFlowSessionProviderRegistry().register("codex", () => {
+        invocations += 1;
+        return { outputs: { "response.md": "Response" } };
+      });
+
+      const result = await executeAgentFlowCommandPipeline(store, runId, workflow, undefined, providers);
+      expect(result).toMatchObject({ status: "paused", failedStep: "draft" });
+      expect(result.message).toContain(Object.hasOwn(codexOptions, "profile") ? "Codex profile" : "reasoning effort");
+      expect(invocations).toBe(0);
+      expect(store.getSession(runId, "writer")).toMatchObject({ status: "paused", startedAt: null });
+      expect(store.getBudget(runId, "model:model_calls")).toBeNull();
+      expect(store.getBudget(runId, "model:frontier_calls")).toBeNull();
+      store.close();
+    }
+  });
+
   test("rejects and aborts when an in-flight interrupt check throws", async () => {
     let interruptChecks = 0;
     let aborted = false;

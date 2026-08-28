@@ -1467,6 +1467,18 @@ export function resolveAgentFlowCodexOptions(
     stepOptions?.reasoning_effort ?? runOptions?.reasoningEffort ?? sessionOptions?.reasoning_effort,
     "Codex reasoning effort"
   );
+  if (profile !== undefined && !CODEX_PROFILE_PATTERN.test(profile)) {
+    throw new AgentFlowSessionRequestError(
+      "Codex profile must contain only letters, numbers, hyphens, and underscores.",
+      "AGENT_FLOW_CODEX_PROFILE_INVALID"
+    );
+  }
+  if (reasoningEffort !== undefined && !CODEX_REASONING_EFFORTS.has(reasoningEffort)) {
+    throw new AgentFlowSessionRequestError(
+      "Codex reasoning effort must be one of: minimal, low, medium, high, xhigh.",
+      "AGENT_FLOW_CODEX_REASONING_EFFORT_INVALID"
+    );
+  }
   return profile === undefined && model === undefined && reasoningEffort === undefined ? {} : {
     codexOptions: {
       ...(profile === undefined ? {} : { profile }),
