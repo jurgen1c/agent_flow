@@ -255,7 +255,16 @@ steps:
         path: "secrets/api_token",
         kind: "fixture",
         contentType: "text/plain; charset=utf-8",
-        content: "opaque-value"
+        content: "decoy.txt"
+      });
+      store.writeArtifact({
+        id: `decoy-${mode}`,
+        runId,
+        stepId: "fixture",
+        path: "decoy.txt",
+        kind: "fixture",
+        contentType: "text/plain; charset=utf-8",
+        content: "must not be treated as the referenced artifact"
       });
 
       const result = await executeAgentFlowCommandPipeline(
@@ -885,6 +894,66 @@ steps:
     expect(store.listRuns().find((run) => run.parentRunId === "artifact-parent")?.inputs)
       .toEqual({ pr_url: "https://github.com/example/repo/pull/1" });
     expect(store.readArtifact("artifact-parent", "child.txt").content.toString("utf8")).toBe("resolved\n");
+    store.close();
+  });
+
+  test("does not copy artifacts named by resolved artifact contents into child runs", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-artifact-content-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: artifact-content-child
+version: 1
+style: pipeline
+maturity: experimental
+inputs:
+  label: { required: true }
+steps:
+  - { id: write, type: command, command: "printf child > shared.txt", outputs: [shared.txt] }
+`);
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: artifact-content-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: child
+    type: workflow
+    workflow: artifact-content-child
+    inputs: { label: "{{ artifacts.value }}" }
+    outputs: [shared.txt]
+    overwrite: true
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register(parent.name, parent)
+      .register(child.name, child);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, { id: "artifact-content-parent", workflow: parent });
+    store.writeArtifact({
+      id: "artifact-content-value",
+      runId: "artifact-content-parent",
+      stepId: "fixture",
+      path: "value",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "shared.txt"
+    });
+    store.writeArtifact({
+      id: "artifact-content-decoy",
+      runId: "artifact-content-parent",
+      stepId: "fixture",
+      path: "shared.txt",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "parent"
+    });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "artifact-content-parent", parent, undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({ status: "completed" });
+    const childRun = store.listRuns().find((run) => run.parentRunId === "artifact-content-parent")!;
+    expect(childRun.inputs).toEqual({ label: "shared.txt" });
+    expect(store.readArtifact(childRun.id, "shared.txt").content.toString()).toBe("child");
+    expect(store.readArtifact("artifact-content-parent", "shared.txt").content.toString()).toBe("child");
     store.close();
   });
 

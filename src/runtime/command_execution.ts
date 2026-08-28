@@ -5866,7 +5866,7 @@ function collectWorkflowStepArtifactPaths(
   paths: Set<string>
 ): void {
   if (typeof declared === "string") {
-    const reference = /^\{\{\s*(?:inputs\.[A-Za-z_][A-Za-z0-9_-]*|artifacts\.[A-Za-z0-9_.-]+)\s*}}$/.exec(declared);
+    const reference = /^\{\{\s*inputs\.[A-Za-z_][A-Za-z0-9_-]*\s*}}$/.exec(declared);
     if (reference !== null && typeof resolved === "string") {
       collectRecoveryArtifactPaths(store, runId, resolved, paths);
     }
@@ -5930,10 +5930,12 @@ function secureNestedRecoveryInputValue(
     || artifactSensitive
     || (reference !== null && agentFlowInputKeyLooksSensitive(reference[1]!));
   if (typeof resolved === "string") {
-    try {
-      if (store.getArtifact(runId, resolved) !== null) return resolved;
-    } catch {
-      // Literal nested-recovery inputs do not have to be artifact paths.
+    if (reference !== null) {
+      try {
+        if (store.getArtifact(runId, resolved) !== null) return resolved;
+      } catch {
+        // Referenced workflow inputs do not have to be artifact paths.
+      }
     }
     return secureNestedRecoveryScalarValue(workflow, label, resolved, inheritedSensitive);
   }
