@@ -452,6 +452,22 @@ async function runLifecycleCommand(
             stderr: `Agent Flow run ${runArgs.runId} input ${JSON.stringify(changedInput[0])} differs from its persisted value; start a new run ID to change inputs.`
           };
         }
+        const initialContext = existingRun.context.agentFlowInitialContext;
+        const persistedCodexOptions = initialContext !== null && typeof initialContext === "object"
+            && !Array.isArray(initialContext)
+            && initialContext.codexOptions !== null && typeof initialContext.codexOptions === "object"
+            && !Array.isArray(initialContext.codexOptions)
+          ? initialContext.codexOptions
+          : undefined;
+        const changedCodexOption = Object.entries(runArgs.codexOptions ?? {}).find(([name, value]) =>
+          persistedCodexOptions === undefined || !isDeepStrictEqual(persistedCodexOptions[name], value)
+        );
+        if (changedCodexOption !== undefined) {
+          return {
+            exitCode: 2,
+            stderr: `Agent Flow run ${runArgs.runId} Codex option ${JSON.stringify(changedCodexOption[0])} differs from its persisted value; start a new run ID to change Codex options.`
+          };
+        }
       }
       const inputs = existingRun?.inputs ?? providedInputs;
       const inputError = validateRunInputs(workflowResult!.workflow, inputs);

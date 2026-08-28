@@ -401,7 +401,14 @@ steps:
 `);
     const workflow = parseAgentFlowWorkflowOrThrow(fs.readFileSync(path.join(repo, "workflow.yml"), "utf8"));
     const interrupted = await openAgentFlowRunState({ cwd: repo });
-    createAgentFlowLifecycleRun(interrupted, { id: "cli-recovery", workflow, inputs: { ticket: "AF-1" } });
+    createAgentFlowLifecycleRun(interrupted, {
+      id: "cli-recovery",
+      workflow,
+      inputs: { ticket: "AF-1" },
+      context: {
+        codexOptions: { profile: "persisted", model: "gpt-5", reasoningEffort: "high" }
+      }
+    });
     interrupted.acquireRunLock("cli-recovery", "run", { ttlMs: 60_000 });
     interrupted.transitionRunWithEvent("cli-recovery", {
       status: "running",
@@ -416,7 +423,15 @@ steps:
     expect(changed).toMatchObject({ exitCode: 2 });
     expect(changed.stderr).toContain("differs from its persisted value");
 
-    const recovered = await captureCli(["run", "workflow.yml", "--id", "cli-recovery"], repo);
+    const changedCodex = await captureCli([
+      "run", "workflow.yml", "--id", "cli-recovery", "--profile", "different"
+    ], repo);
+    expect(changedCodex).toMatchObject({ exitCode: 2 });
+    expect(changedCodex.stderr).toContain('Codex option "profile" differs from its persisted value');
+
+    const recovered = await captureCli([
+      "run", "workflow.yml", "--id", "cli-recovery", "--profile", "persisted"
+    ], repo);
 
     expect(recovered).toMatchObject({ exitCode: 0, stderr: "" });
     expect(recovered.stdout).toContain("Reused Agent Flow run cli-recovery");
@@ -599,6 +614,33 @@ steps:
     const store = await openAgentFlowRunState({ cwd: repo });
     expect(Object.keys(store.getRun("reachable-only")?.context.workflowRegistry as object))
       .toEqual(["reachable-entry"]);
+    store.close();
+  });
+
+  test("does not discover nested repository YAML when no workflow directory is configured", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-sibling-registry-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.mkdirSync(path.join(repo, ".github", "workflows"), { recursive: true });
+    fs.writeFileSync(path.join(repo, "workflow.yml"), `
+name: sibling-entry
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: done, type: result, status: completed }
+`);
+    fs.writeFileSync(path.join(repo, ".github", "workflows", "ci.yml"), `
+name: CI
+on: [push]
+jobs: {}
+`);
+
+    expect(await captureCli([
+      "run", "workflow.yml", "--id", "sibling-only"
+    ], repo)).toMatchObject({ exitCode: 0, stderr: "" });
+    const store = await openAgentFlowRunState({ cwd: repo });
+    expect(Object.keys(store.getRun("sibling-only")?.context.workflowRegistry as object))
+      .toEqual(["sibling-entry"]);
     store.close();
   });
 

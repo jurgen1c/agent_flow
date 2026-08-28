@@ -389,6 +389,50 @@ steps:
     store.close();
   });
 
+  test("rejects recursive programmatic workflow registries before creating another lineage run", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-recursive-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: recursive-a
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: child_b
+    type: workflow
+    workflow: recursive-b
+    inputs: {}
+    outputs: [never.txt]
+`);
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: recursive-b
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: child_a
+    type: workflow
+    workflow: recursive-a
+    inputs: {}
+    outputs: [never.txt]
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register(parent.name, parent)
+      .register(child.name, child);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, { id: "recursive-root", workflow: parent });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "recursive-root", parent, undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({ status: "paused", failedStep: "child_b" });
+    const runs = store.listRuns();
+    expect(runs).toHaveLength(2);
+    const childRun = runs.find((run) => run.parentRunId === "recursive-root")!;
+    expect(JSON.stringify(store.listSteps(childRun.id).at(-1)?.error))
+      .toContain("already present in run recursive-root's parent lineage");
+    store.close();
+  });
+
   test("retries failed children and honors explicit continuation", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-retry-"));
     fs.mkdirSync(path.join(repo, ".git"));

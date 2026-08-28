@@ -8207,6 +8207,7 @@ async function executeNestedWorkflowStep(
   const stepId = requiredStepId(step);
   const workflowName = normalizedTarget(step.workflow)!;
   const workflow = workflows.get(workflowName)!;
+  assertNestedWorkflowNotInLineage(store, parentRunId, workflow);
   const rawInputs = resolveWorkflowStepInputs(store, parentRunId, step.inputs, stepId);
   const unknown = Object.keys(rawInputs).filter((name) => !Object.hasOwn(workflow.inputs ?? {}, name)).sort();
   if (unknown.length > 0) {
@@ -8277,6 +8278,25 @@ async function executeNestedWorkflowStep(
     ? promoteWorkflowStepOutputs(store, parentRunId, childRunId, step)
     : [];
   return { status: result.status, runId: childRunId, outputs, ...(result.message === undefined ? {} : { message: result.message }) };
+}
+
+function assertNestedWorkflowNotInLineage(
+  store: AgentFlowRunStateStore,
+  parentRunId: string,
+  nestedWorkflow: AgentFlowWorkflow
+): void {
+  const visited = new Set<string>();
+  let current = store.getRun(parentRunId);
+  while (current !== null && !visited.has(current.id)) {
+    visited.add(current.id);
+    if (current.workflowName === nestedWorkflow.name) {
+      throw new AgentFlowRunStateError(
+        `Workflow ${nestedWorkflow.name} is already present in run ${current.id}'s parent lineage.`,
+        "AGENT_FLOW_WORKFLOW_RECURSIVE"
+      );
+    }
+    current = current.parentRunId === null ? null : store.getRun(current.parentRunId);
+  }
 }
 
 function serializeWorkflowRegistryForRun(

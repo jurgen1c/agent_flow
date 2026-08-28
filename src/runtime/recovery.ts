@@ -53,7 +53,8 @@ export function loadAgentFlowWorkflowRegistry(
     }
   }
   const source = configuredPath === undefined ? path.dirname(entry) : path.resolve(repoRoot, configuredPath);
-  const files = workflowFiles(source).filter((candidate) => path.basename(candidate) !== ".agent-flow.yml");
+  const files = (configuredPath === undefined ? siblingWorkflowFiles(source) : workflowFiles(source))
+    .filter((candidate) => path.basename(candidate) !== ".agent-flow.yml");
   if (!files.includes(entry)) files.push(entry);
   const registry = createAgentFlowWorkflowRegistry();
   const loaded = [...new Set(files)].sort().map((file) => ({
@@ -117,6 +118,15 @@ function workflowFiles(source: string): string[] {
     if (entry.isDirectory()) return workflowFiles(candidate);
     return entry.isFile() && /\.ya?ml$/i.test(entry.name) ? [candidate] : [];
   });
+}
+
+function siblingWorkflowFiles(source: string): string[] {
+  const stat = fs.statSync(source);
+  if (stat.isFile()) return [source];
+  if (!stat.isDirectory()) throw new Error(`Workflow registry path ${source} is not a file or directory.`);
+  return fs.readdirSync(source, { withFileTypes: true }).flatMap((entry) =>
+    entry.isFile() && /\.ya?ml$/i.test(entry.name) ? [path.join(source, entry.name)] : []
+  );
 }
 
 function assertAcyclicWorkflowRegistry(registry: AgentFlowWorkflowRegistry): void {
