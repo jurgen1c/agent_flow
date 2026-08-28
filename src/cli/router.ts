@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
   bundledAgentFlowSkillNames,
   installAgentFlowSkills,
@@ -436,11 +437,23 @@ async function runLifecycleCommand(
       if (!inputFile.ok) return inputFile.result;
       const explicitInputs = parseRunInputs(runArgs.inputValues);
       if (!explicitInputs.ok) return explicitInputs.result;
-      const inputs = {
+      const providedInputs = {
         ...(fixture === null ? {} : fixture.inputs),
         ...inputFile.inputs,
         ...explicitInputs.inputs
       };
+      if (existingRun !== null) {
+        const changedInput = Object.entries(providedInputs).find(([name, value]) =>
+          !Object.hasOwn(existingRun.inputs, name) || !isDeepStrictEqual(existingRun.inputs[name], value)
+        );
+        if (changedInput !== undefined) {
+          return {
+            exitCode: 2,
+            stderr: `Agent Flow run ${runArgs.runId} input ${JSON.stringify(changedInput[0])} differs from its persisted value; start a new run ID to change inputs.`
+          };
+        }
+      }
+      const inputs = existingRun?.inputs ?? providedInputs;
       const inputError = validateRunInputs(workflowResult!.workflow, inputs);
       if (inputError !== undefined) return { exitCode: 2, stderr: inputError };
       const sessionRequestSteps = registeredWorkflows.flatMap((registeredWorkflow) =>

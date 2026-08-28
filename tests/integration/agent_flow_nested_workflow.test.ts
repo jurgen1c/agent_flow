@@ -189,6 +189,113 @@ steps:
     store.close();
   });
 
+  test("inherits only configured bindings reachable from a child workflow", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-child-bindings-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: binding-child
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: write
+    type: command
+    command: printf 'done\\n' > done.txt
+    outputs: [done.txt]
+`);
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: binding-parent
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  parent_only: { provider: parent-provider }
+steps:
+  - id: child
+    type: workflow
+    workflow: binding-child
+    inputs: {}
+    outputs: [done.txt]
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register(parent.name, parent)
+      .register(child.name, child);
+    const providers = createAgentFlowSessionProviderRegistry().registerConfigured({
+      name: "parent-provider",
+      kind: "local",
+      target: "parent-target",
+      driver: "test-driver",
+      model: "test-model",
+      fingerprint: "sha256:parent"
+    }, () => ({ outputs: {} }));
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, { id: "binding-parent", workflow: parent });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "binding-parent", parent, undefined, providers, undefined, undefined, workflows
+    )).toMatchObject({ status: "completed" });
+    const childRun = store.listRuns().find((run) => run.parentRunId === "binding-parent")!;
+    expect(store.getRun("binding-parent")?.context.providerBindings).toHaveProperty("parent-provider");
+    expect(childRun.context.providerBindings).toBeUndefined();
+    store.close();
+  });
+
+  test("requires explicit overwrite authorization when promoting child outputs", async () => {
+    for (const overwrite of [false, true]) {
+      const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", `agent-flow-nested-overwrite-${overwrite}-`));
+      fs.mkdirSync(path.join(repo, ".git"));
+      const child = parseAgentFlowWorkflowOrThrow(`
+name: overwrite-child
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: write
+    type: command
+    command: printf child > shared.txt
+    outputs: [shared.txt]
+`);
+      const parent = parseAgentFlowWorkflowOrThrow(`
+name: overwrite-parent-${overwrite}
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: child
+    type: workflow
+    workflow: overwrite-child
+    inputs: {}
+    outputs: [shared.txt]
+    overwrite: ${overwrite}
+`);
+      const workflows = createAgentFlowWorkflowRegistry()
+        .register(parent.name, parent)
+        .register(child.name, child);
+      const store = await openAgentFlowRunState({ cwd: repo });
+      const runId = `overwrite-${overwrite}`;
+      createAgentFlowLifecycleRun(store, { id: runId, workflow: parent });
+      store.writeArtifact({
+        id: `existing-${overwrite}`,
+        runId,
+        stepId: "fixture",
+        path: "shared.txt",
+        kind: "fixture",
+        contentType: "text/plain",
+        content: "parent"
+      });
+
+      const result = await executeAgentFlowCommandPipeline(
+        store, runId, parent, undefined, undefined, undefined, undefined, workflows
+      );
+      expect(result.status).toBe(overwrite ? "completed" : "paused");
+      expect(store.readArtifact(runId, "shared.txt").content.toString())
+        .toBe(overwrite ? "child" : "parent");
+      expect(store.getArtifact(runId, "shared.txt")?.producerStepId)
+        .toBe(overwrite ? "child" : "fixture");
+      store.close();
+    }
+  });
+
   test("resolves published artifact values into child workflow inputs", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-artifact-input-"));
     fs.mkdirSync(path.join(repo, ".git"));

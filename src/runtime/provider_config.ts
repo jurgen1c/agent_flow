@@ -81,7 +81,7 @@ const TARGET_FIELDS = new Set([
 ]);
 const ROOT_FIELDS = new Set(["version", "workflows", "prompts", "templates", "runs", "targets", "providers"]);
 const ALIAS_FIELDS = new Set(["kind", "target"]);
-const RESERVED_ALIASES = new Set(["fixture", "local", "frontier"]);
+const RESERVED_ALIASES = new Set(["fixture", "local", "frontier", "codex"]);
 const RESERVED_OBJECT_NAMES = new Set(["__proto__", "prototype", "constructor"]);
 const DRIVERS = new Set<AgentFlowProviderDriver>([
   "openai-responses", "anthropic-messages", "openai-compatible", "codex-cli", "claude-code"

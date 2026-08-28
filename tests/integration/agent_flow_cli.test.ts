@@ -394,12 +394,14 @@ name: cli-recovery
 version: 1
 style: pipeline
 maturity: experimental
+inputs:
+  ticket: { required: true }
 steps:
   - { id: check, type: command, command: "echo recovered >> effects.txt" }
 `);
     const workflow = parseAgentFlowWorkflowOrThrow(fs.readFileSync(path.join(repo, "workflow.yml"), "utf8"));
     const interrupted = await openAgentFlowRunState({ cwd: repo });
-    createAgentFlowLifecycleRun(interrupted, { id: "cli-recovery", workflow });
+    createAgentFlowLifecycleRun(interrupted, { id: "cli-recovery", workflow, inputs: { ticket: "AF-1" } });
     interrupted.acquireRunLock("cli-recovery", "run", { ttlMs: 60_000 });
     interrupted.transitionRunWithEvent("cli-recovery", {
       status: "running",
@@ -408,11 +410,20 @@ steps:
     });
     interrupted.close();
 
+    const changed = await captureCli([
+      "run", "workflow.yml", "--id", "cli-recovery", "--input", "ticket=AF-2"
+    ], repo);
+    expect(changed).toMatchObject({ exitCode: 2 });
+    expect(changed.stderr).toContain("differs from its persisted value");
+
     const recovered = await captureCli(["run", "workflow.yml", "--id", "cli-recovery"], repo);
 
     expect(recovered).toMatchObject({ exitCode: 0, stderr: "" });
     expect(recovered.stdout).toContain("Reused Agent Flow run cli-recovery");
     expect(recovered.stdout).toContain("Status: completed");
+    const recoveredStore = await openAgentFlowRunState({ cwd: repo });
+    expect(recoveredStore.getRun("cli-recovery")?.inputs).toEqual({ ticket: "AF-1" });
+    recoveredStore.close();
     expect(fs.readFileSync(path.join(repo, "effects.txt"), "utf8")).toBe("recovered\n");
     expect((await captureCli(["logs", "cli-recovery"], repo)).stdout).toContain("run.execution_recovered");
   });

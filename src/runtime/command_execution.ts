@@ -4597,7 +4597,7 @@ async function executeNestedRecoveryWorkflow(
         inputs,
         parentRunId,
         recoveryOfRunId: parentRunId,
-        context: nestedWorkflowRunContext(store.getRun(parentRunId)!, workflows)
+        context: nestedWorkflowRunContext(store.getRun(parentRunId)!, nestedWorkflow, workflows)
       });
       if (result.changed) {
         copyRecoveryInputArtifacts(store, parentRunId, recoveryRunId, preparedInputs);
@@ -8238,7 +8238,7 @@ async function executeNestedWorkflowStep(
       workflow,
       inputs: prepared.inputs,
       parentRunId,
-      context: nestedWorkflowRunContext(store.getRun(parentRunId)!, workflows)
+      context: nestedWorkflowRunContext(store.getRun(parentRunId)!, workflow, workflows)
     });
     if (created.changed) copyRecoveryInputArtifacts(store, parentRunId, childRunId, prepared);
   }
@@ -8287,11 +8287,24 @@ function serializeWorkflowRegistryForRun(
 
 function nestedWorkflowRunContext(
   parent: AgentFlowRunRecord,
+  workflow: AgentFlowWorkflow,
   workflows: AgentFlowWorkflowRegistry
 ): Record<string, AgentFlowRunStateValue> {
+  const persistedBindings = mapping(parent.context.providerBindings);
+  const providerNames = new Set(reachableProviderBindingWorkflows(workflow, workflows).flatMap((candidate) =>
+    Object.values(candidate.sessions ?? {}).flatMap((session) => {
+      const provider = normalizedTarget(mapping(session)?.provider);
+      return provider === undefined ? [] : [provider];
+    })
+  ));
+  const providerBindings: Record<string, AgentFlowRunStateValue> | undefined = persistedBindings === undefined
+    ? undefined
+    : Object.fromEntries(Object.entries(persistedBindings).flatMap(([name, value]) =>
+      providerNames.has(name) && value !== undefined ? [[name, value as AgentFlowRunStateValue]] : []
+    ));
   return {
     workflowRegistry: serializeWorkflowRegistryForRun(workflows),
-    ...(parent.context.providerBindings === undefined ? {} : { providerBindings: parent.context.providerBindings }),
+    ...(providerBindings === undefined || Object.keys(providerBindings).length === 0 ? {} : { providerBindings }),
     ...(parent.context.codexOptions === undefined ? {} : { codexOptions: parent.context.codexOptions })
   };
 }
@@ -8313,18 +8326,22 @@ function promoteWorkflowStepOutputs(
       );
     }
     const existing = store.getArtifact(parentRunId, outputPath);
+    const mayReplaceExisting = existing !== null
+      && (step.overwrite === true || existing.producerStepId === stepId);
     return {
-      id: existing?.id ?? `workflow-output:${createHash("sha256").update(`${childRunId}:${outputPath}`).digest("hex")}`,
+      id: mayReplaceExisting
+        ? existing.id
+        : `workflow-output:${createHash("sha256").update(`${childRunId}:${outputPath}`).digest("hex")}`,
       runId: parentRunId,
       stepId,
       path: outputPath,
-      kind: existing?.kind ?? "workflow_output",
+      kind: mayReplaceExisting ? existing.kind : "workflow_output",
       contentType: child.contentType,
       content: store.readArtifact(childRunId, outputPath).content,
-      overwrite: existing !== null,
+      overwrite: mayReplaceExisting,
       requiredRunStatus: "running",
       metadata: {
-        ...(existing?.metadata ?? {}),
+        ...(mayReplaceExisting ? existing.metadata : {}),
         childRunId,
         childArtifactId: child.id,
         ...(child.producerStepId === null ? {} : { childProducerStepId: child.producerStepId })

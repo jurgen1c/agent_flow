@@ -1434,6 +1434,21 @@ function validateSessionReferences(
       }
     }
 
+    if (context.type === "mcp_call" && nonEmptyString(context.step.via) === "codex") {
+      const sessionName = nonEmptyString(context.step.session);
+      const session = sessionName === undefined ? undefined : workflow.sessions?.[sessionName];
+      if (sessionName !== undefined && !isDynamicReference(sessionName) && sessions.has(sessionName)
+          && (!isRecord(session) || session.resume !== true)) {
+        addStepIssue(
+          errors,
+          context,
+          "workflow.mcp_call.session.not_resumable",
+          "session",
+          `Codex-mediated MCP call session ${JSON.stringify(sessionName)} must declare resume: true.`
+        );
+      }
+    }
+
     if (context.type === "decision_record") {
       const owner = nonEmptyString(context.step.owner);
       if (owner !== undefined && isDynamicReference(owner)) {

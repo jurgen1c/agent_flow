@@ -1979,6 +1979,33 @@ steps:
     ]);
   });
 
+  test("requires Codex-mediated MCP sessions to be resumable", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: non-resumable-codex-mcp
+version: 1
+style: pipeline
+maturity: experimental
+limits: { max_frontier_calls: 1 }
+sessions:
+  agent: { provider: codex, resume: false }
+steps:
+  - id: fetch
+    type: mcp_call
+    via: codex
+    session: agent
+    server: atlassian
+    tool: get_issue
+    arguments: { key: AF-1 }
+    outputs: [ticket.json]
+`);
+
+    expect(validateAgentFlowWorkflow(workflow).errors).toContainEqual({
+      code: "workflow.mcp_call.session.not_resumable",
+      message: 'Codex-mediated MCP call session "agent" must declare resume: true.',
+      path: "steps[0].session",
+      stepId: "fetch"
+    });
+  });
+
   test("rejects malformed session authority mappings and capability flags", () => {
     const workflow = parseAgentFlowWorkflowOrThrow(`name: malformed-session-authority
 version: 1

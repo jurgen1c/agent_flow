@@ -525,6 +525,18 @@ targets:
 
     fs.writeFileSync(globalConfig, `version: 1
 targets:
+  codex-target: { kind: frontier, driver: codex-cli, model: codex-test, enabled: true }
+`);
+    fs.writeFileSync(path.join(repo, ".agent-flow.yml"), `version: 1
+providers:
+  codex: { kind: frontier, target: codex-target }
+`);
+    expect(() => loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} }))
+      .toThrow('Alias "codex" is reserved');
+    fs.writeFileSync(path.join(repo, ".agent-flow.yml"), "version: 1\n");
+
+    fs.writeFileSync(globalConfig, `version: 1
+targets:
   "bad\\u001b[2J": { kind: local, driver: openai-compatible, base_url: http://127.0.0.1:11434/v1, model: model, enabled: true }
 `);
     expect(() => loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env: {} }))
@@ -591,6 +603,9 @@ limits: { max_model_calls: 2, max_frontier_calls: 1 }
       path.join(import.meta.dir, "../../schemas/config.schema.json"),
       "utf8"
     )) as {
+      properties: {
+        providers: { propertyNames: { pattern: string } };
+      };
       $defs: {
         target: {
           required: string[];
@@ -602,6 +617,10 @@ limits: { max_model_calls: 2, max_frontier_calls: 1 }
         };
       };
     };
+    const providerNamePattern = new RegExp(schema.properties.providers.propertyNames.pattern);
+    expect(providerNamePattern.test("codex")).toBe(false);
+    expect(providerNamePattern.test("codex:reviewer")).toBe(false);
+    expect(providerNamePattern.test("reviewer")).toBe(true);
     expect(schema.$defs.target.required).toEqual(["kind", "driver", "model", "enabled"]);
     expect(schema.$defs.target.properties.profile.pattern).toBe("^[A-Za-z0-9_-]+$");
     expect(schema.$defs.target.properties.reasoning_effort.enum)
