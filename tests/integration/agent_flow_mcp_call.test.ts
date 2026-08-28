@@ -132,19 +132,40 @@ steps:
     createAgentFlowLifecycleRun(store, { id: "codex-mcp-abort", workflow });
     let started!: () => void;
     const didStart = new Promise<void>((resolve) => { started = resolve; });
-    const providers = createAgentFlowSessionProviderRegistry().register("codex", (request) => {
+    let aborted!: () => void;
+    const didAbort = new Promise<void>((resolve) => { aborted = resolve; });
+    let release!: () => void;
+    const maySettle = new Promise<void>((resolve) => { release = resolve; });
+    let providerSettled = false;
+    const provider = Object.assign((request: Parameters<NonNullable<ReturnType<typeof createAgentFlowSessionProviderRegistry>["get"]>>[0]) => {
       request.reportExternalSessionId?.("abort-thread");
       started();
-      return new Promise(() => undefined);
-    });
+      return new Promise((_resolve, reject) => {
+        request.signal.addEventListener("abort", () => {
+          aborted();
+          void maySettle.then(() => {
+            providerSettled = true;
+            reject(request.signal.reason);
+          });
+        }, { once: true });
+      });
+    }, { waitForAbort: true });
+    const providers = createAgentFlowSessionProviderRegistry().register("codex", provider);
 
     const execution = executeAgentFlowCommandPipeline(
       store, "codex-mcp-abort", workflow, undefined, providers
     );
     await didStart;
     transitionAgentFlowLifecycleRun(store, "codex-mcp-abort", "cancel");
+    await didAbort;
+    expect(await Promise.race([
+      execution.then(() => "settled"),
+      new Promise<string>((resolve) => setTimeout(() => resolve("pending"), 50))
+    ])).toBe("pending");
+    release();
 
     await expect(execution).resolves.toMatchObject({ status: "cancelled", completedSteps: [] });
+    expect(providerSettled).toBe(true);
     expect(store.getSession("codex-mcp-abort", "agent")).toMatchObject({
       status: "cancelled",
       externalSessionId: "abort-thread",

@@ -69,6 +69,7 @@ import {
   executeAgentFlowMcpCall,
   validateAgentFlowMcpArgumentExpressions,
   validateAgentFlowMcpOutputPaths
+  , type AgentFlowMcpCallRequest
   , type AgentFlowMcpCallResponse
 } from "./mcp_call";
 import {
@@ -5150,7 +5151,7 @@ async function executeRecoverySession(
     ...recoveryOperationFileScopes(workflow.steps, failedStep),
     routeFileScope
   ].filter((scope): scope is AgentFlowYamlMapping => scope !== undefined);
-  const codexOptions = resolveAgentFlowCodexOptions(undefined, run.context.codexOptions, session.codex);
+  const codexOptions = resolveAgentFlowCodexOptions(failedStep.codex, run.context.codexOptions, session.codex);
   preflightAgentFlowSessionProvider(adapter, {
     runId,
     stepId: recoveryStepId,
@@ -8781,7 +8782,9 @@ function codexMcpCallRegistry(
 ): AgentFlowMcpCallRegistry {
   const server = normalizedTarget(step.server)!;
   const registry = createAgentFlowMcpCallRegistry();
-  registry.register(server, async (mcpRequest): Promise<AgentFlowMcpCallResponse> => {
+  const codexAdapter = Object.assign(async (
+    mcpRequest: AgentFlowMcpCallRequest
+  ): Promise<AgentFlowMcpCallResponse> => {
     const sessionId = normalizedTarget(step.session)!;
     const session = mapping(workflow.sessions?.[sessionId]);
     if (session === undefined || session.resume !== true) {
@@ -8884,7 +8887,19 @@ function codexMcpCallRegistry(
     };
     let response: AgentFlowSessionProviderResponse;
     try {
-      response = await invokeAgentFlowSessionProvider(adapter, providerRequest, undefined);
+      response = await invokeAgentFlowSessionProvider(
+        adapter,
+        providerRequest,
+        () => activeStopStatus(store, runId),
+        () => mcpRequest.signal.aborted
+          ? mcpRequest.signal.reason instanceof Error
+            ? mcpRequest.signal.reason
+            : new AgentFlowMcpCallError(
+                "Codex-mediated MCP provider was interrupted.",
+                "AGENT_FLOW_MCP_INTERRUPTED"
+              )
+          : undefined
+      );
     } catch (error) {
       const message = redactAgentFlowSensitiveText(error instanceof Error ? error.message : String(error));
       const stopped = activeStopStatus(store, runId);
@@ -8966,7 +8981,8 @@ function codexMcpCallRegistry(
       ...(Object.keys(contentTypes).length === 0 ? {} : { contentTypes }),
       metadata: response.metadata
     };
-  });
+  }, { waitForAbort: true });
+  registry.register(server, codexAdapter);
   return registry;
 }
 

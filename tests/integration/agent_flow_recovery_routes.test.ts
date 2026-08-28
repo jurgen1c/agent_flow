@@ -1451,6 +1451,53 @@ steps:
     store.close();
   });
 
+  test("applies failed-step Codex overrides to recovery sessions", async () => {
+    const root = temporaryRepo();
+    fs.writeFileSync(path.join(root, "fix.md"), "Fix the failure.\n");
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: codex-step-recovery-options
+version: 1
+style: recovery_pipeline
+maturity: experimental
+limits: { max_frontier_calls: 1, max_recovery_cycles: 1 }
+sessions:
+  fixer:
+    provider: codex
+    codex: { profile: session-profile, model: session-model, reasoning_effort: low }
+steps:
+  - id: check
+    type: command
+    command: exit 1
+    codex: { profile: step-profile, model: step-model, reasoning_effort: xhigh }
+    on_failure:
+      route_to: { session: fixer, prompt: fix.md }
+      on_remediated: { return_to: check }
+      on_unresolved: { then: pause }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, {
+      id: "codex-step-recovery-options",
+      workflow,
+      context: {
+        codexOptions: { profile: "run-profile", model: "run-model", reasoningEffort: "medium" }
+      }
+    });
+    let receivedOptions: unknown;
+    const providers = createAgentFlowSessionProviderRegistry().register("codex", (request) => {
+      receivedOptions = request.codexOptions;
+      return { outputs: {}, metadata: { recovery_status: "unresolved" } };
+    });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "codex-step-recovery-options", workflow, undefined, providers
+    )).toMatchObject({ status: "paused" });
+    expect(receivedOptions).toEqual({
+      profile: "step-profile",
+      model: "step-model",
+      reasoningEffort: "xhigh"
+    });
+    store.close();
+  });
+
   test("rejects reported and returned identity switches for resumable recovery sessions", async () => {
     for (const mode of ["report", "return"] as const) {
       const root = temporaryRepo();
