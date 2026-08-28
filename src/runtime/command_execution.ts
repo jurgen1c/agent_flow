@@ -947,11 +947,13 @@ async function runAgentFlowCommandPipeline(
           const lockError = store.runLockInterruption();
           if (lockError !== undefined) throw lockError;
           if (error instanceof AgentFlowMcpCallInterruptedError) {
+            persistCodexMcpSessionInterruption(store, runId, workflow, step, error.status);
             persistMcpCallInterruption(store, runId, stepId, attempt, error.status);
             return interruptedPipelineResult(store, runId, completedSteps, error.status);
           }
           const stopped = activeStopStatus(store, runId);
           if (stopped !== undefined) {
+            persistCodexMcpSessionInterruption(store, runId, workflow, step, stopped);
             persistMcpCallInterruption(store, runId, stepId, attempt, stopped);
             return interruptedPipelineResult(store, runId, completedSteps, stopped);
           }
@@ -7451,6 +7453,32 @@ function persistMcpCallInterruption(
   store.appendRunEvent(runId, { type: "step.interrupted", stepId, payload: output });
 }
 
+function persistCodexMcpSessionInterruption(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  workflow: AgentFlowWorkflow,
+  step: AgentFlowWorkflowStep,
+  status: AgentFlowRunStopStatus
+): void {
+  if (normalizedTarget(step.via) !== "codex") return;
+  const sessionId = normalizedTarget(step.session);
+  if (sessionId === undefined) return;
+  const previous = store.getSession(runId, sessionId);
+  const sessionDefinition = mapping(workflow.sessions?.[sessionId]);
+  const provider = normalizedTarget(sessionDefinition?.provider) ?? "unknown";
+  store.upsertSession({
+    id: sessionId,
+    runId,
+    stepId: requiredStepId(step),
+    provider,
+    status,
+    ...(previous?.externalSessionId === null || previous?.externalSessionId === undefined
+      ? {}
+      : { externalSessionId: previous.externalSessionId }),
+    state: { resume: true, lastStepId: requiredStepId(step), mcp: true, interrupted: status }
+  });
+}
+
 function stoppedPipelineResult(
   store: AgentFlowRunStateStore,
   runId: string,
@@ -8839,10 +8867,13 @@ function codexMcpCallRegistry(
       response = await invokeAgentFlowSessionProvider(adapter, providerRequest, undefined);
     } catch (error) {
       const message = redactAgentFlowSensitiveText(error instanceof Error ? error.message : String(error));
+      const stopped = activeStopStatus(store, runId);
       store.upsertSession({
-        id: sessionId, runId, stepId: mcpRequest.stepId, provider, status: "paused",
+        id: sessionId, runId, stepId: mcpRequest.stepId, provider, status: stopped ?? "paused",
         externalSessionId: externalSessionId ?? null,
-        state: { resume: true, lastStepId: mcpRequest.stepId, mcp: true, error: message }
+        state: stopped === undefined
+          ? { resume: true, lastStepId: mcpRequest.stepId, mcp: true, error: message }
+          : { resume: true, lastStepId: mcpRequest.stepId, mcp: true, interrupted: stopped }
       });
       throw error;
     }

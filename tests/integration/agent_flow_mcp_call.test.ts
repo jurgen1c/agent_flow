@@ -125,6 +125,61 @@ steps:
     store.close();
   });
 
+  test("cancels a Codex MCP session when its in-flight provider is aborted", async () => {
+    const root = temporaryRepo();
+    const workflow = codexMcpWorkflow("codex-mcp-abort");
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "codex-mcp-abort", workflow });
+    let started!: () => void;
+    const didStart = new Promise<void>((resolve) => { started = resolve; });
+    const providers = createAgentFlowSessionProviderRegistry().register("codex", (request) => {
+      request.reportExternalSessionId?.("abort-thread");
+      started();
+      return new Promise(() => undefined);
+    });
+
+    const execution = executeAgentFlowCommandPipeline(
+      store, "codex-mcp-abort", workflow, undefined, providers
+    );
+    await didStart;
+    transitionAgentFlowLifecycleRun(store, "codex-mcp-abort", "cancel");
+
+    await expect(execution).resolves.toMatchObject({ status: "cancelled", completedSteps: [] });
+    expect(store.getSession("codex-mcp-abort", "agent")).toMatchObject({
+      status: "cancelled",
+      externalSessionId: "abort-thread",
+      state: { interrupted: "cancelled" }
+    });
+    store.close();
+  });
+
+  test("cancels a Codex MCP session when cancellation races with its provider response", async () => {
+    const root = temporaryRepo();
+    const workflow = codexMcpWorkflow("codex-mcp-return-race");
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "codex-mcp-return-race", workflow });
+    const providers = createAgentFlowSessionProviderRegistry().register("codex", (request) => {
+      request.reportExternalSessionId?.("return-thread");
+      transitionAgentFlowLifecycleRun(store, "codex-mcp-return-race", "cancel");
+      return {
+        externalSessionId: "return-thread",
+        outputs: { "ticket.json": "{}\n" },
+        metadata: { mcpCalls: [{ server: "jira", tool: "get", arguments: {}, status: "completed" }] }
+      };
+    });
+
+    await expect(executeAgentFlowCommandPipeline(
+      store, "codex-mcp-return-race", workflow, undefined, providers
+    )).resolves.toMatchObject({ status: "cancelled", completedSteps: [] });
+    expect(store.getSession("codex-mcp-return-race", "agent")).toMatchObject({
+      status: "cancelled",
+      externalSessionId: "return-thread",
+      state: { interrupted: "cancelled" }
+    });
+    expect(store.getArtifact("codex-mcp-return-race", "ticket.json")).toBeNull();
+    store.close();
+  });
+
   test("rejects secret-like Codex MCP session IDs before persistence", async () => {
     for (const source of ["reported", "returned"] as const) {
       const root = temporaryRepo();
@@ -2686,6 +2741,19 @@ steps:
       key: "{{ inputs.ticket_key }}"
     outputs: [ticket.json]
     on_failure: { then: pause }
+`);
+}
+
+function codexMcpWorkflow(name: string) {
+  return parseAgentFlowWorkflowOrThrow(`name: ${name}
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  agent: { provider: codex, resume: true }
+limits: { max_frontier_calls: 1 }
+steps:
+  - { id: fetch, type: mcp_call, via: codex, session: agent, server: jira, tool: get, arguments: {}, outputs: [ticket.json] }
 `);
 }
 
