@@ -8402,6 +8402,26 @@ async function executeNestedWorkflowStep(
       // The child may settle while the parent stop is being propagated.
     }
   };
+  propagateParentStop();
+  const childBeforeStart = store.getRun(childRunId)!;
+  if (["completed", "failed", "cancelled"].includes(childBeforeStart.status)) {
+    const outputs = childBeforeStart.status === "completed"
+      ? promoteWorkflowStepOutputs(store, parentRunId, childRunId, step)
+      : [];
+    return {
+      status: childBeforeStart.status as "completed" | "failed" | "cancelled",
+      runId: childRunId,
+      outputs
+    };
+  }
+  if (childBeforeStart.status === "paused") {
+    return {
+      status: "paused",
+      runId: childRunId,
+      outputs: [],
+      message: `Child workflow ${workflowName} is paused.`
+    };
+  }
   const stopMonitor = setInterval(propagateParentStop, 25);
   let result: AgentFlowCommandPipelineResult;
   let promotedOutputs: string[] | undefined;
@@ -8415,7 +8435,7 @@ async function executeNestedWorkflowStep(
       mcpCalls,
       notifications,
       workflows,
-      undefined,
+      propagateParentStop,
       undefined,
       () => {
         const parentStatus = store.getRun(parentRunId)?.status;

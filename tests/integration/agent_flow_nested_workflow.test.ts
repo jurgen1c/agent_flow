@@ -882,6 +882,57 @@ steps:
     store.close();
   });
 
+  test("does not launch a child after its parent is cancelled during child setup", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-setup-cancel-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: setup-cancel-child
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: side_effect
+    type: command
+    command: printf ran > marker.txt
+    outputs: [marker.txt]
+`);
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: setup-cancel-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: child
+    type: workflow
+    workflow: setup-cancel-child
+    inputs: {}
+    outputs: [marker.txt]
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register(parent.name, parent)
+      .register(child.name, child);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, { id: "setup-cancel-parent", workflow: parent });
+    const finalize = store.withRunFinalizationTransaction.bind(store);
+    let cancelDuringSetup = true;
+    store.withRunFinalizationTransaction = ((runId, callback) => {
+      if (runId === "setup-cancel-parent" && cancelDuringSetup) {
+        cancelDuringSetup = false;
+        transitionAgentFlowLifecycleRun(store, runId, "cancel");
+      }
+      return finalize(runId, callback);
+    }) as typeof store.withRunFinalizationTransaction;
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "setup-cancel-parent", parent, undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({ status: "cancelled", completedSteps: [] });
+    const childRun = store.listRuns().find((run) => run.parentRunId === "setup-cancel-parent")!;
+    expect(childRun.status).toBe("cancelled");
+    expect(fs.existsSync(path.join(repo, "marker.txt"))).toBe(false);
+    expect(store.listEvents(childRun.id).map((event) => event.type)).not.toContain("step.started");
+    store.close();
+  });
+
   test("rejects recursive programmatic workflow registries before creating another lineage run", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-recursive-"));
     fs.mkdirSync(path.join(repo, ".git"));
