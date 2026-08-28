@@ -12,6 +12,7 @@ import {
   createAgentFlowWorkflowRegistry,
   defaultAgentFlowArchivePath,
   defaultAgentFlowExportPath,
+  loadAgentFlowWorkflowRegistry,
   openAgentFlowRunState,
   parseAgentFlowWorkflowOrThrow,
   plannedAgentFlowRuntimeCommands,
@@ -267,6 +268,25 @@ steps:
     const result = await captureCli(["run", "workflow.yml", "--id", "direct"], repo);
     expect(result).toMatchObject({ exitCode: 1 });
     expect(result.stderr).toContain("use via: codex");
+    expect(fs.existsSync(path.join(repo, ".agent-flow"))).toBe(false);
+  });
+
+  test("rejects invalid Codex model overrides before creating run state", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-model-override-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.writeFileSync(path.join(repo, "workflow.yml"), `
+name: model-override
+version: 1
+style: pipeline
+maturity: experimental
+steps: []
+`);
+
+    for (const [index, model] of ["   ", " padded ", "bad\nmodel"].entries()) {
+      expect(await captureCli([
+        "run", "workflow.yml", "--id", `invalid-model-${index}`, "--model", model
+      ], repo)).toMatchObject({ exitCode: 1 });
+    }
     expect(fs.existsSync(path.join(repo, ".agent-flow"))).toBe(false);
   });
 
@@ -637,6 +657,10 @@ maturity: experimental
 steps:
   - { id: publish, type: command, command: "printf sibling > child.txt", outputs: [child.txt] }
 `);
+    fs.writeFileSync(path.join(repo, "docker-compose.yml"), `
+services:
+  database: { image: postgres }
+`);
     fs.writeFileSync(path.join(repo, ".github", "workflows", "ci.yml"), `
 name: CI
 on: [push]
@@ -651,6 +675,26 @@ jobs: {}
       .toEqual(["sibling-child", "sibling-entry"]);
     expect(store.readArtifact("sibling-only", "child.txt").content.toString("utf8")).toBe("sibling");
     store.close();
+  });
+
+  test("keeps configured workflow registries inside the repository", () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-registry-containment-"));
+    const outside = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-registry-outside-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.writeFileSync(path.join(repo, "workflow.yml"), `
+name: contained-entry
+version: 1
+style: pipeline
+maturity: experimental
+steps: []
+`);
+    fs.symlinkSync(outside, path.join(repo, "linked-workflows"), "dir");
+
+    for (const configuredPath of ["../outside", outside, "linked-workflows"]) {
+      fs.writeFileSync(path.join(repo, ".agent-flow.yml"), `version: 1\nworkflows: ${JSON.stringify(configuredPath)}\n`);
+      expect(() => loadAgentFlowWorkflowRegistry("workflow.yml", { cwd: repo }))
+        .toThrow("must be repository-relative and stay inside");
+    }
   });
 
   test("does not rewrite fixture state before acquiring an active run lease", async () => {

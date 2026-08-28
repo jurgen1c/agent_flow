@@ -847,6 +847,8 @@ function parseRunLifecycleArgs(args: string[]): ParsedRunLifecycleArgs | AgentFl
   }
   if (runId === undefined) return { exitCode: 1 };
   if (profile !== undefined && !/^[A-Za-z0-9_-]+$/.test(profile)) return { exitCode: 1 };
+  if (model !== undefined && (model.trim().length === 0 || model.trim() !== model
+      || /[\u0000-\u001F\u007F-\u009F]/u.test(model))) return { exitCode: 1 };
   if (reasoningEffort !== undefined
       && !["minimal", "low", "medium", "high", "xhigh"].includes(reasoningEffort)) return { exitCode: 1 };
   return {

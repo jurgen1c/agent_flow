@@ -8,7 +8,8 @@ import {
   executeAgentFlowCommandPipeline,
   openAgentFlowRunState,
   parseAgentFlowWorkflowOrThrow,
-  resumeAgentFlowCommandPipeline
+  resumeAgentFlowCommandPipeline,
+  transitionAgentFlowLifecycleRun
 } from "../../src/runtime";
 
 describe("Agent Flow nested workflow execution", () => {
@@ -181,6 +182,44 @@ steps:
       undefined, undefined, undefined, undefined, workflows
     )).toMatchObject({ status: "completed" });
     expect(store.readArtifact("terminal-parent", "child.txt").content.toString("utf8")).toBe("done");
+    store.close();
+  });
+
+  test("cancels a paused child when its parent is cancelled", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-cancel-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: cancelled-child
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: approve, type: manual_gate, message: Continue?, options: [approve, cancel] }
+`);
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: cancelled-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: child, type: workflow, workflow: cancelled-child, inputs: {}, outputs: [never.txt] }
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register(parent.name, parent)
+      .register(child.name, child);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, { id: "cancelled-parent", workflow: parent });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "cancelled-parent", parent, undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({ status: "paused" });
+    const childRunId = (store.getRun("cancelled-parent")!.context.waiting as { childRunId: string }).childRunId;
+    expect(store.getRun(childRunId)?.status).toBe("paused");
+
+    expect(transitionAgentFlowLifecycleRun(store, "cancelled-parent", "cancel").run.status)
+      .toBe("cancelled");
+    expect(store.getRun(childRunId)?.status).toBe("cancelled");
+    expect(store.getRun(childRunId)?.context.waiting).toBeUndefined();
     store.close();
   });
 

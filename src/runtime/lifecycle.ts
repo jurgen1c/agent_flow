@@ -156,8 +156,9 @@ export function transitionAgentFlowLifecycleRun(
       "AGENT_FLOW_WORKFLOW_INVALID"
     );
   }
+  let result: AgentFlowRunMutationResult;
   if (action === "pause" || (workflow.style === "pipeline" && action === "cancel")) {
-    return withAgentFlowPipelineFinalization(
+    result = withAgentFlowPipelineFinalization(
       store,
       runId,
       () => ({ changed: false, run: store.getRun(runId)! }),
@@ -166,11 +167,26 @@ export function transitionAgentFlowLifecycleRun(
         return transitionAgentFlowLifecycleRunUnlocked(store, runId, action, notifications);
       }
     );
+  } else {
+    result = store.withRunStateTransaction(runId, () => {
+      prepareTransition?.();
+      return transitionAgentFlowLifecycleRunUnlocked(store, runId, action, notifications);
+    });
   }
-  return store.withRunStateTransaction(runId, () => {
-    prepareTransition?.();
-    return transitionAgentFlowLifecycleRunUnlocked(store, runId, action, notifications);
-  });
+  if (action === "cancel") cancelNonterminalChildRuns(store, runId, notifications);
+  return result;
+}
+
+function cancelNonterminalChildRuns(
+  store: AgentFlowRunStateStore,
+  parentRunId: string,
+  notifications: AgentFlowNotificationRegistry
+): void {
+  const children = store.listRuns().filter((run) => run.parentRunId === parentRunId
+    && ["pending", "running", "waiting", "paused"].includes(run.status));
+  for (const child of children) {
+    transitionAgentFlowLifecycleRun(store, child.id, "cancel", notifications);
+  }
 }
 
 function transitionAgentFlowLifecycleRunUnlocked(

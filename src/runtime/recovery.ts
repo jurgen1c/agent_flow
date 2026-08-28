@@ -52,15 +52,24 @@ export function loadAgentFlowWorkflowRegistry(
       configuredPath = root.workflows.trim();
     }
   }
-  const source = configuredPath === undefined ? path.dirname(entry) : path.resolve(repoRoot, configuredPath);
+  const source = configuredPath === undefined
+    ? path.dirname(entry)
+    : containedWorkflowRegistrySource(repoRoot, configuredPath);
   const files = (configuredPath === undefined ? siblingWorkflowFiles(source) : workflowFiles(source))
     .filter((candidate) => path.basename(candidate) !== ".agent-flow.yml");
   if (!files.includes(entry)) files.push(entry);
   const registry = createAgentFlowWorkflowRegistry();
-  const loaded = [...new Set(files)].sort().map((file) => ({
-    file,
-    workflow: parseAgentFlowWorkflowOrThrow(fs.readFileSync(file, "utf8"))
-  }));
+  const loaded = [...new Set(files)].sort().flatMap((file) => {
+    const sourceText = fs.readFileSync(file, "utf8");
+    if (configuredPath !== undefined || file === entry) {
+      return [{ file, workflow: parseAgentFlowWorkflowOrThrow(sourceText) }];
+    }
+    try {
+      return [{ file, workflow: parseAgentFlowWorkflowOrThrow(sourceText) }];
+    } catch {
+      return [];
+    }
+  });
   if (configuredPath !== undefined) {
     for (const { workflow } of loaded) registry.register(workflow.name, workflow);
   } else {
@@ -84,6 +93,20 @@ export function loadAgentFlowWorkflowRegistry(
   }
   assertAcyclicWorkflowRegistry(registry);
   return registry;
+}
+
+function containedWorkflowRegistrySource(repoRoot: string, configuredPath: string): string {
+  if (path.isAbsolute(configuredPath)) {
+    throw new Error(`Workflow registry path ${configuredPath} must be repository-relative and stay inside ${repoRoot}.`);
+  }
+  try {
+    return resolveContainedPath(repoRoot, configuredPath).absolutePath;
+  } catch (error) {
+    throw new Error(
+      `Workflow registry path ${configuredPath} must be repository-relative and stay inside ${repoRoot}.`,
+      { cause: error }
+    );
+  }
 }
 
 export function serializeAgentFlowWorkflowRegistry(
@@ -205,5 +228,5 @@ function requiredName(value: unknown, label: string): string {
 }
 import fs from "node:fs";
 import path from "node:path";
-import { findGitRepositoryRoot } from "@jurgen1c/agent-core/repository";
+import { findGitRepositoryRoot, resolveContainedPath } from "@jurgen1c/agent-core/repository";
 import { parseYamlDocument } from "@jurgen1c/agent-core/yaml";
