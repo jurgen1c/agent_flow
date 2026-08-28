@@ -32,6 +32,9 @@ steps:
     type: command
     command: printf 'child output\\n' > child.txt
     outputs: [child.txt]
+retention:
+  on_success:
+    delete: [child.txt]
 `);
     const parent = parseAgentFlowWorkflowOrThrow(`
 name: parent-workflow
@@ -74,9 +77,55 @@ steps:
     expect(resumed).toMatchObject({ status: "completed" });
     expect(store.getRun(childRunId)?.status).toBe("completed");
     expect(store.readArtifact("parent", "child.txt").content.toString("utf8")).toBe("child output\n");
+    expect(store.getArtifact(childRunId, "child.txt")?.status).toBe("missing");
     expect(store.getArtifact("parent", "child.txt")?.metadata).toMatchObject({
       childRunId
     });
+    store.close();
+  });
+
+  test("promotes child outputs before immediate success retention", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-retention-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: retained-child
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: write
+    type: command
+    command: printf retained > retained.txt
+    outputs: [retained.txt]
+retention:
+  on_success:
+    delete: [retained.txt]
+`);
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: retention-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: child
+    type: workflow
+    workflow: retained-child
+    inputs: {}
+    outputs: [retained.txt]
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register(parent.name, parent)
+      .register(child.name, child);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, { id: "parent", workflow: parent });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "parent", parent, undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({ status: "completed", completedSteps: ["child"] });
+    const childRun = store.listRuns().find((run) => run.parentRunId === "parent")!;
+    expect(childRun.status).toBe("completed");
+    expect(store.getArtifact(childRun.id, "retained.txt")?.status).toBe("missing");
+    expect(store.readArtifact("parent", "retained.txt").content.toString("utf8")).toBe("retained");
     store.close();
   });
 

@@ -217,7 +217,8 @@ export async function executeAgentFlowCommandPipeline(
   notifications: AgentFlowNotificationRegistry = createAgentFlowNotificationRegistry(),
   workflows: AgentFlowWorkflowRegistry = createAgentFlowWorkflowRegistry(),
   prepareExecution?: () => void,
-  beforeRecovery?: () => void
+  beforeRecovery?: () => void,
+  beforeSuccessfulFinalization?: (resultStatus?: string) => void
 ): Promise<AgentFlowCommandPipelineResult> {
   return store.withRunLock(runId, "run", (lock) => {
     beforeRecovery?.();
@@ -227,7 +228,7 @@ export async function executeAgentFlowCommandPipeline(
     prepareExecution?.();
     return runAgentFlowCommandPipeline(
       store, runId, workflow, undefined, transforms, sessionProviders, mcpCalls, notifications, workflows,
-      undefined, recoveredExecution
+      beforeSuccessfulFinalization, recoveredExecution
     );
   });
 }
@@ -242,7 +243,8 @@ export async function resumeAgentFlowCommandPipeline(
   mcpCalls: AgentFlowMcpCallRegistry = createAgentFlowMcpCallRegistry(),
   notifications: AgentFlowNotificationRegistry = createAgentFlowNotificationRegistry(),
   workflows: AgentFlowWorkflowRegistry = createAgentFlowWorkflowRegistry(),
-  prepareResume?: () => void
+  prepareResume?: () => void,
+  beforeSuccessfulFinalization?: (resultStatus?: string) => void
 ): Promise<AgentFlowCommandPipelineResult> {
   return store.withRunLock(runId, "resume", (lock) => {
     prepareResume?.();
@@ -252,7 +254,7 @@ export async function resumeAgentFlowCommandPipeline(
     const effectiveResponse = recoveredExecution === undefined ? response : undefined;
     return runAgentFlowCommandPipeline(
       store, runId, workflow, effectiveResponse, transforms, sessionProviders, mcpCalls, notifications, workflows,
-      undefined, recoveredExecution, prepareResume
+      beforeSuccessfulFinalization, recoveredExecution, prepareResume
     );
   });
 }
@@ -464,7 +466,7 @@ async function runAgentFlowCommandPipeline(
   mcpCalls: AgentFlowMcpCallRegistry,
   notifications: AgentFlowNotificationRegistry,
   workflows: AgentFlowWorkflowRegistry,
-  beforeRemediatedResult?: () => void,
+  beforeSuccessfulFinalization?: (resultStatus?: string) => void,
   recoveredExecution?: RecoveredAgentFlowExecution,
   prepareResume?: () => void
 ): Promise<AgentFlowCommandPipelineResult> {
@@ -550,8 +552,10 @@ async function runAgentFlowCommandPipeline(
         recoveredCompletedCursorPayload = recoveredExecution?.completedCursorPayload;
       }
       routingBudget = persistedRouting === undefined
-        ? createSuccessfulRoutingBudget(workflow, notifications, recoveredExecution?.attempts)
-        : deserializeRoutingBudget(persistedRouting, workflow, notifications);
+        ? createSuccessfulRoutingBudget(
+            workflow, notifications, recoveredExecution?.attempts, beforeSuccessfulFinalization
+          )
+        : deserializeRoutingBudget(persistedRouting, workflow, notifications, beforeSuccessfulFinalization);
       for (const [stepId, attempt] of Object.entries(recoveredExecution?.attempts ?? {})) {
         routingBudget.attempts.set(stepId, Math.max(routingBudget.attempts.get(stepId) ?? 0, attempt));
       }
@@ -562,7 +566,7 @@ async function runAgentFlowCommandPipeline(
     const resumed = waitingRecord?.kind === "workflow"
       ? await resumeNestedWorkflowWaitingStep(
           store, runId, workflow, existing.context, resumeInput, stepLocations, transforms,
-          sessionProviders, mcpCalls, notifications, workflows, prepareResume
+          sessionProviders, mcpCalls, notifications, workflows, prepareResume, beforeSuccessfulFinalization
         )
       : resumeWaitingStep(
           store,
@@ -572,7 +576,8 @@ async function runAgentFlowCommandPipeline(
           resumeInput,
           stepLocations,
           notifications,
-          prepareResume
+          prepareResume,
+          beforeSuccessfulFinalization
         );
     if ("result" in resumed) return resumed.result;
     completedSteps = resumed.completedSteps;
@@ -624,8 +629,7 @@ async function runAgentFlowCommandPipeline(
         stepIndex,
         stepLocations,
         routingBudget,
-        recoveredCompletedCursorPayload,
-        beforeRemediatedResult
+        recoveredCompletedCursorPayload
       );
     }
     if ("result" in routed) return routed.result;
@@ -1435,8 +1439,7 @@ async function runAgentFlowCommandPipeline(
         stepId,
         step,
         attempt,
-        routingBudget.terminalEffects,
-        beforeRemediatedResult
+        routingBudget.terminalEffects
       );
     }
     if (stepType !== "command") {
@@ -1638,6 +1641,7 @@ interface SuccessfulRoutingBudget {
 interface AgentFlowPipelineTerminalEffects {
   workflow: AgentFlowWorkflow;
   notifications: AgentFlowNotificationRegistry;
+  beforeSuccessfulFinalization?: (resultStatus?: string) => void;
 }
 
 interface SerializedSuccessfulRoutingBudget {
@@ -2565,12 +2569,13 @@ function resumeWaitingStep(
   response: AgentFlowPipelineResumeInput,
   stepLocations: Map<string, RuntimeStepLocation>,
   notifications: AgentFlowNotificationRegistry,
-  prepareResume?: () => void
+  prepareResume?: () => void,
+  beforeSuccessfulFinalization?: (resultStatus?: string) => void
 ): ResumedWaitingStep {
   const decision = store.withRunStateTransaction(runId, () => {
     prepareResume?.();
     const persisted = persistWaitingStepResume(
-      store, runId, workflow, context, response, stepLocations, notifications
+      store, runId, workflow, context, response, stepLocations, notifications, beforeSuccessfulFinalization
     );
     if (!("result" in persisted) && !("resumeError" in persisted)) {
       checkpointExecutionRouting(store, runId, persisted.routingBudget);
@@ -2614,7 +2619,8 @@ function persistWaitingStepResume(
   context: Record<string, AgentFlowRunStateValue>,
   response: AgentFlowPipelineResumeInput,
   stepLocations: Map<string, RuntimeStepLocation>,
-  notifications: AgentFlowNotificationRegistry
+  notifications: AgentFlowNotificationRegistry,
+  beforeSuccessfulFinalization?: (resultStatus?: string) => void
 ): ResumedWaitingStep | PersistedResumeDecision | ResetProviderSessionDecision | FailedResumeDecision {
   const waiting = parseWaitingState(context.waiting);
   const location = stepLocations.get(waiting.stepId);
@@ -2675,7 +2681,9 @@ function persistWaitingStepResume(
     }
   }
 
-  const routingBudget = deserializeRoutingBudget(waiting.routing, workflow, notifications);
+  const routingBudget = deserializeRoutingBudget(
+    waiting.routing, workflow, notifications, beforeSuccessfulFinalization
+  );
   const completedSteps = [...waiting.completedSteps];
   let selectedTarget: string | undefined;
   let output: Record<string, AgentFlowRunStateValue>;
@@ -3331,9 +3339,12 @@ function checkpointExecutionRouting(
 function deserializeRoutingBudget(
   serialized: SerializedSuccessfulRoutingBudget,
   workflow: AgentFlowWorkflow,
-  notifications: AgentFlowNotificationRegistry
+  notifications: AgentFlowNotificationRegistry,
+  beforeSuccessfulFinalization?: (resultStatus?: string) => void
 ): SuccessfulRoutingBudget {
-  const configured = createSuccessfulRoutingBudget(workflow, notifications);
+  const configured = createSuccessfulRoutingBudget(
+    workflow, notifications, undefined, beforeSuccessfulFinalization
+  );
   return {
     terminalEffects: configured.terminalEffects,
     maxRecoveryCycles: configured.maxRecoveryCycles,
@@ -4676,7 +4687,11 @@ async function executeNestedRecoveryWorkflow(
             mcpCalls,
             notifications,
             workflows,
-            () => promoteNestedRecoveryOutputs(store, parentRunId, recoveryRunId, parentStep, nestedWorkflow),
+            (resultStatus) => {
+              if (resultStatus === "remediated") {
+                promoteNestedRecoveryOutputs(store, parentRunId, recoveryRunId, parentStep, nestedWorkflow);
+              }
+            },
             recoveredAttempts
           );
         });
@@ -6190,8 +6205,7 @@ function finishResultStep(
   stepId: string,
   step: AgentFlowWorkflowStep,
   attempt: number,
-  terminalEffects: AgentFlowPipelineTerminalEffects,
-  beforeRemediatedResult?: () => void
+  terminalEffects: AgentFlowPipelineTerminalEffects
 ): AgentFlowCommandPipelineResult {
   const resultStatus = normalizedTarget(step.status);
   if (resultStatus === undefined || ![
@@ -6221,8 +6235,7 @@ function finishResultStep(
     attempt,
     resultStatus,
     returnTo,
-    terminalEffects,
-    beforeRemediatedResult
+    terminalEffects
   );
 }
 
@@ -6234,8 +6247,7 @@ function finalizeCompletedResultStep(
   attempt: number,
   resultStatus: string,
   returnTo: string | undefined,
-  terminalEffects: AgentFlowPipelineTerminalEffects,
-  beforeRemediatedResult?: () => void
+  terminalEffects: AgentFlowPipelineTerminalEffects
 ): AgentFlowCommandPipelineResult {
   const intendedStatus = resultStatus === "cancelled"
     ? "cancelled"
@@ -6248,28 +6260,12 @@ function finalizeCompletedResultStep(
       currentStepId: null,
       output: { completedSteps, resultStatus, ...(returnTo === undefined ? {} : { returnTo }) },
       eventPayload: { completedSteps, resultStatus, ...(returnTo === undefined ? {} : { returnTo }) },
-      ...(resultStatus === "remediated" && beforeRemediatedResult !== undefined
-        ? {
-            beforeTerminalEffects: beforeRemediatedResult,
-            onFinalStatus: (
-              status: AgentFlowCommandPipelineResult["status"],
-              message: string | undefined,
-              notificationFailure: AgentFlowNotificationDeliveryResult["requiredFailure"],
-              notificationAttempts: AgentFlowNotificationDeliveryResult["attempts"]
-            ) => {
-              if (status !== "completed") {
-                throw new NotificationPromotionRollbackError(
-                  message ?? "Nested recovery finalization did not complete after output promotion.",
-                  notificationFailure,
-                  notificationAttempts ?? []
-                );
-              }
-            }
-          }
+      ...(intendedStatus === "completed"
+        ? successfulFinalizationHooks(terminalEffects, resultStatus)
         : {})
     });
   } catch (error) {
-    if (error instanceof NotificationPromotionRollbackError) {
+    if (error instanceof SuccessfulFinalizationRollbackError) {
       error.attempts.forEach((attempt) => store.appendRunEvent(runId, attempt));
       if (error.failure !== undefined) {
         return finishRequiredStepNotificationFailure(
@@ -6287,7 +6283,7 @@ function finalizeCompletedResultStep(
     return finishFailure(store, runId, completedSteps, stepId, {
       exitCode: null,
       timedOut: false,
-      message: `Could not promote nested recovery outputs: ${error instanceof Error ? error.message : String(error)}`
+      message: `Could not finalize successful workflow outputs: ${error instanceof Error ? error.message : String(error)}`
     }, "failed", terminalEffects);
   }
   return {
@@ -6321,8 +6317,7 @@ function routeRecoveredCompletedStep(
   stepIndex: number,
   stepLocations: Map<string, RuntimeStepLocation>,
   budget: SuccessfulRoutingBudget,
-  payload: AgentFlowRunStateValue,
-  beforeRemediatedResult?: () => void
+  payload: AgentFlowRunStateValue
 ): SuccessfulRoute {
   const output = mapping(payload);
   const successfulAttempt = typeof output?.attempt === "number"
@@ -6360,8 +6355,7 @@ function routeRecoveredCompletedStep(
         successfulAttempt,
         resultStatus,
         returnTo,
-        budget.terminalEffects,
-        beforeRemediatedResult
+        budget.terminalEffects
       )
     };
   }
@@ -6692,7 +6686,8 @@ function finishSuccessfulTerminalRoute(
 function createSuccessfulRoutingBudget(
   workflow: AgentFlowWorkflow,
   notifications: AgentFlowNotificationRegistry,
-  initialAttempts: Record<string, number> = {}
+  initialAttempts: Record<string, number> = {},
+  beforeSuccessfulFinalization?: (resultStatus?: string) => void
 ): SuccessfulRoutingBudget {
   const limits = mapping(workflow.limits);
   const configuredStepAttempts = mapping(limits?.max_step_attempts);
@@ -6713,7 +6708,11 @@ function createSuccessfulRoutingBudget(
   const reviewCycleStepIds = collectAgentFlowReviewCycleStepIds(workflow.steps);
   const reviewCyclePathReviewIds = collectAgentFlowReviewCyclePathReviewIds(workflow.steps);
   return {
-    terminalEffects: { workflow, notifications },
+    terminalEffects: {
+      workflow,
+      notifications,
+      ...(beforeSuccessfulFinalization === undefined ? {} : { beforeSuccessfulFinalization })
+    },
     maxRecoveryCycles,
     maxReviewCycles,
     stepAttemptLimits,
@@ -6812,13 +6811,26 @@ function finishCompleted(
   completedSteps: string[],
   terminalEffects: AgentFlowPipelineTerminalEffects
 ): AgentFlowCommandPipelineResult {
-  const finalized = finalizePipelineRun(store, runId, terminalEffects, {
-    intendedStatus: "completed",
-    completedSteps,
-    currentStepId: null,
-    output: { completedSteps },
-    eventPayload: { completedSteps }
-  });
+  let finalized: ReturnType<typeof finalizePipelineRun>;
+  try {
+    finalized = finalizePipelineRun(store, runId, terminalEffects, {
+      intendedStatus: "completed",
+      completedSteps,
+      currentStepId: null,
+      output: { completedSteps },
+      eventPayload: { completedSteps },
+      ...successfulFinalizationHooks(terminalEffects)
+    });
+  } catch (error) {
+    if (!(error instanceof SuccessfulFinalizationRollbackError)) throw error;
+    error.attempts.forEach((attempt) => store.appendRunEvent(runId, attempt));
+    const stepId = completedSteps.at(-1) ?? "workflow";
+    return finishFailure(store, runId, completedSteps, stepId, {
+      exitCode: null,
+      timedOut: false,
+      message: `Could not finalize successful workflow outputs: ${error instanceof Error ? error.message : String(error)}`
+    }, "failed", terminalEffects);
+  }
   return { status: finalized.status, completedSteps, ...(finalized.message === undefined ? {} : { message: finalized.message }) };
 }
 
@@ -6871,15 +6883,45 @@ interface FinalizePipelineRunInput {
   ) => void;
 }
 
-class NotificationPromotionRollbackError extends Error {
+class SuccessfulFinalizationRollbackError extends Error {
   constructor(
     message: string,
     readonly failure: AgentFlowNotificationDeliveryResult["requiredFailure"],
     readonly attempts: NonNullable<AgentFlowNotificationDeliveryResult["attempts"]>
   ) {
     super(message);
-    this.name = "NotificationPromotionRollbackError";
+    this.name = "SuccessfulFinalizationRollbackError";
   }
+}
+
+function successfulFinalizationHooks(
+  terminalEffects: AgentFlowPipelineTerminalEffects,
+  resultStatus?: string
+): Pick<FinalizePipelineRunInput, "beforeTerminalEffects" | "onFinalStatus"> | Record<string, never> {
+  const callback = terminalEffects.beforeSuccessfulFinalization;
+  if (callback === undefined) return {};
+  return {
+    beforeTerminalEffects: () => {
+      try {
+        callback(resultStatus);
+      } catch (error) {
+        throw new SuccessfulFinalizationRollbackError(
+          error instanceof Error ? error.message : String(error),
+          undefined,
+          []
+        );
+      }
+    },
+    onFinalStatus: (status, message, notificationFailure, notificationAttempts) => {
+      if (status !== "completed") {
+        throw new SuccessfulFinalizationRollbackError(
+          message ?? "Workflow finalization did not complete after output promotion.",
+          notificationFailure,
+          notificationAttempts ?? []
+        );
+      }
+    }
+  };
 }
 
 function finalizePipelineRun(
@@ -8287,16 +8329,27 @@ async function executeNestedWorkflowStep(
   };
   const stopMonitor = setInterval(propagateParentStop, 25);
   let result: AgentFlowCommandPipelineResult;
+  let promotedOutputs: string[] | undefined;
   try {
     result = await executeAgentFlowCommandPipeline(
-      store, childRunId, workflow, transforms, sessionProviders, mcpCalls, notifications, workflows
+      store,
+      childRunId,
+      workflow,
+      transforms,
+      sessionProviders,
+      mcpCalls,
+      notifications,
+      workflows,
+      undefined,
+      undefined,
+      () => {
+        promotedOutputs = promoteWorkflowStepOutputs(store, parentRunId, childRunId, step);
+      }
     );
   } finally {
     clearInterval(stopMonitor);
   }
-  const outputs = result.status === "completed"
-    ? promoteWorkflowStepOutputs(store, parentRunId, childRunId, step)
-    : [];
+  const outputs = result.status === "completed" ? promotedOutputs ?? [] : [];
   return { status: result.status, runId: childRunId, outputs, ...(result.message === undefined ? {} : { message: result.message }) };
 }
 
@@ -8353,7 +8406,8 @@ function promoteWorkflowStepOutputs(
   store: AgentFlowRunStateStore,
   parentRunId: string,
   childRunId: string,
-  step: AgentFlowWorkflowStep
+  step: AgentFlowWorkflowStep,
+  requiredParentStatus: "running" | "paused" = "running"
 ): string[] {
   const stepId = requiredStepId(step);
   const outputs = normalizedStringList(step.outputs).map(normalizeAgentFlowArtifactPath);
@@ -8379,7 +8433,7 @@ function promoteWorkflowStepOutputs(
       contentType: child.contentType,
       content: store.readArtifact(childRunId, outputPath).content,
       overwrite: mayReplaceExisting,
-      requiredRunStatus: "running",
+      requiredRunStatus: requiredParentStatus,
       metadata: {
         ...(mayReplaceExisting ? existing.metadata : {}),
         childRunId,
@@ -8449,7 +8503,8 @@ async function resumeNestedWorkflowWaitingStep(
   mcpCalls: AgentFlowMcpCallRegistry,
   notifications: AgentFlowNotificationRegistry,
   workflows: AgentFlowWorkflowRegistry,
-  prepareResume?: () => void
+  prepareResume?: () => void,
+  beforeSuccessfulFinalization?: (resultStatus?: string) => void
 ): Promise<ResumedWaitingStep> {
   prepareResume?.();
   const waiting = parseWaitingState(context.waiting);
@@ -8464,6 +8519,10 @@ async function resumeNestedWorkflowWaitingStep(
     throw new AgentFlowRunStateError("Paused child workflow no longer matches the persisted registry.", "AGENT_FLOW_RESUME_STATE");
   }
   const persistedChild = assertPersistedWorkflowIdentity(store, waiting.childRunId, childWorkflow);
+  let promotedOutputs: string[] | undefined;
+  const promoteOutputs = (): void => {
+    promotedOutputs = promoteWorkflowStepOutputs(store, runId, waiting.childRunId!, step, "paused");
+  };
   const childResult = ["completed", "failed", "cancelled"].includes(persistedChild.status)
     ? {
         status: persistedChild.status as "completed" | "failed" | "cancelled",
@@ -8476,7 +8535,7 @@ async function resumeNestedWorkflowWaitingStep(
       }
     : await resumeAgentFlowCommandPipeline(
         store, waiting.childRunId, childWorkflow, response,
-        transforms, sessionProviders, mcpCalls, notifications, workflows
+        transforms, sessionProviders, mcpCalls, notifications, workflows, undefined, promoteOutputs
       );
   if (childResult.status === "paused") {
     const current = store.getRun(runId)!;
@@ -8485,7 +8544,9 @@ async function resumeNestedWorkflowWaitingStep(
     });
     return { result: { status: "paused", completedSteps: waiting.completedSteps, failedStep: waiting.stepId, failureOutcome: "pause", message: childResult.message } };
   }
-  const routingBudget = deserializeRoutingBudget(waiting.routing, workflow, notifications);
+  const routingBudget = deserializeRoutingBudget(
+    waiting.routing, workflow, notifications, beforeSuccessfulFinalization
+  );
   const { waiting: _waiting, ...resumedContext } = store.getRun(runId)!.context;
   store.transitionRunWithEvent(runId, {
     status: "running",
@@ -8532,7 +8593,7 @@ async function resumeNestedWorkflowWaitingStep(
   }
   let outputs: string[];
   try {
-    outputs = promoteWorkflowStepOutputs(store, runId, waiting.childRunId, step);
+    outputs = promotedOutputs ?? promoteWorkflowStepOutputs(store, runId, waiting.childRunId, step);
   } catch (error) {
     const lockError = store.runLockInterruption();
     if (lockError !== undefined) throw lockError;
