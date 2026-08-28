@@ -8340,14 +8340,17 @@ async function executeNestedWorkflowStep(
     );
   }
   if (existing === null) {
-    const created = createAgentFlowLifecycleRun(store, {
-      id: childRunId,
-      workflow,
-      inputs: prepared.inputs,
-      parentRunId,
-      context: nestedWorkflowRunContext(store.getRun(parentRunId)!, workflow, workflows)
+    store.withRunFinalizationTransaction(parentRunId, () => {
+      const created = createAgentFlowLifecycleRun(store, {
+        id: childRunId,
+        workflow,
+        inputs: prepared.inputs,
+        parentRunId,
+        context: nestedWorkflowRunContext(store.getRun(parentRunId)!, workflow, workflows)
+      });
+      if (created.changed) copyRecoveryInputArtifacts(store, parentRunId, childRunId, prepared);
+      return created;
     });
-    if (created.changed) copyRecoveryInputArtifacts(store, parentRunId, childRunId, prepared);
   }
   const current = store.getRun(childRunId)!;
   if (["completed", "failed", "cancelled"].includes(current.status)) {

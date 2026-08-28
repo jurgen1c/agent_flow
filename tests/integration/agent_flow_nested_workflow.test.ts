@@ -274,6 +274,62 @@ steps:
     }
   });
 
+  test("keeps ancestor stale approvals in nested action guards", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-stale-approval-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: stale-approval-child
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: ask, type: input_request, question: Give value, save_as: answer.json }
+  - { id: done, type: result, status: completed }
+`);
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: stale-approval-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: produce, type: command, command: "printf before > evidence.txt", outputs: [evidence.txt] }
+  - { id: approve, type: approval, reviewer: human, subject: Check, artifacts: [evidence.txt] }
+  - { id: child, type: workflow, workflow: stale-approval-child, inputs: {}, outputs: [answer.json] }
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register(parent.name, parent)
+      .register(child.name, child);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, { id: "stale-approval-parent", workflow: parent });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "stale-approval-parent", parent, undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({ status: "paused" });
+    expect(await resumeAgentFlowCommandPipeline(
+      store, "stale-approval-parent", parent, { outcome: "approve" },
+      undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({ status: "paused", failedStep: "child" });
+    const evidence = store.getArtifact("stale-approval-parent", "evidence.txt")!;
+    fs.writeFileSync(path.join(repo, evidence.storagePath), "changed");
+
+    const snapshot = buildAgentFlowRunActionSnapshot(store, "stale-approval-parent");
+    expect(snapshot.staleApprovals).toContainEqual(expect.objectContaining({
+      id: expect.stringContaining("approval:approve"),
+      detected: true
+    }));
+    expect(snapshot.warnings).toContainEqual(expect.objectContaining({ code: "action.approval.stale" }));
+    expect(snapshot.actions).toContainEqual(expect.objectContaining({
+      action: "provide_input",
+      enabled: false
+    }));
+    await expect(executeAgentFlowRunAction(store, "stale-approval-parent", {
+      action: "provide_input",
+      guard: snapshot.guard,
+      answer: "value"
+    }, { workflows })).rejects.toMatchObject({ code: "AGENT_FLOW_ACTION_NOT_ALLOWED" });
+    store.close();
+  });
+
   test("settles a paused parent when its child completed before the parent resumed", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-terminal-child-"));
     fs.mkdirSync(path.join(repo, ".git"));
@@ -762,6 +818,67 @@ steps:
     )).toMatchObject({ status: "failed", failedStep: "child" });
     expect(store.getRun("setup-failure")?.status).toBe("failed");
     expect(store.listSteps("setup-failure").at(-1)).toMatchObject({ stepId: "child", status: "failed" });
+    store.close();
+  });
+
+  test("rolls back child creation when copying an artifact-backed input fails", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-copy-failure-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: copy-failure-child
+version: 1
+style: pipeline
+maturity: experimental
+inputs: { payload: { required: true } }
+steps:
+  - { id: done, type: result, status: completed }
+`);
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: copy-failure-parent
+version: 1
+style: pipeline
+maturity: experimental
+inputs: { source: { required: true } }
+steps:
+  - id: child
+    type: workflow
+    workflow: copy-failure-child
+    inputs: { payload: "{{ inputs.source }}" }
+    outputs: [never.txt]
+    on_failure: { then: fail }
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register(parent.name, parent)
+      .register(child.name, child);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, {
+      id: "copy-failure-parent",
+      workflow: parent,
+      inputs: { source: "source.txt" }
+    });
+    store.writeArtifact({
+      id: "copy-source",
+      runId: "copy-failure-parent",
+      stepId: "fixture",
+      path: "source.txt",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "source\n"
+    });
+    const writeArtifact = store.writeArtifact.bind(store);
+    store.writeArtifact = (input) => {
+      if (input.kind === "recovery_input") throw new Error("injected child input copy failure");
+      return writeArtifact(input);
+    };
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "copy-failure-parent", parent, undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({
+      status: "failed",
+      failedStep: "child",
+      message: "injected child input copy failure"
+    });
+    expect(store.listRuns().filter((run) => run.parentRunId === "copy-failure-parent")).toHaveLength(0);
     store.close();
   });
 

@@ -146,11 +146,13 @@ export function buildAgentFlowRunActionSnapshot(
   let staleApprovals: AgentFlowRunActionSnapshot["staleApprovals"] = [];
   let approvalEvidenceValid = true;
   try {
-    staleApprovals = detectStaleApprovals(
-      store,
-      waitingRun.id,
-      approvals,
-      waitingResult.waiting?.approvalId ?? undefined
+    staleApprovals = nestedActionApprovalLineage(store, run, waitingRun).flatMap((lineageRun) =>
+      detectStaleApprovals(
+        store,
+        lineageRun.id,
+        store.listApprovals(lineageRun.id),
+        lineageRun.id === waitingRun.id ? waitingResult.waiting?.approvalId ?? undefined : undefined
+      )
     );
   } catch (error) {
     approvalEvidenceValid = false;
@@ -531,6 +533,26 @@ function detectStaleApprovals(
     if (changed) stale.set(approval.id, { id: approval.id, stepId: approval.stepId, detected: true });
   }
   return [...stale.values()].sort((left, right) => left.id.localeCompare(right.id));
+}
+
+function nestedActionApprovalLineage(
+  store: AgentFlowRunStateStore,
+  rootRun: AgentFlowRunRecord,
+  waitingRun: AgentFlowRunRecord
+): AgentFlowRunRecord[] {
+  const lineage: AgentFlowRunRecord[] = [];
+  const visited = new Set<string>();
+  let current: AgentFlowRunRecord | null = waitingRun;
+  while (current !== null && !visited.has(current.id)) {
+    visited.add(current.id);
+    lineage.push(current);
+    if (current.id === rootRun.id) return lineage.reverse();
+    current = current.parentRunId === null ? null : store.getRun(current.parentRunId);
+  }
+  throw new AgentFlowRunStateError(
+    `Nested action run ${waitingRun.id} is not in run ${rootRun.id}'s parent lineage.`,
+    "AGENT_FLOW_RUN_LINEAGE_INVALID"
+  );
 }
 
 function relevantApprovals(
