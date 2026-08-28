@@ -24,6 +24,7 @@ import {
   loadAgentFlowProviderCatalog,
   loadAgentFlowRepositoryProviderAliases,
   lintAgentFlowWorkflow,
+  loadAgentFlowWorkflowRegistry,
   normalizeAgentFlowArtifactPath,
   providerBindingsForWorkflow,
   parseAgentFlowWorkflow,
@@ -35,6 +36,8 @@ import {
   renderAgentFlowProviderCatalog,
   renderAgentFlowWorkflowGraph,
   resumeAgentFlowCommandPipeline,
+  createAgentFlowWorkflowRegistryFromSnapshot,
+  serializeAgentFlowWorkflowRegistry,
   simulateAgentFlowWorkflow,
   transitionAgentFlowLifecycleRun,
   doctorAgentFlowProviderCatalog,
@@ -203,7 +206,8 @@ function renderHelp(topic?: string): string {
     "  agent-flow explain <workflow>",
     "  agent-flow graph <workflow>",
     "  agent-flow simulate <workflow> --fixture <file>",
-    "  agent-flow run <workflow> --id <run-id> [--provider <alias=target>]",
+    "  agent-flow run <workflow> --id <run-id> [--input <key=value>] [--input-file <json>] [--provider <alias=target>]",
+    "  agent-flow run <workflow> --id <run-id> [--profile <name>] [--model <name>] [--reasoning-effort <level>]",
     "  agent-flow run <workflow> --id <run-id> --fixture <file>",
     "  agent-flow resume <run-id> --outcome <choice> [--fixture <file>]",
     "  agent-flow resume <run-id> --answer <value> [--fixture <file>]",
@@ -365,6 +369,17 @@ async function runLifecycleCommand(
     : args[0];
   const workflowResult = command === "run" ? readWorkflow(workflowPath, "run") : null;
   if (workflowResult && "exitCode" in workflowResult) return workflowResult;
+  if (command === "run") {
+    const directMcp = collectWorkflowSteps(workflowResult!.workflow.steps)
+      .filter((step) => String(step.type ?? "").trim() === "mcp_call"
+        && (step.via === undefined || String(step.via).trim() === "direct"));
+    if (directMcp.length > 0) {
+      return {
+        exitCode: 1,
+        stderr: `Stock Agent Flow CLI cannot execute direct MCP step ${String(directMcp[0]!.id)}; use via: codex with a named Codex session or run through a host that registers MCP adapters.`
+      };
+    }
+  }
 
   let store: Awaited<ReturnType<typeof openAgentFlowRunState>> | undefined;
   try {
@@ -389,8 +404,23 @@ async function runLifecycleCommand(
 
     if (command === "run") {
       const runArgs = parsedRun as ParsedRunLifecycleArgs;
+      const workflows = loadAgentFlowWorkflowRegistry(workflowPath, { cwd: options.cwd });
+      const workflowSnapshot = serializeAgentFlowWorkflowRegistry(workflows);
       const fixture = runArgs.fixturePath === undefined ? null : readRunFixture(runArgs.fixturePath, options.cwd);
       if (fixture !== null && "exitCode" in fixture) return fixture;
+      const inputFile = runArgs.inputFilePath === undefined
+        ? { ok: true as const, inputs: {} }
+        : readRunInputFile(runArgs.inputFilePath, options.cwd);
+      if (!inputFile.ok) return inputFile.result;
+      const explicitInputs = parseRunInputs(runArgs.inputValues);
+      if (!explicitInputs.ok) return explicitInputs.result;
+      const inputs = {
+        ...(fixture === null ? {} : fixture.inputs),
+        ...inputFile.inputs,
+        ...explicitInputs.inputs
+      };
+      const inputError = validateRunInputs(workflowResult!.workflow, inputs);
+      if (inputError !== undefined) return { exitCode: 2, stderr: inputError };
       const sessionRequestSteps = collectSessionRequestSteps(workflowResult!.workflow.steps);
       const requiredProviders = collectRequiredWorkflowProviders(workflowResult!.workflow, sessionRequestSteps);
       const usesFixtureProvider = requiredProviders.includes("fixture");
@@ -409,11 +439,12 @@ async function runLifecycleCommand(
         homeDir: options.homeDir,
         ...(runArgs.configPath === undefined ? {} : { configPath: runArgs.configPath }),
         overrides: providerOverrides,
-        aliases: requiredProviders.filter((provider) => provider !== "fixture")
+        aliases: requiredProviders.filter((provider) => provider !== "fixture" && provider !== "codex")
       });
       const configuredValidation = validateAgentFlowWorkflow(
         workflowResult!.workflow,
-        (provider) => Object.hasOwn(repositoryAliases, provider) ? repositoryAliases[provider]!.kind : undefined
+        (provider) => provider === "codex" ? "frontier"
+          : Object.hasOwn(repositoryAliases, provider) ? repositoryAliases[provider]!.kind : undefined
       );
       if (!configuredValidation.valid) {
         return {
@@ -428,7 +459,7 @@ async function runLifecycleCommand(
         };
       }
       const missingProviders = [...new Set(requiredProviders)]
-        .filter((provider) => provider !== "fixture" && !Object.hasOwn(catalog.bindings, provider))
+        .filter((provider) => provider !== "fixture" && provider !== "codex" && !Object.hasOwn(catalog.bindings, provider))
         .sort();
       if (missingProviders.length > 0) {
         return {
@@ -453,13 +484,22 @@ async function runLifecycleCommand(
       const serializedBindings = serializeAgentFlowProviderBindings(
         providerBindingsForWorkflow(workflowResult!.workflow, catalog)
       );
+      const initialContext = existingRun === null
+        ? {
+            ...(Object.keys(serializedBindings).length === 0 ? {} : { providerBindings: serializedBindings }),
+            ...(runArgs.codexOptions === undefined ? {} : { codexOptions: runArgs.codexOptions }),
+            workflowRegistry: workflowSnapshot as unknown as import("../runtime/index").AgentFlowRunStateValue
+          }
+        : existingRun.context.agentFlowInitialContext !== null
+            && typeof existingRun.context.agentFlowInitialContext === "object"
+            && !Array.isArray(existingRun.context.agentFlowInitialContext)
+          ? existingRun.context.agentFlowInitialContext
+          : {};
       const result = createAgentFlowLifecycleRun(store, {
         id: runArgs.runId,
         workflow: workflowResult!.workflow,
-        ...(fixture === null ? {} : { inputs: fixture.inputs }),
-        ...(Object.keys(serializedBindings).length === 0
-          ? {}
-          : { context: { providerBindings: serializedBindings } }),
+        inputs,
+        context: initialContext,
         allowInterruptedRecovery: true
       });
       const providers = createAgentFlowConfiguredProviderRegistry(catalog, { env: options.env });
@@ -482,7 +522,7 @@ async function runLifecycleCommand(
         providers,
         undefined,
         notifications,
-        undefined,
+        workflows,
         fixture === null ? undefined : () => {
           if (usesFixtureProvider) {
             store!.updateRun(result.run.id, {
@@ -593,6 +633,9 @@ async function runLifecycleCommand(
         }
       }
       const persistedWorkflow = workflow as unknown as import("../runtime/index").AgentFlowWorkflow;
+      const workflows = createAgentFlowWorkflowRegistryFromSnapshot(
+        run.context.workflowRegistry ?? { [persistedWorkflow.name]: persistedWorkflow } as unknown as import("../runtime/index").AgentFlowRunStateValue
+      );
       const usesFixtureProvider = collectRequiredWorkflowProviders(persistedWorkflow).includes("fixture");
       const pinnedOverrides = persistedProviderOverrides(run.context.providerBindings, runId);
       const catalog = loadAgentFlowProviderCatalog({
@@ -625,7 +668,8 @@ async function runLifecycleCommand(
         undefined,
         providers,
         undefined,
-        notifications
+        notifications,
+        workflows
       );
       if (usesFixtureProvider && resumeArgs.fixturePath !== undefined && execution.status === "paused") {
         const resumedRun = requireRun(store, runId);
@@ -692,6 +736,13 @@ interface ParsedRunLifecycleArgs {
   runId: string;
   fixturePath?: string;
   configPath?: string;
+  inputFilePath?: string;
+  inputValues: string[];
+  codexOptions?: {
+    profile?: string;
+    model?: string;
+    reasoningEffort?: string;
+  };
   providerOverrides: string[];
 }
 
@@ -708,6 +759,11 @@ function parseRunLifecycleArgs(args: string[]): ParsedRunLifecycleArgs | AgentFl
   let runId: string | undefined;
   let fixturePath: string | undefined;
   let configPath: string | undefined;
+  let inputFilePath: string | undefined;
+  let profile: string | undefined;
+  let model: string | undefined;
+  let reasoningEffort: string | undefined;
+  const inputValues: string[] = [];
   const providerOverrides: string[] = [];
   for (let index = 1; index < args.length; index += 2) {
     const flag = args[index];
@@ -716,17 +772,90 @@ function parseRunLifecycleArgs(args: string[]): ParsedRunLifecycleArgs | AgentFl
     if (flag === "--id" && runId === undefined) runId = value;
     else if (flag === "--fixture" && fixturePath === undefined) fixturePath = value;
     else if (flag === "--config" && configPath === undefined) configPath = value;
+    else if (flag === "--input-file" && inputFilePath === undefined) inputFilePath = value;
+    else if (flag === "--input") inputValues.push(value);
+    else if (flag === "--profile" && profile === undefined) profile = value;
+    else if (flag === "--model" && model === undefined) model = value;
+    else if (flag === "--reasoning-effort" && reasoningEffort === undefined) reasoningEffort = value;
     else if (flag === "--provider") providerOverrides.push(value);
     else return { exitCode: 1 };
   }
   if (runId === undefined) return { exitCode: 1 };
+  if (profile !== undefined && !/^[A-Za-z0-9_-]+$/.test(profile)) return { exitCode: 1 };
+  if (reasoningEffort !== undefined
+      && !["minimal", "low", "medium", "high", "xhigh"].includes(reasoningEffort)) return { exitCode: 1 };
   return {
     workflowPath: args[0],
     runId,
+    inputValues,
     providerOverrides,
     ...(fixturePath === undefined ? {} : { fixturePath }),
-    ...(configPath === undefined ? {} : { configPath })
+    ...(configPath === undefined ? {} : { configPath }),
+    ...(inputFilePath === undefined ? {} : { inputFilePath }),
+    ...(profile === undefined && model === undefined && reasoningEffort === undefined ? {} : {
+      codexOptions: {
+        ...(profile === undefined ? {} : { profile }),
+        ...(model === undefined ? {} : { model }),
+        ...(reasoningEffort === undefined ? {} : { reasoningEffort })
+      }
+    })
   };
+}
+
+function parseRunInputs(
+  values: string[]
+): { ok: true; inputs: Record<string, import("../runtime/index").AgentFlowRunStateValue> }
+  | { ok: false; result: AgentFlowCliResult } {
+  const inputs: Record<string, import("../runtime/index").AgentFlowRunStateValue> = {};
+  for (const value of values) {
+    const separator = value.indexOf("=");
+    if (separator < 1) {
+      return { ok: false, result: { exitCode: 2, stderr: `Invalid --input ${JSON.stringify(value)}; expected key=value.` } };
+    }
+    const key = value.slice(0, separator).trim();
+    if (key.length === 0) return { ok: false, result: { exitCode: 2, stderr: "Agent Flow input names cannot be empty." } };
+    if (Object.hasOwn(inputs, key)) {
+      return { ok: false, result: { exitCode: 2, stderr: `Agent Flow input ${JSON.stringify(key)} was provided more than once with --input.` } };
+    }
+    const raw = value.slice(separator + 1);
+    try {
+      inputs[key] = JSON.parse(raw) as import("../runtime/index").AgentFlowRunStateValue;
+    } catch {
+      inputs[key] = raw;
+    }
+  }
+  return { ok: true, inputs };
+}
+
+function readRunInputFile(
+  inputFilePath: string,
+  cwd?: string
+): { ok: true; inputs: Record<string, import("../runtime/index").AgentFlowRunStateValue> }
+  | { ok: false; result: AgentFlowCliResult } {
+  const resolvedPath = cwd === undefined ? inputFilePath : path.resolve(cwd, inputFilePath);
+  try {
+    const parsed = JSON.parse(fs.readFileSync(resolvedPath, "utf8")) as unknown;
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { ok: false, result: { exitCode: 2, stderr: `Agent Flow input file ${inputFilePath} must contain a JSON object.` } };
+    }
+    return { ok: true, inputs: parsed as Record<string, import("../runtime/index").AgentFlowRunStateValue> };
+  } catch (error) {
+    return { ok: false, result: { exitCode: 2, stderr: `Could not read Agent Flow input file ${inputFilePath}: ${error instanceof Error ? error.message : String(error)}` } };
+  }
+}
+
+function validateRunInputs(
+  workflow: import("../runtime/index").AgentFlowWorkflow,
+  inputs: Record<string, import("../runtime/index").AgentFlowRunStateValue>
+): string | undefined {
+  const declared = new Set(Object.keys(workflow.inputs ?? {}));
+  const unknown = Object.keys(inputs).filter((name) => !declared.has(name)).sort();
+  if (unknown.length > 0) return `Agent Flow run has unknown inputs: ${unknown.join(", ")}.`;
+  const missing = Object.entries(workflow.inputs ?? {}).flatMap(([name, definition]) =>
+    definition !== null && typeof definition === "object" && !Array.isArray(definition)
+      && definition.required === true && !Object.hasOwn(inputs, name) ? [name] : []
+  ).sort();
+  return missing.length === 0 ? undefined : `Agent Flow run is missing required inputs: ${missing.join(", ")}.`;
 }
 
 function parseResumeLifecycleArgs(args: string[]): ParsedResumeLifecycleArgs | AgentFlowCliResult {
@@ -815,7 +944,7 @@ function validLifecycleArgs(command: ActiveLifecycleCommand, args: string[]): bo
 }
 
 function lifecycleUsage(topic: string): string | null {
-  if (topic === "run") return "Usage: agent-flow run <workflow> --id <run-id> [--fixture <file>]";
+  if (topic === "run") return "Usage: agent-flow run <workflow> --id <run-id> [--fixture <file>] [--input <key=value>] [--input-file <json>] [--profile <name>] [--model <name>] [--reasoning-effort <level>]";
   if (topic === "resume") return "Usage: agent-flow resume <run-id> (--outcome <choice> | --answer <value> | --reset-session <session-name>) [--fixture <file>] [--config <file>]";
   if (topic === "inject") return "Usage: agent-flow inject <run-id> <session-name> <context>";
   if (topic === "cleanup") return "Usage: agent-flow cleanup ([--] <run-id> | --older-than <duration> [--status <status>]) [--approve]";
@@ -1130,7 +1259,8 @@ function simulateWorkflow(args: string[], options: AgentFlowCliOptions): AgentFl
   const aliasResult = repositoryProviderAliases(options);
   if (!aliasResult.ok) return aliasResult.result;
   const aliases = aliasResult.aliases;
-  const providerKind = (provider: string) => Object.hasOwn(aliases, provider) ? aliases[provider]!.kind : undefined;
+  const providerKind = (provider: string) => provider === "codex" ? "frontier"
+    : Object.hasOwn(aliases, provider) ? aliases[provider]!.kind : undefined;
   const configuredValidation = validateAgentFlowWorkflow(
     workflowResult.workflow,
     providerKind
@@ -1186,7 +1316,8 @@ function checkWorkflow(
   const aliasResult = repositoryProviderAliases(options);
   if (!aliasResult.ok) return aliasResult.result;
   const aliases = aliasResult.aliases;
-  const providerKind = (provider: string) => Object.hasOwn(aliases, provider) ? aliases[provider]!.kind : undefined;
+  const providerKind = (provider: string) => provider === "codex" ? "frontier"
+    : Object.hasOwn(aliases, provider) ? aliases[provider]!.kind : undefined;
   const configuredValidation = validateAgentFlowWorkflow(
     workflow,
     providerKind
@@ -1323,12 +1454,35 @@ function collectRequiredWorkflowProviders(
       .filter((session): session is string => typeof session === "string"),
     ...collectDisagreementResolverSessions(workflow, sessionRequestSteps),
     ...collectRecoveryRouteSessions(workflow.steps)
+    , ...collectWorkflowSteps(workflow.steps)
+      .filter((step) => String(step.type ?? "").trim() === "mcp_call" && String(step.via ?? "direct").trim() === "codex")
+      .flatMap((step) => typeof step.session === "string" ? [step.session] : [])
   ];
   return configuredSessionNames
     .map((session) => workflow.sessions?.[session.trim()])
     .flatMap((session) => session !== null && typeof session === "object" && !Array.isArray(session)
       ? [String((session as Record<string, unknown>).provider ?? "").trim()]
       : []);
+}
+
+function collectWorkflowSteps(
+  steps: import("../runtime/index").AgentFlowWorkflowStep[]
+): import("../runtime/index").AgentFlowWorkflowStep[] {
+  const collected: import("../runtime/index").AgentFlowWorkflowStep[] = [];
+  const visit = (step: import("../runtime/index").AgentFlowWorkflowStep): void => {
+    collected.push(step);
+    for (const field of ["body", "steps", "branches"] as const) {
+      const nested = step[field];
+      if (!Array.isArray(nested)) continue;
+      for (const candidate of nested) {
+        if (candidate !== null && typeof candidate === "object" && !Array.isArray(candidate)) {
+          visit(candidate as import("../runtime/index").AgentFlowWorkflowStep);
+        }
+      }
+    }
+  };
+  steps.forEach(visit);
+  return collected;
 }
 
 function providerForSessionRequestStep(

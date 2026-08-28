@@ -202,41 +202,15 @@ targets:
 
 Do not put API keys in YAML. `api_key_env` names the environment variable to
 read for API drivers. Native drivers use the existing `codex` or `claude`
-executable and its current login. Set `model` to a model identifier accepted by
-that CLI. For Codex, `profile` is optional and names
-`$CODEX_HOME/<profile>.config.toml`; `reasoning_effort` is optional and accepts
-`minimal`, `low`, `medium`, `high`, or `xhigh`. Agent Flow requires `model`,
-passes model and reasoning as CLI overrides, and hashes both Codex's base
-`config.toml` and the selected profile file so resumable runs fail closed if
-any selected behavior drifts. `providers doctor` strict-loads the profile with
-the installed Codex CLI without sending a model request.
+executable and its current login. Codex also works without either config file:
+declare `provider: codex` in a session. Agent Flow lets the installed Codex load
+its normal user and repository config, permissions/sandbox, rules, skills,
+plugins, and MCP servers. It does not require `bubblewrap` or `flock` for Codex.
 
-Current Codex profiles use one file per profile rather than a
-`[profiles.<name>]` table. For the target above, create:
-
-```toml
-# ~/.codex/deep-review.config.toml
-model_verbosity = "low"
-```
-
-The explicit Agent Flow `model` and `reasoning_effort` take precedence over
-values in the base or profile file. Targets without `profile` continue to
-ignore ambient Codex user configuration. Repository-local `.codex/config.toml`
-is hidden, and user skills, hooks, MCP servers, apps, plugins, web search,
-analytics/telemetry, notifications, and other ambient hosted tools are disabled
-for both profiled and unprofiled native sessions. Profile and base config layers
-must also be self-contained: Agent Flow rejects settings that reference mutable
-instruction, project-document discovery, model-catalog, sub-agent, skill, or
-SQLite files. If the selected Codex model provider uses `env_key` or
-`env_http_headers`, Agent Flow forwards only those named environment variables
-and both `providers doctor` and workflow preflight report missing values;
-unrelated `OPENAI_*` credentials
-are omitted unless the provider explicitly requires them. Agent Flow owns the
-shell environment policy so model-spawned commands cannot inherit forwarded
-credentials. Profiled endpoints must be credential-free HTTPS URLs without
-queries or fragments. Command-backed provider authentication, the built-in
-`amazon-bedrock` provider, custom shell-environment policies, and overrides of
-the reserved `permissions.agent_flow_native` profile are not supported. See the official Codex
+Codex model, profile, and reasoning settings are optional. Configure them under
+`codex:` on a session or step, or pass `--model`, `--profile`, and
+`--reasoning-effort` when starting a run. Precedence is step, run, session,
+configured target, then Codex config. See the official Codex
 [profile documentation](https://learn.chatgpt.com/docs/config-file/config-advanced#profiles)
 and [`model_reasoning_effort` reference](https://learn.chatgpt.com/docs/config-file/config-reference).
 
@@ -264,10 +238,7 @@ Map them to repository aliases and select those aliases from workflow sessions.
 A session with `resume: true` keeps one Codex thread across every step that uses
 that session; a separate Agent Flow run always starts a fresh thread.
 
-Built-in native execution currently requires Linux with `bubblewrap` and
-`flock`; install them with your system package manager, then use
-`agent-flow providers doctor` to verify the CLI, login, and sandbox
-prerequisites.
+Use `agent-flow providers doctor` to verify configured CLI targets and login.
 
 Commit a repository-root `.agent-flow.yml` containing portable aliases:
 
@@ -278,6 +249,7 @@ providers:
   implementer: { kind: frontier, target: codex-main }
   local-drafter: { kind: local, target: qwen-local }
   local-reviewer: { kind: local, target: gemma-local }
+workflows: workflows
 ```
 
 The alias kind is a safety boundary: a local alias cannot be redirected to a
@@ -292,6 +264,12 @@ agent-flow providers doctor
 
 `doctor` checks required credential variables and target readiness only. It
 does not make a paid API call or generate model output.
+
+The optional `workflows` path is relative to the repository root. A
+`type: workflow` step names a workflow found there (or, when omitted, beside
+the entry workflow), supplies its declared inputs, and lists the exact child
+artifacts to promote after completion. Child approvals and input requests pause
+the parent and continue when the parent run is resumed.
 
 Use aliases in workflow sessions. Each step selects its session, so one step
 can use Claude, another Codex, and local steps can use Qwen and Gemma:

@@ -10,7 +10,7 @@ export function isAgentFlowFrontierProvider(
 ): boolean {
   if (typeof value !== "string") return false;
   const provider = value.trim();
-  return resolver?.(provider) === "frontier" || provider === "frontier"
+  return resolver?.(provider) === "frontier" || provider === "frontier" || provider === "codex"
     || (provider.startsWith("codex:") && provider.slice("codex:".length).trim().length > 0);
 }
 

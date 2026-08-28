@@ -75,7 +75,7 @@ describe("Agent Flow CLI", () => {
     });
     expect(dispatch(["help", "run"])).toEqual({
       exitCode: 0,
-      stdout: "agent-flow run\n\nUsage: agent-flow run <workflow> --id <run-id> [--fixture <file>]"
+      stdout: "agent-flow run\n\nUsage: agent-flow run <workflow> --id <run-id> [--fixture <file>] [--input <key=value>] [--input-file <json>] [--profile <name>] [--model <name>] [--reasoning-effort <level>]"
     });
     expect(dispatch(["help", "inject"])).toEqual({
       exitCode: 0,
@@ -203,6 +203,148 @@ steps:
     expect(restartedStatus.stdout).toContain("Status: completed");
     expect(await captureCli(["pause", "run-cli"], repo)).toMatchObject({ exitCode: 2 });
     expect(await captureCli(["pause", "missing"], repo)).toMatchObject({ exitCode: 4 });
+  });
+
+  test("merges fixture, JSON-file, and repeatable CLI inputs before creating a run", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-inputs-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.writeFileSync(path.join(repo, "workflow.yml"), `
+name: cli-inputs
+version: 1
+style: pipeline
+maturity: experimental
+inputs:
+  ticket: { required: true }
+  count: {}
+  enabled: {}
+steps:
+  - { id: done, type: result, status: completed }
+`);
+    fs.writeFileSync(path.join(repo, "fixture.json"), JSON.stringify({ inputs: { ticket: "fixture", count: 1 } }));
+    fs.writeFileSync(path.join(repo, "inputs.json"), JSON.stringify({ ticket: "file", count: 2, enabled: false }));
+
+    expect(await captureCli([
+      "run", "workflow.yml", "--id", "input-run", "--fixture", "fixture.json",
+      "--input-file", "inputs.json", "--input", "ticket=CLI-7", "--input", "enabled=true"
+    ], repo)).toMatchObject({ exitCode: 0 });
+    const store = await openAgentFlowRunState({ cwd: repo });
+    expect(store.getRun("input-run")?.inputs).toEqual({ ticket: "CLI-7", count: 2, enabled: true });
+    store.close();
+
+    const duplicate = await captureCli([
+      "run", "workflow.yml", "--id", "duplicate", "--input", "ticket=A", "--input", "ticket=B"
+    ], repo);
+    expect(duplicate).toMatchObject({ exitCode: 2 });
+    expect(duplicate.stderr).toContain("provided more than once");
+    const unknown = await captureCli([
+      "run", "workflow.yml", "--id", "unknown", "--input", "ticket=A", "--input", "extra=1"
+    ], repo);
+    expect(unknown).toMatchObject({ exitCode: 2 });
+    expect(unknown.stderr).toContain("unknown inputs: extra");
+    const missing = await captureCli(["run", "workflow.yml", "--id", "missing"], repo);
+    expect(missing).toMatchObject({ exitCode: 2 });
+    expect(missing.stderr).toContain("missing required inputs: ticket");
+  });
+
+  test("rejects direct MCP in the stock CLI before creating run state", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-direct-mcp-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.writeFileSync(path.join(repo, "workflow.yml"), `
+name: direct-mcp
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: fetch
+    type: mcp_call
+    server: atlassian
+    tool: get_issue
+    arguments: { key: AF-1 }
+    outputs: [ticket.json]
+`);
+    const result = await captureCli(["run", "workflow.yml", "--id", "direct"], repo);
+    expect(result).toMatchObject({ exitCode: 1 });
+    expect(result.stderr).toContain("use via: codex");
+    expect(fs.existsSync(path.join(repo, ".agent-flow"))).toBe(false);
+  });
+
+  test("runs input through Codex MCP, a nested workflow, and approval resume end to end", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-e2e-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const bin = path.join(repo, "bin");
+    const codexHome = path.join(repo, "codex-home");
+    fs.mkdirSync(bin);
+    fs.mkdirSync(codexHome);
+    fs.writeFileSync(path.join(bin, "codex"), `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const schema = JSON.parse(fs.readFileSync(args[args.indexOf("--output-schema") + 1], "utf8"));
+const outputPath = args[args.indexOf("--output-last-message") + 1];
+const outputs = {};
+for (const name of schema.properties.outputs.required) outputs[name] = name.endsWith(".json") ? '{"key":"AF-9"}\\n' : 'codex output\\n';
+fs.writeFileSync(outputPath, JSON.stringify({ outputs }));
+const resume = args.indexOf("resume");
+const thread = resume > 0 ? args[args.length - 2] : "thread-e2e";
+fs.writeSync(1, JSON.stringify({ type: "thread.started", thread_id: thread }) + "\\n");
+fs.writeSync(1, JSON.stringify({ type: "item.completed", item: { type: "mcp_tool_call", server: "atlassian", tool: "get_issue" } }) + "\\n");
+fs.writeSync(1, JSON.stringify({ type: "turn.completed" }) + "\\n");
+`, { mode: 0o755 });
+    fs.writeFileSync(path.join(repo, "parent.yml"), `
+name: parent-e2e
+version: 1
+style: pipeline
+maturity: experimental
+inputs:
+  ticket: { required: true }
+sessions:
+  agent: { provider: codex, resume: true }
+limits:
+  max_frontier_calls: 1
+steps:
+  - id: fetch
+    type: mcp_call
+    via: codex
+    session: agent
+    server: atlassian
+    tool: get_issue
+    arguments: { key: "{{ inputs.ticket }}" }
+    outputs: [ticket.json]
+  - id: child
+    type: workflow
+    workflow: child-e2e
+    inputs: { ticket: "{{ inputs.ticket }}" }
+    outputs: [child.txt]
+`);
+    fs.writeFileSync(path.join(repo, "child.yml"), `
+name: child-e2e
+version: 1
+style: pipeline
+maturity: experimental
+inputs:
+  ticket: { required: true }
+steps:
+  - id: approve
+    type: manual_gate
+    message: Approve child?
+    options: [approve, pause, cancel]
+  - id: publish
+    type: command
+    command: printf 'nested complete\\n' > child.txt
+    outputs: [child.txt]
+`);
+    const env = { PATH: `${bin}:${process.env.PATH ?? ""}`, CODEX_HOME: codexHome };
+    const started = await captureCli([
+      "run", "parent.yml", "--id", "e2e", "--input", "ticket=AF-9", "--model", "test-model"
+    ], repo, env);
+    expect(started).toMatchObject({ exitCode: 3 });
+    expect(started.stdout).toContain("Status: paused");
+    const resumed = await captureCli(["resume", "e2e", "--outcome", "approve"], repo, env);
+    expect(resumed).toMatchObject({ exitCode: 0 });
+    const store = await openAgentFlowRunState({ cwd: repo });
+    expect(store.getRun("e2e")?.inputs).toEqual({ ticket: "AF-9" });
+    expect(store.getSession("e2e", "agent")?.externalSessionId).toBe("thread-e2e");
+    expect(store.readArtifact("e2e", "child.txt").content.toString("utf8")).toBe("nested complete\n");
+    store.close();
   });
 
   test("recovers an interrupted running execution through the documented run command", async () => {
@@ -1617,13 +1759,17 @@ steps:
 
 });
 
-async function captureCli(args: string[], cwd: string): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+async function captureCli(
+  args: string[],
+  cwd: string,
+  env?: Readonly<Record<string, string | undefined>>
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   let stdout = "";
   let stderr = "";
   const exitCode = await runCli(args, {
     stdout: { write: (chunk: string) => { stdout += chunk; return true; } },
     stderr: { write: (chunk: string) => { stderr += chunk; return true; } }
-  }, { cwd });
+  }, { cwd, ...(env === undefined ? {} : { env }) });
   return { exitCode, stdout, stderr };
 }
 

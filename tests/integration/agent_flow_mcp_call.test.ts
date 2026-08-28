@@ -7,6 +7,7 @@ import {
   createAgentFlowFixtureMcpAdapter,
   createAgentFlowLifecycleRun,
   createAgentFlowMcpCallRegistry,
+  createAgentFlowSessionProviderRegistry,
   AgentFlowMcpCallError,
   AgentFlowRunStateError,
   executeAgentFlowCommandPipeline,
@@ -30,6 +31,90 @@ const examplePath = path.join(repoRoot, "examples/workflows/jira-ticket-spec.yml
 const fixturePath = path.join(repoRoot, "tests/fixtures/agent-flow/simulation/jira-ticket.json");
 
 describe("Agent Flow MCP call steps", () => {
+  test("routes a Codex-mediated call through a named resumable session and requires matching JSONL evidence", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: codex-mcp
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  agent: { provider: codex, resume: true }
+limits:
+  max_frontier_calls: 1
+steps:
+  - id: fetch
+    type: mcp_call
+    via: codex
+    session: agent
+    server: atlassian
+    tool: get_issue
+    arguments: { key: AF-1 }
+    outputs: [ticket.json]
+`);
+    const prompts: string[] = [];
+    const providers = createAgentFlowSessionProviderRegistry();
+    providers.register("codex", async (request) => {
+      prompts.push(request.prompt.content);
+      request.reportExternalSessionId?.("codex-thread-1");
+      return {
+        externalSessionId: "codex-thread-1",
+        outputs: { "ticket.json": '{"key":"AF-1"}\n' },
+        metadata: { mcpCalls: [{ server: "atlassian", tool: "get_issue", status: "completed" }] }
+      };
+    });
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "codex-mcp", workflow });
+    expect(await executeAgentFlowCommandPipeline(
+      store, "codex-mcp", workflow, undefined, providers
+    )).toMatchObject({ status: "completed" });
+    expect(prompts[0]).toContain('server "atlassian" tool "get_issue" exactly once');
+    expect(store.getSession("codex-mcp", "agent")).toMatchObject({
+      status: "completed", externalSessionId: "codex-thread-1"
+    });
+    expect(store.readArtifact("codex-mcp", "ticket.json").content.toString("utf8"))
+      .toBe('{"key":"AF-1"}\n');
+    store.close();
+  });
+
+  test("rejects Codex-mediated outputs without matching completed MCP evidence", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: codex-mcp-no-evidence
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  agent: { provider: codex, resume: true }
+limits:
+  max_frontier_calls: 1
+steps:
+  - id: fetch
+    type: mcp_call
+    via: codex
+    session: agent
+    server: atlassian
+    tool: get_issue
+    arguments: { key: AF-1 }
+    outputs: [ticket.json]
+`);
+    const providers = createAgentFlowSessionProviderRegistry();
+    providers.register("codex", async (request) => {
+      request.reportExternalSessionId?.("codex-thread-1");
+      return {
+        externalSessionId: "codex-thread-1",
+        outputs: { "ticket.json": '{"key":"AF-1"}\n' }
+      };
+    });
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "codex-mcp-no-evidence", workflow });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "codex-mcp-no-evidence", workflow, undefined, providers
+    )).toMatchObject({ status: "paused", failedStep: "fetch" });
+    expect(store.getSession("codex-mcp-no-evidence", "agent")?.status).toBe("failed");
+    expect(store.getArtifact("codex-mcp-no-evidence", "ticket.json")).toBeNull();
+    store.close();
+  });
+
   test("requires server, tool, arguments, and declared outputs", () => {
     const workflow = parseAgentFlowWorkflowOrThrow(`name: invalid-mcp-contract
 version: 1

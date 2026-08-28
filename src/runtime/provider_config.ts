@@ -5,11 +5,9 @@ import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { findGitRepositoryRoot } from "@jurgen1c/agent-core/repository";
 import { parseYamlDocument, type JsonValue } from "@jurgen1c/agent-core/yaml";
-import { parse as parseToml, type TomlTable } from "smol-toml";
 import { redactAgentFlowSensitiveText } from "./failure_payload";
 
 const NATIVE_PROVIDER_DOCTOR_TIMEOUT_MS = 5_000;
-const MAX_CODEX_PROFILE_BYTES = 1024 * 1024;
 
 export type AgentFlowConfiguredProviderKind = "local" | "frontier";
 export type AgentFlowProviderDriver =
@@ -32,17 +30,6 @@ export interface AgentFlowConfiguredTarget {
   reasoning_effort?: AgentFlowCodexReasoningEffort;
 }
 
-export interface AgentFlowResolvedCodexProfile {
-  home: string;
-  path: string;
-  fingerprint: string;
-  baseConfigPath: string;
-  baseConfigFingerprint?: string;
-  mcpServerIds: readonly string[];
-  providerEnvironmentNames: readonly string[];
-  requiresOpenAiAuth: boolean;
-}
-
 export interface AgentFlowProviderAlias {
   kind: AgentFlowConfiguredProviderKind;
   target: string;
@@ -53,7 +40,6 @@ export interface AgentFlowResolvedProviderBinding extends AgentFlowProviderAlias
   target: string;
   config: AgentFlowConfiguredTarget;
   fingerprint: string;
-  codexProfile?: AgentFlowResolvedCodexProfile;
 }
 
 export interface AgentFlowProviderCatalog {
@@ -157,18 +143,12 @@ export function loadAgentFlowProviderCatalog(
         `Alias kind ${definition.kind} cannot resolve to ${config.kind} target ${JSON.stringify(targetName)}.`
       );
     }
-    const codexProfile = resolveCodexProfile(config, env, homeDir, repoRoot, globalConfigPath, targetName);
     bindings[alias] = Object.freeze({
       alias,
       target: targetName,
       kind: definition.kind,
       config,
-      fingerprint: fingerprintTarget(
-        config,
-        codexProfile?.fingerprint,
-        codexProfile?.baseConfigFingerprint
-      ),
-      ...(codexProfile === undefined ? {} : { codexProfile })
+      fingerprint: fingerprintTarget(config)
     });
   }
   return Object.freeze({
@@ -267,11 +247,12 @@ export function doctorAgentFlowProviderCatalog(
         return `${binding.alias}: missing credential environment variable ${keyName}`;
       }
       if (binding.config.driver === "codex-cli" || binding.config.driver === "claude-code") {
-        if (process.platform !== "linux" || !fs.existsSync("/usr/bin/bwrap") || !fs.existsSync("/usr/bin/flock")) {
+        if (binding.config.driver === "claude-code"
+            && (process.platform !== "linux" || !fs.existsSync("/usr/bin/bwrap") || !fs.existsSync("/usr/bin/flock"))) {
           ok = false;
           return `${binding.alias}: native CLI filesystem sandbox is unavailable (bubblewrap and flock are required on Linux)`;
         }
-        const sandboxProbe = spawnSync("/usr/bin/bwrap", [
+        const sandboxProbe = binding.config.driver === "claude-code" ? spawnSync("/usr/bin/bwrap", [
           "--die-with-parent",
           "--new-session",
           "--unshare-pid",
@@ -288,59 +269,24 @@ export function doctorAgentFlowProviderCatalog(
           env: { PATH: "/usr/bin:/bin" },
           timeout: NATIVE_PROVIDER_DOCTOR_TIMEOUT_MS,
           killSignal: "SIGKILL"
-        });
-        if (sandboxProbe.error !== undefined || sandboxProbe.status !== 0) {
+        }) : undefined;
+        if (sandboxProbe !== undefined && (sandboxProbe.error !== undefined || sandboxProbe.status !== 0)) {
           ok = false;
           return `${binding.alias}: native CLI filesystem sandbox cannot create the required bubblewrap namespace`;
         }
         const command = binding.config.driver === "codex-cli" ? "codex" : "claude";
-        const probeEnvironment = agentFlowNativeProviderEnvironment(
-          command,
-          env,
-          binding.codexProfile?.requiresOpenAiAuth !== false
-        );
-        if (binding.config.driver === "codex-cli" && binding.codexProfile !== undefined) {
-          probeEnvironment.CODEX_HOME = binding.codexProfile.home;
-          const missingCredential = binding.codexProfile.providerEnvironmentNames
-            .find((name) => !environmentValue(env, name));
-          if (missingCredential !== undefined) {
-            ok = false;
-            return `${binding.alias}: missing credential environment variable ${missingCredential}`;
-          }
-          Object.assign(
-            probeEnvironment,
-            selectedCodexProviderEnvironment(env, binding.codexProfile.providerEnvironmentNames)
-          );
-        }
+        const probeEnvironment = binding.config.driver === "codex-cli"
+          ? {
+              HOME: env.HOME ?? os.homedir(),
+              ...Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined))
+            }
+          : agentFlowNativeProviderEnvironment(command, env, true);
         const version = runAgentFlowNativeProviderDoctorProbe(command, ["--version"], probeEnvironment);
         if (version.error !== undefined || version.status !== 0) {
           ok = false;
           return `${binding.alias}: ${command} executable is unavailable`;
         }
-        if (binding.config.driver === "codex-cli" && binding.config.profile !== undefined) {
-          const profile = runAgentFlowNativeProviderDoctorProbe(
-            command,
-            [
-              "exec",
-              "--profile", binding.config.profile,
-              "--strict-config",
-              "--model", binding.config.model,
-              "--ephemeral",
-              "--skip-git-repo-check",
-              "--json",
-              "-"
-            ],
-            probeEnvironment
-          );
-          const noPromptAfterValidConfig = String(profile.stderr).includes("No prompt provided via stdin");
-          if (profile.error !== undefined || (profile.status !== 0 && !noPromptAfterValidConfig)) {
-            ok = false;
-            return `${binding.alias}: codex profile ${binding.config.profile} is incompatible with the installed CLI`;
-          }
-        }
-        const requiresLogin = binding.config.driver === "claude-code"
-          || binding.codexProfile?.requiresOpenAiAuth !== false;
-        if (requiresLogin) {
+        {
           const authArguments = binding.config.driver === "codex-cli"
             ? ["login", "status"]
             : ["auth", "status"];
@@ -606,9 +552,7 @@ function parseOverrides(values: readonly string[]): Record<string, string> {
 }
 
 function fingerprintTarget(
-  target: AgentFlowConfiguredTarget,
-  profileFingerprint?: string,
-  baseConfigFingerprint?: string
+  target: AgentFlowConfiguredTarget
 ): string {
   const stable = JSON.stringify({
     kind: target.kind,
@@ -620,9 +564,7 @@ function fingerprintTarget(
     ...(target.profile === undefined
       ? {}
       : {
-          profile: target.profile,
-          profile_fingerprint: profileFingerprint ?? null,
-          base_config_fingerprint: baseConfigFingerprint ?? null
+          profile: target.profile
         }),
     ...(target.reasoning_effort === undefined
       ? {}
@@ -631,279 +573,11 @@ function fingerprintTarget(
   return `sha256:${createHash("sha256").update(stable).digest("hex")}`;
 }
 
-function resolveCodexProfile(
-  target: AgentFlowConfiguredTarget,
-  env: Readonly<Record<string, string | undefined>>,
-  homeDir: string,
-  repoRoot: string,
-  sourcePath: string,
-  targetName: string
-): AgentFlowResolvedCodexProfile | undefined {
-  if (target.driver !== "codex-cli" || target.profile === undefined) return undefined;
-  const configuredHome = env.CODEX_HOME === undefined
-    ? path.join(homeDir, ".codex")
-    : env.CODEX_HOME;
-  if (!configuredHome || configuredHome !== configuredHome.trim()
-      || /[\u0000-\u001F\u007F-\u009F]/u.test(configuredHome)) {
-    throw configError(sourcePath, `targets.${targetName}.profile`, "CODEX_HOME must contain a canonical filesystem path.");
-  }
-  const codexHome = path.isAbsolute(configuredHome)
-    ? path.normalize(configuredHome)
-    : path.resolve(repoRoot, configuredHome);
-  let resolvedCodexHome: string;
-  try {
-    resolvedCodexHome = fs.realpathSync(codexHome);
-  } catch (error) {
-    throw configError(
-      sourcePath,
-      `targets.${targetName}.profile`,
-      `Could not resolve CODEX_HOME at ${codexHome}: ${errorMessage(error)}.`
-    );
-  }
-  const resolvedRepoRoot = fs.realpathSync(repoRoot);
-  if (filesystemPathsOverlap(resolvedCodexHome, resolvedRepoRoot)
-      || resolvedCodexHome === path.parse(resolvedCodexHome).root) {
-    throw configError(
-      sourcePath,
-      `targets.${targetName}.profile`,
-      `CODEX_HOME at ${resolvedCodexHome} must be separate from the repository and cannot be a filesystem root.`
-    );
-  }
-  const profilePath = path.join(resolvedCodexHome, `${target.profile}.config.toml`);
-  const baseConfigPath = path.join(resolvedCodexHome, "config.toml");
-  let profileIdentity: ReturnType<typeof codexConfigIdentity>;
-  try {
-    profileIdentity = codexConfigIdentity(profilePath);
-  } catch (error) {
-    throw configError(
-      sourcePath,
-      `targets.${targetName}.profile`,
-      `Could not read Codex profile ${JSON.stringify(target.profile)} at ${profilePath}: ${errorMessage(error)}.`
-    );
-  }
-  let baseConfigIdentity: ReturnType<typeof codexConfigIdentity> | undefined;
-  try {
-    baseConfigIdentity = fs.existsSync(baseConfigPath)
-      ? codexConfigIdentity(baseConfigPath)
-      : undefined;
-  } catch (error) {
-    throw configError(
-      sourcePath,
-      `targets.${targetName}.profile`,
-      `Could not read Codex base config at ${baseConfigPath}: ${errorMessage(error)}.`
-    );
-  }
-  try {
-    const runtimeConfig = resolveCodexProfileRuntimeConfig(
-      baseConfigIdentity?.config,
-      profileIdentity.config
-    );
-    return Object.freeze({
-      home: resolvedCodexHome,
-      path: fs.realpathSync(profilePath),
-      fingerprint: profileIdentity.fingerprint,
-      baseConfigPath,
-      ...(baseConfigIdentity === undefined
-        ? {}
-        : { baseConfigFingerprint: baseConfigIdentity.fingerprint }),
-      mcpServerIds: Object.freeze(runtimeConfig.mcpServerIds),
-      providerEnvironmentNames: Object.freeze(runtimeConfig.providerEnvironmentNames),
-      requiresOpenAiAuth: runtimeConfig.requiresOpenAiAuth
-    });
-  } catch (error) {
-    throw configError(
-      sourcePath,
-      `targets.${targetName}.profile`,
-      `Could not resolve Codex profile ${JSON.stringify(target.profile)} using ${profilePath} and ${baseConfigPath}: ${errorMessage(error)}.`
-    );
-  }
-}
-
-export function fingerprintAgentFlowCodexProfile(profilePath: string): string {
-  return `sha256:${createHash("sha256").update(readBoundedCodexConfig(profilePath)).digest("hex")}`;
-}
-
-function codexConfigIdentity(configPath: string): { fingerprint: string; config: TomlTable } {
-  const snapshot = readBoundedCodexConfig(configPath);
-  let config: TomlTable;
-  try {
-    config = parseToml(snapshot.toString("utf8"));
-  } catch (error) {
-    throw new Error(`config is not valid TOML: ${redactAgentFlowSensitiveText(errorMessage(error))}`);
-  }
-  assertCodexConfigHasNoUnpinnedFileInputs(config);
-  return {
-    fingerprint: `sha256:${createHash("sha256").update(snapshot).digest("hex")}`,
-    config
-  };
-}
-
-function assertCodexConfigHasNoUnpinnedFileInputs(config: TomlTable): void {
-  const unsupportedRootKeys = [
-    "experimental_compact_prompt_file",
-    "experimental_instructions_file",
-    "model_catalog_json",
-    "model_instructions_file",
-    "project_doc_fallback_filenames",
-    "project_root_markers",
-    "sqlite_home"
-  ].filter((key) => Object.hasOwn(config, key));
-  if (unsupportedRootKeys.length > 0) {
-    throw new Error(
-      `path-referenced Codex settings are not supported by Agent Flow profiles: ${unsupportedRootKeys.join(", ")}`
-    );
-  }
-  if (Object.hasOwn(config, "profile") || Object.hasOwn(config, "profiles")) {
-    throw new Error("legacy Codex profile selectors and [profiles.*] tables are not supported by Agent Flow profiles");
-  }
-  if (Object.hasOwn(config, "skills")) {
-    throw new Error("path-referenced Codex skills are not supported by Agent Flow profiles");
-  }
-  if (Object.hasOwn(config, "shell_environment_policy")) {
-    throw new Error("shell_environment_policy is managed by Agent Flow and cannot be configured by Agent Flow profiles");
-  }
-  if (isTomlTable(config.permissions) && Object.hasOwn(config.permissions, "agent_flow_native")) {
-    throw new Error("the reserved permissions.agent_flow_native profile cannot be configured by Agent Flow profiles");
-  }
-  if (isTomlTable(config.agents)) {
-    const referencedAgents = Object.entries(config.agents)
-      .filter(([, value]) => isTomlTable(value) && Object.hasOwn(value, "config_file"))
-      .map(([name]) => name);
-    if (referencedAgents.length > 0) {
-      throw new Error(
-        `path-referenced Codex agent configs are not supported by Agent Flow profiles: ${referencedAgents.join(", ")}`
-      );
-    }
-  }
-}
-
-function resolveCodexProfileRuntimeConfig(
-  baseConfig: TomlTable | undefined,
-  profileConfig: TomlTable
-): {
-  mcpServerIds: string[];
-  providerEnvironmentNames: string[];
-  requiresOpenAiAuth: boolean;
-} {
-  const mcpServerIds = [...new Set([
-    ...tomlTableKeys(baseConfig?.mcp_servers),
-    ...tomlTableKeys(profileConfig.mcp_servers)
-  ])].sort();
-  if (mcpServerIds.some((serverId) => !/^[A-Za-z0-9_-]+$/.test(serverId))) {
-    throw new Error("Codex MCP server IDs must contain only letters, numbers, hyphens, and underscores");
-  }
-  const providerName = effectiveTomlString(baseConfig, profileConfig, "model_provider") ?? "openai";
-  if (providerName === "amazon-bedrock") {
-    throw new Error("the amazon-bedrock Codex provider is not supported by Agent Flow profiles");
-  }
-  const baseProvider = tomlNamedTable(baseConfig?.model_providers, providerName);
-  const profileProvider = tomlNamedTable(profileConfig.model_providers, providerName);
-  const openAiBaseUrl = effectiveTomlString(baseConfig, profileConfig, "openai_base_url");
-  if (openAiBaseUrl !== undefined) validateCodexProfileEndpoint(openAiBaseUrl, "openai_base_url");
-  const providerBaseUrl = effectiveTomlString(baseProvider, profileProvider, "base_url");
-  if (providerBaseUrl !== undefined) validateCodexProfileEndpoint(providerBaseUrl, "model provider base_url");
-  if (Object.hasOwn(profileProvider ?? {}, "auth") || Object.hasOwn(baseProvider ?? {}, "auth")) {
-    throw new Error("command-backed Codex provider authentication is not supported by Agent Flow profiles");
-  }
-  const environmentNames = new Set<string>();
-  const envKey = effectiveTomlString(baseProvider, profileProvider, "env_key");
-  if (envKey !== undefined) environmentNames.add(requiredEnvironmentName(envKey));
-  const environmentHeaders = {
-    ...tomlStringMap(baseProvider?.env_http_headers, "model provider env_http_headers"),
-    ...tomlStringMap(profileProvider?.env_http_headers, "model provider env_http_headers")
-  };
-  for (const name of Object.values(environmentHeaders)) {
-    environmentNames.add(requiredEnvironmentName(name));
-  }
-  return {
-    mcpServerIds,
-    providerEnvironmentNames: [...environmentNames].sort(),
-    requiresOpenAiAuth: providerName === "openai"
-      || effectiveTomlBoolean(baseProvider, profileProvider, "requires_openai_auth") === true
-  };
-}
-
-function tomlTableKeys(value: unknown): string[] {
-  return isTomlTable(value) ? Object.keys(value) : [];
-}
-
-function tomlNamedTable(value: unknown, name: string): TomlTable | undefined {
-  if (!isTomlTable(value)) return undefined;
-  const selected = value[name];
-  return isTomlTable(selected) ? selected : undefined;
-}
-
-function effectiveTomlString(
-  base: TomlTable | undefined,
-  profile: TomlTable | undefined,
-  key: string
-): string | undefined {
-  const value = profile?.[key] ?? base?.[key];
-  if (value === undefined) return undefined;
-  if (typeof value !== "string") throw new Error(`Codex ${key} must be a string`);
-  return value;
-}
-
-function validateCodexProfileEndpoint(value: string, label: string): void {
-  let url: URL;
-  try { url = new URL(value); } catch { throw new Error(`Codex ${label} must be an absolute URL`); }
-  if (url.protocol !== "https:") throw new Error(`Codex ${label} must use HTTPS`);
-  if (url.username || url.password || value.includes("?") || value.includes("#")) {
-    throw new Error(`Codex ${label} must not contain credentials, a query, or a fragment`);
-  }
-}
-
-function effectiveTomlBoolean(
-  base: TomlTable | undefined,
-  profile: TomlTable | undefined,
-  key: string
-): boolean | undefined {
-  const value = profile?.[key] ?? base?.[key];
-  return typeof value === "boolean" ? value : undefined;
-}
-
-function tomlStringMap(value: unknown, label: string): Record<string, string> {
-  if (value === undefined) return {};
-  if (!isTomlTable(value) || Object.values(value).some((entry) => typeof entry !== "string")) {
-    throw new Error(`${label} must map header names to environment variable names`);
-  }
-  return value as Record<string, string>;
-}
-
 function requiredEnvironmentName(value: string): string {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(value) || RESERVED_OBJECT_NAMES.has(value)) {
     throw new Error("Codex provider credential references must use canonical environment variable names");
   }
   return value;
-}
-
-function filesystemPathsOverlap(left: string, right: string): boolean {
-  return left === right
-    || left.startsWith(`${right}${path.sep}`)
-    || right.startsWith(`${left}${path.sep}`);
-}
-
-function readBoundedCodexConfig(configPath: string): Buffer {
-  let descriptor: number | undefined;
-  try {
-    descriptor = fs.openSync(configPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
-    const stat = fs.fstatSync(descriptor);
-    if (!stat.isFile()) throw new Error("profile must be a regular non-symlink file");
-    if (stat.size > MAX_CODEX_PROFILE_BYTES) {
-      throw new Error(`profile exceeds ${MAX_CODEX_PROFILE_BYTES} bytes`);
-    }
-    const snapshot = fs.readFileSync(descriptor);
-    if (snapshot.byteLength > MAX_CODEX_PROFILE_BYTES) {
-      throw new Error(`profile exceeds ${MAX_CODEX_PROFILE_BYTES} bytes`);
-    }
-    return snapshot;
-  } finally {
-    if (descriptor !== undefined) fs.closeSync(descriptor);
-  }
-}
-
-function isTomlTable(value: unknown): value is TomlTable {
-  return value !== null && typeof value === "object" && !Array.isArray(value) && !(value instanceof Date);
 }
 
 function emptyMap<T>(): Record<string, T> {

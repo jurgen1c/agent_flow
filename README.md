@@ -164,6 +164,7 @@ version: 1
 providers:
   implementer: { kind: frontier, target: codex-main }
   drafter: { kind: local, target: qwen-local }
+workflows: workflows
 ```
 
 Steps select sessions, and sessions select those aliases:
@@ -185,51 +186,32 @@ never belong in either YAML file. Use `--provider alias=target` on a new run to
 swap Qwen for Gemma, Claude for Codex, or another same-kind target. See
 [Configure local or cloud models](docs/quickstart.md#configure-local-or-cloud-models)
 for native CLI and HTTP drivers plus a multi-model workflow. `codex-cli` and
-`claude-code` use the developer's existing CLI installation and login. Native
-targets require an explicit `model`. Codex targets may also select a named
-`profile` and pin `reasoning_effort` to `minimal`, `low`, `medium`, `high`, or
-`xhigh`. Agent Flow passes model and reasoning as CLI overrides, hashes the
-Codex base config and selected profile file into the target fingerprint, and
-rejects resume if any of them drift. Provider doctor also strict-loads the
-selected profile with the installed Codex CLI without starting a model request.
+`claude-code` use the developer's existing CLI installation and login. Codex
+can also be selected directly with `provider: codex`, without an Agent Flow
+provider catalog. Model, profile, and reasoning overrides may be declared on a
+session or step, or supplied to `agent-flow run`; omitted settings come from
+Codex's normal configuration.
 Sessions with
 `resume: true` persist the native Codex thread or Claude session across steps.
 If that external session disappears, inspect the paused run and explicitly
 start a fresh native session with
 `agent-flow resume <run-id> --reset-session <session-name>`.
 
-Native CLIs run at the repository root. Read-only sessions use the CLI's
-read-only mode. File-writing sessions require `authority.can_modify_files: true`
-and a non-empty effective `file_scope`; Agent Flow audits all resulting changes
-against every scope layer and fails closed on out-of-scope writes. It does not
-roll those filesystem changes back. Built-in native execution currently
-requires Linux with `bubblewrap` and `flock`; the host sandbox makes the
-checkout read-only unless write authority is granted, keeps `.git` read-only,
-hides `.agent-flow`, and leaves unrelated host paths unmounted. Audited native
-invocations share a per-repository write lock with Agent Flow command steps and
-file-writing custom adapters. The child receives a minimal environment:
-CLI authentication/provider variables, proxy and certificate settings, locale,
-and basic process variables such as `PATH` and `HOME`; unrelated secrets are not
-inherited. The CLI's agent-facing sandbox also denies access to its mounted
-login and session-state directory. Targets without a profile disable ambient
-Codex user configuration. Profile targets load Codex's base-plus-profile
-configuration layers and hash both files for drift detection. Repository-local
-`.codex/config.toml` remains hidden, and user skills, hooks, MCP servers, apps,
-plugins, web search, analytics/telemetry, notifications, and other ambient
-hosted tools remain disabled for native provider invocations. Profile and base
-layers that refer to mutable instruction, project-document discovery,
-model-catalog, sub-agent, skill, or SQLite files are rejected so resumable-run
-drift detection remains complete. Agent Flow owns the shell environment policy,
-so model-spawned commands receive core process variables without inheriting the
-credentials forwarded to Codex. For a selected custom Codex model provider,
-only environment variables named by its `env_key` or `env_http_headers` are
-forwarded, and both provider doctor and execution preflight fail when one is
-missing; unrelated `OPENAI_*` credentials are omitted unless explicitly required.
-Profiled provider endpoints must use HTTPS without embedded
-credentials, queries, or fragments. Command-backed provider authentication,
-the built-in `amazon-bedrock` provider, custom shell-environment policies, and
-overrides of Agent Flow's reserved `permissions.agent_flow_native` profile are
-rejected.
+Codex runs at the repository root with the normal process environment and owns
+its configuration, authentication, permissions/sandbox, rules, skills,
+plugins, and MCP servers. Agent Flow does not add an outer `bubblewrap` or
+`flock` boundary and does not suppress ambient Codex features. Claude and HTTP
+provider boundaries are unchanged.
+
+Run inputs can come from a fixture, a JSON object file, or repeatable CLI flags:
+
+```bash
+agent-flow run workflow.yml --id AF-123 \
+  --input-file inputs.json --input ticket_key=AF-123 --input dry_run=true
+```
+
+They merge in that order, with later sources winning. Duplicate `--input` keys,
+unknown inputs, and missing required inputs fail before run creation.
 
 Ordinary custom registrations preserve the previous behavior: Agent Flow pins
 the provider name in the workflow but cannot fingerprint changes inside
@@ -237,8 +219,16 @@ application-owned adapter code. Applications that want configured-provider
 drift protection for their own adapter can use `registerConfigured` with a
 complete local/frontier descriptor and a privacy-safe target fingerprint.
 
-Pass the workflow registry as the final `executeAgentFlowCommandPipeline`
-argument when a workflow uses `route_to.workflow`. Recovery session providers
+Nested `type: workflow` steps execute a referenced workflow as a linked child
+run. By default the CLI resolves referenced workflows from the entry workflow's
+directory; set `workflows:` in `.agent-flow.yml` to use an explicit registry
+file or directory. The child receives the declared `inputs`, pauses and resumes
+through its parent, and promotes only the paths declared by the parent step's
+`outputs` after the child completes. Missing, duplicate, and recursive workflow
+references fail before execution. Programmatic hosts pass the workflow registry
+as the final `executeAgentFlowCommandPipeline` argument.
+
+Recovery session providers
 report `metadata.recovery_status` as `remediated` or `unresolved`.
 Routed remediation that writes repository files must explicitly authorize them
 through the existing session authority and layered `file_scope` policy. Context

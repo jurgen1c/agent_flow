@@ -3273,7 +3273,7 @@ steps: []
       enum: ["ask_user", "arbiter", "arbiter_then_user", "owner_decides", "fail"]
     });
     expect(Object.keys(schema.$defs.session.properties ?? {}).sort()).toEqual([
-      "authority", "file_scope", "owns", "provider", "resume", "role"
+      "authority", "codex", "file_scope", "owns", "provider", "resume", "role"
     ]);
     expect(schema.$defs.step.properties).toMatchObject({
       allow_overlap: { type: "boolean" },

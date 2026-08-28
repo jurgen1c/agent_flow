@@ -116,7 +116,7 @@ const STEP_REQUIREMENTS: Readonly<Record<string, ReadonlyArray<readonly [string,
   result: [["status", "string"]],
   review: [["reviewer", "string"], ["subject", "string"], ["artifacts", "array"], ["outputs", "array"]],
   session_request: [["session", "string"], ["prompt", "string"], ["inputs", "array"], ["outputs", "array"]],
-  workflow: [["workflow", "string"]]
+  workflow: [["workflow", "string"], ["inputs", "mapping"], ["outputs", "array"]]
 };
 
 export function validateAgentFlowWorkflow(
@@ -790,6 +790,16 @@ function validateRequiredStepFields(context: StepContext, errors: AgentFlowWorkf
 
   validateArtifactFieldShapes(context, errors);
 
+  if (context.type === "mcp_call") {
+    const via = context.step.via === undefined ? "direct" : nonEmptyString(context.step.via);
+    if (via !== "direct" && via !== "codex") {
+      addStepIssue(errors, context, "workflow.mcp_call.via.invalid", "via", "MCP call via must be direct or codex.");
+    }
+    if (via === "codex" && nonEmptyString(context.step.session) === undefined) {
+      addStepIssue(errors, context, "workflow.mcp_call.session.required", "session", "Codex-mediated MCP calls require a named session.");
+    }
+  }
+
   if (context.type === "command" && context.step.timeout_seconds !== undefined &&
       (typeof context.step.timeout_seconds !== "number" || !Number.isFinite(context.step.timeout_seconds) || context.step.timeout_seconds <= 0)) {
     addStepIssue(
@@ -1345,7 +1355,9 @@ function validateSessionReferences(
   const sessions = new Set(Object.keys(workflow.sessions ?? {}));
 
   for (const context of contexts) {
-    const fields = sessionReferenceFields(context.type);
+    const fields = context.type === "mcp_call" && nonEmptyString(context.step.via) === "codex"
+      ? ["session"]
+      : sessionReferenceFields(context.type);
 
     for (const field of fields) {
       const value = nonEmptyString(context.step[field]);

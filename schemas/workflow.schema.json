@@ -154,7 +154,9 @@
             { "type": "string", "minLength": 1, "pattern": "\\S" },
             { "type": "object", "minProperties": 1 }
           ]
-        }
+        },
+        "via": { "enum": ["direct", "codex"] },
+        "codex": { "$ref": "#/$defs/codexOptions" }
       },
       "allOf": [
         {
@@ -317,6 +319,7 @@
         "provider": { "type": "string", "minLength": 1, "pattern": "\\S" },
         "role": { "type": "string", "minLength": 1, "pattern": "\\S" },
         "resume": { "type": "boolean" },
+        "codex": { "$ref": "#/$defs/codexOptions" },
         "owns": {
           "type": "array",
           "minItems": 1,
@@ -327,6 +330,15 @@
         "file_scope": { "$ref": "#/$defs/fileScope" }
       },
       "additionalProperties": true
+    },
+    "codexOptions": {
+      "type": "object",
+      "properties": {
+        "profile": { "type": "string", "minLength": 1, "pattern": "^[A-Za-z0-9_-]+$" },
+        "model": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "reasoning_effort": { "enum": ["minimal", "low", "medium", "high", "xhigh"] }
+      },
+      "additionalProperties": false
     },
     "sessionAuthority": {
       "type": "object",

@@ -81,6 +81,11 @@ export interface AgentFlowSessionProviderRequest {
   providerDriver?: string;
   providerModel?: string;
   providerFingerprint?: string;
+  codexOptions?: {
+    profile?: string;
+    model?: string;
+    reasoningEffort?: string;
+  };
   kind?: "review" | "consult" | "challenge" | "approval" | "disagreement" | "session_request" | "recovery";
   resume: boolean;
   externalSessionId?: string;
@@ -1052,6 +1057,24 @@ async function executeAgentFlowSessionStep(
       ? {}
       : { providerModel: `sha256:${digest(providerDescriptor.model)}` }),
     ...(providerDescriptor.fingerprint === undefined ? {} : { providerFingerprint: providerDescriptor.fingerprint }),
+    ...(() => {
+      const stepOptions = mapping(step.codex);
+      const runOptions = mapping(run.context.codexOptions);
+      const sessionOptions = mapping(session.codex);
+      const profile = optionalCodexString(stepOptions?.profile ?? runOptions?.profile ?? sessionOptions?.profile, "Codex profile");
+      const model = optionalCodexString(stepOptions?.model ?? runOptions?.model ?? sessionOptions?.model, "Codex model");
+      const reasoningEffort = optionalCodexString(
+        stepOptions?.reasoning_effort ?? runOptions?.reasoningEffort ?? sessionOptions?.reasoning_effort,
+        "Codex reasoning effort"
+      );
+      return profile === undefined && model === undefined && reasoningEffort === undefined ? {} : {
+        codexOptions: {
+          ...(profile === undefined ? {} : { profile }),
+          ...(model === undefined ? {} : { model }),
+          ...(reasoningEffort === undefined ? {} : { reasoningEffort })
+        }
+      };
+    })(),
     kind,
     resume,
     ...(priorExternalSessionId === undefined
@@ -1424,6 +1447,15 @@ async function executeAgentFlowSessionStep(
       { cause: sanitizedErrorCause(error) }
     );
   }
+}
+
+function optionalCodexString(value: unknown, label: string): string | undefined {
+  if (value === undefined) return undefined;
+  const normalized = requiredName(value, label);
+  if (normalized !== value || /[\u0000-\u001F\u007F-\u009F]/u.test(normalized)) {
+    throw new AgentFlowSessionRequestError(`${label} must not contain surrounding whitespace or control characters.`);
+  }
+  return normalized;
 }
 
 export async function invokeAgentFlowSessionProvider(
