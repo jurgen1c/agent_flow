@@ -78,6 +78,46 @@ steps:
     store.close();
   });
 
+  test("routes a Codex-mediated call through a registered Codex profile", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: codex-profile-mcp
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  agent: { provider: "codex:reviewer", resume: true }
+limits:
+  max_frontier_calls: 1
+steps:
+  - { id: fetch, type: mcp_call, via: codex, session: agent, server: jira, tool: get, arguments: { key: AF-1 }, outputs: [ticket.json] }
+`);
+    const providers = createAgentFlowSessionProviderRegistry([{
+      kind: "codex_profile",
+      profile: "reviewer",
+      enabled: true,
+      adapter: async (request) => {
+        request.reportExternalSessionId?.("profile-thread");
+        return {
+          externalSessionId: "profile-thread",
+          outputs: { "ticket.json": '{"key":"AF-1"}\n' },
+          metadata: {
+            mcpCalls: [{ server: "jira", tool: "get", arguments: { key: "AF-1" }, status: "completed" }]
+          }
+        };
+      }
+    }]);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "codex-profile-mcp", workflow });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "codex-profile-mcp", workflow, undefined, providers
+    )).toMatchObject({ status: "completed" });
+    expect(store.getSession("codex-profile-mcp", "agent")).toMatchObject({
+      status: "waiting", externalSessionId: "profile-thread"
+    });
+    store.close();
+  });
+
   test("rejects Codex-mediated outputs without matching completed MCP evidence", async () => {
     const root = temporaryRepo();
     const workflow = parseAgentFlowWorkflowOrThrow(`name: codex-mcp-no-evidence

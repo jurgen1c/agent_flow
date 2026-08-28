@@ -2028,8 +2028,10 @@ function validateArtifactPaths(contexts: StepContext[], errors: AgentFlowWorkflo
     }
     if (context.type === "workflow") {
       const rawOutputs = Array.isArray(context.step.outputs) ? context.step.outputs : [];
+      const seen = new Set<string>();
       for (const [index, value] of rawOutputs.entries()) {
-        if (typeof value !== "string" || normalizedStaticArtifactPath(value) === undefined) {
+        const normalized = typeof value === "string" ? normalizedStaticArtifactPath(value) : undefined;
+        if (normalized === undefined) {
           addStepIssue(
             errors,
             context,
@@ -2037,7 +2039,18 @@ function validateArtifactPaths(contexts: StepContext[], errors: AgentFlowWorkflo
             `outputs[${index}]`,
             "Nested workflow outputs must contain normalized static repo-relative artifact paths."
           );
+          continue;
         }
+        if (seen.has(normalized)) {
+          addStepIssue(
+            errors,
+            context,
+            "workflow.workflow.output.duplicate",
+            `outputs[${index}]`,
+            `Nested workflow outputs must not contain duplicate artifact path "${normalized}".`
+          );
+        }
+        seen.add(normalized);
       }
       continue;
     }

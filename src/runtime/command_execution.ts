@@ -8743,9 +8743,10 @@ function codexMcpCallRegistry(
     const descriptor = provider === undefined ? undefined : providers.describe(provider);
     const adapter = provider === undefined ? undefined : providers.get(provider);
     if (provider === undefined || adapter === undefined
-        || !(provider === "codex" || descriptor?.driver === "codex-cli")) {
+        || !(provider === "codex" || descriptor?.kind === "codex_profile"
+          || descriptor?.driver === "codex-cli")) {
       throw new AgentFlowMcpCallError(
-        `Codex-mediated MCP call ${mcpRequest.stepId} session ${sessionId} must use provider codex or a codex-cli alias.`,
+        `Codex-mediated MCP call ${mcpRequest.stepId} session ${sessionId} must use provider codex, a Codex profile, or a codex-cli alias.`,
         "AGENT_FLOW_MCP_CODEX_PROVIDER_INVALID"
       );
     }

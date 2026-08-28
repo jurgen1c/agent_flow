@@ -2077,6 +2077,28 @@ steps:
     ]);
   });
 
+  test("rejects duplicate nested-workflow output paths", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: duplicate-nested-outputs
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - id: child
+    type: workflow
+    workflow: nested
+    inputs: {}
+    outputs: [result.json, result.json]
+    overwrite: true
+`);
+
+    expect(validateAgentFlowWorkflow(workflow).errors).toContainEqual({
+      code: "workflow.workflow.output.duplicate",
+      message: 'Nested workflow outputs must not contain duplicate artifact path "result.json".',
+      path: "steps[0].outputs[1]",
+      stepId: "child"
+    });
+  });
+
   test("rejects malformed session authority mappings and capability flags", () => {
     const workflow = parseAgentFlowWorkflowOrThrow(`name: malformed-session-authority
 version: 1
