@@ -315,10 +315,10 @@ function reachableProviderBindingWorkflows(
   workflows: AgentFlowWorkflowRegistry
 ): AgentFlowWorkflow[] {
   const reachable: AgentFlowWorkflow[] = [];
-  const visited = new Set<string>();
+  const visited = new Set<AgentFlowWorkflow>();
   const visit = (candidate: AgentFlowWorkflow): void => {
-    if (visited.has(candidate.name)) return;
-    visited.add(candidate.name);
+    if (visited.has(candidate)) return;
+    visited.add(candidate);
     reachable.push(candidate);
     for (const name of referencedRuntimeWorkflowNames(candidate.steps)) {
       const referenced = workflows.get(name);
@@ -958,7 +958,7 @@ async function runAgentFlowCommandPipeline(
             persistMcpCallInterruption(store, runId, stepId, attempt, stopped);
             return interruptedPipelineResult(store, runId, completedSteps, stopped);
           }
-          if (error instanceof AgentFlowSessionPolicyError) {
+          if (normalizedTarget(step.via) === "codex" && error instanceof AgentFlowSessionPolicyError) {
             failure = redactAgentFlowSensitiveText(error.message);
             const outcome = error.status === "pause" ? "pause" : "fail";
             persistMcpCallFailure(store, runId, stepId, failure, false, attempt, outcome);

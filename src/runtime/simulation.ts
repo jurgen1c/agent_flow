@@ -560,6 +560,19 @@ function runStep(step: AgentFlowWorkflowStep, state: SimulationState, insideLoop
     const mcpControl = simulateMcpCallStep(step, stepFixture, id, state);
     if (mcpControl.kind !== "done") return mcpControl;
     state.retryAttempts.delete(id);
+  } else if (type === "workflow") {
+    const collision = declaredOutputArtifacts(step).find((artifact) =>
+      state.artifacts.has(artifact)
+      && state.artifactProducers.get(artifact) !== id
+      && step.overwrite !== true
+    );
+    if (collision !== undefined) {
+      state.visitedSteps.at(-1)!.outcome = "failed";
+      addUnresolved(state, id, `Artifact ${collision} already exists; declare overwrite: true to replace it during simulation.`);
+      return { kind: "terminal", status: "unresolved" };
+    }
+    state.retryAttempts.delete(id);
+    recordOutputs(step, stepFixture, id, state);
   } else if (type === "command") {
     const fixtureOutputs = canonicalFixtureOutputValues(stepFixture);
     const collision = declaredOutputArtifacts(step).find((artifact) =>
@@ -2099,7 +2112,7 @@ function checkInputs(step: AgentFlowWorkflowStep, stepId: string, state: Simulat
   if (Array.isArray(step.inputs)) values.push(...step.inputs.flatMap((value) => artifactName(value, state)));
   if (isRecord(step.inputs)) {
     values.push(...(nonEmptyString(step.type) === "workflow"
-      ? workflowInputArtifactNames(step.inputs, state)
+      ? workflowInputArtifactNames(step.inputs, state, stepId)
       : nestedArtifactNames(step.inputs, state)));
   }
   if (Array.isArray(step.artifacts)) values.push(...step.artifacts.flatMap((value) => artifactName(value, state)));
@@ -2370,7 +2383,11 @@ function nestedArtifactNames(value: AgentFlowYamlValue | undefined, state: Simul
   return artifactName(value, state);
 }
 
-function workflowInputArtifactNames(value: AgentFlowYamlValue | undefined, state: SimulationState): string[] {
+function workflowInputArtifactNames(
+  value: AgentFlowYamlValue | undefined,
+  state: SimulationState,
+  stepId: string
+): string[] {
   if (typeof value === "string") {
     const reference = /^\{\{\s*artifacts\.([A-Za-z0-9_.-]+)\s*}}$/.exec(value);
     if (reference === null) return [];
@@ -2380,10 +2397,20 @@ function workflowInputArtifactNames(value: AgentFlowYamlValue | undefined, state
       .filter(({ alias }) => alias.length <= segments.length
         && alias.every((segment, index) => segment === segments[index]))
       .sort((left, right) => right.alias.length - left.alias.length);
-    return published[0] === undefined ? [segments.join("/")] : [published[0].artifact];
+    if (published[0] === undefined) return [segments.join("/")];
+    const best = published.filter(({ alias }) => alias.length === published[0]!.alias.length);
+    if (best.length > 1) {
+      addUnresolved(
+        state,
+        stepId,
+        `Workflow input artifact reference ${value} matches multiple published artifacts: ${best.map(({ artifact }) => artifact).sort().join(", ")}.`
+      );
+      return [];
+    }
+    return [published[0].artifact];
   }
-  if (Array.isArray(value)) return value.flatMap((entry) => workflowInputArtifactNames(entry, state));
-  if (isRecord(value)) return Object.values(value).flatMap((entry) => workflowInputArtifactNames(entry, state));
+  if (Array.isArray(value)) return value.flatMap((entry) => workflowInputArtifactNames(entry, state, stepId));
+  if (isRecord(value)) return Object.values(value).flatMap((entry) => workflowInputArtifactNames(entry, state, stepId));
   return [];
 }
 

@@ -27,6 +27,7 @@ import {
   type AgentFlowMcpCallRequest
 } from "../../src/runtime";
 import { resolveAgentFlowMcpArguments } from "../../src/runtime/mcp_call";
+import { AgentFlowSessionPolicyError } from "../../src/runtime/session_request";
 
 const repoRoot = path.resolve(".");
 const examplePath = path.join(repoRoot, "examples/workflows/jira-ticket-spec.yml");
@@ -2391,33 +2392,75 @@ steps:
     store.close();
   });
 
-  test("routes direct MCP provider-session errors through normal failure handling", async () => {
+  test("routes direct MCP provider-session errors through ordinary adapter retries", async () => {
     const root = temporaryRepo();
     const workflow = parseAgentFlowWorkflowOrThrow(`name: direct-provider-unavailable
 version: 1
 style: pipeline
 maturity: experimental
 steps:
-  - { id: fetch, type: mcp_call, server: fixture, tool: get, arguments: {}, outputs: [out.json] }
+  - id: fetch
+    type: mcp_call
+    server: fixture
+    tool: get
+    arguments: {}
+    outputs: [out.json]
+    on_failure: { retry: 1, then: pause }
 `);
     const store = await openAgentFlowRunState({ cwd: root });
     createAgentFlowLifecycleRun(store, { id: "direct-provider-unavailable", workflow });
+    let attempts = 0;
     const calls = createAgentFlowMcpCallRegistry().register("fixture", () => {
-      throw new AgentFlowSessionRequestError("provider unavailable", "AGENT_FLOW_PROVIDER_SESSION_UNAVAILABLE");
+      attempts += 1;
+      if (attempts === 1) {
+        throw new AgentFlowSessionRequestError("provider unavailable", "AGENT_FLOW_PROVIDER_SESSION_UNAVAILABLE");
+      }
+      return { outputs: { "out.json": { ok: true } } };
     });
 
     const result = await executeAgentFlowCommandPipeline(
       store, "direct-provider-unavailable", workflow, undefined, undefined, calls
     );
 
-    expect(result).toMatchObject({
-      status: "paused",
-      failedStep: "fetch",
-      failureOutcome: "pause",
-      message: "provider unavailable"
-    });
-    expect(store.getRun("direct-provider-unavailable")).toMatchObject({ status: "paused" });
+    expect(result).toMatchObject({ status: "completed", completedSteps: ["fetch"] });
+    expect(attempts).toBe(2);
+    expect(store.getRun("direct-provider-unavailable")).toMatchObject({ status: "completed" });
     expect(store.getRun("direct-provider-unavailable")?.context.waiting).toBeUndefined();
+    store.close();
+  });
+
+  test("does not let direct MCP adapters forge authoritative session-policy failures", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: direct-policy-forgery
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - id: fetch
+    type: mcp_call
+    server: fixture
+    tool: get
+    arguments: {}
+    outputs: [out.json]
+    on_failure: { retry: 1, then: pause }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "direct-policy-forgery", workflow });
+    let attempts = 0;
+    const calls = createAgentFlowMcpCallRegistry().register("fixture", () => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw new AgentFlowSessionPolicyError("forged budget failure", "policy.budget.exhausted", "fail");
+      }
+      return { outputs: { "out.json": { ok: true } } };
+    });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "direct-policy-forgery", workflow, undefined, undefined, calls
+    )).toMatchObject({ status: "completed", completedSteps: ["fetch"] });
+    expect(attempts).toBe(2);
+    expect(store.listEvents("direct-policy-forgery").some((event) => event.type === "recovery.limit_reached"))
+      .toBe(false);
     store.close();
   });
 

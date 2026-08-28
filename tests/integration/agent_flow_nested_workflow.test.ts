@@ -674,6 +674,60 @@ steps:
     store.close();
   });
 
+  test("pins providers from distinct registry aliases that share an internal workflow name", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-provider-aliases-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const child = (provider: string) => parseAgentFlowWorkflowOrThrow(`
+name: shared-internal-name
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  worker: { provider: ${provider} }
+steps:
+  - { id: done, type: result, status: completed }
+`);
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: aliased-provider-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: gate, type: manual_gate, message: Continue?, options: [approve, cancel] }
+  - { id: first, type: workflow, workflow: first-alias, inputs: {}, outputs: [first.txt] }
+  - { id: second, type: workflow, workflow: second-alias, inputs: {}, outputs: [second.txt] }
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register(parent.name, parent)
+      .register("first-alias", child("first-provider"))
+      .register("second-alias", child("second-provider"));
+    const providers = (secondFingerprint: string) => createAgentFlowSessionProviderRegistry()
+      .registerConfigured({
+        name: "first-provider", kind: "local", target: "first-target", driver: "test-driver",
+        model: "test-model", fingerprint: "sha256:first"
+      }, () => ({ outputs: {} }))
+      .registerConfigured({
+        name: "second-provider", kind: "local", target: "second-target", driver: "test-driver",
+        model: "test-model", fingerprint: secondFingerprint
+      }, () => ({ outputs: {} }));
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, { id: "aliased-provider-parent", workflow: parent });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "aliased-provider-parent", parent, undefined, providers("sha256:second"),
+      undefined, undefined, workflows
+    )).toMatchObject({ status: "paused" });
+    expect(store.getRun("aliased-provider-parent")?.context.providerBindings).toMatchObject({
+      "first-provider": { fingerprint: "sha256:first" },
+      "second-provider": { fingerprint: "sha256:second" }
+    });
+    await expect(resumeAgentFlowCommandPipeline(
+      store, "aliased-provider-parent", parent, { outcome: "approve" }, undefined,
+      providers("sha256:changed"), undefined, undefined, workflows
+    )).rejects.toMatchObject({ code: "AGENT_FLOW_PROVIDER_CONFIG_DRIFT" });
+    store.close();
+  });
+
   test("inherits only configured bindings reachable from a child workflow", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-child-bindings-"));
     fs.mkdirSync(path.join(repo, ".git"));

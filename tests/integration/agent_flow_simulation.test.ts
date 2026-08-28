@@ -1587,6 +1587,61 @@ steps:
     expect(available.missingArtifacts).toEqual([]);
   });
 
+  test("rejects ambiguous artifact aliases in nested-workflow inputs", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: ambiguous-mapped-artifact-input
+version: 1
+style: pipeline
+maturity: draft
+steps:
+  - id: nested
+    type: workflow
+    workflow: child
+    inputs: { payload: "{{ artifacts.foo_bar }}" }
+`);
+    const result = simulateAgentFlowWorkflow(workflow, {
+      artifacts: {
+        "foo-bar.json": { source: "hyphen" },
+        "foo_bar.json": { source: "underscore" }
+      }
+    });
+
+    expect(result.status).toBe("unresolved");
+    expect(result.unresolvedBranches).toEqual([{
+      stepId: "nested",
+      reason: "Workflow input artifact reference {{ artifacts.foo_bar }} matches multiple published artifacts: foo-bar.json, foo_bar.json."
+    }]);
+  });
+
+  test("requires overwrite authority for nested-workflow output collisions", () => {
+    const workflow = (overwrite: boolean) => parseAgentFlowWorkflowOrThrow(`name: nested-output-collision-${overwrite}
+version: 1
+style: pipeline
+maturity: draft
+steps:
+  - id: nested
+    type: workflow
+    workflow: child
+    inputs: {}
+    outputs: [shared.txt]
+    overwrite: ${overwrite}
+`);
+    const fixture = {
+      artifacts: { "shared.txt": "parent" },
+      steps: { nested: { outputs: { "shared.txt": "child" } } }
+    };
+    const rejected = simulateAgentFlowWorkflow(workflow(false), fixture);
+    const allowed = simulateAgentFlowWorkflow(workflow(true), fixture);
+
+    expect(rejected.status).toBe("unresolved");
+    expect(rejected.unresolvedBranches).toEqual([{
+      stepId: "nested",
+      reason: "Artifact shared.txt already exists; declare overwrite: true to replace it during simulation."
+    }]);
+    expect(rejected.artifactValues["shared.txt"]).toBe("parent");
+    expect(allowed.status).toBe("completed");
+    expect(allowed.artifactValues["shared.txt"]).toBe("child");
+  });
+
   test("marks exhausted retry-only failures as failed", () => {
     const workflow = parseAgentFlowWorkflowOrThrow(`name: exhausted-retry
 version: 1

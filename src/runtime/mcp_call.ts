@@ -234,10 +234,11 @@ export async function executeAgentFlowMcpCall(
     response = await invokeAdapter(adapter, request, options.stopStatus, options.interruptError);
   } catch (error) {
     if (error instanceof AgentFlowMcpCallInterruptedError) throw error;
-    if (error instanceof AgentFlowSessionPolicyError) {
+    const codexMediated = typeof step.via === "string" && step.via.trim() === "codex";
+    if (codexMediated && error instanceof AgentFlowSessionPolicyError) {
       throw new AgentFlowSessionPolicyError(errorMessage(error), error.code, error.status);
     }
-    if (error instanceof AgentFlowSessionRequestError
+    if (codexMediated && error instanceof AgentFlowSessionRequestError
         && error.code === "AGENT_FLOW_PROVIDER_SESSION_UNAVAILABLE") {
       throw new AgentFlowSessionRequestError(errorMessage(error), error.code);
     }
