@@ -1979,6 +1979,19 @@ steps:
     ]);
   });
 
+  test("publishes the runtime Codex model constraints in the workflow schema", () => {
+    const schema = JSON.parse(fs.readFileSync(path.join(repoRoot, "schemas/workflow.schema.json"), "utf8")) as {
+      $defs: { codexOptions: { properties: { model: unknown } } };
+    };
+
+    expect(schema.$defs.codexOptions.properties.model).toEqual({
+      type: "string",
+      minLength: 1,
+      pattern: "^\\S(?:.*\\S)?$",
+      not: { pattern: "[\\u0000-\\u001F\\u007F-\\u009F]" }
+    });
+  });
+
   test("requires Codex-mediated MCP sessions to be resumable", () => {
     const workflow = parseAgentFlowWorkflowOrThrow(`name: non-resumable-codex-mcp
 version: 1

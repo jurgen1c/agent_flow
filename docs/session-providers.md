@@ -74,7 +74,9 @@ agent-flow providers doctor [--config path/to/config.yml]
 ```
 
 `list` is redacted. `doctor` checks environment-variable presence and target
-readiness without calling a model.
+readiness without calling a model. For Codex, readiness verifies the executable
+but does not assume `codex login` is authoritative because ambient custom model
+providers may use their own authentication.
 
 ## Per-step selection and swapping
 

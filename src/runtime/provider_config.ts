@@ -286,11 +286,8 @@ export function doctorAgentFlowProviderCatalog(
           ok = false;
           return `${binding.alias}: ${command} executable is unavailable`;
         }
-        {
-          const authArguments = binding.config.driver === "codex-cli"
-            ? ["login", "status"]
-            : ["auth", "status"];
-          const auth = runAgentFlowNativeProviderDoctorProbe(command, authArguments, probeEnvironment);
+        if (binding.config.driver === "claude-code") {
+          const auth = runAgentFlowNativeProviderDoctorProbe(command, ["auth", "status"], probeEnvironment);
           if (auth.error !== undefined || auth.status !== 0) {
             ok = false;
             return `${binding.alias}: ${command} is not authenticated`;

@@ -8883,20 +8883,31 @@ function codexMcpCallRegistry(
         "AGENT_FLOW_MCP_CODEX_EVENT_MISSING"
       );
     }
+    let validatedOutputs: ReturnType<typeof validateAgentFlowSessionProviderResponse>;
+    try {
+      validatedOutputs = validateAgentFlowSessionProviderResponse(
+        mcpRequest.stepId,
+        mcpRequest.outputs,
+        response
+      );
+    } catch (error) {
+      const message = redactAgentFlowSensitiveText(error instanceof Error ? error.message : String(error));
+      store.upsertSession({
+        id: sessionId, runId, stepId: mcpRequest.stepId, provider, status: "failed",
+        externalSessionId: externalSessionId ?? null,
+        state: { resume: true, lastStepId: mcpRequest.stepId, mcp: true, error: message }
+      });
+      throw error;
+    }
+    const contentTypes = Object.fromEntries(
+      [...validatedOutputs].flatMap(([outputPath, output]) =>
+        output.contentType === undefined ? [] : [[outputPath, output.contentType]])
+    );
     store.upsertSession({
       id: sessionId, runId, stepId: mcpRequest.stepId, provider, status: "waiting",
       externalSessionId: externalSessionId ?? null,
       state: { resume: true, lastStepId: mcpRequest.stepId, mcp: true }
     });
-    const validatedOutputs = validateAgentFlowSessionProviderResponse(
-      mcpRequest.stepId,
-      mcpRequest.outputs,
-      response
-    );
-    const contentTypes = Object.fromEntries(
-      [...validatedOutputs].flatMap(([outputPath, output]) =>
-        output.contentType === undefined ? [] : [[outputPath, output.contentType]])
-    );
     return {
       outputs: Object.fromEntries(
         [...validatedOutputs].map(([outputPath, output]) => [outputPath, output.content])

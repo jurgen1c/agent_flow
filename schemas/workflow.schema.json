@@ -335,7 +335,12 @@
       "type": "object",
       "properties": {
         "profile": { "type": "string", "minLength": 1, "pattern": "^[A-Za-z0-9_-]+$" },
-        "model": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^\\S(?:.*\\S)?$",
+          "not": { "pattern": "[\\u0000-\\u001F\\u007F-\\u009F]" }
+        },
         "reasoning_effort": { "enum": ["minimal", "low", "medium", "high", "xhigh"] }
       },
       "additionalProperties": false

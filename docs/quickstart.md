@@ -238,7 +238,10 @@ Map them to repository aliases and select those aliases from workflow sessions.
 A session with `resume: true` keeps one Codex thread across every step that uses
 that session; a separate Agent Flow run always starts a fresh thread.
 
-Use `agent-flow providers doctor` to verify configured CLI targets and login.
+Use `agent-flow providers doctor` to verify configured CLI targets. Claude Code
+authentication is checked directly; Codex readiness is limited to the executable
+because its active provider may authenticate through ambient custom-provider
+configuration rather than `codex login`.
 
 Commit a repository-root `.agent-flow.yml` containing portable aliases:
 

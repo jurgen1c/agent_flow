@@ -206,6 +206,39 @@ steps:
     store.close();
   });
 
+  test("marks a Codex MCP session failed when its output contract is malformed", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: codex-mcp-invalid-output
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  agent: { provider: codex, resume: true }
+limits: { max_frontier_calls: 1 }
+steps:
+  - { id: fetch, type: mcp_call, via: codex, session: agent, server: jira, tool: get, arguments: {}, outputs: [ticket.json] }
+`);
+    const providers = createAgentFlowSessionProviderRegistry().register("codex", async (request) => {
+      request.reportExternalSessionId?.("invalid-output-thread");
+      return {
+        externalSessionId: "invalid-output-thread",
+        outputs: { "unexpected.json": "{}\n" },
+        metadata: { mcpCalls: [{ server: "jira", tool: "get", arguments: {}, status: "completed" }] }
+      };
+    });
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "codex-mcp-invalid-output", workflow });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "codex-mcp-invalid-output", workflow, undefined, providers
+    )).toMatchObject({ status: "paused", failedStep: "fetch" });
+    expect(store.getSession("codex-mcp-invalid-output", "agent")).toMatchObject({
+      status: "failed", externalSessionId: "invalid-output-thread"
+    });
+    expect(store.getArtifact("codex-mcp-invalid-output", "ticket.json")).toBeNull();
+    store.close();
+  });
+
   test("rejects wrong arguments, duplicate calls, and additional Codex MCP operations", async () => {
     const evidenceCases = [
       [{ server: "atlassian", tool: "get_issue", arguments: { key: "AF-2" }, status: "completed" }],

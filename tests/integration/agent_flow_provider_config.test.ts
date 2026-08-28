@@ -87,6 +87,35 @@ describe("Agent Flow configured providers", () => {
     }
   });
 
+  test("does not require OpenAI login for pass-through Codex targets", () => {
+    const { repo, home, globalConfig } = configuredRepo();
+    const bin = path.join(path.dirname(repo), "custom-codex-bin");
+    fs.mkdirSync(bin);
+    fs.writeFileSync(path.join(bin, "codex"), `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "codex-cli custom-provider"
+  exit 0
+fi
+exit 1
+`);
+    fs.chmodSync(path.join(bin, "codex"), 0o755);
+    fs.writeFileSync(globalConfig, `version: 1
+targets:
+  custom-codex: { kind: frontier, driver: codex-cli, model: custom-model, enabled: true }
+`);
+    fs.writeFileSync(path.join(repo, ".agent-flow.yml"), `version: 1
+providers:
+  coder: { kind: frontier, target: custom-codex }
+`);
+    const env = { PATH: `${bin}:/usr/bin:/bin`, HOME: home };
+    const catalog = loadAgentFlowProviderCatalog({ cwd: repo, homeDir: home, env });
+
+    expect(doctorAgentFlowProviderCatalog(catalog, env)).toEqual({
+      ok: true,
+      lines: ["coder: ready (codex-cli, codex-cli custom-provider)"]
+    });
+  });
+
   test("uses the configured HOME for asdf tool-version mounts", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-flow-asdf-home-"));
     try {
