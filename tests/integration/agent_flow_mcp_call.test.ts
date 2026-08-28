@@ -59,7 +59,7 @@ steps:
       return {
         externalSessionId: "codex-thread-1",
         outputs: { "ticket.json": '{"key":"AF-1"}\n' },
-        metadata: { mcpCalls: [{ server: "atlassian", tool: "get_issue", status: "completed" }] }
+        metadata: { mcpCalls: [{ server: "atlassian", tool: "get_issue", arguments: { key: "AF-1" }, status: "completed" }] }
       };
     });
     const store = await openAgentFlowRunState({ cwd: root });
@@ -112,6 +112,115 @@ steps:
     )).toMatchObject({ status: "paused", failedStep: "fetch" });
     expect(store.getSession("codex-mcp-no-evidence", "agent")?.status).toBe("failed");
     expect(store.getArtifact("codex-mcp-no-evidence", "ticket.json")).toBeNull();
+    store.close();
+  });
+
+  test("rejects wrong arguments, duplicate calls, and additional Codex MCP operations", async () => {
+    const evidenceCases = [
+      [{ server: "atlassian", tool: "get_issue", arguments: { key: "AF-2" }, status: "completed" }],
+      [
+        { server: "atlassian", tool: "get_issue", arguments: { key: "AF-1" }, status: "completed" },
+        { server: "atlassian", tool: "get_issue", arguments: { key: "AF-1" }, status: "completed" }
+      ],
+      [
+        { server: "atlassian", tool: "search", arguments: { query: "AF-1" }, status: "completed" },
+        { server: "atlassian", tool: "get_issue", arguments: { key: "AF-1" }, status: "completed" }
+      ]
+    ];
+    for (const [index, mcpCalls] of evidenceCases.entries()) {
+      const root = temporaryRepo();
+      const runId = `codex-mcp-contract-${index}`;
+      const workflow = parseAgentFlowWorkflowOrThrow(`name: ${runId}
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  agent: { provider: codex, resume: true }
+limits:
+  max_frontier_calls: 1
+steps:
+  - id: fetch
+    type: mcp_call
+    via: codex
+    session: agent
+    server: atlassian
+    tool: get_issue
+    arguments: { key: AF-1 }
+    outputs: [ticket.json]
+`);
+      const providers = createAgentFlowSessionProviderRegistry().register("codex", async (request) => {
+        request.reportExternalSessionId?.(`thread-${index}`);
+        return {
+          externalSessionId: `thread-${index}`,
+          outputs: { "ticket.json": '{"key":"AF-1"}\n' },
+          metadata: { mcpCalls }
+        };
+      });
+      const store = await openAgentFlowRunState({ cwd: root });
+      createAgentFlowLifecycleRun(store, { id: runId, workflow });
+
+      expect(await executeAgentFlowCommandPipeline(
+        store, runId, workflow, undefined, providers
+      )).toMatchObject({ status: "paused", failedStep: "fetch" });
+      expect(store.getArtifact(runId, "ticket.json")).toBeNull();
+      store.close();
+    }
+  });
+
+  test("persists a Codex MCP thread as soon as the provider reports it", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: codex-mcp-thread-durability
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  agent: { provider: codex, resume: true }
+limits:
+  max_frontier_calls: 1
+steps:
+  - id: fetch
+    type: mcp_call
+    via: codex
+    session: agent
+    server: atlassian
+    tool: get_issue
+    arguments: { key: AF-1 }
+    outputs: [ticket.json]
+`);
+    let releaseProvider!: () => void;
+    let providerEntered!: () => void;
+    const entered = new Promise<void>((resolve) => { providerEntered = resolve; });
+    const release = new Promise<void>((resolve) => { releaseProvider = resolve; });
+    const providers = createAgentFlowSessionProviderRegistry().register("codex", async (request) => {
+      request.reportExternalSessionId?.("durable-thread");
+      providerEntered();
+      await release;
+      return {
+        externalSessionId: "durable-thread",
+        outputs: { "ticket.json": '{"key":"AF-1"}\n' },
+        metadata: {
+          mcpCalls: [{
+            server: "atlassian",
+            tool: "get_issue",
+            arguments: { key: "AF-1" },
+            status: "completed"
+          }]
+        }
+      };
+    });
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "codex-mcp-thread-durability", workflow });
+    const execution = executeAgentFlowCommandPipeline(
+      store, "codex-mcp-thread-durability", workflow, undefined, providers
+    );
+    await entered;
+
+    expect(store.getSession("codex-mcp-thread-durability", "agent")).toMatchObject({
+      status: "running",
+      externalSessionId: "durable-thread"
+    });
+    releaseProvider();
+    expect(await execution).toMatchObject({ status: "completed" });
     store.close();
   });
 

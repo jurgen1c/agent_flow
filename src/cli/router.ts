@@ -36,6 +36,7 @@ import {
   renderAgentFlowProviderCatalog,
   renderAgentFlowWorkflowGraph,
   resumeAgentFlowCommandPipeline,
+  createAgentFlowWorkflowRegistry,
   createAgentFlowWorkflowRegistryFromSnapshot,
   serializeAgentFlowWorkflowRegistry,
   simulateAgentFlowWorkflow,
@@ -404,7 +405,28 @@ async function runLifecycleCommand(
 
     if (command === "run") {
       const runArgs = parsedRun as ParsedRunLifecycleArgs;
-      const workflows = loadAgentFlowWorkflowRegistry(workflowPath, { cwd: options.cwd });
+      const existingRun = store.getRun(runArgs.runId);
+      const availableWorkflows = existingRun === null
+        ? loadAgentFlowWorkflowRegistry(workflowPath, { cwd: options.cwd })
+        : createAgentFlowWorkflowRegistryFromSnapshot(
+            existingRun.context.workflowRegistry
+              ?? { [workflowResult!.workflow.name]: workflowResult!.workflow } as unknown as import("../runtime/index").AgentFlowRunStateValue
+          );
+      const workflows = reachableWorkflowRegistry(
+        availableWorkflows,
+        existingRun?.workflowName ?? workflowResult!.workflow.name
+      );
+      const registeredWorkflows = workflows.names().map((name) => workflows.get(name)!);
+      const directMcp = registeredWorkflows.flatMap((registeredWorkflow) =>
+        collectWorkflowSteps(registeredWorkflow.steps).map((step) => ({ workflow: registeredWorkflow, step }))
+      ).find(({ step }) => String(step.type ?? "").trim() === "mcp_call"
+        && (step.via === undefined || String(step.via).trim() === "direct"));
+      if (directMcp !== undefined) {
+        return {
+          exitCode: 1,
+          stderr: `Stock Agent Flow CLI cannot execute direct MCP step ${String(directMcp.step.id)} in workflow ${directMcp.workflow.name}; use via: codex with a named Codex session or run through a host that registers MCP adapters.`
+        };
+      }
       const workflowSnapshot = serializeAgentFlowWorkflowRegistry(workflows);
       const fixture = runArgs.fixturePath === undefined ? null : readRunFixture(runArgs.fixturePath, options.cwd);
       if (fixture !== null && "exitCode" in fixture) return fixture;
@@ -421,11 +443,14 @@ async function runLifecycleCommand(
       };
       const inputError = validateRunInputs(workflowResult!.workflow, inputs);
       if (inputError !== undefined) return { exitCode: 2, stderr: inputError };
-      const sessionRequestSteps = collectSessionRequestSteps(workflowResult!.workflow.steps);
-      const requiredProviders = collectRequiredWorkflowProviders(workflowResult!.workflow, sessionRequestSteps);
+      const sessionRequestSteps = registeredWorkflows.flatMap((registeredWorkflow) =>
+        collectSessionRequestSteps(registeredWorkflow.steps).map((step) => ({ workflow: registeredWorkflow, step }))
+      );
+      const requiredProviders = registeredWorkflows.flatMap((registeredWorkflow) =>
+        collectRequiredWorkflowProviders(registeredWorkflow)
+      );
       const usesFixtureProvider = requiredProviders.includes("fixture");
       const repositoryAliases = loadAgentFlowRepositoryProviderAliases({ cwd: options.cwd });
-      const existingRun = store.getRun(runArgs.runId);
       const providerOverrides = existingRun === null
         ? runArgs.providerOverrides
         : reconcilePinnedProviderOverrides(
@@ -441,15 +466,19 @@ async function runLifecycleCommand(
         overrides: providerOverrides,
         aliases: requiredProviders.filter((provider) => provider !== "fixture" && provider !== "codex")
       });
-      const configuredValidation = validateAgentFlowWorkflow(
-        workflowResult!.workflow,
-        (provider) => provider === "codex" ? "frontier"
-          : Object.hasOwn(repositoryAliases, provider) ? repositoryAliases[provider]!.kind : undefined
-      );
-      if (!configuredValidation.valid) {
+      const configuredValidations = registeredWorkflows.map((registeredWorkflow) => ({
+        workflow: registeredWorkflow,
+        validation: validateAgentFlowWorkflow(
+          registeredWorkflow,
+          (provider) => provider === "codex" ? "frontier"
+            : Object.hasOwn(repositoryAliases, provider) ? repositoryAliases[provider]!.kind : undefined
+        )
+      }));
+      const invalidConfiguredWorkflow = configuredValidations.find(({ validation }) => !validation.valid);
+      if (invalidConfiguredWorkflow !== undefined) {
         return {
           exitCode: 2,
-          stderr: `Agent Flow run failed: ${workflowPath}\n${formatAgentFlowWorkflowIssues(configuredValidation.errors)}`
+          stderr: `Agent Flow run failed: ${workflowPath} (${invalidConfiguredWorkflow.workflow.name})\n${formatAgentFlowWorkflowIssues(invalidConfiguredWorkflow.validation.errors)}`
         };
       }
       if (usesFixtureProvider && fixture === null) {
@@ -470,19 +499,21 @@ async function runLifecycleCommand(
         };
       }
       if (fixture !== null) {
-        const unsupportedOutputStep = sessionRequestSteps.find((step) =>
+        const unsupportedOutputStep = sessionRequestSteps.find(({ workflow, step }) =>
           fixture.arrayOutputSteps.has(String(step.id ?? "").trim())
-          && providerForSessionRequestStep(workflowResult!.workflow, step) === "fixture"
+          && providerForSessionRequestStep(workflow, step) === "fixture"
         );
         if (unsupportedOutputStep !== undefined) {
           return {
             exitCode: 2,
-            stderr: `Run fixture step ${String(unsupportedOutputStep.id).trim()}.outputs must be an object with materializable output values; array-form outputs are simulation-only.`
+            stderr: `Run fixture step ${String(unsupportedOutputStep.step.id).trim()}.outputs must be an object with materializable output values; array-form outputs are simulation-only.`
           };
         }
       }
       const serializedBindings = serializeAgentFlowProviderBindings(
-        providerBindingsForWorkflow(workflowResult!.workflow, catalog)
+        [...new Map(registeredWorkflows.flatMap((registeredWorkflow) =>
+          providerBindingsForWorkflow(registeredWorkflow, catalog).map((binding) => [binding.alias, binding] as const)
+        )).values()]
       );
       const initialContext = existingRun === null
         ? {
@@ -617,26 +648,31 @@ async function runLifecycleCommand(
       const fixturePath = resumeArgs.fixturePath ?? persistedFixturePath;
       const fixture = fixturePath === undefined ? null : readRunFixture(fixturePath, options.cwd);
       if (fixture !== null && "exitCode" in fixture) return fixture;
+      const persistedWorkflow = workflow as unknown as import("../runtime/index").AgentFlowWorkflow;
+      const workflows = reachableWorkflowRegistry(
+        createAgentFlowWorkflowRegistryFromSnapshot(
+          run.context.workflowRegistry ?? { [persistedWorkflow.name]: persistedWorkflow } as unknown as import("../runtime/index").AgentFlowRunStateValue
+        ),
+        persistedWorkflow.name
+      );
+      const registeredWorkflows = workflows.names().map((name) => workflows.get(name)!);
       if (fixture !== null) {
-        const unsupportedOutputStep = collectSessionRequestSteps(
-          (workflow as unknown as import("../runtime/index").AgentFlowWorkflow).steps
-        ).find((step) => fixture.arrayOutputSteps.has(String(step.id ?? "").trim())
-          && providerForSessionRequestStep(
-            workflow as unknown as import("../runtime/index").AgentFlowWorkflow,
-            step
-          ) === "fixture");
+        const unsupportedOutputStep = registeredWorkflows.flatMap((registeredWorkflow) =>
+          collectSessionRequestSteps(registeredWorkflow.steps).map((step) => ({ workflow: registeredWorkflow, step }))
+        ).find(({ workflow: registeredWorkflow, step }) =>
+          fixture.arrayOutputSteps.has(String(step.id ?? "").trim())
+          && providerForSessionRequestStep(registeredWorkflow, step) === "fixture"
+        );
         if (unsupportedOutputStep !== undefined) {
           return {
             exitCode: 2,
-            stderr: `Run fixture step ${String(unsupportedOutputStep.id).trim()}.outputs must be an object with materializable output values; array-form outputs are simulation-only.`
+            stderr: `Run fixture step ${String(unsupportedOutputStep.step.id).trim()}.outputs must be an object with materializable output values; array-form outputs are simulation-only.`
           };
         }
       }
-      const persistedWorkflow = workflow as unknown as import("../runtime/index").AgentFlowWorkflow;
-      const workflows = createAgentFlowWorkflowRegistryFromSnapshot(
-        run.context.workflowRegistry ?? { [persistedWorkflow.name]: persistedWorkflow } as unknown as import("../runtime/index").AgentFlowRunStateValue
+      const usesFixtureProvider = registeredWorkflows.some((registeredWorkflow) =>
+        collectRequiredWorkflowProviders(registeredWorkflow).includes("fixture")
       );
-      const usesFixtureProvider = collectRequiredWorkflowProviders(persistedWorkflow).includes("fixture");
       const pinnedOverrides = persistedProviderOverrides(run.context.providerBindings, runId);
       const catalog = loadAgentFlowProviderCatalog({
         cwd: options.cwd,
@@ -1483,6 +1519,42 @@ function collectWorkflowSteps(
   };
   steps.forEach(visit);
   return collected;
+}
+
+function reachableWorkflowRegistry(
+  available: import("../runtime/index").AgentFlowWorkflowRegistry,
+  entryName: string
+): import("../runtime/index").AgentFlowWorkflowRegistry {
+  const reachable = createAgentFlowWorkflowRegistry();
+  const visit = (name: string): void => {
+    if (reachable.get(name) !== undefined) return;
+    const workflow = available.get(name);
+    if (workflow === undefined) throw new Error(`Referenced workflow ${name} is not registered.`);
+    reachable.register(name, workflow);
+    for (const referenced of referencedWorkflowNames(workflow.steps)) visit(referenced);
+  };
+  visit(entryName);
+  return reachable;
+}
+
+function referencedWorkflowNames(
+  steps: import("../runtime/index").AgentFlowWorkflowStep[]
+): string[] {
+  const names = new Set<string>();
+  for (const step of collectWorkflowSteps(steps)) {
+    if (String(step.type ?? "").trim() === "workflow" && typeof step.workflow === "string"
+        && step.workflow.trim().length > 0) {
+      names.add(step.workflow.trim());
+    }
+    const onFailure = step.on_failure;
+    if (onFailure === null || typeof onFailure !== "object" || Array.isArray(onFailure)) continue;
+    const route = onFailure.route_to;
+    if (route === null || typeof route !== "object" || Array.isArray(route)) continue;
+    if (typeof route.workflow === "string" && route.workflow.trim().length > 0) {
+      names.add(route.workflow.trim());
+    }
+  }
+  return [...names].sort();
 }
 
 function providerForSessionRequestStep(

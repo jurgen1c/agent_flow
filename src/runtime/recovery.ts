@@ -146,6 +146,14 @@ function referencedWorkflowNames(steps: AgentFlowWorkflowStep[]): string[] {
     if (step.type === "workflow" && typeof step.workflow === "string" && step.workflow.trim().length > 0) {
       names.add(step.workflow.trim());
     }
+    const onFailure = step.on_failure;
+    if (onFailure !== null && typeof onFailure === "object" && !Array.isArray(onFailure)) {
+      const route = onFailure.route_to;
+      if (route !== null && typeof route === "object" && !Array.isArray(route)
+          && typeof route.workflow === "string" && route.workflow.trim().length > 0) {
+        names.add(route.workflow.trim());
+      }
+    }
     for (const field of ["body", "steps", "branches"] as const) {
       const nested = step[field];
       if (Array.isArray(nested)) nested.forEach((candidate) => {

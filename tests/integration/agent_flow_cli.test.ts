@@ -9,11 +9,13 @@ import {
   MAX_AGENT_FLOW_PORTABLE_ARCHIVE_CONTENT_BYTES,
   applyAgentFlowRetention,
   createAgentFlowLifecycleRun,
+  createAgentFlowWorkflowRegistry,
   defaultAgentFlowArchivePath,
   defaultAgentFlowExportPath,
   openAgentFlowRunState,
   parseAgentFlowWorkflowOrThrow,
   plannedAgentFlowRuntimeCommands,
+  serializeAgentFlowWorkflowRegistry,
   writeAgentFlowPortableArchive,
   writeAgentFlowFinalSummary
 } from "../../src/runtime";
@@ -268,6 +270,43 @@ steps:
     expect(fs.existsSync(path.join(repo, ".agent-flow"))).toBe(false);
   });
 
+  test("rejects direct MCP in reachable child workflows before creating a run", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-child-direct-mcp-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.writeFileSync(path.join(repo, "parent.yml"), `
+name: direct-mcp-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: child
+    type: workflow
+    workflow: direct-mcp-child
+    inputs: {}
+    outputs: [ticket.json]
+`);
+    fs.writeFileSync(path.join(repo, "child.yml"), `
+name: direct-mcp-child
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: fetch
+    type: mcp_call
+    server: atlassian
+    tool: get_issue
+    arguments: { key: AF-1 }
+    outputs: [ticket.json]
+`);
+
+    const result = await captureCli(["run", "parent.yml", "--id", "nested-direct"], repo);
+    expect(result).toMatchObject({ exitCode: 1 });
+    expect(result.stderr).toContain("direct MCP step fetch in workflow direct-mcp-child");
+    const store = await openAgentFlowRunState({ cwd: repo });
+    expect(store.getRun("nested-direct")).toBeNull();
+    store.close();
+  });
+
   test("runs input through Codex MCP, a nested workflow, and approval resume end to end", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-e2e-"));
     fs.mkdirSync(path.join(repo, ".git"));
@@ -286,7 +325,7 @@ fs.writeFileSync(outputPath, JSON.stringify({ outputs }));
 const resume = args.indexOf("resume");
 const thread = resume > 0 ? args[args.length - 2] : "thread-e2e";
 fs.writeSync(1, JSON.stringify({ type: "thread.started", thread_id: thread }) + "\\n");
-fs.writeSync(1, JSON.stringify({ type: "item.completed", item: { type: "mcp_tool_call", server: "atlassian", tool: "get_issue" } }) + "\\n");
+fs.writeSync(1, JSON.stringify({ type: "item.completed", item: { type: "mcp_tool_call", server: "atlassian", tool: "get_issue", arguments: { key: "AF-9" }, status: "completed" } }) + "\\n");
 fs.writeSync(1, JSON.stringify({ type: "turn.completed" }) + "\\n");
 `, { mode: 0o755 });
     fs.writeFileSync(path.join(repo, "parent.yml"), `
@@ -376,6 +415,180 @@ steps:
     expect(recovered.stdout).toContain("Status: completed");
     expect(fs.readFileSync(path.join(repo, "effects.txt"), "utf8")).toBe("recovered\n");
     expect((await captureCli(["logs", "cli-recovery"], repo)).stdout).toContain("run.execution_recovered");
+  });
+
+  test("recovers child providers and workflow definitions from the persisted registry", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-child-recovery-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.mkdirSync(path.join(repo, "prompts"));
+    fs.writeFileSync(path.join(repo, "prompts", "write.md"), "Write the response.\n");
+    fs.writeFileSync(path.join(repo, "parent.yml"), `
+name: recovered-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: child
+    type: workflow
+    workflow: recovered-child
+    inputs: { request: request.md }
+    outputs: [response.md]
+`);
+    const originalChildSource = `
+name: recovered-child
+version: 1
+style: pipeline
+maturity: experimental
+inputs:
+  request: { required: true }
+sessions:
+  writer: { provider: fixture }
+limits: { max_model_calls: 1 }
+steps:
+  - id: write
+    type: session_request
+    session: writer
+    prompt: prompts/write.md
+    inputs: [request.md]
+    outputs: [response.md]
+`;
+    fs.writeFileSync(path.join(repo, "child.yml"), originalChildSource);
+    fs.writeFileSync(path.join(repo, "fixture.json"), JSON.stringify({
+      artifacts: { "request.md": "request" },
+      steps: { write: { outputs: { "response.md": "persisted child response\n" } } }
+    }));
+    const parent = parseAgentFlowWorkflowOrThrow(fs.readFileSync(path.join(repo, "parent.yml"), "utf8"));
+    const child = parseAgentFlowWorkflowOrThrow(originalChildSource);
+    const registry = createAgentFlowWorkflowRegistry().register(parent.name, parent).register(child.name, child);
+    const interrupted = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(interrupted, {
+      id: "child-recovery",
+      workflow: parent,
+      context: { workflowRegistry: serializeAgentFlowWorkflowRegistry(registry) as never }
+    });
+    interrupted.acquireRunLock("child-recovery", "run", { ttlMs: 60_000 });
+    interrupted.transitionRunWithEvent("child-recovery", {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    interrupted.writeArtifact({
+      id: "request",
+      runId: "child-recovery",
+      stepId: "fixture",
+      path: "request.md",
+      kind: "fixture",
+      contentType: "text/plain; charset=utf-8",
+      content: "request"
+    });
+    interrupted.close();
+    fs.writeFileSync(path.join(repo, "child.yml"), `
+name: recovered-child
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: changed
+    type: command
+    command: printf 'changed child\\n' > response.md
+    outputs: [response.md]
+`);
+
+    const recovered = await captureCli([
+      "run", "parent.yml", "--id", "child-recovery", "--fixture", "fixture.json"
+    ], repo);
+
+    expect(recovered).toMatchObject({ exitCode: 0 });
+    const store = await openAgentFlowRunState({ cwd: repo });
+    expect(store.readArtifact("child-recovery", "response.md").content.toString("utf8"))
+      .toBe("persisted child response\n");
+    store.close();
+  });
+
+  test("pins configured providers used only by a reachable child workflow", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-child-provider-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.mkdirSync(path.join(repo, "workflows"));
+    fs.writeFileSync(path.join(repo, "config.yml"), `version: 1
+targets:
+  child-local:
+    kind: local
+    driver: openai-compatible
+    base_url: http://127.0.0.1:11434/v1
+    model: child-model
+    enabled: true
+`);
+    fs.writeFileSync(path.join(repo, ".agent-flow.yml"), `version: 1
+workflows: workflows
+providers:
+  child-writer: { kind: local, target: child-local }
+`);
+    fs.writeFileSync(path.join(repo, "workflows", "parent.yml"), `
+name: child-provider-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: child
+    type: workflow
+    workflow: child-provider-child
+    inputs: {}
+    outputs: [response.md]
+`);
+    fs.writeFileSync(path.join(repo, "workflows", "child.yml"), `
+name: child-provider-child
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  writer: { provider: child-writer }
+limits: { max_model_calls: 1 }
+steps:
+  - { id: approve, type: manual_gate, message: Continue?, options: [approve, cancel] }
+  - { id: write, type: session_request, session: writer, prompt: prompt.md, inputs: [input.md], outputs: [response.md] }
+`);
+
+    expect(await captureCli([
+      "run", "workflows/parent.yml", "--id", "child-provider", "--config", "config.yml"
+    ], repo)).toMatchObject({ exitCode: 3 });
+    const store = await openAgentFlowRunState({ cwd: repo });
+    expect(store.getRun("child-provider")?.context.providerBindings).toMatchObject({
+      "child-writer": { target: "child-local", kind: "local", driver: "openai-compatible" }
+    });
+    store.close();
+  });
+
+  test("ignores providers and validation in unrelated workflow registry entries", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-reachable-registry-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.mkdirSync(path.join(repo, "workflows"));
+    fs.writeFileSync(path.join(repo, ".agent-flow.yml"), "version: 1\nworkflows: workflows\n");
+    fs.writeFileSync(path.join(repo, "workflows", "entry.yml"), `
+name: reachable-entry
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: done, type: result, status: completed }
+`);
+    fs.writeFileSync(path.join(repo, "workflows", "unrelated.yml"), `
+name: unrelated-entry
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  writer: { provider: fixture }
+steps:
+  - { id: write, type: session_request, session: writer, prompt: prompt.md, inputs: [input.md], outputs: [output.md] }
+`);
+
+    expect(await captureCli([
+      "run", "workflows/entry.yml", "--id", "reachable-only"
+    ], repo)).toMatchObject({ exitCode: 0 });
+    const store = await openAgentFlowRunState({ cwd: repo });
+    expect(Object.keys(store.getRun("reachable-only")?.context.workflowRegistry as object))
+      .toEqual(["reachable-entry"]);
+    store.close();
   });
 
   test("does not rewrite fixture state before acquiring an active run lease", async () => {

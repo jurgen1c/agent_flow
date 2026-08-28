@@ -8,6 +8,7 @@ import {
   isNormalizedStaticAgentFlowArtifactPath,
   normalizeAgentFlowArtifactPath,
   type AgentFlowRunLockRecord,
+  type AgentFlowArtifactRecord,
   type AgentFlowRunRecord,
   type AgentFlowRunStateValue,
   type AgentFlowRunStateStore,
@@ -181,6 +182,7 @@ interface AgentFlowPipelineWaitingState {
   sessionId?: string;
   childRunId?: string;
   workflowName?: string;
+  retryAttemptIndex?: number;
   evidence?: AgentFlowWaitingEvidence[];
   completedSteps: string[];
   routing: SerializedSuccessfulRoutingBudget;
@@ -220,7 +222,7 @@ export async function executeAgentFlowCommandPipeline(
   return store.withRunLock(runId, "run", (lock) => {
     beforeRecovery?.();
     const run = assertPersistedWorkflowIdentity(store, runId, workflow);
-    assertOrPersistConfiguredProviderBindings(store, run, workflow, sessionProviders);
+    assertOrPersistConfiguredProviderBindings(store, run, workflow, sessionProviders, workflows);
     const recoveredExecution = recoverInterruptedExecution(store, lock);
     prepareExecution?.();
     return runAgentFlowCommandPipeline(
@@ -245,7 +247,7 @@ export async function resumeAgentFlowCommandPipeline(
   return store.withRunLock(runId, "resume", (lock) => {
     prepareResume?.();
     const run = assertPersistedWorkflowIdentity(store, runId, workflow);
-    assertOrPersistConfiguredProviderBindings(store, run, workflow, sessionProviders);
+    assertOrPersistConfiguredProviderBindings(store, run, workflow, sessionProviders, workflows);
     const recoveredExecution = recoverInterruptedExecution(store, lock);
     const effectiveResponse = recoveredExecution === undefined ? response : undefined;
     return runAgentFlowCommandPipeline(
@@ -259,27 +261,31 @@ function assertOrPersistConfiguredProviderBindings(
   store: AgentFlowRunStateStore,
   run: AgentFlowRunRecord,
   workflow: AgentFlowWorkflow,
-  providers: AgentFlowSessionProviderRegistry
+  providers: AgentFlowSessionProviderRegistry,
+  workflows: AgentFlowWorkflowRegistry
 ): void {
   const bindings: Record<string, AgentFlowRunStateValue> = {};
-  for (const session of Object.values(workflow.sessions ?? {})) {
-    if (session === null || typeof session !== "object" || Array.isArray(session)) continue;
-    const provider = normalizedTarget((session as AgentFlowYamlMapping).provider);
-    if (provider === undefined || Object.hasOwn(bindings, provider)) continue;
-    const descriptor = providers.describe(provider);
-    if (descriptor?.target === undefined || descriptor.driver === undefined
-        || descriptor.fingerprint === undefined) continue;
-    bindings[provider] = {
-      target: descriptor.target,
-      kind: descriptor.kind,
-      driver: descriptor.driver,
-      ...(descriptor.model === undefined ? {} : { modelHash: hashAgentFlowProviderModel(descriptor.model) }),
-      ...(descriptor.profile === undefined ? {} : { profile: descriptor.profile }),
-      ...(descriptor.reasoningEffort === undefined
-        ? {}
-        : { reasoningEffort: descriptor.reasoningEffort }),
-      fingerprint: descriptor.fingerprint
-    };
+  const bindingWorkflows = reachableProviderBindingWorkflows(workflow, workflows);
+  for (const bindingWorkflow of bindingWorkflows) {
+    for (const session of Object.values(bindingWorkflow.sessions ?? {})) {
+      if (session === null || typeof session !== "object" || Array.isArray(session)) continue;
+      const provider = normalizedTarget((session as AgentFlowYamlMapping).provider);
+      if (provider === undefined || Object.hasOwn(bindings, provider)) continue;
+      const descriptor = providers.describe(provider);
+      if (descriptor?.target === undefined || descriptor.driver === undefined
+          || descriptor.fingerprint === undefined) continue;
+      bindings[provider] = {
+        target: descriptor.target,
+        kind: descriptor.kind,
+        driver: descriptor.driver,
+        ...(descriptor.model === undefined ? {} : { modelHash: hashAgentFlowProviderModel(descriptor.model) }),
+        ...(descriptor.profile === undefined ? {} : { profile: descriptor.profile }),
+        ...(descriptor.reasoningEffort === undefined
+          ? {}
+          : { reasoningEffort: descriptor.reasoningEffort }),
+        fingerprint: descriptor.fingerprint
+      };
+    }
   }
 
   const persisted = run.context.providerBindings;
@@ -294,6 +300,45 @@ function assertOrPersistConfiguredProviderBindings(
       "AGENT_FLOW_PROVIDER_CONFIG_DRIFT"
     );
   }
+}
+
+function reachableProviderBindingWorkflows(
+  workflow: AgentFlowWorkflow,
+  workflows: AgentFlowWorkflowRegistry
+): AgentFlowWorkflow[] {
+  const reachable: AgentFlowWorkflow[] = [];
+  const visited = new Set<string>();
+  const visit = (candidate: AgentFlowWorkflow): void => {
+    if (visited.has(candidate.name)) return;
+    visited.add(candidate.name);
+    reachable.push(candidate);
+    for (const name of referencedRuntimeWorkflowNames(candidate.steps)) {
+      const referenced = workflows.get(name);
+      if (referenced !== undefined) visit(referenced);
+    }
+  };
+  visit(workflow);
+  return reachable;
+}
+
+function referencedRuntimeWorkflowNames(steps: AgentFlowWorkflowStep[]): string[] {
+  const names = new Set<string>();
+  const visit = (step: AgentFlowWorkflowStep): void => {
+    if (normalizedTarget(step.type) === "workflow") {
+      const name = normalizedTarget(step.workflow);
+      if (name !== undefined) names.add(name);
+    }
+    const onFailure = mapping(step.on_failure);
+    const route = mapping(onFailure?.route_to);
+    const recoveryWorkflow = normalizedTarget(route?.workflow);
+    if (recoveryWorkflow !== undefined) names.add(recoveryWorkflow);
+    for (const field of ["body", "steps", "branches"] as const) {
+      const nested = step[field];
+      if (Array.isArray(nested)) nested.filter(isWorkflowStep).forEach(visit);
+    }
+  };
+  steps.forEach(visit);
+  return [...names].sort();
 }
 
 function assertPersistedWorkflowIdentity(
@@ -534,6 +579,7 @@ async function runAgentFlowCommandPipeline(
     routingBudget = resumed.routingBudget;
     currentSteps = resumed.steps;
     stepIndex = resumed.nextIndex;
+    pendingRetryAttemptIndex = resumed.pendingRetryAttemptIndex;
   }
 
   if (recoveredCompletedCursorPayload !== undefined) {
@@ -624,9 +670,7 @@ async function runAgentFlowCommandPipeline(
     const stoppedBeforeStep = stoppedPipelineResult(store, runId, completedSteps);
     if (stoppedBeforeStep !== undefined) return stoppedBeforeStep;
     const stepId = requiredStepId(step);
-    const recoveredRetryAttemptIndex = stepId === recoveredExecution?.cursorStepId
-      ? pendingRetryAttemptIndex
-      : undefined;
+    const recoveredRetryAttemptIndex = pendingRetryAttemptIndex;
     pendingRetryAttemptIndex = undefined;
     const stepType = normalizedTarget(step.type);
     const staleApprovalIds = mergeContinuationStaleApprovals(store, runId, workflow, step);
@@ -669,60 +713,92 @@ async function runAgentFlowCommandPipeline(
       checkpointExecutionRouting(store, runId, routingBudget, stepId);
     }
     if (stepType === "workflow") {
-      const attempt = allocateStepAttempt(routingBudget, stepId);
-      if (attempt === undefined) return stepAttemptLimitResult(store, runId, completedSteps, stepId, routingBudget);
+      const firstAttempt = allocateStepAttempt(routingBudget, stepId);
+      if (firstAttempt === undefined) return stepAttemptLimitResult(store, runId, completedSteps, stepId, routingBudget);
       const preflightError = validateWorkflowStep(step, workflows);
       if (preflightError !== undefined) {
-        persistWorkflowStepFailure(store, runId, stepId, attempt, preflightError);
+        persistWorkflowStepFailure(store, runId, stepId, firstAttempt, preflightError, false, "fail");
         return finishFailure(store, runId, completedSteps, stepId, {
           exitCode: null, timedOut: false, message: preflightError
         }, "failed", routingBudget.terminalEffects);
       }
-      store.updateRun(runId, { currentStepId: stepId, error: null });
-      store.upsertStep({
-        runId, stepId, attempt, status: "running",
-        input: { attempt, workflow: step.workflow as string, inputs: (step.inputs ?? {}) as AgentFlowRunStateValue }
-      });
-      store.appendRunEvent(runId, {
-        type: "step.started", stepId,
-        payload: { attempt, workflow: step.workflow as string }
-      });
-      const child = await executeNestedWorkflowStep(
-        store, runId, workflow, step, attempt, transforms, sessionProviders, mcpCalls, notifications, workflows
-      );
-      if (child.status === "paused") {
-        return pauseForNestedWorkflow(
-          store, runId, step, attempt, child.runId, completedSteps, routingBudget, child.message
-        );
-      }
-      if (child.status !== "completed") {
-        const message = child.message ?? `Child workflow run ${child.runId} ${child.status}.`;
-        persistWorkflowStepFailure(store, runId, stepId, attempt, message);
-        const recoveryRoute = await routeAfterFailedStep(
-          store, runId, workflow, completedSteps, stepId, step, currentSteps, stepIndex,
-          stepLocations, routingBudget, transforms, sessionProviders, mcpCalls, notifications, workflows
-        );
-        if (recoveryRoute !== undefined) {
-          if ("result" in recoveryRoute) return recoveryRoute.result;
-          currentSteps = recoveryRoute.steps;
-          stepIndex = recoveryRoute.nextIndex;
-          continue;
+      const retries = failureRetries(step);
+      let failure: string | undefined;
+      const firstAttemptIndex = nextRetryAttemptIndex(recoveredRetryAttemptIndex, retries, stepId);
+      for (let attemptIndex = firstAttemptIndex; attemptIndex <= retries + 1; attemptIndex += 1) {
+        const attempt = attemptIndex === firstAttemptIndex ? firstAttempt : allocateStepAttempt(routingBudget, stepId);
+        if (attempt === undefined) return stepAttemptLimitResult(store, runId, completedSteps, stepId, routingBudget);
+        const stopped = activeStopStatus(store, runId);
+        if (stopped !== undefined) return stoppedPipelineResult(store, runId, completedSteps)!;
+        store.updateRun(runId, { currentStepId: stepId, error: null });
+        store.upsertStep({
+          runId, stepId, attempt, status: "running",
+          input: { attempt, workflow: step.workflow as string, inputs: (step.inputs ?? {}) as AgentFlowRunStateValue }
+        });
+        store.appendRunEvent(runId, {
+          type: "step.started", stepId,
+          payload: { attempt, workflow: step.workflow as string }
+        });
+        try {
+          const child = await executeNestedWorkflowStep(
+            store, runId, workflow, step, attempt, transforms, sessionProviders, mcpCalls, notifications, workflows
+          );
+          if (child.status === "paused") {
+            return pauseForNestedWorkflow(
+              store, runId, step, attempt, attemptIndex, child.runId, completedSteps, routingBudget, child.message
+            );
+          }
+          if (child.status === "completed") {
+            const output = { attempt, workflow: step.workflow as string, childRunId: child.runId, outputs: child.outputs };
+            store.upsertStep({ runId, stepId, attempt, status: "completed", output });
+            store.appendRunEvent(runId, { type: "step.completed", stepId, payload: output });
+            completedSteps.push(stepId);
+            failure = undefined;
+            break;
+          }
+          failure = child.message ?? `Child workflow run ${child.runId} ${child.status}.`;
+        } catch (error) {
+          const lockError = store.runLockInterruption();
+          if (lockError !== undefined) throw lockError;
+          const stopped = activeStopStatus(store, runId);
+          if (stopped !== undefined) return stoppedPipelineResult(store, runId, completedSteps)!;
+          failure = redactAgentFlowSensitiveText(error instanceof Error ? error.message : String(error));
         }
-        return finishFailure(store, runId, completedSteps, stepId, {
-          exitCode: null, timedOut: false, message
-        }, failureStatus(step), routingBudget.terminalEffects);
+        const retryable = attemptIndex <= retries;
+        persistWorkflowStepFailure(
+          store, runId, stepId, attempt, failure, retryable, failureOutcome(step, retryable)
+        );
+        if (!retryable) break;
       }
-      const output = { attempt, workflow: step.workflow as string, childRunId: child.runId, outputs: child.outputs };
-      store.upsertStep({ runId, stepId, attempt, status: "completed", output });
-      store.appendRunEvent(runId, { type: "step.completed", stepId, payload: output });
-      completedSteps.push(stepId);
-      const routed = routeAfterSuccessfulStep(
-        store, runId, completedSteps, stepId, step, currentSteps, stepIndex, stepLocations, routingBudget
+      if (failure === undefined) {
+        const routed = routeAfterSuccessfulStep(
+          store, runId, completedSteps, stepId, step, currentSteps, stepIndex, stepLocations, routingBudget
+        );
+        if ("result" in routed) return routed.result;
+        currentSteps = routed.steps;
+        stepIndex = routed.nextIndex;
+        continue;
+      }
+      const recoveryRoute = await routeAfterFailedStep(
+        store, runId, workflow, completedSteps, stepId, step, currentSteps, stepIndex,
+        stepLocations, routingBudget, transforms, sessionProviders, mcpCalls, notifications, workflows
       );
-      if ("result" in routed) return routed.result;
-      currentSteps = routed.steps;
-      stepIndex = routed.nextIndex;
-      continue;
+      if (recoveryRoute !== undefined) {
+        if ("result" in recoveryRoute) return recoveryRoute.result;
+        currentSteps = recoveryRoute.steps;
+        stepIndex = recoveryRoute.nextIndex;
+        continue;
+      }
+      if (failureContinues(step)) {
+        const routed = fallthroughAfterStep(store, runId, completedSteps, stepId, currentSteps, stepIndex, routingBudget);
+        if ("result" in routed) return routed.result;
+        currentSteps = routed.steps;
+        stepIndex = routed.nextIndex;
+        continue;
+      }
+      return finishFailure(store, runId, completedSteps, stepId, {
+        exitCode: null, timedOut: false, message: failure
+      }, failureStatus(step), routingBudget.terminalEffects);
     }
     if (stepType === "approval" && normalizedTarget(step.reviewer) === "human") {
       const attempt = allocateStepAttempt(routingBudget, stepId);
@@ -1568,7 +1644,13 @@ interface RecoveredAgentFlowExecution {
 }
 
 type ResumedWaitingStep =
-  | { steps: AgentFlowWorkflowStep[]; nextIndex: number; completedSteps: string[]; routingBudget: SuccessfulRoutingBudget }
+  | {
+      steps: AgentFlowWorkflowStep[];
+      nextIndex: number;
+      completedSteps: string[];
+      routingBudget: SuccessfulRoutingBudget;
+      pendingRetryAttemptIndex?: number;
+    }
   | { result: AgentFlowCommandPipelineResult };
 
 type ReviewDisagreementControl =
@@ -3294,6 +3376,12 @@ function parseWaitingState(value: AgentFlowRunStateValue | undefined): AgentFlow
   const workflowName = typeof record.workflowName === "string" && record.workflowName.trim().length > 0
     ? record.workflowName.trim()
     : undefined;
+  const persistedRetryAttemptIndex = Number.isSafeInteger(record.retryAttemptIndex) && Number(record.retryAttemptIndex) > 0
+    ? Number(record.retryAttemptIndex)
+    : undefined;
+  const retryAttemptIndex = kind === "workflow" && record.retryAttemptIndex === undefined
+    ? 1
+    : persistedRetryAttemptIndex;
   const evidence = Array.isArray(record.evidence)
     ? record.evidence.flatMap((entry) => {
       const candidate = mapping(entry);
@@ -3315,7 +3403,8 @@ function parseWaitingState(value: AgentFlowRunStateValue | undefined): AgentFlow
       || (kind === "disagreement" && (evidence.length === 0 || evidence.length !== (record.evidence as unknown[] | undefined)?.length))
       || (kind === "input_request" && saveAs === undefined)
       || (kind === "provider_session" && (sessionId === undefined || validOutcomes.length !== 0))
-      || (kind === "workflow" && (childRunId === undefined || workflowName === undefined || validOutcomes.length !== 0))) {
+      || (kind === "workflow" && (childRunId === undefined || workflowName === undefined
+        || retryAttemptIndex === undefined || validOutcomes.length !== 0))) {
     throw new AgentFlowRunStateError(
       "Paused Agent Flow run has incomplete persisted interaction state.",
       "AGENT_FLOW_RESUME_STATE"
@@ -3337,6 +3426,7 @@ function parseWaitingState(value: AgentFlowRunStateValue | undefined): AgentFlow
     ...(sessionId === undefined ? {} : { sessionId }),
     ...(childRunId === undefined ? {} : { childRunId }),
     ...(workflowName === undefined ? {} : { workflowName }),
+    ...(retryAttemptIndex === undefined ? {} : { retryAttemptIndex }),
     ...(kind === "approval" || kind === "disagreement" ? { evidence } : {}),
     completedSteps,
     routing: serialized
@@ -4506,7 +4596,8 @@ async function executeNestedRecoveryWorkflow(
         workflow: nestedWorkflow,
         inputs,
         parentRunId,
-        recoveryOfRunId: parentRunId
+        recoveryOfRunId: parentRunId,
+        context: nestedWorkflowRunContext(store.getRun(parentRunId)!, workflows)
       });
       if (result.changed) {
         copyRecoveryInputArtifacts(store, parentRunId, recoveryRunId, preparedInputs);
@@ -4553,7 +4644,7 @@ async function executeNestedRecoveryWorkflow(
         result = await store.withRunLock(recoveryRunId, "run", (lock) => {
           terminalizeChildOnError = true;
           const childRun = assertPersistedWorkflowIdentity(store, recoveryRunId, nestedWorkflow);
-          assertOrPersistConfiguredProviderBindings(store, childRun, nestedWorkflow, sessionProviders);
+          assertOrPersistConfiguredProviderBindings(store, childRun, nestedWorkflow, sessionProviders, workflows);
           const recoveredAttempts = recoverInterruptedExecution(store, lock);
           return runAgentFlowCommandPipeline(
             store,
@@ -5750,7 +5841,10 @@ function secureNestedRecoveryInputValue(
   const reference = typeof declared === "string"
     ? /^\{\{\s*inputs\.([A-Za-z_][A-Za-z0-9_-]*)\s*}}$/.exec(declared)
     : null;
+  const artifactSensitive = typeof declared === "string"
+    && workflowStepArtifactReferenceIsSensitive(store, runId, declared);
   const inheritedSensitive = sensitive
+    || artifactSensitive
     || (reference !== null && agentFlowInputKeyLooksSensitive(reference[1]!));
   if (typeof resolved === "string") {
     try {
@@ -7961,6 +8055,143 @@ function validateWorkflowStep(
   return undefined;
 }
 
+function resolveWorkflowStepInputs(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  value: unknown,
+  stepId: string
+): Record<string, AgentFlowRunStateValue> {
+  const run = store.getRun(runId);
+  if (run === null) {
+    throw new AgentFlowRunStateError(`Parent workflow run ${runId} was not found.`, "AGENT_FLOW_WORKFLOW_INPUT_EXPRESSION");
+  }
+  const input = mapping(value) ?? {};
+  const resolve = (candidate: unknown): AgentFlowRunStateValue => {
+    if (typeof candidate === "string") {
+      const expression = /^\{\{\s*([^}]+?)\s*}}$/.exec(candidate);
+      if (expression === null) return candidate;
+      if (expression[1] === "step.id") return stepId;
+      const inputReference = /^inputs\.([A-Za-z_][A-Za-z0-9_-]*)$/.exec(expression[1]!);
+      if (inputReference !== null && Object.hasOwn(run.inputs, inputReference[1]!)) {
+        return run.inputs[inputReference[1]!]!;
+      }
+      const artifactReference = /^artifacts\.([A-Za-z0-9_.-]+)$/.exec(expression[1]!);
+      if (artifactReference !== null) {
+        return resolveWorkflowStepArtifactInput(store, runId, artifactReference[1]!.split("."), candidate);
+      }
+      throw new AgentFlowRunStateError(
+        `Unsupported workflow step input expression ${candidate}.`,
+        "AGENT_FLOW_WORKFLOW_INPUT_EXPRESSION"
+      );
+    }
+    if (Array.isArray(candidate)) return candidate.map(resolve);
+    const record = mapping(candidate);
+    if (record !== undefined) {
+      return Object.fromEntries(Object.entries(record).map(([name, entry]) => [name, resolve(entry)]));
+    }
+    return candidate === null || typeof candidate === "boolean" || typeof candidate === "number" ? candidate : null;
+  };
+  return Object.fromEntries(Object.entries(input).map(([name, candidate]) => [name, resolve(candidate)]));
+}
+
+function resolveWorkflowStepArtifactInput(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  segments: string[],
+  expression: string
+): AgentFlowRunStateValue {
+  const selected = selectWorkflowStepArtifactInput(store, runId, segments, expression);
+  const content = store.readArtifact(runId, selected.artifact.declaredPath, {
+    maxBytes: MAX_AGENT_FLOW_SESSION_INPUT_BYTES
+  }).content;
+  let source: string;
+  try {
+    source = new TextDecoder("utf-8", { fatal: true }).decode(content);
+  } catch (error) {
+    throw new AgentFlowRunStateError(
+      `Workflow step input artifact ${selected.artifact.declaredPath} is not valid UTF-8.`,
+      "AGENT_FLOW_WORKFLOW_INPUT_EXPRESSION",
+      { cause: error }
+    );
+  }
+  let resolved: AgentFlowRunStateValue | undefined;
+  try {
+    resolved = JSON.parse(source) as AgentFlowRunStateValue;
+  } catch (error) {
+    if (selected.remaining.length > 0) {
+      throw new AgentFlowRunStateError(
+        `Workflow step input artifact ${selected.artifact.declaredPath} must contain JSON to resolve ${expression}.`,
+        "AGENT_FLOW_WORKFLOW_INPUT_EXPRESSION",
+        { cause: error }
+      );
+    }
+    return source.trim();
+  }
+  for (const segment of selected.remaining) {
+    if (Array.isArray(resolved)) {
+      const index = /^(?:0|[1-9][0-9]*)$/.test(segment) ? Number(segment) : -1;
+      if (index < 0 || index >= resolved.length) resolved = undefined;
+      else resolved = resolved[index]!;
+    } else {
+      const record = mapping(resolved);
+      resolved = record !== undefined && Object.hasOwn(record, segment)
+        ? record[segment] as AgentFlowRunStateValue
+        : undefined;
+    }
+    if (resolved === undefined) {
+      throw new AgentFlowRunStateError(
+        `Workflow step input expression ${expression} does not resolve a published artifact value.`,
+        "AGENT_FLOW_WORKFLOW_INPUT_EXPRESSION"
+      );
+    }
+  }
+  return resolved;
+}
+
+function selectWorkflowStepArtifactInput(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  segments: string[],
+  expression: string
+): { artifact: AgentFlowArtifactRecord; remaining: string[] } {
+  const candidates = store.listArtifactMetadata(runId)
+    .filter((artifact) => artifact.writtenAt !== null)
+    .map((artifact) => ({ artifact, alias: agentFlowConditionArtifactAlias(artifact.declaredPath) }))
+    .filter(({ alias }) => alias.length <= segments.length
+      && alias.every((segment, index) => segment === segments[index]))
+    .sort((left, right) => right.alias.length - left.alias.length);
+  const selected = candidates[0];
+  if (selected === undefined) {
+    throw new AgentFlowRunStateError(
+      `Workflow step input expression ${expression} does not match a published artifact.`,
+      "AGENT_FLOW_WORKFLOW_INPUT_EXPRESSION"
+    );
+  }
+  const ambiguous = candidates.filter(({ alias }) => isDeepStrictEqual(alias, selected.alias));
+  if (ambiguous.length > 1) {
+    throw new AgentFlowRunStateError(
+      `Workflow step input expression ${expression} matches multiple published artifacts: ${ambiguous.map(({ artifact }) => artifact.declaredPath).join(", ")}.`,
+      "AGENT_FLOW_WORKFLOW_INPUT_EXPRESSION"
+    );
+  }
+  return { artifact: selected.artifact, remaining: segments.slice(selected.alias.length) };
+}
+
+function workflowStepArtifactReferenceIsSensitive(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  declared: string
+): boolean {
+  const reference = /^\{\{\s*artifacts\.([A-Za-z0-9_.-]+)\s*}}$/.exec(declared);
+  if (reference === null) return false;
+  const segments = reference[1]!.split(".");
+  const selected = selectWorkflowStepArtifactInput(store, runId, segments, declared);
+  return [
+    ...agentFlowConditionArtifactAlias(selected.artifact.declaredPath),
+    ...selected.remaining
+  ].some(agentFlowInputKeyLooksSensitive);
+}
+
 async function executeNestedWorkflowStep(
   store: AgentFlowRunStateStore,
   parentRunId: string,
@@ -7976,7 +8207,7 @@ async function executeNestedWorkflowStep(
   const stepId = requiredStepId(step);
   const workflowName = normalizedTarget(step.workflow)!;
   const workflow = workflows.get(workflowName)!;
-  const rawInputs = resolveRecoveryInputs(step.inputs, store.getRun(parentRunId)!.inputs, stepId, null);
+  const rawInputs = resolveWorkflowStepInputs(store, parentRunId, step.inputs, stepId);
   const unknown = Object.keys(rawInputs).filter((name) => !Object.hasOwn(workflow.inputs ?? {}, name)).sort();
   if (unknown.length > 0) {
     throw new AgentFlowRunStateError(
@@ -7988,7 +8219,7 @@ async function executeNestedWorkflowStep(
   const prepared = prepareNestedRecoveryInputs(
     store, parentRunId, `workflow:${stepId}`, step.inputs, rawInputs, null, parentWorkflow, workflow
   );
-  const childRunId = `${parentRunId}:workflow:${safeId(stepId)}`;
+  const childRunId = `${parentRunId}:workflow:${safeId(stepId)}:attempt-${attempt}`;
   const existing = store.getRun(childRunId);
   if (existing !== null && !(existing.workflowName === workflow.name
       && existing.workflowVersion === workflow.version
@@ -8007,7 +8238,7 @@ async function executeNestedWorkflowStep(
       workflow,
       inputs: prepared.inputs,
       parentRunId,
-      context: { workflowRegistry: serializeWorkflowRegistryForRun(workflows) }
+      context: nestedWorkflowRunContext(store.getRun(parentRunId)!, workflows)
     });
     if (created.changed) copyRecoveryInputArtifacts(store, parentRunId, childRunId, prepared);
   }
@@ -8052,6 +8283,17 @@ function serializeWorkflowRegistryForRun(
   workflows: AgentFlowWorkflowRegistry
 ): AgentFlowRunStateValue {
   return Object.fromEntries(workflows.names().map((name) => [name, workflows.get(name)!])) as unknown as AgentFlowRunStateValue;
+}
+
+function nestedWorkflowRunContext(
+  parent: AgentFlowRunRecord,
+  workflows: AgentFlowWorkflowRegistry
+): Record<string, AgentFlowRunStateValue> {
+  return {
+    workflowRegistry: serializeWorkflowRegistryForRun(workflows),
+    ...(parent.context.providerBindings === undefined ? {} : { providerBindings: parent.context.providerBindings }),
+    ...(parent.context.codexOptions === undefined ? {} : { codexOptions: parent.context.codexOptions })
+  };
 }
 
 function promoteWorkflowStepOutputs(
@@ -8103,6 +8345,7 @@ function pauseForNestedWorkflow(
   runId: string,
   step: AgentFlowWorkflowStep,
   attempt: number,
+  retryAttemptIndex: number,
   childRunId: string,
   completedSteps: string[],
   routingBudget: SuccessfulRoutingBudget,
@@ -8119,6 +8362,7 @@ function pauseForNestedWorkflow(
     validOutcomes: [],
     childRunId,
     workflowName: normalizedTarget(step.workflow),
+    retryAttemptIndex,
     completedSteps: [...completedSteps],
     routing: serializeRoutingBudget(routingBudget)
   };
@@ -8180,15 +8424,51 @@ async function resumeNestedWorkflowWaitingStep(
     event: { type: "run.resume", stepId: waiting.stepId, payload: { childRunId: waiting.childRunId } }
   });
   store.updateRun(runId, { context: resumedContext, error: null });
-  if (childResult.status !== "completed") {
-    const message = childResult.message ?? `Child workflow run ${waiting.childRunId} ${childResult.status}.`;
-    persistWorkflowStepFailure(store, runId, waiting.stepId, waiting.attempt, message);
+  const routeFailure = (message: string): ResumedWaitingStep => {
+    const retryable = waiting.retryAttemptIndex! <= failureRetries(step);
+    persistWorkflowStepFailure(
+      store,
+      runId,
+      waiting.stepId,
+      waiting.attempt,
+      message,
+      retryable,
+      failureOutcome(step, retryable)
+    );
+    if (retryable) {
+      return {
+        steps: location.steps,
+        nextIndex: location.index,
+        completedSteps: waiting.completedSteps,
+        routingBudget,
+        pendingRetryAttemptIndex: waiting.retryAttemptIndex
+      };
+    }
+    if (failureContinues(step)) {
+      const routed = fallthroughAfterStep(
+        store, runId, waiting.completedSteps, waiting.stepId, location.steps, location.index, routingBudget
+      );
+      return "result" in routed
+        ? routed
+        : { ...routed, completedSteps: waiting.completedSteps, routingBudget };
+    }
     return { result: finishFailure(
       store, runId, waiting.completedSteps, waiting.stepId,
       { exitCode: null, timedOut: false, message }, failureStatus(step), routingBudget.terminalEffects
     ) };
+  };
+  if (childResult.status !== "completed") {
+    const message = childResult.message ?? `Child workflow run ${waiting.childRunId} ${childResult.status}.`;
+    return routeFailure(message);
   }
-  const outputs = promoteWorkflowStepOutputs(store, runId, waiting.childRunId, step);
+  let outputs: string[];
+  try {
+    outputs = promoteWorkflowStepOutputs(store, runId, waiting.childRunId, step);
+  } catch (error) {
+    const lockError = store.runLockInterruption();
+    if (lockError !== undefined) throw lockError;
+    return routeFailure(redactAgentFlowSensitiveText(error instanceof Error ? error.message : String(error)));
+  }
   const output = { attempt: waiting.attempt, workflow: waiting.workflowName, childRunId: waiting.childRunId, outputs };
   store.upsertStep({ runId, stepId: waiting.stepId, attempt: waiting.attempt, status: "completed", output });
   store.appendRunEvent(runId, { type: "step.completed", stepId: waiting.stepId, payload: output });
@@ -8205,7 +8485,9 @@ function persistWorkflowStepFailure(
   runId: string,
   stepId: string,
   attempt: number,
-  message: string
+  message: string,
+  retryable: boolean,
+  outcome: AgentFlowFailureOutcome
 ): void {
   const persisted = persistAgentFlowFailurePayload(store, {
     id: `workflow:${safeId(stepId)}:attempt-${attempt}`,
@@ -8216,9 +8498,9 @@ function persistWorkflowStepFailure(
     exitCode: null,
     summary: message,
     classification: "workflow_failure",
-    retryable: false,
-    outcome: "fail",
-    indexPayload: { attempt, message, outcome: "fail" }
+    retryable,
+    outcome,
+    indexPayload: { attempt, message, outcome }
   });
   const error = { ...persisted.indexPayload, ...failureReference(persisted) };
   store.upsertStep({ runId, stepId, attempt, status: "failed", error });
@@ -8292,8 +8574,7 @@ function codexMcpCallRegistry(
       outputs: [...mcpRequest.outputs],
       repoRoot: store.repoRoot,
       canModifyFiles: false,
-      signal: mcpRequest.signal,
-      reportExternalSessionId: (candidate) => { externalSessionId = candidate; }
+      signal: mcpRequest.signal
     };
     adapter.preflight?.(providerRequest);
     reserveAgentFlowSessionModelCallBudgets(
@@ -8308,6 +8589,31 @@ function codexMcpCallRegistry(
       externalSessionId: externalSessionId ?? null,
       state: { resume: true, lastStepId: mcpRequest.stepId, mcp: true }
     });
+    providerRequest.reportExternalSessionId = (candidate) => {
+      const reported = normalizedTarget(candidate);
+      if (reported === undefined) {
+        throw new AgentFlowSessionRequestError(
+          `Codex provider ${provider} reported an invalid persistent external session ID.`,
+          "AGENT_FLOW_SESSION_RESPONSE_INVALID"
+        );
+      }
+      if (externalSessionId !== undefined && reported !== externalSessionId) {
+        throw new AgentFlowSessionRequestError(
+          `Codex provider ${provider} reported an external session ID that differs from the persisted ID for session ${sessionId}.`,
+          "AGENT_FLOW_SESSION_RESPONSE_INVALID"
+        );
+      }
+      externalSessionId = reported;
+      store.upsertSession({
+        id: sessionId,
+        runId,
+        stepId: mcpRequest.stepId,
+        provider,
+        status: "running",
+        externalSessionId: reported,
+        state: { resume: true, lastStepId: mcpRequest.stepId, mcp: true, externalSessionEstablished: true }
+      });
+    };
     let response: AgentFlowSessionProviderResponse;
     try {
       response = await invokeAgentFlowSessionProvider(adapter, providerRequest, undefined);
@@ -8319,18 +8625,37 @@ function codexMcpCallRegistry(
       });
       throw error;
     }
-    externalSessionId = response.externalSessionId ?? externalSessionId;
-    const calls = response.metadata?.mcpCalls;
-    const matched = Array.isArray(calls) && calls.some((call) => mapping(call)?.status === "completed"
-      && mapping(call)?.server === mcpRequest.server && mapping(call)?.tool === mcpRequest.tool);
+    if (response.externalSessionId !== undefined) {
+      const returned = normalizedTarget(response.externalSessionId);
+      if (returned === undefined || externalSessionId !== undefined && returned !== externalSessionId) {
+        store.upsertSession({
+          id: sessionId, runId, stepId: mcpRequest.stepId, provider, status: "failed",
+          externalSessionId: externalSessionId ?? null,
+          state: { resume: true, lastStepId: mcpRequest.stepId, mcp: true, error: "external_session_identity_mismatch" }
+        });
+        throw new AgentFlowSessionRequestError(
+          `Codex provider ${provider} returned an external session ID that differs from the persisted ID for session ${sessionId}.`,
+          "AGENT_FLOW_SESSION_RESPONSE_INVALID"
+        );
+      }
+      externalSessionId = returned;
+    }
+    const rawCalls = response.metadata?.mcpCalls;
+    const calls = Array.isArray(rawCalls) ? rawCalls.map(mapping) : [];
+    const call = calls.length === 1 ? calls[0] : undefined;
+    const matched = call !== undefined
+      && call.status === "completed"
+      && call.server === mcpRequest.server
+      && call.tool === mcpRequest.tool
+      && isDeepStrictEqual(call.arguments, mcpRequest.arguments);
     if (!matched) {
       store.upsertSession({
         id: sessionId, runId, stepId: mcpRequest.stepId, provider, status: "failed",
         externalSessionId: externalSessionId ?? null,
-        state: { resume: true, lastStepId: mcpRequest.stepId, mcp: true, error: "matching_mcp_event_missing" }
+        state: { resume: true, lastStepId: mcpRequest.stepId, mcp: true, error: "exact_mcp_event_mismatch" }
       });
       throw new AgentFlowMcpCallError(
-        `Codex completed without a matching MCP event for ${mcpRequest.server}.${mcpRequest.tool}.`,
+        `Codex completed without exactly one matching MCP event for ${mcpRequest.server}.${mcpRequest.tool} and its declared arguments.`,
         "AGENT_FLOW_MCP_CODEX_EVENT_MISSING"
       );
     }

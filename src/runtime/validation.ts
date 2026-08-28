@@ -90,6 +90,7 @@ const TARGET_FIELDS = new Set(["else", "goto", "on_approve", "on_cancel", "on_re
 const RECOVERY_ROUTE_STEP_TYPES = new Set(["artifact_transform", "command", "mcp_call", "session_request"]);
 const SHELL_EXECUTABLES = new Set(["bash", "dash", "ksh", "sh", "zsh"]);
 const SHELL_ANALYSIS_BUDGET = 65_536;
+const CODEX_REASONING_EFFORTS = new Set(["minimal", "low", "medium", "high", "xhigh"]);
 export const AGENT_FLOW_COLLABORATION_AUTHORITY_CAPABILITIES = [
   "can_advise",
   "can_approve",
@@ -540,6 +541,8 @@ function validateSessionDefinitions(workflow: AgentFlowWorkflow, errors: AgentFl
         }
       }
 
+      validateCodexOptions(value.codex, `sessions.${name}.codex`, errors);
+
       if (value.resume !== undefined && typeof value.resume !== "boolean") {
         errors.push({
           code: "workflow.session.resume.invalid",
@@ -767,6 +770,61 @@ function validateStepShapes(contexts: StepContext[], errors: AgentFlowWorkflowIs
     }
 
     validateRequiredStepFields(context, errors);
+    validateCodexOptions(context.step.codex, `${context.path}.codex`, errors, context.id);
+  }
+}
+
+function validateCodexOptions(
+  value: unknown,
+  pathPrefix: string,
+  errors: AgentFlowWorkflowIssue[],
+  stepId?: string
+): void {
+  if (value === undefined) return;
+  if (!isRecord(value)) {
+    errors.push({
+      code: "workflow.codex.options.invalid",
+      message: "Codex options must be a mapping.",
+      path: pathPrefix,
+      ...(stepId === undefined ? {} : { stepId })
+    });
+    return;
+  }
+  for (const field of Object.keys(value).filter((field) => !["profile", "model", "reasoning_effort"].includes(field))) {
+    errors.push({
+      code: "workflow.codex.option.unsupported",
+      message: `Codex option ${JSON.stringify(field)} is not supported.`,
+      path: `${pathPrefix}.${field}`,
+      ...(stepId === undefined ? {} : { stepId })
+    });
+  }
+  if (value.profile !== undefined
+      && (typeof value.profile !== "string" || !/^[A-Za-z0-9_-]+$/.test(value.profile))) {
+    errors.push({
+      code: "workflow.codex.profile.invalid",
+      message: "Codex profile must contain only letters, numbers, hyphens, and underscores.",
+      path: `${pathPrefix}.profile`,
+      ...(stepId === undefined ? {} : { stepId })
+    });
+  }
+  if (value.model !== undefined
+      && (typeof value.model !== "string" || value.model.trim().length === 0 || value.model !== value.model.trim()
+        || /[\u0000-\u001F\u007F-\u009F]/u.test(value.model))) {
+    errors.push({
+      code: "workflow.codex.model.invalid",
+      message: "Codex model must be non-empty text without surrounding whitespace or control characters.",
+      path: `${pathPrefix}.model`,
+      ...(stepId === undefined ? {} : { stepId })
+    });
+  }
+  if (value.reasoning_effort !== undefined
+      && (typeof value.reasoning_effort !== "string" || !CODEX_REASONING_EFFORTS.has(value.reasoning_effort))) {
+    errors.push({
+      code: "workflow.codex.reasoning_effort.invalid",
+      message: "Codex reasoning_effort must be minimal, low, medium, high, or xhigh.",
+      path: `${pathPrefix}.reasoning_effort`,
+      ...(stepId === undefined ? {} : { stepId })
+    });
   }
 }
 
@@ -822,15 +880,16 @@ function validateRequiredStepFields(context: StepContext, errors: AgentFlowWorkf
   }
 
   const sessionApproval = context.type === "approval" && nonEmptyString(context.step.reviewer) !== "human";
-  if ((context.type === "command" || context.type === "artifact_transform" || context.type === "session_request" || context.type === "mcp_call" || sessionApproval) && isRecord(context.step.on_failure)) {
+  if ((context.type === "command" || context.type === "artifact_transform" || context.type === "session_request"
+      || context.type === "mcp_call" || context.type === "workflow" || sessionApproval) && isRecord(context.step.on_failure)) {
     const failureLabel = context.type === "command"
       ? "Command"
       : context.type === "artifact_transform" ? "Artifact transform" : context.type === "mcp_call" ? "MCP call"
-        : context.type === "approval" ? "Approval" : "Session request";
+        : context.type === "workflow" ? "Workflow" : context.type === "approval" ? "Approval" : "Session request";
     const failureCode = context.type === "command"
       ? "workflow.command"
       : context.type === "artifact_transform" ? "workflow.artifact_transform" : context.type === "mcp_call" ? "workflow.mcp_call"
-        : context.type === "approval" ? "workflow.approval" : "workflow.session_request";
+        : context.type === "workflow" ? "workflow.workflow" : context.type === "approval" ? "workflow.approval" : "workflow.session_request";
     const retry = context.step.on_failure.retry;
     const failureThen = typeof context.step.on_failure.then === "string"
       ? context.step.on_failure.then.trim()
@@ -853,7 +912,8 @@ function validateRequiredStepFields(context: StepContext, errors: AgentFlowWorkf
         `${failureLabel} failures may continue or be ignored only when on_failure.allowed is true.`
       );
     }
-    if (context.type === "artifact_transform" || context.type === "session_request" || context.type === "mcp_call" || sessionApproval) {
+    if (context.type === "artifact_transform" || context.type === "session_request" || context.type === "mcp_call"
+        || context.type === "workflow" || sessionApproval) {
       const unsupportedTarget = unsupportedTransformFailureTarget(context.step.on_failure);
       if (unsupportedTarget !== undefined) {
         addStepIssue(

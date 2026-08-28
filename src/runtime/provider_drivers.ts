@@ -203,10 +203,14 @@ async function invokeCodexCli(
           if (isRecord(event) && event.type === "thread.started") reportThread(event.thread_id);
           if (isRecord(event) && event.type === "item.completed" && isRecord(event.item)
               && event.item.type === "mcp_tool_call") {
+            const arguments_ = codexMcpArguments(event.item.arguments);
             observedMcpCalls.push({
               ...(typeof event.item.server === "string" ? { server: event.item.server } : {}),
               ...(typeof event.item.tool === "string" ? { tool: event.item.tool } : {}),
-              status: "completed"
+              ...(arguments_ === undefined ? {} : { arguments: arguments_ }),
+              status: typeof event.item.status === "string"
+                ? event.item.status
+                : event.item.error === undefined || event.item.error === null ? "completed" : "failed"
             });
           }
         }
@@ -1238,6 +1242,21 @@ function parseJsonObject(source: string, label: string): Record<string, unknown>
   try { value = JSON.parse(source); } catch { throw providerError(`${label} is not valid JSON.`); }
   if (!isRecord(value)) throw providerError(`${label} must be a JSON object.`);
   return value;
+}
+
+function codexMcpArguments(value: unknown): AgentFlowRunStateValue | undefined {
+  if (typeof value === "string") {
+    try {
+      return JSON.parse(value) as AgentFlowRunStateValue;
+    } catch {
+      return undefined;
+    }
+  }
+  if (value === null || typeof value === "boolean" || typeof value === "number"
+      || Array.isArray(value) || isRecord(value)) {
+    return value as AgentFlowRunStateValue;
+  }
+  return undefined;
 }
 
 function optionalString(value: unknown): string | undefined {

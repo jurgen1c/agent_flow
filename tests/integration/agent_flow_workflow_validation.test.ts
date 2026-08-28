@@ -1933,6 +1933,52 @@ steps:
     ]);
   });
 
+  test("validates Codex profile and reasoning options on sessions and steps", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: invalid-codex-options
+version: 1
+style: pipeline
+maturity: experimental
+limits: { max_frontier_calls: 1 }
+sessions:
+  worker:
+    provider: codex
+    codex: { profile: ../bad, reasoning_effort: extreme }
+steps:
+  - id: ask
+    type: session_request
+    session: worker
+    prompt: request.md
+    inputs: [input.md]
+    outputs: [output.md]
+    codex: { profile: ../step, reasoning_effort: extreme }
+`);
+
+    expect(validateAgentFlowWorkflow(workflow).errors).toEqual([
+      {
+        code: "workflow.codex.profile.invalid",
+        message: "Codex profile must contain only letters, numbers, hyphens, and underscores.",
+        path: "sessions.worker.codex.profile"
+      },
+      {
+        code: "workflow.codex.reasoning_effort.invalid",
+        message: "Codex reasoning_effort must be minimal, low, medium, high, or xhigh.",
+        path: "sessions.worker.codex.reasoning_effort"
+      },
+      {
+        code: "workflow.codex.profile.invalid",
+        message: "Codex profile must contain only letters, numbers, hyphens, and underscores.",
+        path: "steps[0].codex.profile",
+        stepId: "ask"
+      },
+      {
+        code: "workflow.codex.reasoning_effort.invalid",
+        message: "Codex reasoning_effort must be minimal, low, medium, high, or xhigh.",
+        path: "steps[0].codex.reasoning_effort",
+        stepId: "ask"
+      }
+    ]);
+  });
+
   test("rejects malformed session authority mappings and capability flags", () => {
     const workflow = parseAgentFlowWorkflowOrThrow(`name: malformed-session-authority
 version: 1
