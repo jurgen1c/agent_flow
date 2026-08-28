@@ -220,6 +220,7 @@ inputs:
   ticket: { required: true }
   count: {}
   enabled: {}
+  __proto__: {}
 steps:
   - { id: done, type: result, status: completed }
 `);
@@ -228,10 +229,14 @@ steps:
 
     expect(await captureCli([
       "run", "workflow.yml", "--id", "input-run", "--fixture", "fixture.json",
-      "--input-file", "inputs.json", "--input", "ticket=CLI-7", "--input", "enabled=true"
+      "--input-file", "inputs.json", "--input", "ticket=CLI-7", "--input", "enabled=true",
+      "--input", "__proto__=prototype-safe"
     ], repo)).toMatchObject({ exitCode: 0 });
     const store = await openAgentFlowRunState({ cwd: repo });
-    expect(store.getRun("input-run")?.inputs).toEqual({ ticket: "CLI-7", count: 2, enabled: true });
+    const persistedInputs = store.getRun("input-run")?.inputs;
+    expect(persistedInputs).toMatchObject({ ticket: "CLI-7", count: 2, enabled: true });
+    expect(Object.hasOwn(persistedInputs!, "__proto__")).toBe(true);
+    expect(persistedInputs?.__proto__).toBe("prototype-safe");
     store.close();
 
     const duplicate = await captureCli([

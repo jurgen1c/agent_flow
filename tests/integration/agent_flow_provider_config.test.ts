@@ -812,6 +812,7 @@ providers:
     fs.writeFileSync(ambientConfig, "[mcp_servers.atlassian]\ncommand = 'ambient-mcp'\n");
     fs.writeFileSync(ambientSkill, "ambient skill\n");
     fs.writeFileSync(path.join(fake.root, "read-path"), `${ambientConfig}\n${ambientSkill}\n`);
+    fs.writeFileSync(path.join(fake.root, "emit-ambient-mcp"), "enabled\n");
     const env = {
       PATH: `${fake.bin}:${process.env.PATH ?? ""}`,
       CODEX_HOME: fake.root,
@@ -833,6 +834,8 @@ providers:
     await registry.get("coder")!({ ...request, externalSessionId: first.externalSessionId });
 
     expect(first).toMatchObject({ externalSessionId: "codex-thread-1", outputs: { "draft.md": "codex output\n" } });
+    expect(first.metadata).not.toHaveProperty("mcpCalls");
+    expect(JSON.stringify(first.metadata)).not.toContain("ambient-secret");
     expect(ids).toEqual(["codex-thread-1", "codex-thread-1"]);
     const invocations = fs.readFileSync(fake.log, "utf8").trim().split("\n")
       .map((line) => JSON.parse(line) as { args: string[]; unrelatedSecret?: string; hostReads?: Array<string | null> });
@@ -1953,6 +1956,18 @@ if (splitUtf8) {
   }, 20);
 } else {
   fs.writeSync(1, threadEvent);
+  if (fs.existsSync(path.join(root, "emit-ambient-mcp"))) {
+    fs.writeSync(1, JSON.stringify({
+      type: "item.completed",
+      item: {
+        type: "mcp_tool_call",
+        server: "ambient",
+        tool: "lookup",
+        arguments: { token: "ambient-secret" },
+        status: "completed"
+      }
+    }) + "\n");
+  }
   fs.writeSync(1, JSON.stringify({ type: "turn.completed" }) + "\n");
 }
 `, { mode: 0o755 });

@@ -104,6 +104,7 @@ export interface AgentFlowSessionProviderRequest {
   };
   signal: AbortSignal;
   reportExternalSessionId?: (externalSessionId: string) => void;
+  captureMcpCallEvidence?: boolean;
 }
 
 export interface AgentFlowSessionProviderOutput {

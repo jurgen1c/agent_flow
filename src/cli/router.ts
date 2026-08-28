@@ -888,7 +888,10 @@ function parseRunInputs(
   values: string[]
 ): { ok: true; inputs: Record<string, import("../runtime/index").AgentFlowRunStateValue> }
   | { ok: false; result: AgentFlowCliResult } {
-  const inputs: Record<string, import("../runtime/index").AgentFlowRunStateValue> = {};
+  const inputs = Object.create(null) as Record<
+    string,
+    import("../runtime/index").AgentFlowRunStateValue
+  >;
   for (const value of values) {
     const separator = value.indexOf("=");
     if (separator < 1) {

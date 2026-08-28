@@ -8752,6 +8752,7 @@ function codexMcpCallRegistry(
       outputs: [...mcpRequest.outputs],
       repoRoot: store.repoRoot,
       canModifyFiles: false,
+      captureMcpCallEvidence: true,
       signal: mcpRequest.signal
     };
     adapter.preflight?.(providerRequest);

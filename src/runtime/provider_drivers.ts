@@ -201,7 +201,8 @@ async function invokeCodexCli(
             throw providerError("Codex CLI emitted malformed JSONL output.");
           }
           if (isRecord(event) && event.type === "thread.started") reportThread(event.thread_id);
-          if (isRecord(event) && event.type === "item.completed" && isRecord(event.item)
+          if (request.captureMcpCallEvidence === true
+              && isRecord(event) && event.type === "item.completed" && isRecord(event.item)
               && event.item.type === "mcp_tool_call") {
             const arguments_ = codexMcpArguments(event.item.arguments);
             observedMcpCalls.push({
