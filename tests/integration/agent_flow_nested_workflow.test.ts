@@ -636,6 +636,47 @@ steps:
     store.close();
   });
 
+  test("records an in-flight child cancellation as an interruption instead of a failure", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-running-cancel-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: running-cancel-child
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: wait, type: command, command: sleep 2 }
+`);
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: running-cancel-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: child, type: workflow, workflow: running-cancel-child, inputs: {}, outputs: [never.txt] }
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register(parent.name, parent)
+      .register(child.name, child);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, { id: "running-cancel-parent", workflow: parent });
+
+    const execution = executeAgentFlowCommandPipeline(
+      store, "running-cancel-parent", parent, undefined, undefined, undefined, undefined, workflows
+    );
+    setTimeout(() => transitionAgentFlowLifecycleRun(store, "running-cancel-parent", "cancel"), 25);
+    expect(await execution).toMatchObject({ status: "cancelled" });
+
+    const childRunId = store.listRuns().find((run) => run.parentRunId === "running-cancel-parent")!.id;
+    expect(store.getRun(childRunId)?.status).toBe("cancelled");
+    expect(store.listSteps("running-cancel-parent").find((step) => step.stepId === "child" && step.attempt === 1))
+      .toMatchObject({ status: "cancelled" });
+    const events = store.listEvents("running-cancel-parent");
+    expect(events.some((event) => event.type === "step.interrupted" && event.stepId === "child")).toBe(true);
+    expect(events.some((event) => event.type === "step.failed" && event.stepId === "child")).toBe(false);
+    store.close();
+  });
+
   test("pins configured providers only for workflows reachable from the active run", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-reachable-provider-"));
     fs.mkdirSync(path.join(repo, ".git"));

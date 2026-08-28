@@ -113,6 +113,89 @@ describe("Agent Flow CLI", () => {
     expect(invalid.stderr).toContain("workflow.loop.unbounded");
   });
 
+  test("validates reachable workflow registries and child input contracts before run creation", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-registry-validation-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const parentPath = path.join(repo, "parent.yml");
+    fs.writeFileSync(parentPath, `
+name: registry-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: child, type: workflow, workflow: registry-child, inputs: { typo: value }, outputs: [out.txt] }
+`);
+
+    const missing = dispatch(["validate", parentPath], { cwd: repo });
+    expect(missing).toMatchObject({ exitCode: 2 });
+    expect(missing.stderr).toContain("references missing workflow registry-child");
+
+    fs.writeFileSync(path.join(repo, "child.yml"), `
+name: registry-child
+version: 1
+style: pipeline
+maturity: experimental
+inputs:
+  ticket: { required: true }
+steps:
+  - { id: done, type: result, status: completed }
+`);
+    const invalidInputs = dispatch(["validate", parentPath], { cwd: repo });
+    expect(invalidInputs).toMatchObject({ exitCode: 2 });
+    expect(invalidInputs.stderr).toContain("supplies unknown inputs to registry-child: typo");
+
+    const run = await captureCli(["run", parentPath, "--id", "invalid-child-contract"], repo);
+    expect(run).toMatchObject({ exitCode: 1 });
+    expect(run.stderr).toContain("supplies unknown inputs to registry-child: typo");
+    const store = await openAgentFlowRunState({ cwd: repo });
+    expect(store.getRun("invalid-child-contract")).toBeNull();
+    store.close();
+  });
+
+  test("uses configured target drivers when validating Codex-mediated MCP calls", () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-codex-driver-validation-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const configHome = path.join(repo, "config");
+    fs.mkdirSync(path.join(configHome, "agent-flow"), { recursive: true });
+    fs.writeFileSync(path.join(repo, ".agent-flow.yml"), `
+version: 1
+providers:
+  wrong: { kind: frontier, target: claude-main }
+`);
+    fs.writeFileSync(path.join(configHome, "agent-flow", "config.yml"), `
+version: 1
+targets:
+  claude-main:
+    kind: frontier
+    driver: claude-code
+    model: claude-test
+    enabled: true
+`);
+    const workflowPath = path.join(repo, "workflow.yml");
+    fs.writeFileSync(workflowPath, `
+name: wrong-codex-driver
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  agent: { provider: wrong, resume: true }
+limits: { max_frontier_calls: 1 }
+steps:
+  - { id: fetch, type: mcp_call, via: codex, session: agent, server: jira, tool: get, arguments: {}, outputs: [out.json] }
+`);
+    const fixturePath = path.join(repo, "fixture.json");
+    fs.writeFileSync(fixturePath, JSON.stringify({ artifacts: {} }));
+    const options = { cwd: repo, env: { XDG_CONFIG_HOME: configHome } };
+
+    for (const result of [
+      dispatch(["validate", workflowPath], options),
+      dispatch(["simulate", workflowPath, "--fixture", fixturePath], options)
+    ]) {
+      expect(result).toMatchObject({ exitCode: 2 });
+      expect(result.stderr).toContain("workflow.mcp_call.session.provider.invalid");
+    }
+  });
+
   test("lints workflows without rewriting them", () => {
     const fixturePath = path.join(repoRoot, "tests/fixtures/agent-flow/workflows/content-review-collab.yml");
     const before = fs.readFileSync(fixturePath, "utf8");

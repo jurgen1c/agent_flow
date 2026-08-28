@@ -70,11 +70,11 @@ export function loadAgentFlowWorkflowRegistry(
       return [];
     }
   });
+  const entryWorkflow = loaded.find((candidate) => candidate.file === entry)?.workflow;
+  if (entryWorkflow === undefined) throw new Error(`Entry workflow ${entry} was not loaded.`);
   if (configuredPath !== undefined) {
     for (const { workflow } of loaded) registry.register(workflow.name, workflow);
   } else {
-    const entryWorkflow = loaded.find((candidate) => candidate.file === entry)?.workflow;
-    if (entryWorkflow === undefined) throw new Error(`Entry workflow ${entry} was not loaded.`);
     const candidates = new Map<string, AgentFlowWorkflow[]>();
     for (const { workflow } of loaded) {
       candidates.set(workflow.name, [...(candidates.get(workflow.name) ?? []), workflow]);
@@ -91,7 +91,8 @@ export function loadAgentFlowWorkflowRegistry(
     };
     registerReachable(entryWorkflow);
   }
-  assertAcyclicWorkflowRegistry(registry);
+  assertAcyclicWorkflowRegistry(registry, [entryWorkflow.name]);
+  assertWorkflowStepInputContracts(registry, [entryWorkflow.name]);
   return registry;
 }
 
@@ -129,6 +130,7 @@ export function createAgentFlowWorkflowRegistryFromSnapshot(
     registry.register(name, workflow as AgentFlowWorkflow);
   }
   assertAcyclicWorkflowRegistry(registry);
+  assertWorkflowStepInputContracts(registry);
   return registry;
 }
 
@@ -152,7 +154,10 @@ function siblingWorkflowFiles(source: string): string[] {
   );
 }
 
-function assertAcyclicWorkflowRegistry(registry: AgentFlowWorkflowRegistry): void {
+function assertAcyclicWorkflowRegistry(
+  registry: AgentFlowWorkflowRegistry,
+  roots: string[] = registry.names()
+): void {
   const visiting = new Set<string>();
   const visited = new Set<string>();
   const visit = (name: string, lineage: string[]): void => {
@@ -170,7 +175,67 @@ function assertAcyclicWorkflowRegistry(registry: AgentFlowWorkflowRegistry): voi
     visiting.delete(name);
     visited.add(name);
   };
-  registry.names().forEach((name) => visit(name, []));
+  roots.forEach((name) => visit(name, []));
+}
+
+function assertWorkflowStepInputContracts(
+  registry: AgentFlowWorkflowRegistry,
+  roots: string[] = registry.names()
+): void {
+  const reachable = new Set<string>();
+  const visit = (name: string): void => {
+    if (reachable.has(name)) return;
+    reachable.add(name);
+    const workflow = registry.get(name);
+    if (workflow === undefined) return;
+    referencedWorkflowNames(workflow.steps).forEach(visit);
+  };
+  roots.forEach(visit);
+  for (const parentName of [...reachable].sort()) {
+    const parent = registry.get(parentName)!;
+    for (const step of workflowSteps(parent.steps)) {
+      if (typeof step.type !== "string" || step.type.trim() !== "workflow") continue;
+      if (typeof step.workflow !== "string" || step.workflow.trim().length === 0) continue;
+      const childName = step.workflow.trim();
+      const child = registry.get(childName);
+      if (child === undefined) continue;
+      const inputs = step.inputs;
+      if (inputs === null || typeof inputs !== "object" || Array.isArray(inputs)) continue;
+      const supplied = Object.keys(inputs);
+      const unknown = supplied.filter((name) => !Object.hasOwn(child.inputs ?? {}, name)).sort();
+      if (unknown.length > 0) {
+        throw new Error(
+          `Workflow ${parentName} step ${String(step.id ?? "(unnamed)")} supplies unknown inputs to ${childName}: ${unknown.join(", ")}.`
+        );
+      }
+      const missing = Object.entries(child.inputs ?? {}).flatMap(([name, definition]) =>
+        definition !== null && typeof definition === "object" && !Array.isArray(definition)
+          && definition.required === true && !Object.hasOwn(inputs, name) ? [name] : []
+      ).sort();
+      if (missing.length > 0) {
+        throw new Error(
+          `Workflow ${parentName} step ${String(step.id ?? "(unnamed)")} omits required inputs for ${childName}: ${missing.join(", ")}.`
+        );
+      }
+    }
+  }
+}
+
+function workflowSteps(steps: AgentFlowWorkflowStep[]): AgentFlowWorkflowStep[] {
+  const collected: AgentFlowWorkflowStep[] = [];
+  const visit = (step: AgentFlowWorkflowStep): void => {
+    collected.push(step);
+    for (const field of ["body", "steps", "branches"] as const) {
+      const nested = step[field];
+      if (Array.isArray(nested)) nested.forEach((candidate) => {
+        if (candidate !== null && typeof candidate === "object" && !Array.isArray(candidate)) {
+          visit(candidate as AgentFlowWorkflowStep);
+        }
+      });
+    }
+  };
+  steps.forEach(visit);
+  return collected;
 }
 
 function referencedWorkflowNames(steps: AgentFlowWorkflowStep[]): string[] {

@@ -753,6 +753,11 @@ async function runAgentFlowCommandPipeline(
           const child = await executeNestedWorkflowStep(
             store, runId, workflow, step, attempt, transforms, sessionProviders, mcpCalls, notifications, workflows
           );
+          const stopped = activeStopStatus(store, runId);
+          if (stopped !== undefined) {
+            persistWorkflowStepInterruption(store, runId, stepId, attempt, child.runId, stopped);
+            return stoppedPipelineResult(store, runId, completedSteps)!;
+          }
           if (child.status === "paused") {
             return pauseForNestedWorkflow(
               store, runId, step, attempt, attemptIndex, child.runId, completedSteps, routingBudget, child.message
@@ -8190,8 +8195,14 @@ function validateWorkflowStep(
 ): string | undefined {
   const workflowName = normalizedTarget(step.workflow);
   if (workflowName === undefined) return "Workflow step requires a static non-empty workflow name.";
-  if (workflows.get(workflowName) === undefined) return `Workflow ${workflowName} is not registered.`;
-  if (mapping(step.inputs) === undefined) return "Workflow step inputs must be a mapping.";
+  const workflow = workflows.get(workflowName);
+  if (workflow === undefined) return `Workflow ${workflowName} is not registered.`;
+  const inputs = mapping(step.inputs);
+  if (inputs === undefined) return "Workflow step inputs must be a mapping.";
+  const unknown = Object.keys(inputs).filter((name) => !Object.hasOwn(workflow.inputs ?? {}, name)).sort();
+  if (unknown.length > 0) return `Child workflow ${workflowName} received unknown inputs: ${unknown.join(", ")}.`;
+  const missing = requiredWorkflowInputNames(workflow).filter((name) => !Object.hasOwn(inputs, name));
+  if (missing.length > 0) return `Child workflow ${workflowName} is missing required inputs: ${missing.join(", ")}.`;
   if (!nonEmptyStringArray(step.outputs)) return "Workflow step outputs must declare at least one child artifact path.";
   try {
     for (const output of step.outputs) normalizeAgentFlowArtifactPath(output);
@@ -8199,6 +8210,25 @@ function validateWorkflowStep(
     return error instanceof Error ? error.message : String(error);
   }
   return undefined;
+}
+
+function requiredWorkflowInputNames(workflow: AgentFlowWorkflow): string[] {
+  return Object.entries(workflow.inputs ?? {}).flatMap(([name, definition]) =>
+    mapping(definition)?.required === true ? [name] : []
+  ).sort();
+}
+
+function persistWorkflowStepInterruption(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  stepId: string,
+  attempt: number,
+  childRunId: string,
+  status: AgentFlowRunStopStatus
+): void {
+  const output = { attempt, childRunId, status };
+  store.upsertStep({ runId, stepId, attempt, status, output });
+  store.appendRunEvent(runId, { type: "step.interrupted", stepId, payload: output });
 }
 
 function resolveWorkflowStepInputs(

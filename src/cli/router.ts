@@ -1354,11 +1354,9 @@ function simulateWorkflow(args: string[], options: AgentFlowCliOptions): AgentFl
   const [workflowPath, , fixturePath] = args;
   const workflowResult = readWorkflow(workflowPath, "simulate");
   if ("exitCode" in workflowResult) return workflowResult;
-  const aliasResult = repositoryProviderAliases(options);
-  if (!aliasResult.ok) return aliasResult.result;
-  const aliases = aliasResult.aliases;
-  const providerKind = (provider: string) => provider === "codex" ? "frontier"
-    : Object.hasOwn(aliases, provider) ? aliases[provider]!.kind : undefined;
+  const providerResult = configuredProviderResolver([workflowResult.workflow], options);
+  if (!providerResult.ok) return providerResult.result;
+  const providerKind = providerResult.providerKind;
   const configuredValidation = validateAgentFlowWorkflow(
     workflowResult.workflow,
     providerKind
@@ -1411,19 +1409,33 @@ function checkWorkflow(
   const workflowResult = readWorkflow(workflowPath, command);
   if ("exitCode" in workflowResult) return workflowResult;
   const workflow = workflowResult.workflow;
-  const aliasResult = repositoryProviderAliases(options);
-  if (!aliasResult.ok) return aliasResult.result;
-  const aliases = aliasResult.aliases;
-  const providerKind = (provider: string) => provider === "codex" ? "frontier"
-    : Object.hasOwn(aliases, provider) ? aliases[provider]!.kind : undefined;
-  const configuredValidation = validateAgentFlowWorkflow(
-    workflow,
-    providerKind
-  );
-  if (!configuredValidation.valid) {
+  let workflows = [workflow];
+  if (command === "validate" || command === "lint") {
+    try {
+      const registry = reachableWorkflowRegistry(
+        loadAgentFlowWorkflowRegistry(workflowPath, { cwd: options.cwd }),
+        workflow.name
+      );
+      workflows = registry.names().map((name) => registry.get(name)!);
+    } catch (error) {
+      return {
+        exitCode: 2,
+        stderr: `Agent Flow ${command} failed: ${workflowPath}\n${error instanceof Error ? error.message : String(error)}`
+      };
+    }
+  }
+  const providerResult = configuredProviderResolver(workflows, options);
+  if (!providerResult.ok) return providerResult.result;
+  const providerKind = providerResult.providerKind;
+  const configuredValidations = workflows.map((registeredWorkflow) => ({
+    workflow: registeredWorkflow,
+    validation: validateAgentFlowWorkflow(registeredWorkflow, providerKind)
+  }));
+  const invalidConfiguredWorkflow = configuredValidations.find(({ validation }) => !validation.valid);
+  if (invalidConfiguredWorkflow !== undefined) {
     return {
       exitCode: 2,
-      stderr: `Agent Flow ${command} failed: ${workflowPath}\n${formatAgentFlowWorkflowIssues(configuredValidation.errors)}`
+      stderr: `Agent Flow ${command} failed: ${workflowPath} (${invalidConfiguredWorkflow.workflow.name})\n${formatAgentFlowWorkflowIssues(invalidConfiguredWorkflow.validation.errors)}`
     };
   }
 
@@ -1449,7 +1461,9 @@ function checkWorkflow(
   }
 
   if (command === "validate") {
-    const warnings = lintAgentFlowWorkflow(workflow, providerKind).warnings;
+    const warnings = workflows.flatMap((registeredWorkflow) =>
+      lintAgentFlowWorkflow(registeredWorkflow, providerKind).warnings
+    );
 
     return warnings.length === 0
       ? { exitCode: 0, stdout: `Agent Flow validation passed: ${workflowPath}` }
@@ -1459,7 +1473,11 @@ function checkWorkflow(
         };
   }
 
-  const lint = lintAgentFlowWorkflow(workflow, providerKind);
+  const lint = {
+    warnings: workflows.flatMap((registeredWorkflow) =>
+      lintAgentFlowWorkflow(registeredWorkflow, providerKind).warnings
+    )
+  };
 
   if (lint.warnings.length === 0) {
     return { exitCode: 0, stdout: `Agent Flow lint passed with no warnings: ${workflowPath}` };
@@ -1477,6 +1495,49 @@ function repositoryProviderAliases(
   | { ok: false; result: AgentFlowCliResult } {
   try {
     return { ok: true, aliases: loadAgentFlowRepositoryProviderAliases({ cwd: options.cwd }) };
+  } catch (error) {
+    return { ok: false, result: { exitCode: 2, stderr: error instanceof Error ? error.message : String(error) } };
+  }
+}
+
+function configuredProviderResolver(
+  workflows: import("../runtime/index").AgentFlowWorkflow[],
+  options: AgentFlowCliOptions
+): {
+  ok: true;
+  providerKind: (provider: string) => "local" | "frontier" | { kind: "local" | "frontier"; driver?: string } | undefined;
+} | { ok: false; result: AgentFlowCliResult } {
+  const aliasResult = repositoryProviderAliases(options);
+  if (!aliasResult.ok) return aliasResult;
+  const aliases = aliasResult.aliases;
+  const selectedAliases = [...new Set(workflows.flatMap((workflow) =>
+    collectWorkflowSteps(workflow.steps).flatMap((step) => {
+      if (String(step.type ?? "").trim() !== "mcp_call" || String(step.via ?? "direct").trim() !== "codex") {
+        return [];
+      }
+      const sessionName = typeof step.session === "string" ? step.session.trim() : "";
+      const session = workflow.sessions?.[sessionName];
+      if (session === null || typeof session !== "object" || Array.isArray(session)) return [];
+      const provider = (session as Record<string, unknown>).provider;
+      return typeof provider === "string" && provider.trim().length > 0 ? [provider.trim()] : [];
+    })
+  ))]
+    .filter((provider) => Object.hasOwn(aliases, provider));
+  try {
+    const catalog = loadAgentFlowProviderCatalog({
+      cwd: options.cwd,
+      env: options.env,
+      homeDir: options.homeDir,
+      aliases: selectedAliases
+    });
+    return {
+      ok: true,
+      providerKind: (provider: string) => provider === "codex"
+        ? { kind: "frontier", driver: "codex-cli" }
+        : Object.hasOwn(catalog.bindings, provider)
+          ? { kind: catalog.bindings[provider]!.kind, driver: catalog.bindings[provider]!.config.driver }
+          : Object.hasOwn(aliases, provider) ? aliases[provider]!.kind : undefined
+    };
   } catch (error) {
     return { ok: false, result: { exitCode: 2, stderr: error instanceof Error ? error.message : String(error) } };
   }
