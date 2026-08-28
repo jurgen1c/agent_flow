@@ -320,33 +320,45 @@ function reachableProviderBindingWorkflows(
     if (visited.has(candidate)) return;
     visited.add(candidate);
     reachable.push(candidate);
-    for (const name of referencedRuntimeWorkflowNames(candidate.steps)) {
+    for (const { name, recovery } of referencedRuntimeWorkflowReferences(candidate.steps)) {
       const referenced = workflows.get(name);
-      if (referenced !== undefined) visit(referenced);
+      if (referenced === undefined) {
+        throw new AgentFlowRunStateError(
+          `${recovery ? "Recovery workflow" : "Referenced workflow"} ${name} is not registered.`,
+          recovery ? "AGENT_FLOW_RECOVERY_WORKFLOW_UNKNOWN" : "AGENT_FLOW_WORKFLOW_REGISTRY_INCOMPLETE"
+        );
+      }
+      visit(referenced);
     }
   };
   visit(workflow);
   return reachable;
 }
 
-function referencedRuntimeWorkflowNames(steps: AgentFlowWorkflowStep[]): string[] {
-  const names = new Set<string>();
+function referencedRuntimeWorkflowReferences(
+  steps: AgentFlowWorkflowStep[]
+): Array<{ name: string; recovery: boolean }> {
+  const references = new Map<string, boolean>();
   const visit = (step: AgentFlowWorkflowStep): void => {
     if (normalizedTarget(step.type) === "workflow") {
       const name = normalizedTarget(step.workflow);
-      if (name !== undefined) names.add(name);
+      if (name !== undefined) references.set(name, false);
     }
     const onFailure = mapping(step.on_failure);
     const route = mapping(onFailure?.route_to);
     const recoveryWorkflow = normalizedTarget(route?.workflow);
-    if (recoveryWorkflow !== undefined) names.add(recoveryWorkflow);
+    if (recoveryWorkflow !== undefined && !references.has(recoveryWorkflow)) {
+      references.set(recoveryWorkflow, true);
+    }
     for (const field of ["body", "steps", "branches"] as const) {
       const nested = step[field];
       if (Array.isArray(nested)) nested.filter(isWorkflowStep).forEach(visit);
     }
   };
   steps.forEach(visit);
-  return [...names].sort();
+  return [...references]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([name, recovery]) => ({ name, recovery }));
 }
 
 function assertPersistedWorkflowIdentity(
@@ -777,6 +789,9 @@ async function runAgentFlowCommandPipeline(
           if (lockError !== undefined) throw lockError;
           const stopped = activeStopStatus(store, runId);
           if (stopped !== undefined) return stoppedPipelineResult(store, runId, completedSteps)!;
+          if (["AGENT_FLOW_RUN_LOCKED", "AGENT_FLOW_RUN_LOCK_LOST"].includes(agentFlowErrorCode(error) ?? "")) {
+            throw error;
+          }
           failure = redactAgentFlowSensitiveText(error instanceof Error ? error.message : String(error));
         }
         const retryable = attemptIndex <= retries;

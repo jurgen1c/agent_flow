@@ -1304,6 +1304,97 @@ steps:
     store.close();
   });
 
+  test("rejects an incomplete programmatic registry before earlier steps can run", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-incomplete-registry-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: incomplete-registry-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: effect, type: command, command: "printf side-effect > marker.txt", outputs: [marker.txt] }
+  - { id: child, type: workflow, workflow: missing-child, inputs: {}, outputs: [never.txt] }
+`);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, { id: "incomplete-registry-parent", workflow: parent });
+
+    await expect(executeAgentFlowCommandPipeline(
+      store,
+      "incomplete-registry-parent",
+      parent,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      createAgentFlowWorkflowRegistry()
+    )).rejects.toMatchObject({ code: "AGENT_FLOW_WORKFLOW_REGISTRY_INCOMPLETE" });
+    expect(store.getRun("incomplete-registry-parent")?.status).toBe("pending");
+    expect(store.listEvents("incomplete-registry-parent").map((event) => event.type))
+      .toEqual(["run.created"]);
+    expect(fs.existsSync(path.join(repo, "marker.txt"))).toBe(false);
+    store.close();
+  });
+
+  test("propagates a live nested child lease without failing or retrying the parent step", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-child-lock-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: locked-child
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: publish, type: command, command: "printf done > done.txt", outputs: [done.txt] }
+`);
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: locked-child-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: child, type: workflow, workflow: locked-child, inputs: {}, outputs: [done.txt], on_failure: { retry: 1 } }
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register(parent.name, parent)
+      .register(child.name, child);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    const competitor = await openAgentFlowRunState({ cwd: repo });
+    const parentRunId = "locked-child-parent";
+    const childRunId = `${parentRunId}:workflow:child-ddc9e669:attempt-1`;
+    createAgentFlowLifecycleRun(store, { id: parentRunId, workflow: parent });
+    createAgentFlowLifecycleRun(store, {
+      id: childRunId,
+      workflow: child,
+      inputs: {},
+      parentRunId
+    });
+    let entered!: () => void;
+    let release!: () => void;
+    const lockEntered = new Promise<void>((resolve) => { entered = resolve; });
+    const lockRelease = new Promise<void>((resolve) => { release = resolve; });
+    const heldLock = competitor.withRunLock(childRunId, "run", async () => {
+      entered();
+      await lockRelease;
+    });
+    await lockEntered;
+
+    await expect(executeAgentFlowCommandPipeline(
+      store, parentRunId, parent, undefined, undefined, undefined, undefined, workflows
+    )).rejects.toMatchObject({ code: "AGENT_FLOW_RUN_LOCKED" });
+    expect(store.getRun(parentRunId)?.status).toBe("running");
+    expect(store.listSteps(parentRunId)).toEqual([
+      expect.objectContaining({ stepId: "child", attempt: 1, status: "running" })
+    ]);
+    expect(store.listEvents(parentRunId).some((event) => event.type === "step.failed")).toBe(false);
+    expect(store.listRuns().filter((run) => run.parentRunId === parentRunId)).toHaveLength(1);
+
+    release();
+    await heldLock;
+    competitor.close();
+    store.close();
+  });
+
   test("uses registry aliases rather than internal workflow names for recursion identity", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-alias-identity-"));
     fs.mkdirSync(path.join(repo, ".git"));
