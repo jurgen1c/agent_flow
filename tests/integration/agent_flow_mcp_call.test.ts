@@ -99,7 +99,12 @@ steps:
         request.reportExternalSessionId?.("profile-thread");
         return {
           externalSessionId: "profile-thread",
-          outputs: { "ticket.json": '{"key":"AF-1"}\n' },
+          outputs: {
+            "ticket.json": {
+              content: '{"key":"AF-1"}\n',
+              contentType: "application/vnd.agent-flow.ticket+json"
+            }
+          },
           metadata: {
             mcpCalls: [{ server: "jira", tool: "get", arguments: { key: "AF-1" }, status: "completed" }]
           }
@@ -115,7 +120,51 @@ steps:
     expect(store.getSession("codex-profile-mcp", "agent")).toMatchObject({
       status: "waiting", externalSessionId: "profile-thread"
     });
+    expect(store.getArtifact("codex-profile-mcp", "ticket.json")?.contentType)
+      .toBe("application/vnd.agent-flow.ticket+json");
     store.close();
+  });
+
+  test("rejects secret-like Codex MCP session IDs before persistence", async () => {
+    for (const source of ["reported", "returned"] as const) {
+      const root = temporaryRepo();
+      const runId = `codex-mcp-sensitive-session-${source}`;
+      const workflow = parseAgentFlowWorkflowOrThrow(`name: ${runId}
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  agent: { provider: codex, resume: true }
+limits:
+  max_frontier_calls: 1
+steps:
+  - { id: fetch, type: mcp_call, via: codex, session: agent, server: jira, tool: get, arguments: {}, outputs: [ticket.json] }
+`);
+      const providers = createAgentFlowSessionProviderRegistry().register("codex", async (request) => {
+        if (source === "reported") {
+          request.reportExternalSessionId?.("Authorization: Bearer codex-mcp-session-secret");
+        }
+        return {
+          ...(source === "returned"
+            ? { externalSessionId: "Authorization: Bearer codex-mcp-session-secret" }
+            : {}),
+          outputs: { "ticket.json": "{}\n" },
+          metadata: { mcpCalls: [{ server: "jira", tool: "get", arguments: {}, status: "completed" }] }
+        };
+      });
+      const store = await openAgentFlowRunState({ cwd: root });
+      createAgentFlowLifecycleRun(store, { id: runId, workflow });
+
+      expect(await executeAgentFlowCommandPipeline(
+        store, runId, workflow, undefined, providers
+      )).toMatchObject({ status: "paused", failedStep: "fetch" });
+      expect(store.getSession(runId, "agent")?.externalSessionId).toBeNull();
+      expect(JSON.stringify(store.getSession(runId, "agent")))
+        .not.toContain("codex-mcp-session-secret");
+      expect(JSON.stringify(store.listEvents(runId)))
+        .not.toContain("codex-mcp-session-secret");
+      store.close();
+    }
   });
 
   test("rejects Codex-mediated outputs without matching completed MCP evidence", async () => {

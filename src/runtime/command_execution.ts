@@ -8816,6 +8816,7 @@ function codexMcpCallRegistry(
           "AGENT_FLOW_SESSION_RESPONSE_INVALID"
         );
       }
+      assertAgentFlowAdapterStringSafe(workflow, "Codex provider external session ID", reported);
       if (externalSessionId !== undefined && reported !== externalSessionId) {
         throw new AgentFlowSessionRequestError(
           `Codex provider ${provider} reported an external session ID that differs from the persisted ID for session ${sessionId}.`,
@@ -8847,6 +8848,9 @@ function codexMcpCallRegistry(
     }
     if (response.externalSessionId !== undefined) {
       const returned = normalizedTarget(response.externalSessionId);
+      if (returned !== undefined) {
+        assertAgentFlowAdapterStringSafe(workflow, "Codex provider external session ID", returned);
+      }
       if (returned === undefined || externalSessionId !== undefined && returned !== externalSessionId) {
         store.upsertSession({
           id: sessionId, runId, stepId: mcpRequest.stepId, provider, status: "failed",
@@ -8884,13 +8888,20 @@ function codexMcpCallRegistry(
       externalSessionId: externalSessionId ?? null,
       state: { resume: true, lastStepId: mcpRequest.stepId, mcp: true }
     });
+    const validatedOutputs = validateAgentFlowSessionProviderResponse(
+      mcpRequest.stepId,
+      mcpRequest.outputs,
+      response
+    );
+    const contentTypes = Object.fromEntries(
+      [...validatedOutputs].flatMap(([outputPath, output]) =>
+        output.contentType === undefined ? [] : [[outputPath, output.contentType]])
+    );
     return {
-      outputs: Object.fromEntries(Object.entries(response.outputs).map(([outputPath, value]) => [
-        outputPath,
-        value !== null && typeof value === "object" && !ArrayBuffer.isView(value) && "content" in value
-          ? value.content
-          : value
-      ])) as Record<string, AgentFlowRunStateValue | Uint8Array>,
+      outputs: Object.fromEntries(
+        [...validatedOutputs].map(([outputPath, output]) => [outputPath, output.content])
+      ) as Record<string, AgentFlowRunStateValue | Uint8Array>,
+      ...(Object.keys(contentTypes).length === 0 ? {} : { contentTypes }),
       metadata: response.metadata
     };
   });
