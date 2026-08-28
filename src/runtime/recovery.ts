@@ -153,7 +153,8 @@ function assertAcyclicWorkflowRegistry(registry: AgentFlowWorkflowRegistry): voi
 function referencedWorkflowNames(steps: AgentFlowWorkflowStep[]): string[] {
   const names = new Set<string>();
   const visit = (step: AgentFlowWorkflowStep): void => {
-    if (step.type === "workflow" && typeof step.workflow === "string" && step.workflow.trim().length > 0) {
+    if (typeof step.type === "string" && step.type.trim() === "workflow"
+        && typeof step.workflow === "string" && step.workflow.trim().length > 0) {
       names.add(step.workflow.trim());
     }
     const onFailure = step.on_failure;

@@ -946,7 +946,27 @@ async function runAgentFlowCommandPipeline(
             persistMcpCallInterruption(store, runId, stepId, attempt, stopped);
             return interruptedPipelineResult(store, runId, completedSteps, stopped);
           }
-          failure = error instanceof Error ? error.message : String(error);
+          if (error instanceof AgentFlowSessionPolicyError) {
+            failure = redactAgentFlowSensitiveText(error.message);
+            const outcome = error.status === "pause" ? "pause" : "fail";
+            persistMcpCallFailure(store, runId, stepId, failure, false, attempt, outcome);
+            recordModelLimitDecision(store, runId, stepId, workflow, error, false);
+            return finishFailure(store, runId, completedSteps, stepId, {
+              exitCode: null,
+              timedOut: false,
+              message: failure
+            }, error.status === "pause" ? "paused" : "failed", routingBudget.terminalEffects);
+          }
+          if (error instanceof AgentFlowSessionRequestError
+              && error.code === "AGENT_FLOW_PROVIDER_SESSION_UNAVAILABLE") {
+            failure = redactAgentFlowSensitiveText(error.message);
+            const sessionId = normalizedTarget(step.session)!;
+            persistMcpCallFailure(store, runId, stepId, failure, false, attempt, "pause");
+            return pauseForUnavailableProviderSession(
+              store, runId, step, sessionId, attempt, completedSteps, routingBudget, failure
+            );
+          }
+          failure = redactAgentFlowSensitiveText(error instanceof Error ? error.message : String(error));
           const retryable = attemptIndex <= retries && mcpCallFailureIsRetryable(error);
           persistMcpCallFailure(store, runId, stepId, failure, retryable, attempt, failureOutcome(step, retryable));
           if (!retryable) break;
@@ -8443,9 +8463,21 @@ async function resumeNestedWorkflowWaitingStep(
   if (childWorkflow === undefined || normalizedTarget(step.workflow) !== waiting.workflowName) {
     throw new AgentFlowRunStateError("Paused child workflow no longer matches the persisted registry.", "AGENT_FLOW_RESUME_STATE");
   }
-  const childResult = await resumeAgentFlowCommandPipeline(
-    store, waiting.childRunId, childWorkflow, response, transforms, sessionProviders, mcpCalls, notifications, workflows
-  );
+  const persistedChild = assertPersistedWorkflowIdentity(store, waiting.childRunId, childWorkflow);
+  const childResult = ["completed", "failed", "cancelled"].includes(persistedChild.status)
+    ? {
+        status: persistedChild.status as "completed" | "failed" | "cancelled",
+        completedSteps: [],
+        ...(persistedChild.status === "completed"
+          ? {}
+          : { message: persistedChild.status === "failed"
+              ? terminalFailureMessage(persistedChild.error)
+              : `Child workflow run ${waiting.childRunId} was cancelled.` })
+      }
+    : await resumeAgentFlowCommandPipeline(
+        store, waiting.childRunId, childWorkflow, response,
+        transforms, sessionProviders, mcpCalls, notifications, workflows
+      );
   if (childResult.status === "paused") {
     const current = store.getRun(runId)!;
     store.updateRun(runId, {
@@ -8655,10 +8687,11 @@ function codexMcpCallRegistry(
     try {
       response = await invokeAgentFlowSessionProvider(adapter, providerRequest, undefined);
     } catch (error) {
+      const message = redactAgentFlowSensitiveText(error instanceof Error ? error.message : String(error));
       store.upsertSession({
-        id: sessionId, runId, stepId: mcpRequest.stepId, provider, status: "failed",
+        id: sessionId, runId, stepId: mcpRequest.stepId, provider, status: "paused",
         externalSessionId: externalSessionId ?? null,
-        state: { resume: true, lastStepId: mcpRequest.stepId, mcp: true, error: error instanceof Error ? error.message : String(error) }
+        state: { resume: true, lastStepId: mcpRequest.stepId, mcp: true, error: message }
       });
       throw error;
     }
@@ -8697,7 +8730,7 @@ function codexMcpCallRegistry(
       );
     }
     store.upsertSession({
-      id: sessionId, runId, stepId: mcpRequest.stepId, provider, status: "completed",
+      id: sessionId, runId, stepId: mcpRequest.stepId, provider, status: "waiting",
       externalSessionId: externalSessionId ?? null,
       state: { resume: true, lastStepId: mcpRequest.stepId, mcp: true }
     });

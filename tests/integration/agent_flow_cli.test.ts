@@ -627,7 +627,15 @@ version: 1
 style: pipeline
 maturity: experimental
 steps:
-  - { id: done, type: result, status: completed }
+  - { id: child, type: " workflow ", workflow: sibling-child, inputs: {}, outputs: [child.txt] }
+`);
+    fs.writeFileSync(path.join(repo, "child.yml"), `
+name: sibling-child
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: publish, type: command, command: "printf sibling > child.txt", outputs: [child.txt] }
 `);
     fs.writeFileSync(path.join(repo, ".github", "workflows", "ci.yml"), `
 name: CI
@@ -640,7 +648,8 @@ jobs: {}
     ], repo)).toMatchObject({ exitCode: 0, stderr: "" });
     const store = await openAgentFlowRunState({ cwd: repo });
     expect(Object.keys(store.getRun("sibling-only")?.context.workflowRegistry as object))
-      .toEqual(["sibling-entry"]);
+      .toEqual(["sibling-child", "sibling-entry"]);
+    expect(store.readArtifact("sibling-only", "child.txt").content.toString("utf8")).toBe("sibling");
     store.close();
   });
 

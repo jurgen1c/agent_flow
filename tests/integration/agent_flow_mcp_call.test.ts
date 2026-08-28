@@ -10,6 +10,7 @@ import {
   createAgentFlowSessionProviderRegistry,
   AgentFlowMcpCallError,
   AgentFlowRunStateError,
+  AgentFlowSessionRequestError,
   executeAgentFlowCommandPipeline,
   executeAgentFlowMcpCall,
   MAX_AGENT_FLOW_MCP_ARGUMENT_BYTES,
@@ -19,6 +20,7 @@ import {
   openAgentFlowRunState,
   parseAgentFlowSimulationFixture,
   parseAgentFlowWorkflowOrThrow,
+  resumeAgentFlowCommandPipeline,
   simulateAgentFlowWorkflow,
   transitionAgentFlowLifecycleRun,
   validateAgentFlowWorkflow,
@@ -69,7 +71,7 @@ steps:
     )).toMatchObject({ status: "completed" });
     expect(prompts[0]).toContain('server "atlassian" tool "get_issue" exactly once');
     expect(store.getSession("codex-mcp", "agent")).toMatchObject({
-      status: "completed", externalSessionId: "codex-thread-1"
+      status: "waiting", externalSessionId: "codex-thread-1"
     });
     expect(store.readArtifact("codex-mcp", "ticket.json").content.toString("utf8"))
       .toBe('{"key":"AF-1"}\n');
@@ -221,6 +223,132 @@ steps:
     });
     releaseProvider();
     expect(await execution).toMatchObject({ status: "completed" });
+    store.close();
+  });
+
+  test("preserves model-limit policy and simulation budgets for Codex-mediated MCP calls", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: codex-mcp-budget
+version: 1
+style: recovery_pipeline
+maturity: experimental
+policies: { recovery_limits: fail }
+sessions:
+  agent: { provider: codex, resume: true }
+limits:
+  max_frontier_calls: 1
+steps:
+  - { id: first, type: mcp_call, via: codex, session: agent, server: jira, tool: get, arguments: { key: AF-1 }, outputs: [first.json] }
+  - { id: second, type: mcp_call, via: codex, session: agent, server: jira, tool: get, arguments: { key: AF-2 }, outputs: [second.json] }
+`);
+    let invocations = 0;
+    const providers = createAgentFlowSessionProviderRegistry().register("codex", async (request) => {
+      invocations += 1;
+      request.reportExternalSessionId?.("budget-thread");
+      const key = request.stepId === "first" ? "AF-1" : "AF-2";
+      const output = request.outputs[0]!;
+      return {
+        externalSessionId: "budget-thread",
+        outputs: { [output]: JSON.stringify({ key }) },
+        metadata: { mcpCalls: [{ server: "jira", tool: "get", arguments: { key }, status: "completed" }] }
+      };
+    });
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "codex-mcp-budget", workflow });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "codex-mcp-budget", workflow, undefined, providers
+    )).toMatchObject({ status: "failed", failedStep: "second" });
+    expect(invocations).toBe(1);
+    expect(store.listEvents("codex-mcp-budget").map((event) => event.type))
+      .toContain("recovery.limit_reached");
+    store.close();
+
+    expect(simulateAgentFlowWorkflow(workflow, {
+      steps: {
+        first: { outputs: { "first.json": { key: "AF-1" } } },
+        second: { outputs: { "second.json": { key: "AF-2" } } }
+      }
+    })).toMatchObject({
+      status: "failed",
+      visitedSteps: [
+        { id: "first", outcome: "succeeded" },
+        { id: "second", outcome: "failed" }
+      ]
+    });
+  });
+
+  test("pauses Codex MCP for an unavailable thread and resumes after explicit reset", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: codex-mcp-reset
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  agent: { provider: codex, resume: true }
+limits:
+  max_frontier_calls: 3
+steps:
+  - { id: first, type: mcp_call, via: codex, session: agent, server: jira, tool: get, arguments: { key: AF-1 }, outputs: [first.json] }
+  - { id: second, type: mcp_call, via: codex, session: agent, server: jira, tool: get, arguments: { key: AF-2 }, outputs: [second.json] }
+`);
+    const providers = createAgentFlowSessionProviderRegistry().register("codex", async (request) => {
+      if (request.stepId === "second" && request.externalSessionId === "thread-1") {
+        throw new AgentFlowSessionRequestError(
+          "Codex thread not found",
+          "AGENT_FLOW_PROVIDER_SESSION_UNAVAILABLE"
+        );
+      }
+      const thread = request.stepId === "first" ? "thread-1" : "thread-2";
+      const key = request.stepId === "first" ? "AF-1" : "AF-2";
+      request.reportExternalSessionId?.(thread);
+      return {
+        externalSessionId: thread,
+        outputs: { [request.outputs[0]!]: JSON.stringify({ key }) },
+        metadata: { mcpCalls: [{ server: "jira", tool: "get", arguments: { key }, status: "completed" }] }
+      };
+    });
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "codex-mcp-reset", workflow });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "codex-mcp-reset", workflow, undefined, providers
+    )).toMatchObject({ status: "paused", failedStep: "second" });
+    expect(store.getRun("codex-mcp-reset")?.context.waiting).toMatchObject({
+      kind: "provider_session", sessionId: "agent"
+    });
+    expect(await resumeAgentFlowCommandPipeline(
+      store, "codex-mcp-reset", workflow, { resetSession: "agent" }, undefined, providers
+    )).toMatchObject({ status: "completed" });
+    expect(store.getSession("codex-mcp-reset", "agent")?.externalSessionId).toBe("thread-2");
+    store.close();
+  });
+
+  test("redacts Codex MCP provider failures before persisting session state", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: codex-mcp-redacted-error
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  agent: { provider: codex, resume: true }
+limits: { max_frontier_calls: 1 }
+steps:
+  - { id: fetch, type: mcp_call, via: codex, session: agent, server: jira, tool: get, arguments: {}, outputs: [ticket.json] }
+`);
+    const providers = createAgentFlowSessionProviderRegistry().register("codex", async () => {
+      throw new Error("Authorization: Bearer codex-mcp-secret");
+    });
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "codex-mcp-redacted-error", workflow });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "codex-mcp-redacted-error", workflow, undefined, providers
+    )).toMatchObject({ status: "paused" });
+    expect(JSON.stringify(store.getSession("codex-mcp-redacted-error", "agent")))
+      .not.toContain("codex-mcp-secret");
+    expect(JSON.stringify(store.listEvents("codex-mcp-redacted-error")))
+      .not.toContain("codex-mcp-secret");
     store.close();
   });
 

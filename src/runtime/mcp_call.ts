@@ -17,6 +17,10 @@ import {
   secureAgentFlowSensitiveJsonInputValue
 } from "./execution_security";
 import { agentFlowInputKeyLooksSensitive, redactAgentFlowSensitiveText } from "./failure_payload";
+import {
+  AgentFlowSessionPolicyError,
+  AgentFlowSessionRequestError
+} from "./session_request";
 
 export const MAX_AGENT_FLOW_MCP_OUTPUT_BYTES = 10 * 1024 * 1024;
 export const MAX_AGENT_FLOW_MCP_METADATA_BYTES = 1024 * 1024;
@@ -228,6 +232,13 @@ export async function executeAgentFlowMcpCall(
     response = await invokeAdapter(adapter, request, options.stopStatus, options.interruptError);
   } catch (error) {
     if (error instanceof AgentFlowMcpCallInterruptedError) throw error;
+    if (error instanceof AgentFlowSessionPolicyError) {
+      throw new AgentFlowSessionPolicyError(errorMessage(error), error.code, error.status);
+    }
+    if (error instanceof AgentFlowSessionRequestError
+        && error.code === "AGENT_FLOW_PROVIDER_SESSION_UNAVAILABLE") {
+      throw new AgentFlowSessionRequestError(errorMessage(error), error.code);
+    }
     if (error instanceof AgentFlowMcpCallError) {
       throw new AgentFlowMcpCallError(errorMessage(error), error.code, { cause: sanitizedErrorCause(error) });
     }

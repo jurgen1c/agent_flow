@@ -1065,6 +1065,14 @@ function simulateMcpCallStep(
       error instanceof Error ? error.message : String(error)
     );
   }
+  if (nonEmptyString(step.via) === "codex") {
+    const budgetControl = simulationModelBudgetControl(step, stepId, state);
+    if (budgetControl !== undefined) {
+      const visit = state.visitedSteps.at(-1);
+      if (visit?.id === stepId && visit.outcome === "succeeded") visit.outcome = "failed";
+      return budgetControl;
+    }
+  }
   const declaredOutputs = new Set(
     (Array.isArray(step.outputs) ? step.outputs : [])
       .flatMap((output) => nonEmptyString(output) ?? [])

@@ -142,6 +142,48 @@ steps:
     }
   });
 
+  test("settles a paused parent when its child completed before the parent resumed", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-terminal-child-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: terminal-child
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: approve, type: manual_gate, message: Continue?, options: [approve, cancel] }
+  - { id: publish, type: command, command: "printf done > child.txt", outputs: [child.txt] }
+`);
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: terminal-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: child, type: workflow, workflow: terminal-child, inputs: {}, outputs: [child.txt] }
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register(parent.name, parent)
+      .register(child.name, child);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, { id: "terminal-parent", workflow: parent });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "terminal-parent", parent, undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({ status: "paused" });
+    const childRunId = (store.getRun("terminal-parent")!.context.waiting as { childRunId: string }).childRunId;
+    expect(await resumeAgentFlowCommandPipeline(
+      store, childRunId, child, { outcome: "approve" }, undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({ status: "completed" });
+
+    expect(await resumeAgentFlowCommandPipeline(
+      store, "terminal-parent", parent, { outcome: "approve" },
+      undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({ status: "completed" });
+    expect(store.readArtifact("terminal-parent", "child.txt").content.toString("utf8")).toBe("done");
+    store.close();
+  });
+
   test("pins configured providers only for workflows reachable from the active run", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-reachable-provider-"));
     fs.mkdirSync(path.join(repo, ".git"));
