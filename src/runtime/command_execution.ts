@@ -8543,7 +8543,7 @@ function promoteWorkflowStepOutputs(
       }
     }
     const child = store.getArtifact(childRunId, outputPath);
-    if (child === null || child.writtenAt === null) {
+    if (child === null || child.writtenAt === null || child.kind === "recovery_input") {
       throw new AgentFlowRunStateError(
         `Child workflow run ${childRunId} did not publish required output ${outputPath}.`,
         "AGENT_FLOW_WORKFLOW_OUTPUT_MISSING"

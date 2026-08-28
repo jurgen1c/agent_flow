@@ -475,6 +475,21 @@ steps:
         { id: "second", outcome: "failed" }
       ]
     });
+
+    const failedFirst = structuredClone(workflow);
+    failedFirst.steps[0]!.on_failure = { then: "continue" };
+    expect(simulateAgentFlowWorkflow(failedFirst, {
+      steps: {
+        first: { outcome: "failed" },
+        second: { outputs: { "second.json": { key: "AF-2" } } }
+      }
+    })).toMatchObject({
+      status: "failed",
+      visitedSteps: [
+        { id: "first", outcome: "failed" },
+        { id: "second", outcome: "failed" }
+      ]
+    });
   });
 
   test("pauses Codex MCP for an unavailable thread and resumes after explicit reset", async () => {

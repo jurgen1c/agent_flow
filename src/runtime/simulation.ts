@@ -542,6 +542,10 @@ function runStep(step: AgentFlowWorkflowStep, state: SimulationState, insideLoop
       return simulateSessionRequestStep(step, stepFixture, id, state, true);
     }
     if (type === "mcp_call") {
+      if (nonEmptyString(step.via) === "codex") {
+        const budgetControl = simulationModelBudgetControl(step, id, state);
+        if (budgetControl !== undefined) return budgetControl;
+      }
       return simulatedSessionFailure(step, stepFixture, id, state, "Fixture marks the MCP call as failed.");
     }
     return failureControl(step, stepFixture, id, state);

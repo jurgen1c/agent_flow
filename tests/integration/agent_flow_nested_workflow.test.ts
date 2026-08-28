@@ -1007,6 +1007,66 @@ steps:
     store.close();
   });
 
+  test("does not promote a copied child input as a declared child output", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-input-output-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: input-output-child
+version: 1
+style: pipeline
+maturity: experimental
+inputs: { payload: { required: true } }
+steps:
+  - { id: done, type: result, status: completed }
+`);
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: input-output-parent
+version: 1
+style: pipeline
+maturity: experimental
+inputs: { source: { required: true } }
+steps:
+  - id: child
+    type: workflow
+    workflow: input-output-child
+    inputs: { payload: "{{ inputs.source }}" }
+    outputs: [source.txt]
+    overwrite: true
+    on_failure: { then: fail }
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register(parent.name, parent)
+      .register(child.name, child);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, {
+      id: "input-output-parent",
+      workflow: parent,
+      inputs: { source: "source.txt" }
+    });
+    store.writeArtifact({
+      id: "input-output-source",
+      runId: "input-output-parent",
+      stepId: "fixture",
+      path: "source.txt",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "parent input\n"
+    });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "input-output-parent", parent, undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({
+      status: "failed",
+      failedStep: "child",
+      message: expect.stringContaining("did not publish required output source.txt")
+    });
+    const childRun = store.listRuns().find((run) => run.parentRunId === "input-output-parent")!;
+    expect(childRun.status).toBe("failed");
+    expect(store.getArtifact(childRun.id, "source.txt")?.kind).toBe("recovery_input");
+    expect(store.readArtifact("input-output-parent", "source.txt").content.toString()).toBe("parent input\n");
+    store.close();
+  });
+
   test("persists child setup errors and finalizes the parent", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-setup-failure-"));
     fs.mkdirSync(path.join(repo, ".git"));
