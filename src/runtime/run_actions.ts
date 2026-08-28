@@ -142,15 +142,26 @@ export function buildAgentFlowRunActionSnapshot(
     waitingRun = nested.run ?? run;
   }
   const approvals = store.listApprovals(waitingRun.id);
+  let guardedLineage: Array<{
+    run: AgentFlowRunRecord;
+    approvals: AgentFlowApprovalRecord[];
+  }> = [{
+    run,
+    approvals: run.id === waitingRun.id ? approvals : store.listApprovals(run.id)
+  }];
   const warnings: AgentFlowRunActionWarning[] = [];
   let staleApprovals: AgentFlowRunActionSnapshot["staleApprovals"] = [];
   let approvalEvidenceValid = true;
   try {
-    staleApprovals = nestedActionApprovalLineage(store, run, waitingRun).flatMap((lineageRun) =>
+    guardedLineage = nestedActionApprovalLineage(store, run, waitingRun).map((lineageRun) => ({
+      run: lineageRun,
+      approvals: lineageRun.id === waitingRun.id ? approvals : store.listApprovals(lineageRun.id)
+    }));
+    staleApprovals = guardedLineage.flatMap(({ run: lineageRun, approvals: lineageApprovals }) =>
       detectStaleApprovals(
         store,
         lineageRun.id,
-        store.listApprovals(lineageRun.id),
+        lineageApprovals,
         lineageRun.id === waitingRun.id ? waitingResult.waiting?.approvalId ?? undefined : undefined
       )
     );
@@ -304,9 +315,7 @@ export function buildAgentFlowRunActionSnapshot(
     activeApprovalBlockReason
   );
   const guardPayload = {
-    run,
-    waitingRun,
-    approvals,
+    lineage: guardedLineage,
     waiting,
     disagreementEvidence,
     staleApprovals,

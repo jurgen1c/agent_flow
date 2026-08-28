@@ -330,6 +330,69 @@ steps:
     store.close();
   });
 
+  test("invalidates the action guard when an intermediate child run changes", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-lineage-guard-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const leaf = parseAgentFlowWorkflowOrThrow(`
+name: lineage-leaf
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: wait, type: manual_gate, message: Continue?, options: [approve, cancel] }
+  - { id: publish, type: command, command: "printf done > leaf.txt", outputs: [leaf.txt] }
+  - { id: done, type: result, status: completed }
+`);
+    const middle = parseAgentFlowWorkflowOrThrow(`
+name: lineage-middle
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: leaf, type: workflow, workflow: lineage-leaf, inputs: {}, outputs: [leaf.txt] }
+`);
+    const root = parseAgentFlowWorkflowOrThrow(`
+name: lineage-root
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: middle, type: workflow, workflow: lineage-middle, inputs: {}, outputs: [leaf.txt] }
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register(root.name, root)
+      .register(middle.name, middle)
+      .register(leaf.name, leaf);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, { id: "lineage-root", workflow: root });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "lineage-root", root, undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({ status: "paused" });
+    const middleRunId = (store.getRun("lineage-root")!.context.waiting as { childRunId: string }).childRunId;
+    const middleRun = store.getRun(middleRunId)!;
+    const leafRunId = (middleRun.context.waiting as { childRunId: string }).childRunId;
+    const snapshot = buildAgentFlowRunActionSnapshot(store, "lineage-root");
+    expect(snapshot.waiting).toMatchObject({
+      kind: "workflow",
+      nestedKind: "manual_gate",
+      childRunId: leafRunId
+    });
+
+    store.updateRun(middleRunId, {
+      context: { ...middleRun.context, routingRevision: "changed" }
+    });
+
+    await expect(executeAgentFlowRunAction(
+      store,
+      "lineage-root",
+      { action: "approve", guard: snapshot.guard },
+      { workflows }
+    )).rejects.toMatchObject({ code: "AGENT_FLOW_ACTION_STALE" });
+    expect(store.getRun(leafRunId)?.status).toBe("paused");
+    store.close();
+  });
+
   test("settles a paused parent when its child completed before the parent resumed", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-terminal-child-"));
     fs.mkdirSync(path.join(repo, ".git"));
