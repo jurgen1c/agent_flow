@@ -528,6 +528,13 @@ async function runLifecycleCommand(
         };
       }
       if (fixture !== null) {
+        const duplicateFixtureStep = duplicateFixtureSessionStep(sessionRequestSteps);
+        if (duplicateFixtureStep !== undefined) {
+          return {
+            exitCode: 2,
+            stderr: `Run fixture step ID ${JSON.stringify(duplicateFixtureStep.stepId)} is used by multiple reachable workflows (${duplicateFixtureStep.workflows.join(", ")}); fixture-backed session step IDs must be unique across the reachable workflow registry.`
+          };
+        }
         const unsupportedOutputStep = sessionRequestSteps.find(({ workflow, step }) =>
           fixture.arrayOutputSteps.has(String(step.id ?? "").trim())
           && providerForSessionRequestStep(workflow, step) === "fixture"
@@ -686,9 +693,17 @@ async function runLifecycleCommand(
       );
       const registeredWorkflows = workflows.names().map((name) => workflows.get(name)!);
       if (fixture !== null) {
-        const unsupportedOutputStep = registeredWorkflows.flatMap((registeredWorkflow) =>
+        const sessionRequestSteps = registeredWorkflows.flatMap((registeredWorkflow) =>
           collectSessionRequestSteps(registeredWorkflow.steps).map((step) => ({ workflow: registeredWorkflow, step }))
-        ).find(({ workflow: registeredWorkflow, step }) =>
+        );
+        const duplicateFixtureStep = duplicateFixtureSessionStep(sessionRequestSteps);
+        if (duplicateFixtureStep !== undefined) {
+          return {
+            exitCode: 2,
+            stderr: `Run fixture step ID ${JSON.stringify(duplicateFixtureStep.stepId)} is used by multiple reachable workflows (${duplicateFixtureStep.workflows.join(", ")}); fixture-backed session step IDs must be unique across the reachable workflow registry.`
+          };
+        }
+        const unsupportedOutputStep = sessionRequestSteps.find(({ workflow: registeredWorkflow, step }) =>
           fixture.arrayOutputSteps.has(String(step.id ?? "").trim())
           && providerForSessionRequestStep(registeredWorkflow, step) === "fixture"
         );
@@ -1530,6 +1545,27 @@ function collectRequiredWorkflowProviders(
     .flatMap((session) => session !== null && typeof session === "object" && !Array.isArray(session)
       ? [String((session as Record<string, unknown>).provider ?? "").trim()]
       : []);
+}
+
+function duplicateFixtureSessionStep(
+  entries: Array<{
+    workflow: import("../runtime/index").AgentFlowWorkflow;
+    step: import("../runtime/index").AgentFlowWorkflowStep;
+  }>
+): { stepId: string; workflows: string[] } | undefined {
+  const workflowsByStep = new Map<string, Set<string>>();
+  for (const { workflow, step } of entries) {
+    if (providerForSessionRequestStep(workflow, step) !== "fixture") continue;
+    const stepId = String(step.id ?? "").trim();
+    if (stepId.length === 0) continue;
+    const workflows = workflowsByStep.get(stepId) ?? new Set<string>();
+    workflows.add(workflow.name);
+    workflowsByStep.set(stepId, workflows);
+  }
+  for (const [stepId, workflows] of [...workflowsByStep].sort(([left], [right]) => left.localeCompare(right))) {
+    if (workflows.size > 1) return { stepId, workflows: [...workflows].sort() };
+  }
+  return undefined;
 }
 
 function collectWorkflowSteps(

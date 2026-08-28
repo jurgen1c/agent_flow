@@ -604,6 +604,45 @@ steps:
     store.close();
   });
 
+  test("rejects ambiguous fixture step IDs across reachable workflows", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-fixture-step-id-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.writeFileSync(path.join(repo, "parent.yml"), `
+name: fixture-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: first, type: workflow, workflow: fixture-child-a, inputs: {}, outputs: [a.txt] }
+  - { id: second, type: workflow, workflow: fixture-child-b, inputs: {}, outputs: [b.txt] }
+`);
+    for (const [name, output] of [["fixture-child-a", "a.txt"], ["fixture-child-b", "b.txt"]]) {
+      fs.writeFileSync(path.join(repo, `${name}.yml`), `
+name: ${name}
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  writer: { provider: fixture }
+limits: { max_model_calls: 1 }
+steps:
+  - { id: generate, type: session_request, session: writer, prompt: prompt.md, inputs: [input.md], outputs: [${output}] }
+`);
+    }
+    fs.writeFileSync(path.join(repo, "fixture.json"), JSON.stringify({
+      steps: { generate: { outputs: { "a.txt": "a" } } }
+    }));
+
+    const result = await captureCli([
+      "run", "parent.yml", "--id", "fixture-duplicates", "--fixture", "fixture.json"
+    ], repo);
+    expect(result).toMatchObject({ exitCode: 2 });
+    expect(result.stderr).toContain("fixture-backed session step IDs must be unique");
+    const store = await openAgentFlowRunState({ cwd: repo });
+    expect(store.getRun("fixture-duplicates")).toBeNull();
+    store.close();
+  });
+
   test("ignores providers and validation in unrelated workflow registry entries", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-reachable-registry-"));
     fs.mkdirSync(path.join(repo, ".git"));

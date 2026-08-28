@@ -52,6 +52,7 @@ import {
   preflightAgentFlowSessionProviderEvidence,
   readAgentFlowSessionInput,
   readAgentFlowSessionPrompt,
+  resolveAgentFlowCodexOptions,
   reserveAgentFlowSessionModelCallBudgets,
   validateAgentFlowSessionOutputSize,
   validateAgentFlowSessionProviderMetadata,
@@ -5143,6 +5144,7 @@ async function executeRecoverySession(
     ...recoveryOperationFileScopes(workflow.steps, failedStep),
     routeFileScope
   ].filter((scope): scope is AgentFlowYamlMapping => scope !== undefined);
+  const codexOptions = resolveAgentFlowCodexOptions(undefined, run.context.codexOptions, session.codex);
   preflightAgentFlowSessionProvider(adapter, {
     runId,
     stepId: recoveryStepId,
@@ -5160,6 +5162,7 @@ async function executeRecoverySession(
       ? {}
       : { providerModel: hashAgentFlowProviderModel(providerDescriptor.model) }),
     ...(providerDescriptor.fingerprint === undefined ? {} : { providerFingerprint: providerDescriptor.fingerprint }),
+    ...codexOptions,
     resume,
     ...(priorExternalSessionId === undefined ? {} : { externalSessionId: priorExternalSessionId }),
     prompt: { ...prompt },
@@ -5311,6 +5314,7 @@ async function executeRecoverySession(
             ? {}
             : { providerModel: hashAgentFlowProviderModel(providerDescriptor.model) }),
           ...(providerDescriptor.fingerprint === undefined ? {} : { providerFingerprint: providerDescriptor.fingerprint }),
+          ...codexOptions,
           resume,
           ...(externalSessionId === undefined ? {} : { externalSessionId }),
           prompt: { ...prompt },
@@ -8343,7 +8347,12 @@ async function executeNestedWorkflowStep(
       undefined,
       undefined,
       () => {
-        promotedOutputs = promoteWorkflowStepOutputs(store, parentRunId, childRunId, step);
+        const parentStatus = store.getRun(parentRunId)?.status;
+        if (parentStatus === "running" || parentStatus === "paused") {
+          promotedOutputs = promoteWorkflowStepOutputs(
+            store, parentRunId, childRunId, step, parentStatus
+          );
+        }
       }
     );
   } finally {

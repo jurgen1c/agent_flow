@@ -1097,7 +1097,10 @@ version: 1
 style: recovery_pipeline
 maturity: experimental
 sessions:
-  fixer: { provider: coder, resume: true }
+  fixer:
+    provider: coder
+    resume: true
+    codex: { profile: workflow-profile, model: workflow-model, reasoning_effort: low }
 steps:
   - id: check
     type: command
@@ -1116,9 +1119,17 @@ limits:
     const env = { PATH: `${fake.bin}:${process.env.PATH ?? ""}`, CODEX_HOME: fake.root };
 
     const started = await captureCli([
-      "run", "workflow.yml", "--id", "native-recovery-reset", "--config", globalConfig
+      "run", "workflow.yml", "--id", "native-recovery-reset", "--config", globalConfig,
+      "--profile", "run-profile", "--model", "run-model", "--reasoning-effort", "medium"
     ], repo, env);
     expect(started).toMatchObject({ exitCode: 3 });
+    const recoveryInvocations = fs.readFileSync(fake.log, "utf8").trim().split("\n")
+      .map((line) => JSON.parse(line) as { args: string[] });
+    expect(recoveryInvocations[0]!.args).toContain("run-profile");
+    expect(recoveryInvocations[0]!.args).toContain("run-model");
+    expect(recoveryInvocations[0]!.args).toContain('model_reasoning_effort="medium"');
+    expect(recoveryInvocations[0]!.args).not.toContain("workflow-profile");
+    expect(recoveryInvocations[0]!.args).not.toContain("workflow-model");
     const pausedStore = await openAgentFlowRunState({ cwd: repo });
     expect(pausedStore.getRun("native-recovery-reset")?.context.waiting).toMatchObject({
       kind: "provider_session",

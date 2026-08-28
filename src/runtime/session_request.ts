@@ -16,7 +16,12 @@ import {
   isAgentFlowWorkspaceWriteLockManaged,
   withAgentFlowWorkspaceWriteLock
 } from "./workspace_lock";
-import type { AgentFlowWorkflow, AgentFlowWorkflowStep, AgentFlowYamlMapping } from "./workflow";
+import type {
+  AgentFlowWorkflow,
+  AgentFlowWorkflowStep,
+  AgentFlowYamlMapping,
+  AgentFlowYamlValue
+} from "./workflow";
 import { createAgentFlowReviewPrompt, parseAgentFlowReviewResult } from "./review";
 import {
   createAgentFlowChallengePrompt,
@@ -1057,24 +1062,7 @@ async function executeAgentFlowSessionStep(
       ? {}
       : { providerModel: `sha256:${digest(providerDescriptor.model)}` }),
     ...(providerDescriptor.fingerprint === undefined ? {} : { providerFingerprint: providerDescriptor.fingerprint }),
-    ...(() => {
-      const stepOptions = mapping(step.codex);
-      const runOptions = mapping(run.context.codexOptions);
-      const sessionOptions = mapping(session.codex);
-      const profile = optionalCodexString(stepOptions?.profile ?? runOptions?.profile ?? sessionOptions?.profile, "Codex profile");
-      const model = optionalCodexString(stepOptions?.model ?? runOptions?.model ?? sessionOptions?.model, "Codex model");
-      const reasoningEffort = optionalCodexString(
-        stepOptions?.reasoning_effort ?? runOptions?.reasoningEffort ?? sessionOptions?.reasoning_effort,
-        "Codex reasoning effort"
-      );
-      return profile === undefined && model === undefined && reasoningEffort === undefined ? {} : {
-        codexOptions: {
-          ...(profile === undefined ? {} : { profile }),
-          ...(model === undefined ? {} : { model }),
-          ...(reasoningEffort === undefined ? {} : { reasoningEffort })
-        }
-      };
-    })(),
+    ...resolveAgentFlowCodexOptions(step.codex, run.context.codexOptions, session.codex),
     kind,
     resume,
     ...(priorExternalSessionId === undefined
@@ -1456,6 +1444,35 @@ function optionalCodexString(value: unknown, label: string): string | undefined 
     throw new AgentFlowSessionRequestError(`${label} must not contain surrounding whitespace or control characters.`);
   }
   return normalized;
+}
+
+export function resolveAgentFlowCodexOptions(
+  stepValue: unknown,
+  runValue: unknown,
+  sessionValue: unknown
+): Pick<AgentFlowSessionProviderRequest, "codexOptions"> | Record<string, never> {
+  const stepOptions = mapping(stepValue as AgentFlowYamlValue | undefined);
+  const runOptions = mapping(runValue as AgentFlowYamlValue | undefined);
+  const sessionOptions = mapping(sessionValue as AgentFlowYamlValue | undefined);
+  const profile = optionalCodexString(
+    stepOptions?.profile ?? runOptions?.profile ?? sessionOptions?.profile,
+    "Codex profile"
+  );
+  const model = optionalCodexString(
+    stepOptions?.model ?? runOptions?.model ?? sessionOptions?.model,
+    "Codex model"
+  );
+  const reasoningEffort = optionalCodexString(
+    stepOptions?.reasoning_effort ?? runOptions?.reasoningEffort ?? sessionOptions?.reasoning_effort,
+    "Codex reasoning effort"
+  );
+  return profile === undefined && model === undefined && reasoningEffort === undefined ? {} : {
+    codexOptions: {
+      ...(profile === undefined ? {} : { profile }),
+      ...(model === undefined ? {} : { model }),
+      ...(reasoningEffort === undefined ? {} : { reasoningEffort })
+    }
+  };
 }
 
 export async function invokeAgentFlowSessionProvider(

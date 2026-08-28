@@ -2,10 +2,12 @@ import { describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import path from "node:path";
 import {
+  buildAgentFlowRunActionSnapshot,
   createAgentFlowLifecycleRun,
   createAgentFlowSessionProviderRegistry,
   createAgentFlowWorkflowRegistry,
   executeAgentFlowCommandPipeline,
+  executeAgentFlowRunAction,
   openAgentFlowRunState,
   parseAgentFlowWorkflowOrThrow,
   resumeAgentFlowCommandPipeline,
@@ -71,8 +73,14 @@ steps:
       context: { ...parentRun.context, waiting: legacyWaiting as never }
     });
 
-    const resumed = await resumeAgentFlowCommandPipeline(
-      store, "parent", parent, { outcome: "approve" }, undefined, undefined, undefined, undefined, workflows
+    const snapshot = buildAgentFlowRunActionSnapshot(store, "parent");
+    expect(snapshot.waiting).toMatchObject({ kind: "workflow", nestedKind: "manual_gate" });
+    expect(snapshot.actions.find((action) => action.action === "approve")?.enabled).toBe(true);
+    const resumed = await executeAgentFlowRunAction(
+      store,
+      "parent",
+      { action: "approve", guard: snapshot.guard },
+      { workflows }
     );
     expect(resumed).toMatchObject({ status: "completed" });
     expect(store.getRun(childRunId)?.status).toBe("completed");
@@ -126,6 +134,79 @@ steps:
     expect(childRun.status).toBe("completed");
     expect(store.getArtifact(childRun.id, "retained.txt")?.status).toBe("missing");
     expect(store.readArtifact("parent", "retained.txt").content.toString("utf8")).toBe("retained");
+    store.close();
+  });
+
+  test("completes and promotes a child when the parent is externally paused during child execution", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-parent-pause-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.writeFileSync(path.join(repo, "prompt.md"), "Write the result.\n");
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: pause-race-child
+version: 1
+style: pipeline
+maturity: experimental
+inputs:
+  source: { required: true }
+sessions:
+  writer: { provider: fixture }
+limits: { max_model_calls: 1 }
+steps:
+  - id: write
+    type: session_request
+    session: writer
+    prompt: prompt.md
+    inputs: [input.txt]
+    outputs: [result.txt]
+retention:
+  on_success:
+    delete: [result.txt]
+`);
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: pause-race-parent
+version: 1
+style: pipeline
+maturity: experimental
+inputs:
+  source: { required: true }
+steps:
+  - id: child
+    type: workflow
+    workflow: pause-race-child
+    inputs: { source: "{{ inputs.source }}" }
+    outputs: [result.txt]
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register(parent.name, parent)
+      .register(child.name, child);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, {
+      id: "pause-race-parent",
+      workflow: parent,
+      inputs: { source: "input.txt" }
+    });
+    store.writeArtifact({
+      id: "pause-race-input",
+      runId: "pause-race-parent",
+      path: "input.txt",
+      kind: "fixture",
+      contentType: "text/plain; charset=utf-8",
+      content: "input\n"
+    });
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+      transitionAgentFlowLifecycleRun(store, "pause-race-parent", "pause");
+      return { outputs: { "result.txt": "completed before pause\n" } };
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store, "pause-race-parent", parent, undefined, providers, undefined, undefined, workflows
+    );
+    expect(result).toMatchObject({ status: "paused" });
+    const childRun = store.listRuns().find((run) => run.parentRunId === "pause-race-parent")!;
+    expect(childRun.status).toBe("completed");
+    expect(store.getArtifact(childRun.id, "result.txt")?.status).toBe("missing");
+    expect(store.readArtifact("pause-race-parent", "result.txt").content.toString("utf8"))
+      .toBe("completed before pause\n");
     store.close();
   });
 
