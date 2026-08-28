@@ -4594,7 +4594,7 @@ async function executeNestedRecoveryWorkflow(
     );
   }
   const parent = store.getRun(parentRunId)!;
-  assertRecoveryWorkflowNotInLineage(store, parentRunId, nestedWorkflow);
+  assertRecoveryWorkflowNotInLineage(store, parentRunId, workflowName, nestedWorkflow);
   const failure = store.listFailures(parentRunId).find((entry) => entry.id === failureId)!;
   const resolvedInputs = resolveRecoveryInputs(route.inputs, parent.inputs, stepId, failure.payloadPath);
   const preparedInputs = prepareNestedRecoveryInputs(
@@ -4612,7 +4612,7 @@ async function executeNestedRecoveryWorkflow(
   const recoveryRunId = `${parentRunId}:recovery:${safeId(stepId)}:attempt-${attempt}`;
   const existing = store.getRun(recoveryRunId);
   if (existing !== null) {
-    assertExistingRecoveryRunIdentity(existing, nestedWorkflow, inputs, parentRunId);
+    assertExistingRecoveryRunIdentity(existing, workflowName, nestedWorkflow, inputs, parentRunId);
   }
   if (existing !== null && existing.status !== "pending" && existing.status !== "running") {
     const output = mapping(existing.output);
@@ -4637,7 +4637,7 @@ async function executeNestedRecoveryWorkflow(
         inputs,
         parentRunId,
         recoveryOfRunId: parentRunId,
-        context: nestedWorkflowRunContext(store.getRun(parentRunId)!, nestedWorkflow, workflows)
+        context: nestedWorkflowRunContext(store.getRun(parentRunId)!, workflowName, nestedWorkflow, workflows)
       });
       if (result.changed) {
         copyRecoveryInputArtifacts(store, parentRunId, recoveryRunId, preparedInputs);
@@ -4894,6 +4894,7 @@ function nestedWorkflowOutputPaths(steps: AgentFlowWorkflowStep[]): string[] {
 
 function assertExistingRecoveryRunIdentity(
   existing: NonNullable<ReturnType<AgentFlowRunStateStore["getRun"]>>,
+  workflowRegistryName: string,
   workflow: AgentFlowWorkflow,
   inputs: Record<string, AgentFlowRunStateValue>,
   parentRunId: string
@@ -4904,6 +4905,8 @@ function assertExistingRecoveryRunIdentity(
       && existing.workflowMaturity === workflow.maturity
       && existing.parentRunId === parentRunId
       && existing.recoveryOfRunId === parentRunId
+      && (existing.context.workflowRegistryName === undefined
+        || existing.context.workflowRegistryName === workflowRegistryName)
       && isDeepStrictEqual(existing.context.workflow, workflow)
       && isDeepStrictEqual(existing.inputs, inputs)) return;
   throw new AgentFlowRunStateError(
@@ -4915,13 +4918,18 @@ function assertExistingRecoveryRunIdentity(
 function assertRecoveryWorkflowNotInLineage(
   store: AgentFlowRunStateStore,
   parentRunId: string,
+  workflowRegistryName: string,
   nestedWorkflow: AgentFlowWorkflow
 ): void {
   const visited = new Set<string>();
   let current = store.getRun(parentRunId);
   while (current !== null && !visited.has(current.id)) {
     visited.add(current.id);
-    if (isDeepStrictEqual(current.context.workflow, nestedWorkflow)) {
+    const currentRegistryName = normalizedTarget(current.context.workflowRegistryName);
+    const sameRegistryIdentity = currentRegistryName === undefined
+      ? isDeepStrictEqual(current.context.workflow, nestedWorkflow)
+      : currentRegistryName === workflowRegistryName;
+    if (sameRegistryIdentity) {
       throw new AgentFlowRunStateError(
         `Recovery workflow ${nestedWorkflow.name} is already present in run ${current.id}'s recovery lineage.`,
         "AGENT_FLOW_RECOVERY_WORKFLOW_RECURSIVE"
@@ -8345,7 +8353,7 @@ async function executeNestedWorkflowStep(
   const stepId = requiredStepId(step);
   const workflowName = normalizedTarget(step.workflow)!;
   const workflow = workflows.get(workflowName)!;
-  assertNestedWorkflowNotInLineage(store, parentRunId, workflow);
+  assertNestedWorkflowNotInLineage(store, parentRunId, workflowName, workflow);
   const rawInputs = resolveWorkflowStepInputs(store, parentRunId, step.inputs, stepId);
   const unknown = Object.keys(rawInputs).filter((name) => !Object.hasOwn(workflow.inputs ?? {}, name)).sort();
   if (unknown.length > 0) {
@@ -8364,6 +8372,8 @@ async function executeNestedWorkflowStep(
       && existing.workflowVersion === workflow.version
       && existing.parentRunId === parentRunId
       && existing.recoveryOfRunId === null
+      && (existing.context.workflowRegistryName === undefined
+        || existing.context.workflowRegistryName === workflowName)
       && isDeepStrictEqual(existing.context.workflow, workflow)
       && isDeepStrictEqual(existing.inputs, prepared.inputs))) {
     throw new AgentFlowRunStateError(
@@ -8378,7 +8388,7 @@ async function executeNestedWorkflowStep(
         workflow,
         inputs: prepared.inputs,
         parentRunId,
-        context: nestedWorkflowRunContext(store.getRun(parentRunId)!, workflow, workflows)
+        context: nestedWorkflowRunContext(store.getRun(parentRunId)!, workflowName, workflow, workflows)
       });
       if (created.changed) copyRecoveryInputArtifacts(store, parentRunId, childRunId, prepared);
       return created;
@@ -8460,13 +8470,18 @@ async function executeNestedWorkflowStep(
 function assertNestedWorkflowNotInLineage(
   store: AgentFlowRunStateStore,
   parentRunId: string,
+  workflowRegistryName: string,
   nestedWorkflow: AgentFlowWorkflow
 ): void {
   const visited = new Set<string>();
   let current = store.getRun(parentRunId);
   while (current !== null && !visited.has(current.id)) {
     visited.add(current.id);
-    if (current.workflowName === nestedWorkflow.name) {
+    const currentRegistryName = normalizedTarget(current.context.workflowRegistryName);
+    const sameRegistryIdentity = currentRegistryName === undefined
+      ? isDeepStrictEqual(current.context.workflow, nestedWorkflow)
+      : currentRegistryName === workflowRegistryName;
+    if (sameRegistryIdentity) {
       throw new AgentFlowRunStateError(
         `Workflow ${nestedWorkflow.name} is already present in run ${current.id}'s parent lineage.`,
         "AGENT_FLOW_WORKFLOW_RECURSIVE"
@@ -8484,6 +8499,7 @@ function serializeWorkflowRegistryForRun(
 
 function nestedWorkflowRunContext(
   parent: AgentFlowRunRecord,
+  workflowRegistryName: string,
   workflow: AgentFlowWorkflow,
   workflows: AgentFlowWorkflowRegistry
 ): Record<string, AgentFlowRunStateValue> {
@@ -8500,6 +8516,7 @@ function nestedWorkflowRunContext(
       providerNames.has(name) && value !== undefined ? [[name, value as AgentFlowRunStateValue]] : []
     ));
   return {
+    workflowRegistryName,
     workflowRegistry: serializeWorkflowRegistryForRun(workflows),
     ...(providerBindings === undefined || Object.keys(providerBindings).length === 0 ? {} : { providerBindings }),
     ...(parent.context.codexOptions === undefined ? {} : { codexOptions: parent.context.codexOptions })

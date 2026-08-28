@@ -185,7 +185,21 @@ function cancelNonterminalChildRuns(
   const children = store.listRuns().filter((run) => run.parentRunId === parentRunId
     && ["pending", "running", "waiting", "paused"].includes(run.status));
   for (const child of children) {
-    transitionAgentFlowLifecycleRun(store, child.id, "cancel", notifications);
+    const current = store.getRun(child.id);
+    if (current === null || ["completed", "failed", "cancelled"].includes(current.status)) {
+      cancelNonterminalChildRuns(store, child.id, notifications);
+      continue;
+    }
+    try {
+      transitionAgentFlowLifecycleRun(store, child.id, "cancel", notifications);
+    } catch (error) {
+      const settled = store.getRun(child.id);
+      if (!(error instanceof AgentFlowRunStateError)
+          || error.code !== "AGENT_FLOW_RUN_TRANSITION"
+          || settled === null
+          || !["completed", "failed", "cancelled"].includes(settled.status)) throw error;
+      cancelNonterminalChildRuns(store, child.id, notifications);
+    }
   }
 }
 

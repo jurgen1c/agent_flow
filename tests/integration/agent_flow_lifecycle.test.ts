@@ -90,6 +90,43 @@ describe("Agent Flow run lifecycle", () => {
     store.close();
   });
 
+  test("continues cancelling descendants when a snapshotted child settles concurrently", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(WORKFLOW_SOURCE);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: "cancel-race-parent", workflow });
+    createAgentFlowLifecycleRun(store, {
+      id: "cancel-race-settled",
+      workflow,
+      parentRunId: "cancel-race-parent"
+    });
+    createAgentFlowLifecycleRun(store, {
+      id: "cancel-race-pending",
+      workflow,
+      parentRunId: "cancel-race-parent"
+    });
+    const listRuns = store.listRuns.bind(store);
+    let settleAfterSnapshot = true;
+    store.listRuns = (() => {
+      const runs = listRuns();
+      if (settleAfterSnapshot) {
+        settleAfterSnapshot = false;
+        store.transitionRunWithEvent("cancel-race-settled", {
+          status: "completed",
+          allowedFrom: ["pending"],
+          event: { type: "run.completed", payload: {} }
+        });
+      }
+      return runs;
+    }) as typeof store.listRuns;
+
+    expect(transitionAgentFlowLifecycleRun(store, "cancel-race-parent", "cancel"))
+      .toMatchObject({ run: { status: "cancelled" } });
+    expect(store.getRun("cancel-race-settled")?.status).toBe("completed");
+    expect(store.getRun("cancel-race-pending")?.status).toBe("cancelled");
+    store.close();
+  });
+
   test("requires initial lifecycle context to match when reusing a run ID", async () => {
     const repoRoot = temporaryRepo();
     const workflow = parseAgentFlowWorkflowOrThrow(WORKFLOW_SOURCE);

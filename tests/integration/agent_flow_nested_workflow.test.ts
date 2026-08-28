@@ -1203,6 +1203,39 @@ steps:
     store.close();
   });
 
+  test("uses registry aliases rather than internal workflow names for recursion identity", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-alias-identity-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: shared-internal-name
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: child, type: workflow, workflow: child-alias, inputs: {}, outputs: [done.txt] }
+`);
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: shared-internal-name
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: done, type: command, command: "printf done > done.txt", outputs: [done.txt] }
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register("parent-alias", parent)
+      .register("child-alias", child);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, { id: "alias-identity-parent", workflow: parent });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "alias-identity-parent", parent, undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({ status: "completed", completedSteps: ["child"] });
+    expect(store.listRuns().find((run) => run.parentRunId === "alias-identity-parent")?.context)
+      .toMatchObject({ workflowRegistryName: "child-alias" });
+    store.close();
+  });
+
   test("retries failed children and honors explicit continuation", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-retry-"));
     fs.mkdirSync(path.join(repo, ".git"));
