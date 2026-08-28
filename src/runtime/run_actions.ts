@@ -23,6 +23,7 @@ import {
   type AgentFlowSessionProviderRegistry
 } from "./session_request";
 import {
+  createAgentFlowWorkflowRegistryFromSnapshot,
   createAgentFlowWorkflowRegistry,
   type AgentFlowWorkflowRegistry
 } from "./recovery";
@@ -74,6 +75,7 @@ export interface AgentFlowRunActionWaitingState {
   approvalId: string | null;
   sessionId?: string;
   childRunId?: string;
+  childStatus?: "completed" | "failed" | "cancelled";
   nestedKind?: Exclude<AgentFlowRunActionWaitingState["kind"], "workflow">;
 }
 
@@ -194,6 +196,7 @@ export function buildAgentFlowRunActionSnapshot(
       });
     }
   }
+
   if (waitingResult.error !== null) {
     warnings.push({
       code: "action.waiting.invalid",
@@ -377,6 +380,7 @@ export async function executeAgentFlowRunAction(
       409
     );
   }
+  const workflows = runtime.workflows ?? persistedWorkflowRegistry(run, workflow);
 
   let changed = true;
   let completedSteps: string[] = [];
@@ -399,33 +403,48 @@ export async function executeAgentFlowRunAction(
       runtime.sessionProviders ?? createAgentFlowSessionProviderRegistry(),
       runtime.mcpCalls ?? createAgentFlowMcpCallRegistry(),
       runtime.notifications ?? createAgentFlowNotificationRegistry(),
-      runtime.workflows ?? createAgentFlowWorkflowRegistry(),
+      workflows,
       assertCurrent
     );
     completedSteps = execution.completedSteps;
     message = execution.message ?? null;
   } else if (input.action === "resume") {
-    const execution = await executeAgentFlowCommandPipeline(
-      store,
-      runId,
-      workflow,
-      runtime.transforms ?? createAgentFlowArtifactTransformRegistry(),
-      runtime.sessionProviders ?? createAgentFlowSessionProviderRegistry(),
-      runtime.mcpCalls ?? createAgentFlowMcpCallRegistry(),
-      runtime.notifications ?? createAgentFlowNotificationRegistry(),
-      runtime.workflows ?? createAgentFlowWorkflowRegistry(),
-      () => {
-        store.withRunStateTransaction(runId, () => {
-          assertCurrent();
-          store.transitionRunWithEvent(runId, {
-            status: "pending",
-            allowedFrom: ["paused"],
-            event: { type: "run.resume", payload: { status: "pending" } }
-          });
-        });
-      },
-      assertCurrent
-    );
+    const nestedTerminal = initialSnapshot.waiting?.kind === "workflow"
+      && initialSnapshot.waiting.childStatus !== undefined;
+    const execution = nestedTerminal
+      ? await resumeAgentFlowCommandPipeline(
+          store,
+          runId,
+          workflow,
+          { outcome: "continue" },
+          runtime.transforms ?? createAgentFlowArtifactTransformRegistry(),
+          runtime.sessionProviders ?? createAgentFlowSessionProviderRegistry(),
+          runtime.mcpCalls ?? createAgentFlowMcpCallRegistry(),
+          runtime.notifications ?? createAgentFlowNotificationRegistry(),
+          workflows,
+          assertCurrent
+        )
+      : await executeAgentFlowCommandPipeline(
+          store,
+          runId,
+          workflow,
+          runtime.transforms ?? createAgentFlowArtifactTransformRegistry(),
+          runtime.sessionProviders ?? createAgentFlowSessionProviderRegistry(),
+          runtime.mcpCalls ?? createAgentFlowMcpCallRegistry(),
+          runtime.notifications ?? createAgentFlowNotificationRegistry(),
+          workflows,
+          () => {
+            store.withRunStateTransaction(runId, () => {
+              assertCurrent();
+              store.transitionRunWithEvent(runId, {
+                status: "pending",
+                allowedFrom: ["paused"],
+                event: { type: "run.resume", payload: { status: "pending" } }
+              });
+            });
+          },
+          assertCurrent
+        );
     completedSteps = execution.completedSteps;
     message = execution.message ?? null;
   } else {
@@ -594,15 +613,19 @@ function actionAvailability(
     && (interactionKind === "approval" || interactionKind === "manual_gate" || interactionKind === "disagreement")
     && waiting.validOutcomes.includes(interactionKind === "disagreement" ? "request_changes" : "reject");
   const canInput = actionStateValid && !hasStaleApprovals && interactionKind === "input_request";
-  const canResume = actionStateValid && !hasStaleApprovals && run.status === "paused" && waiting === null;
+  const canSettleWorkflow = waiting?.kind === "workflow" && waiting.childStatus !== undefined;
+  const canResume = actionStateValid && !hasStaleApprovals && run.status === "paused"
+    && (waiting === null || canSettleWorkflow);
   const canPause = actionStateValid && ["pending", "running", "waiting"].includes(run.status);
   const canCancel = actionStateValid && ["pending", "running", "waiting", "paused"].includes(run.status);
   return [
     action("approve", "Approve", canApprove, unavailable ?? activeApprovalBlockReason ?? outcomeReason ?? "Approve is not a valid outcome for this gate.", "Confirm approval after reviewing the warnings and evidence shown above."),
     action("reject", "Reject", canReject, unavailable ?? activeApprovalBlockReason ?? outcomeReason ?? "Reject is not a valid outcome for this gate.", "Reject this gate and continue along its configured rejection path?"),
     action("provide_input", "Provide input", canInput, unavailable ?? "This run is not waiting for input.", null),
-    action("resume", "Resume", canResume, unavailable ?? (waiting === null
+    action("resume", canSettleWorkflow ? "Settle child" : "Resume", canResume, unavailable ?? (waiting === null
       ? "Only a paused run can resume."
+      : canSettleWorkflow
+        ? "The linked child workflow has not reached a terminal state."
       : interactionKind === "provider_session"
         ? `Reset the unavailable provider session with agent-flow resume ${run.id} --reset-session ${waiting.sessionId}.`
         : "Respond to the waiting interaction instead of using plain resume."), null),
@@ -674,8 +697,22 @@ function resolveNestedActionWaitingState(
     }
     visited.add(childRunId);
     run = store.getRun(childRunId);
-    if (run === null || run.status !== "paused") {
-      return { waiting: null, error: "The nested child workflow is missing or no longer paused.", run };
+    if (run === null) {
+      return { waiting: null, error: "The nested child workflow is missing.", run };
+    }
+    if (["completed", "failed", "cancelled"].includes(run.status)) {
+      return {
+        waiting: {
+          ...waiting,
+          childRunId: run.id,
+          childStatus: run.status as "completed" | "failed" | "cancelled"
+        },
+        error: null,
+        run
+      };
+    }
+    if (run.status !== "paused") {
+      return { waiting: null, error: "The nested child workflow is no longer paused.", run };
     }
     const parsed = parseWaitingState(run.context.waiting);
     if (parsed.error !== null || parsed.waiting === null) {
@@ -715,6 +752,15 @@ function persistedWorkflow(run: AgentFlowRunRecord): AgentFlowWorkflow | null {
   return workflow !== null && typeof workflow === "object" && !Array.isArray(workflow)
     ? workflow as unknown as AgentFlowWorkflow
     : null;
+}
+
+function persistedWorkflowRegistry(
+  run: AgentFlowRunRecord,
+  workflow: AgentFlowWorkflow
+): AgentFlowWorkflowRegistry {
+  return run.context.workflowRegistry === undefined
+    ? createAgentFlowWorkflowRegistry().register(workflow.name, workflow)
+    : createAgentFlowWorkflowRegistryFromSnapshot(run.context.workflowRegistry);
 }
 
 function assertRunAction(value: string): asserts value is AgentFlowRunAction {

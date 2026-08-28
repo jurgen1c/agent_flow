@@ -11,6 +11,7 @@ import {
   openAgentFlowRunState,
   parseAgentFlowWorkflowOrThrow,
   resumeAgentFlowCommandPipeline,
+  serializeAgentFlowWorkflowRegistry,
   transitionAgentFlowLifecycleRun
 } from "../../src/runtime";
 
@@ -284,6 +285,8 @@ maturity: experimental
 steps:
   - { id: approve, type: manual_gate, message: Continue?, options: [approve, cancel] }
   - { id: publish, type: command, command: "printf done > child.txt", outputs: [child.txt] }
+retention:
+  on_success: { delete: [child.txt] }
 `);
     const parent = parseAgentFlowWorkflowOrThrow(`
 name: terminal-parent
@@ -297,7 +300,11 @@ steps:
       .register(parent.name, parent)
       .register(child.name, child);
     const store = await openAgentFlowRunState({ cwd: repo });
-    createAgentFlowLifecycleRun(store, { id: "terminal-parent", workflow: parent });
+    createAgentFlowLifecycleRun(store, {
+      id: "terminal-parent",
+      workflow: parent,
+      context: { workflowRegistry: serializeAgentFlowWorkflowRegistry(workflows) as never }
+    });
 
     expect(await executeAgentFlowCommandPipeline(
       store, "terminal-parent", parent, undefined, undefined, undefined, undefined, workflows
@@ -306,12 +313,69 @@ steps:
     expect(await resumeAgentFlowCommandPipeline(
       store, childRunId, child, { outcome: "approve" }, undefined, undefined, undefined, undefined, workflows
     )).toMatchObject({ status: "completed" });
+    expect(store.getArtifact(childRunId, "child.txt")?.status).toBe("missing");
+    expect(store.readArtifact("terminal-parent", "child.txt").content.toString("utf8")).toBe("done");
 
-    expect(await resumeAgentFlowCommandPipeline(
-      store, "terminal-parent", parent, { outcome: "approve" },
-      undefined, undefined, undefined, undefined, workflows
+    const snapshot = buildAgentFlowRunActionSnapshot(store, "terminal-parent");
+    expect(snapshot.waiting).toMatchObject({ kind: "workflow", childStatus: "completed" });
+    expect(snapshot.actions.find((action) => action.action === "resume")).toMatchObject({ enabled: true });
+    expect(await executeAgentFlowRunAction(
+      store, "terminal-parent", { action: "resume", guard: snapshot.guard }
     )).toMatchObject({ status: "completed" });
     expect(store.readArtifact("terminal-parent", "child.txt").content.toString("utf8")).toBe("done");
+    store.close();
+  });
+
+  test("rechecks a parent action guard after acquiring the nested child lock", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-action-race-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: guarded-child
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: first, type: manual_gate, message: First?, options: [approve, cancel] }
+  - { id: second, type: manual_gate, message: Second?, options: [approve, cancel] }
+`);
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: guarded-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: child, type: workflow, workflow: guarded-child, inputs: {}, outputs: [unused.txt] }
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register(parent.name, parent)
+      .register(child.name, child);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, { id: "guarded-parent", workflow: parent });
+    expect(await executeAgentFlowCommandPipeline(
+      store, "guarded-parent", parent, undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({ status: "paused" });
+    const childRunId = (store.getRun("guarded-parent")!.context.waiting as { childRunId: string }).childRunId;
+    const snapshot = buildAgentFlowRunActionSnapshot(store, "guarded-parent");
+    const originalWithRunLock = store.withRunLock.bind(store);
+    let advanced = false;
+    store.withRunLock = (async (runId, operation, callback) => {
+      if (runId === childRunId && operation === "resume" && !advanced) {
+        advanced = true;
+        expect(await resumeAgentFlowCommandPipeline(
+          store, childRunId, child, { outcome: "approve" },
+          undefined, undefined, undefined, undefined, workflows
+        )).toMatchObject({ status: "paused" });
+      }
+      return originalWithRunLock(runId, operation, callback);
+    }) as typeof store.withRunLock;
+
+    await expect(executeAgentFlowRunAction(
+      store,
+      "guarded-parent",
+      { action: "approve", guard: snapshot.guard },
+      { workflows }
+    )).rejects.toMatchObject({ code: "AGENT_FLOW_ACTION_STALE" });
+    expect(store.getRun(childRunId)?.context.waiting).toMatchObject({ stepId: "second" });
     store.close();
   });
 

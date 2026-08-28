@@ -227,9 +227,11 @@ export async function executeAgentFlowCommandPipeline(
     assertOrPersistConfiguredProviderBindings(store, run, workflow, sessionProviders, workflows);
     const recoveredExecution = recoverInterruptedExecution(store, lock);
     prepareExecution?.();
+    const finalization = beforeSuccessfulFinalization
+      ?? linkedParentWorkflowPromotion(store, run, workflow);
     return runAgentFlowCommandPipeline(
       store, runId, workflow, undefined, transforms, sessionProviders, mcpCalls, notifications, workflows,
-      beforeSuccessfulFinalization, recoveredExecution
+      finalization, recoveredExecution
     );
   });
 }
@@ -253,9 +255,11 @@ export async function resumeAgentFlowCommandPipeline(
     assertOrPersistConfiguredProviderBindings(store, run, workflow, sessionProviders, workflows);
     const recoveredExecution = recoverInterruptedExecution(store, lock);
     const effectiveResponse = recoveredExecution === undefined ? response : undefined;
+    const finalization = beforeSuccessfulFinalization
+      ?? linkedParentWorkflowPromotion(store, run, workflow);
     return runAgentFlowCommandPipeline(
       store, runId, workflow, effectiveResponse, transforms, sessionProviders, mcpCalls, notifications, workflows,
-      beforeSuccessfulFinalization, recoveredExecution, prepareResume
+      finalization, recoveredExecution, prepareResume
     );
   });
 }
@@ -8420,7 +8424,16 @@ function promoteWorkflowStepOutputs(
 ): string[] {
   const stepId = requiredStepId(step);
   const outputs = normalizedStringList(step.outputs).map(normalizeAgentFlowArtifactPath);
-  const writes: WriteAgentFlowArtifactInput[] = outputs.map((outputPath) => {
+  const writes: WriteAgentFlowArtifactInput[] = outputs.flatMap((outputPath) => {
+    const existing = store.getArtifact(parentRunId, outputPath);
+    if (existing?.metadata.childRunId === childRunId && existing.writtenAt !== null) {
+      try {
+        store.readArtifact(parentRunId, outputPath);
+        return [];
+      } catch {
+        // Rebuild an unavailable parent copy from the child when possible.
+      }
+    }
     const child = store.getArtifact(childRunId, outputPath);
     if (child === null || child.writtenAt === null) {
       throw new AgentFlowRunStateError(
@@ -8428,10 +8441,9 @@ function promoteWorkflowStepOutputs(
         "AGENT_FLOW_WORKFLOW_OUTPUT_MISSING"
       );
     }
-    const existing = store.getArtifact(parentRunId, outputPath);
     const mayReplaceExisting = existing !== null
       && (step.overwrite === true || existing.producerStepId === stepId);
-    return {
+    return [{
       id: mayReplaceExisting
         ? existing.id
         : `workflow-output:${createHash("sha256").update(`${childRunId}:${outputPath}`).digest("hex")}`,
@@ -8449,7 +8461,7 @@ function promoteWorkflowStepOutputs(
         childArtifactId: child.id,
         ...(child.producerStepId === null ? {} : { childProducerStepId: child.producerStepId })
       }
-    };
+    }];
   });
   if (writes.length > 0) store.writeArtifactsAtomically(writes);
   store.appendRunEvent(parentRunId, {
@@ -8458,6 +8470,33 @@ function promoteWorkflowStepOutputs(
     payload: { childRunId, artifacts: outputs }
   });
   return outputs;
+}
+
+function linkedParentWorkflowPromotion(
+  store: AgentFlowRunStateStore,
+  child: AgentFlowRunRecord,
+  workflow: AgentFlowWorkflow
+): ((resultStatus?: string) => void) | undefined {
+  if (child.parentRunId === null || child.recoveryOfRunId !== null) return undefined;
+  const parent = store.getRun(child.parentRunId);
+  if (parent?.status !== "paused") return undefined;
+  let waiting: AgentFlowPipelineWaitingState;
+  try {
+    waiting = parseWaitingState(parent.context.waiting);
+  } catch {
+    return undefined;
+  }
+  if (waiting.kind !== "workflow" || waiting.childRunId !== child.id
+      || waiting.workflowName !== workflow.name) return undefined;
+  const parentWorkflow = mapping(parent.context.workflow) as AgentFlowWorkflow | undefined;
+  if (parentWorkflow === undefined) return undefined;
+  const location = collectRuntimeStepLocations(parentWorkflow.steps).get(waiting.stepId);
+  const step = location?.steps[location.index];
+  if (step === undefined || normalizedTarget(step.type) !== "workflow"
+      || normalizedTarget(step.workflow) !== workflow.name) return undefined;
+  return () => {
+    promoteWorkflowStepOutputs(store, parent.id, child.id, step, "paused");
+  };
 }
 
 function pauseForNestedWorkflow(
@@ -8544,7 +8583,7 @@ async function resumeNestedWorkflowWaitingStep(
       }
     : await resumeAgentFlowCommandPipeline(
         store, waiting.childRunId, childWorkflow, response,
-        transforms, sessionProviders, mcpCalls, notifications, workflows, undefined, promoteOutputs
+        transforms, sessionProviders, mcpCalls, notifications, workflows, prepareResume, promoteOutputs
       );
   if (childResult.status === "paused") {
     const current = store.getRun(runId)!;
