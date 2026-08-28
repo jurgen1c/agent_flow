@@ -514,11 +514,13 @@ name: recovered-parent
 version: 1
 style: pipeline
 maturity: experimental
+inputs:
+  request: { required: true }
 steps:
   - id: child
     type: workflow
     workflow: recovered-child
-    inputs: { request: request.md }
+    inputs: { request: "{{ inputs.request }}" }
     outputs: [response.md]
 `);
     const originalChildSource = `
@@ -551,6 +553,7 @@ steps:
     createAgentFlowLifecycleRun(interrupted, {
       id: "child-recovery",
       workflow: parent,
+      inputs: { request: "request.md" },
       context: { workflowRegistry: serializeAgentFlowWorkflowRegistry(registry) as never }
     });
     interrupted.acquireRunLock("child-recovery", "run", { ttlMs: 60_000 });

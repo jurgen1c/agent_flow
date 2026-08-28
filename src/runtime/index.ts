@@ -358,7 +358,7 @@ export type {
   AgentFlowPolicyRequest,
   AgentFlowPolicyStatus
 } from "./policy";
-export type { AgentFlowProviderKindResolver } from "./policy_utils";
+export type { AgentFlowProviderIdentity, AgentFlowProviderKindResolver } from "./policy_utils";
 export type {
   AgentFlowApprovalRecord,
   AgentFlowApprovalStatus,

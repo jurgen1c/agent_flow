@@ -2006,6 +2006,77 @@ steps:
     });
   });
 
+  test("requires Codex-mediated MCP calls to use known Codex providers", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: incompatible-codex-mcp-providers
+version: 1
+style: pipeline
+maturity: experimental
+limits: { max_frontier_calls: 2 }
+sessions:
+  fixture_agent: { provider: fixture, resume: true }
+  api_agent: { provider: api, resume: true }
+steps:
+  - { id: fixture_call, type: mcp_call, via: codex, session: fixture_agent, server: jira, tool: get, arguments: {}, outputs: [fixture.json] }
+  - { id: api_call, type: mcp_call, via: codex, session: api_agent, server: jira, tool: get, arguments: {}, outputs: [api.json] }
+`);
+
+    const validation = validateAgentFlowWorkflow(workflow, (provider) => provider === "api"
+      ? { kind: "frontier", driver: "openai-responses" }
+      : undefined);
+    expect(validation.errors.filter((issue) => issue.code === "workflow.mcp_call.session.provider.invalid"))
+      .toEqual([
+        {
+          code: "workflow.mcp_call.session.provider.invalid",
+          message: 'Codex-mediated MCP call session "fixture_agent" must use the built-in Codex provider, a Codex profile, or a configured codex-cli provider.',
+          path: "steps[0].session",
+          stepId: "fixture_call"
+        },
+        {
+          code: "workflow.mcp_call.session.provider.invalid",
+          message: 'Codex-mediated MCP call session "api_agent" must use the built-in Codex provider, a Codex profile, or a configured codex-cli provider.',
+          path: "steps[1].session",
+          stepId: "api_call"
+        }
+      ]);
+  });
+
+  test("rejects noncanonical nested-workflow output paths", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: invalid-nested-outputs
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: child
+    type: workflow
+    workflow: nested
+    inputs: {}
+    outputs: [../x, a/../x, " x "]
+`);
+
+    expect(validateAgentFlowWorkflow(workflow).errors.filter((issue) =>
+      issue.code === "workflow.workflow.output.invalid"
+    )).toEqual([
+      {
+        code: "workflow.workflow.output.invalid",
+        message: "Nested workflow outputs must contain normalized static repo-relative artifact paths.",
+        path: "steps[0].outputs[0]",
+        stepId: "child"
+      },
+      {
+        code: "workflow.workflow.output.invalid",
+        message: "Nested workflow outputs must contain normalized static repo-relative artifact paths.",
+        path: "steps[0].outputs[1]",
+        stepId: "child"
+      },
+      {
+        code: "workflow.workflow.output.invalid",
+        message: "Nested workflow outputs must contain normalized static repo-relative artifact paths.",
+        path: "steps[0].outputs[2]",
+        stepId: "child"
+      }
+    ]);
+  });
+
   test("rejects malformed session authority mappings and capability flags", () => {
     const workflow = parseAgentFlowWorkflowOrThrow(`name: malformed-session-authority
 version: 1

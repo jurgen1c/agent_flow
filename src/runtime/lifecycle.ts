@@ -550,6 +550,11 @@ function providerKindResolverFromBindings(
     if (!Object.hasOwn(value, provider)) return undefined;
     const binding = value[provider];
     if (binding === null || typeof binding !== "object" || Array.isArray(binding)) return undefined;
-    return binding.kind === "local" || binding.kind === "frontier" ? binding.kind : undefined;
+    return binding.kind === "local" || binding.kind === "frontier"
+      ? {
+          kind: binding.kind,
+          ...(typeof binding.driver === "string" ? { driver: binding.driver } : {})
+        }
+      : undefined;
   };
 }

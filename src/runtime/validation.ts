@@ -6,7 +6,12 @@ import type {
   AgentFlowYamlValue
 } from "./workflow";
 import { validateAgentFlowPolicyPrimitives } from "./policy";
-import { isAgentFlowFrontierProvider, policyGlobLayersHaveWritablePath, type AgentFlowProviderKindResolver } from "./policy_utils";
+import {
+  agentFlowProviderIdentity,
+  isAgentFlowFrontierProvider,
+  policyGlobLayersHaveWritablePath,
+  type AgentFlowProviderKindResolver
+} from "./policy_utils";
 import { normalizeAgentFlowArtifactPath } from "./run_state";
 import { MAX_AGENT_FLOW_SESSION_INPUTS } from "./session_request";
 import {
@@ -145,7 +150,7 @@ export function validateAgentFlowWorkflow(
   validateTargetShapes(executableContexts, errors);
   validateTargets(executableContexts, ids, errors);
   validateCommands(workflow, executableContexts, errors);
-  validateSessionReferences(workflow, runtimeContexts, errors);
+  validateSessionReferences(workflow, runtimeContexts, errors, providerKind);
   validateCollaborationAuthority(workflow, runtimeContexts, errors);
   validateControlStepShapes(workflow, executableContexts, errors);
   validateConditionExpressions(workflow, executableContexts, errors);
@@ -1410,7 +1415,8 @@ export function agentFlowCommandUnsafeReason(command: string): string | undefine
 function validateSessionReferences(
   workflow: AgentFlowWorkflow,
   contexts: StepContext[],
-  errors: AgentFlowWorkflowIssue[]
+  errors: AgentFlowWorkflowIssue[],
+  providerKind?: AgentFlowProviderKindResolver
 ): void {
   const sessions = new Set(Object.keys(workflow.sessions ?? {}));
 
@@ -1445,6 +1451,20 @@ function validateSessionReferences(
           "workflow.mcp_call.session.not_resumable",
           "session",
           `Codex-mediated MCP call session ${JSON.stringify(sessionName)} must declare resume: true.`
+        );
+      }
+      const provider = isRecord(session) ? nonEmptyString(session.provider) : undefined;
+      const identity = provider === undefined ? undefined : agentFlowProviderIdentity(provider, providerKind);
+      if (provider !== undefined && !isDynamicReference(provider)
+          && provider !== "codex" && !provider.startsWith("codex:")
+          && (["fixture", "local", "frontier"].includes(provider)
+            || (identity?.driver !== undefined && identity.driver !== "codex-cli"))) {
+        addStepIssue(
+          errors,
+          context,
+          "workflow.mcp_call.session.provider.invalid",
+          "session",
+          `Codex-mediated MCP call session ${JSON.stringify(sessionName)} must use the built-in Codex provider, a Codex profile, or a configured codex-cli provider.`
         );
       }
     }
@@ -2003,6 +2023,21 @@ function validateArtifactPaths(contexts: StepContext[], errors: AgentFlowWorkflo
           );
         }
         seen.add(normalized);
+      }
+      continue;
+    }
+    if (context.type === "workflow") {
+      const rawOutputs = Array.isArray(context.step.outputs) ? context.step.outputs : [];
+      for (const [index, value] of rawOutputs.entries()) {
+        if (typeof value !== "string" || normalizedStaticArtifactPath(value) === undefined) {
+          addStepIssue(
+            errors,
+            context,
+            "workflow.workflow.output.invalid",
+            `outputs[${index}]`,
+            "Nested workflow outputs must contain normalized static repo-relative artifact paths."
+          );
+        }
       }
       continue;
     }

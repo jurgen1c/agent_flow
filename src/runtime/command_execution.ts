@@ -5793,10 +5793,15 @@ function prepareNestedRecoveryInputs(
   inputs: Record<string, AgentFlowRunStateValue>,
   failurePath: string | null,
   securityWorkflow: AgentFlowWorkflow,
-  workflow: AgentFlowWorkflow
+  workflow: AgentFlowWorkflow,
+  artifactReferencesOnly = false
 ): PreparedNestedRecoveryInputs {
   const paths = new Set<string>();
-  collectRecoveryArtifactPaths(store, parentRunId, inputs, paths);
+  if (artifactReferencesOnly) {
+    collectWorkflowStepArtifactPaths(store, parentRunId, declaredInputs, inputs, paths);
+  } else {
+    collectRecoveryArtifactPaths(store, parentRunId, inputs, paths);
+  }
   const sensitivePaths = new Set<string>();
   collectRecoveryReferencedSensitiveArtifactPaths(
     store,
@@ -5847,6 +5852,37 @@ function prepareNestedRecoveryInputs(
     pathMap,
     securityWorkflow
   };
+}
+
+function collectWorkflowStepArtifactPaths(
+  store: AgentFlowRunStateStore,
+  runId: string,
+  declared: unknown,
+  resolved: AgentFlowRunStateValue,
+  paths: Set<string>
+): void {
+  if (typeof declared === "string") {
+    const reference = /^\{\{\s*(?:inputs\.[A-Za-z_][A-Za-z0-9_-]*|artifacts\.[A-Za-z0-9_.-]+)\s*}}$/.exec(declared);
+    if (reference !== null && typeof resolved === "string") {
+      collectRecoveryArtifactPaths(store, runId, resolved, paths);
+    }
+    return;
+  }
+  if (Array.isArray(declared) && Array.isArray(resolved)) {
+    declared.forEach((entry, index) =>
+      collectWorkflowStepArtifactPaths(store, runId, entry, resolved[index] ?? null, paths)
+    );
+    return;
+  }
+  const declaredRecord = mapping(declared);
+  const resolvedRecord = resolved !== null && typeof resolved === "object" && !Array.isArray(resolved)
+    ? resolved as Record<string, AgentFlowRunStateValue>
+    : undefined;
+  if (declaredRecord !== undefined && resolvedRecord !== undefined) {
+    Object.entries(declaredRecord).forEach(([key, entry]) =>
+      collectWorkflowStepArtifactPaths(store, runId, entry, resolvedRecord[key] ?? null, paths)
+    );
+  }
 }
 
 function secureNestedRecoveryInputValues(
@@ -8288,7 +8324,7 @@ async function executeNestedWorkflowStep(
   }
   assertNestedRecoveryRequiredInputs(workflow, rawInputs);
   const prepared = prepareNestedRecoveryInputs(
-    store, parentRunId, `workflow:${stepId}`, step.inputs, rawInputs, null, parentWorkflow, workflow
+    store, parentRunId, `workflow:${stepId}`, step.inputs, rawInputs, null, parentWorkflow, workflow, true
   );
   const childRunId = `${parentRunId}:workflow:${safeId(stepId)}:attempt-${attempt}`;
   const existing = store.getRun(childRunId);

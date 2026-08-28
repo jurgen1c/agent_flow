@@ -675,6 +675,56 @@ steps:
     store.close();
   });
 
+  test("does not copy literal child input strings that happen to name parent artifacts", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-literal-input-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: literal-input-child
+version: 1
+style: pipeline
+maturity: experimental
+inputs:
+  label: { required: true }
+steps:
+  - { id: write, type: command, command: "printf child > shared.txt", outputs: [shared.txt] }
+`);
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: literal-input-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: child
+    type: workflow
+    workflow: literal-input-child
+    inputs: { label: shared.txt }
+    outputs: [shared.txt]
+    overwrite: true
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register(parent.name, parent)
+      .register(child.name, child);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, { id: "literal-input-parent", workflow: parent });
+    store.writeArtifact({
+      id: "existing-shared",
+      runId: "literal-input-parent",
+      stepId: "fixture",
+      path: "shared.txt",
+      kind: "fixture",
+      contentType: "text/plain",
+      content: "parent"
+    });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "literal-input-parent", parent, undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({ status: "completed" });
+    const childRun = store.listRuns().find((run) => run.parentRunId === "literal-input-parent")!;
+    expect(childRun.inputs).toEqual({ label: "shared.txt" });
+    expect(store.readArtifact("literal-input-parent", "shared.txt").content.toString()).toBe("child");
+    store.close();
+  });
+
   test("persists child setup errors and finalizes the parent", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-setup-failure-"));
     fs.mkdirSync(path.join(repo, ".git"));

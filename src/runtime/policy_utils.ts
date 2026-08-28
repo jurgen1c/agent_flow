@@ -2,7 +2,23 @@ import fs from "node:fs";
 import path from "node:path";
 import type { AgentFlowYamlMapping, AgentFlowYamlValue } from "./workflow";
 
-export type AgentFlowProviderKindResolver = (provider: string) => "local" | "frontier" | undefined;
+export interface AgentFlowProviderIdentity {
+  kind: "local" | "frontier";
+  driver?: string;
+}
+
+export type AgentFlowProviderKindResolver = (
+  provider: string
+) => AgentFlowProviderIdentity["kind"] | AgentFlowProviderIdentity | undefined;
+
+export function agentFlowProviderIdentity(
+  provider: string,
+  resolver?: AgentFlowProviderKindResolver
+): AgentFlowProviderIdentity | undefined {
+  const resolved = resolver?.(provider);
+  if (resolved === "local" || resolved === "frontier") return { kind: resolved };
+  return resolved;
+}
 
 export function isAgentFlowFrontierProvider(
   value: unknown,
@@ -10,7 +26,8 @@ export function isAgentFlowFrontierProvider(
 ): boolean {
   if (typeof value !== "string") return false;
   const provider = value.trim();
-  return resolver?.(provider) === "frontier" || provider === "frontier" || provider === "codex"
+  return agentFlowProviderIdentity(provider, resolver)?.kind === "frontier"
+    || provider === "frontier" || provider === "codex"
     || (provider.startsWith("codex:") && provider.slice("codex:".length).trim().length > 0);
 }
 

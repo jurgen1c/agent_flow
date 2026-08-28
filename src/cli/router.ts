@@ -499,8 +499,11 @@ async function runLifecycleCommand(
         workflow: registeredWorkflow,
         validation: validateAgentFlowWorkflow(
           registeredWorkflow,
-          (provider) => provider === "codex" ? "frontier"
-            : Object.hasOwn(repositoryAliases, provider) ? repositoryAliases[provider]!.kind : undefined
+          (provider) => provider === "codex" ? { kind: "frontier", driver: "codex-cli" }
+            : Object.hasOwn(catalog.bindings, provider) ? {
+                kind: catalog.bindings[provider]!.kind,
+                driver: catalog.bindings[provider]!.config.driver
+              } : Object.hasOwn(repositoryAliases, provider) ? repositoryAliases[provider]!.kind : undefined
         )
       }));
       const invalidConfiguredWorkflow = configuredValidations.find(({ validation }) => !validation.valid);
