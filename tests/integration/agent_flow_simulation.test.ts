@@ -1587,6 +1587,30 @@ steps:
     expect(available.missingArtifacts).toEqual([]);
   });
 
+  test("rejects nested-workflow artifact expressions whose property is missing", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: missing-mapped-artifact-property
+version: 1
+style: pipeline
+maturity: draft
+steps:
+  - id: nested
+    type: workflow
+    workflow: child
+    inputs: { payload: "{{ artifacts.config.missing }}" }
+    outputs: [done.txt]
+`);
+    const result = simulateAgentFlowWorkflow(workflow, {
+      artifacts: { "config.json": { present: true } },
+      steps: { nested: { outputs: { "done.txt": "unexpected" } } }
+    });
+
+    expect(result.status).toBe("unresolved");
+    expect(result.visitedSteps).toEqual([{ id: "nested", type: "workflow", outcome: "failed" }]);
+    expect(result.availableArtifacts).toEqual(["config.json"]);
+    expect(result.unresolvedBranches[0]?.reason)
+      .toContain("does not resolve a published artifact value");
+  });
+
   test("rejects ambiguous artifact aliases in nested-workflow inputs", () => {
     const workflow = parseAgentFlowWorkflowOrThrow(`name: ambiguous-mapped-artifact-input
 version: 1

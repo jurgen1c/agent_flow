@@ -490,6 +490,22 @@ steps:
         { id: "second", outcome: "failed" }
       ]
     });
+
+    const invalidFirst = structuredClone(workflow);
+    invalidFirst.steps[0]!.arguments = { key: "{{ inputs.missing }}" };
+    invalidFirst.steps[0]!.on_failure = { retry: 1, allowed: true, then: "continue" };
+    expect(simulateAgentFlowWorkflow(invalidFirst, {
+      steps: {
+        first: { outcome: "failed" },
+        second: { outputs: { "second.json": { key: "AF-2" } } }
+      }
+    })).toMatchObject({
+      status: "completed",
+      visitedSteps: [
+        { id: "first", outcome: "failed" },
+        { id: "second", outcome: "succeeded" }
+      ]
+    });
   });
 
   test("pauses Codex MCP for an unavailable thread and resumes after explicit reset", async () => {
