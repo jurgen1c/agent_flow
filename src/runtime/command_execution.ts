@@ -7276,7 +7276,7 @@ function staleApprovalFailureInput(
   input: FinalizePipelineRunInput
 ): FinalizePipelineRunInput {
   if (input.intendedStatus !== "completed") return input;
-  const staleApprovalIds = latestStaleApprovalStepIds(store, runId);
+  const staleApprovalIds = staleApprovalStepIdsAcrossDescendants(store, runId);
   if (staleApprovalIds.length === 0) return input;
   const message = staleApprovalMessage(staleApprovalIds, "workflow completion");
   return {
