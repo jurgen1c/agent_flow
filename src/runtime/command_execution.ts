@@ -8529,11 +8529,42 @@ async function executeNestedWorkflowStep(
         }
       }
     );
+  } catch (error) {
+    terminalizeNestedWorkflowAfterExecutionError(store, childRunId, workflow, error);
+    throw error;
   } finally {
     clearInterval(stopMonitor);
   }
   const outputs = result.status === "completed" ? promotedOutputs ?? [] : [];
   return { status: result.status, runId: childRunId, outputs, ...(result.message === undefined ? {} : { message: result.message }) };
+}
+
+function terminalizeNestedWorkflowAfterExecutionError(
+  store: AgentFlowRunStateStore,
+  childRunId: string,
+  workflow: AgentFlowWorkflow,
+  error: unknown
+): void {
+  if (["AGENT_FLOW_RUN_LOCKED", "AGENT_FLOW_RUN_LOCK_LOST"].includes(agentFlowErrorCode(error) ?? "")) return;
+  const message = redactAgentFlowSensitiveText(error instanceof Error ? error.message : String(error));
+  const terminalized = store.withRunStateTransaction(childRunId, () => {
+    const child = store.getRun(childRunId);
+    if (child === null || !["pending", "running"].includes(child.status)) return false;
+    store.updateRun(childRunId, {
+      currentStepId: null,
+      error: { code: "nested_workflow.execution_failed", message }
+    });
+    store.transitionRunWithEvent(childRunId, {
+      status: "failed",
+      allowedFrom: ["pending", "running"],
+      event: {
+        type: "run.failed",
+        payload: { code: "nested_workflow.execution_failed", message }
+      }
+    });
+    return true;
+  });
+  if (terminalized) applyAgentFlowRetention(store, childRunId, workflow, "failed");
 }
 
 function assertNestedWorkflowNotInLineage(

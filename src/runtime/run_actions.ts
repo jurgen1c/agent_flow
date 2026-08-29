@@ -153,7 +153,11 @@ export function buildAgentFlowRunActionSnapshot(
   let staleApprovals: AgentFlowRunActionSnapshot["staleApprovals"] = [];
   let approvalEvidenceValid = true;
   try {
-    guardedLineage = nestedActionApprovalLineage(store, run, waitingRun).map((lineageRun) => ({
+    const guardedRuns = nestedActionApprovalLineage(store, run, waitingRun);
+    if (waitingResult.waiting?.kind === "workflow" && waitingResult.waiting.childStatus === "completed") {
+      guardedRuns.push(...completedPromotedDescendants(store, waitingRun, new Set(guardedRuns.map((entry) => entry.id))));
+    }
+    guardedLineage = guardedRuns.map((lineageRun) => ({
       run: lineageRun,
       approvals: lineageRun.id === waitingRun.id ? approvals : store.listApprovals(lineageRun.id)
     }));
@@ -564,6 +568,36 @@ function nestedActionApprovalLineage(
   );
 }
 
+function completedPromotedDescendants(
+  store: AgentFlowRunStateStore,
+  rootRun: AgentFlowRunRecord,
+  visited: Set<string>
+): AgentFlowRunRecord[] {
+  const descendants: AgentFlowRunRecord[] = [];
+  const pending = [rootRun];
+  while (pending.length > 0) {
+    const parent = pending.pop()!;
+    const latestChildByStep = new Map<string, string>();
+    for (const event of store.listEvents(parent.id)) {
+      if (event.type !== "workflow.outputs.promoted" || event.stepId === null
+          || event.payload === null || typeof event.payload !== "object" || Array.isArray(event.payload)) continue;
+      const childRunId = event.payload.childRunId;
+      if (typeof childRunId === "string" && childRunId.trim().length > 0) {
+        latestChildByStep.set(event.stepId, childRunId.trim());
+      }
+    }
+    for (const childRunId of latestChildByStep.values()) {
+      if (visited.has(childRunId)) continue;
+      const child = store.getRun(childRunId);
+      if (child?.parentRunId !== parent.id || child.status !== "completed") continue;
+      visited.add(child.id);
+      descendants.push(child);
+      pending.push(child);
+    }
+  }
+  return descendants;
+}
+
 function relevantApprovals(
   approvals: AgentFlowApprovalRecord[],
   activeApprovalId?: string
@@ -646,7 +680,9 @@ function actionAvailability(
     && waiting.validOutcomes.includes(interactionKind === "disagreement" ? "request_changes" : "reject");
   const canInput = actionStateValid && !hasStaleApprovals && interactionKind === "input_request";
   const canContinueWorkflow = waiting?.kind === "workflow" && waiting.childStatus !== undefined;
-  const canResume = actionStateValid && !hasStaleApprovals && run.status === "paused"
+  const staleApprovalBlocksResume = hasStaleApprovals
+    && (!canContinueWorkflow || waiting.childStatus === "paused" || waiting.childStatus === "completed");
+  const canResume = actionStateValid && !staleApprovalBlocksResume && run.status === "paused"
     && (waiting === null || canContinueWorkflow);
   const canPause = actionStateValid && ["pending", "running", "waiting"].includes(run.status);
   const canCancel = actionStateValid && ["pending", "running", "waiting", "paused"].includes(run.status);
