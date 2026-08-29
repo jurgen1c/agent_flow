@@ -3796,7 +3796,7 @@ function validateRuntimeRecoveryTargets(
       throw invalidRuntimeRecoveryRoute(stepId, "on_remediated and on_unresolved require route_to");
     }
     if (routeValue !== undefined) {
-      if (!["artifact_transform", "command", "mcp_call", "session_request"].includes(normalizedTarget(step.type) ?? "")) {
+      if (!["artifact_transform", "command", "mcp_call", "session_request", "workflow"].includes(normalizedTarget(step.type) ?? "")) {
         throw invalidRuntimeRecoveryRoute(stepId, `recovery is not supported for ${String(step.type)} steps`);
       }
       if (workflow.style !== "recovery_pipeline") {

@@ -22,6 +22,52 @@ import {
 import { preflightAgentFlowSessionProviderEvidence } from "../../src/runtime/session_request";
 
 describe("Agent Flow recovery routes", () => {
+  test("routes a failed nested workflow step through a recovery workflow", async () => {
+    const root = temporaryRepo();
+    const parent = parseAgentFlowWorkflowOrThrow(`name: nested-step-recovery-parent
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - id: child
+    type: workflow
+    workflow: failing-child
+    inputs: {}
+    outputs: [never.txt]
+    on_failure:
+      route_to: { workflow: repair-child }
+      on_remediated: { then: complete }
+      on_unresolved: { then: fail }
+`);
+    const child = parseAgentFlowWorkflowOrThrow(`name: failing-child
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: terminal, type: result, status: failed }
+`);
+    const repair = parseAgentFlowWorkflowOrThrow(`name: repair-child
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: repaired, type: result, status: remediated }
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register(parent.name, parent)
+      .register(child.name, child)
+      .register(repair.name, repair);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "nested-step-recovery", workflow: parent });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "nested-step-recovery", parent, undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({ status: "completed" });
+    expect(store.listRuns().filter((run) => run.parentRunId === "nested-step-recovery"))
+      .toHaveLength(2);
+    store.close();
+  });
+
   test("loads registries whose only cycle is formed by recovery routes", () => {
     const root = temporaryRepo();
     fs.writeFileSync(path.join(root, "repair-a.yml"), `name: repair-a
