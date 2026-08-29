@@ -1617,11 +1617,14 @@ name: setup-failure-parent
 version: 1
 style: pipeline
 maturity: experimental
+inputs:
+  ticket: { required: false }
 steps:
   - id: child
     type: workflow
     workflow: required-child
-    inputs: {}
+    inputs:
+      ticket: "{{ inputs.ticket }}"
     outputs: [missing.txt]
     on_failure: { then: fail }
 `);
@@ -1834,14 +1837,15 @@ steps:
     const store = await openAgentFlowRunState({ cwd: repo });
     createAgentFlowLifecycleRun(store, { id: "recursive-root", workflow: parent });
 
-    expect(await executeAgentFlowCommandPipeline(
+    await expect(executeAgentFlowCommandPipeline(
       store, "recursive-root", parent, undefined, undefined, undefined, undefined, workflows
-    )).toMatchObject({ status: "paused", failedStep: "child_b" });
-    const runs = store.listRuns();
-    expect(runs).toHaveLength(2);
-    const childRun = runs.find((run) => run.parentRunId === "recursive-root")!;
-    expect(JSON.stringify(store.listSteps(childRun.id).at(-1)?.error))
-      .toContain("already present in run recursive-root's parent lineage");
+    )).rejects.toMatchObject({
+      code: "AGENT_FLOW_WORKFLOW_INVALID",
+      message: expect.stringContaining("Recursive workflow reference detected")
+    });
+    expect(store.listRuns()).toHaveLength(1);
+    expect(store.getRun("recursive-root")?.status).toBe("pending");
+    expect(store.listEvents("recursive-root").map((event) => event.type)).toEqual(["run.created"]);
     store.close();
   });
 
@@ -1873,6 +1877,46 @@ steps:
     expect(store.getRun("incomplete-registry-parent")?.status).toBe("pending");
     expect(store.listEvents("incomplete-registry-parent").map((event) => event.type))
       .toEqual(["run.created"]);
+    expect(fs.existsSync(path.join(repo, "marker.txt"))).toBe(false);
+    store.close();
+  });
+
+  test("rejects invalid child input contracts before earlier parent steps can run", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-invalid-contract-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: invalid-contract-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: effect, type: command, command: "printf side-effect > marker.txt", outputs: [marker.txt] }
+  - { id: child, type: workflow, workflow: required-input-child, inputs: {}, outputs: [result.txt] }
+`);
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: required-input-child
+version: 1
+style: pipeline
+maturity: experimental
+inputs:
+  required: { required: true }
+steps:
+  - { id: done, type: result, status: completed }
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register(parent.name, parent)
+      .register(child.name, child);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, { id: "invalid-contract-parent", workflow: parent });
+
+    await expect(executeAgentFlowCommandPipeline(
+      store, "invalid-contract-parent", parent, undefined, undefined, undefined, undefined, workflows
+    )).rejects.toMatchObject({
+      code: "AGENT_FLOW_WORKFLOW_INVALID",
+      message: expect.stringContaining("omits required inputs for required-input-child: required")
+    });
+    expect(store.getRun("invalid-contract-parent")?.status).toBe("pending");
+    expect(store.listEvents("invalid-contract-parent").map((event) => event.type)).toEqual(["run.created"]);
     expect(fs.existsSync(path.join(repo, "marker.txt"))).toBe(false);
     store.close();
   });

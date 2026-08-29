@@ -27,9 +27,12 @@ import {
 } from "./artifact_transform";
 import {
   agentFlowCommandUnsafeReason,
+  formatAgentFlowWorkflowIssues,
   MAX_AGENT_FLOW_COMMAND_RETRIES,
-  MAX_AGENT_FLOW_COMMAND_TIMEOUT_SECONDS
+  MAX_AGENT_FLOW_COMMAND_TIMEOUT_SECONDS,
+  validateAgentFlowWorkflow
 } from "./validation";
+import type { AgentFlowProviderKindResolver } from "./policy_utils";
 import {
   AgentFlowSessionProviderRegistry,
   AgentFlowSessionPolicyError,
@@ -120,6 +123,7 @@ import {
 } from "./execution_security";
 import {
   AgentFlowWorkflowRegistry,
+  assertAgentFlowWorkflowRegistryContracts,
   createAgentFlowWorkflowRegistry,
   createAgentFlowWorkflowRegistryFromSnapshot,
   validateAgentFlowWorkflowStepInputExpressions,
@@ -227,8 +231,7 @@ export async function executeAgentFlowCommandPipeline(
   return store.withRunLock(runId, "run", (lock) => {
     beforeRecovery?.();
     let run = assertPersistedWorkflowIdentity(store, runId, workflow);
-    workflows = pinnedWorkflowRegistry(store, run, workflow, workflows);
-    run = store.getRun(runId)!;
+    ({ run, workflows } = pinnedWorkflowRegistry(store, run, workflow, workflows, sessionProviders));
     assertOrPersistConfiguredProviderBindings(store, run, workflow, sessionProviders, workflows);
     const recoveredExecution = recoverInterruptedExecution(store, lock);
     prepareExecution?.();
@@ -257,8 +260,7 @@ export async function resumeAgentFlowCommandPipeline(
   return store.withRunLock(runId, "resume", (lock) => {
     prepareResume?.();
     let run = assertPersistedWorkflowIdentity(store, runId, workflow);
-    workflows = pinnedWorkflowRegistry(store, run, workflow, workflows);
-    run = store.getRun(runId)!;
+    ({ run, workflows } = pinnedWorkflowRegistry(store, run, workflow, workflows, sessionProviders));
     assertOrPersistConfiguredProviderBindings(store, run, workflow, sessionProviders, workflows);
     const recoveredExecution = recoverInterruptedExecution(store, lock);
     const effectiveResponse = recoveredExecution === undefined ? response : undefined;
@@ -275,8 +277,9 @@ function pinnedWorkflowRegistry(
   store: AgentFlowRunStateStore,
   run: AgentFlowRunRecord,
   workflow: AgentFlowWorkflow,
-  supplied: AgentFlowWorkflowRegistry
-): AgentFlowWorkflowRegistry {
+  supplied: AgentFlowWorkflowRegistry,
+  providers: AgentFlowSessionProviderRegistry
+): { run: AgentFlowRunRecord; workflows: AgentFlowWorkflowRegistry } {
   const registryName = persistedOrSuppliedWorkflowRegistryName(run, workflow, supplied);
   if (run.context.workflowRegistry !== undefined) {
     const persisted = createAgentFlowWorkflowRegistryFromSnapshot(run.context.workflowRegistry);
@@ -287,7 +290,7 @@ function pinnedWorkflowRegistry(
         "AGENT_FLOW_WORKFLOW_REGISTRY_STATE"
       );
     }
-    return persisted;
+    return { run, workflows: persisted };
   }
 
   const reachable = createAgentFlowWorkflowRegistry().register(registryName, workflow);
@@ -308,14 +311,68 @@ function pinnedWorkflowRegistry(
     }
   };
   visit(workflow);
-  store.updateRun(run.id, {
+  let rootIsPersistable = true;
+  try {
+    assertAgentFlowWorkflowRegistryContracts(reachable, [registryName]);
+  } catch (error) {
+    throw new AgentFlowRunStateError(
+      `Agent Flow run ${run.id} cannot start because its workflow registry is invalid: ${error instanceof Error ? error.message : String(error)}`,
+      "AGENT_FLOW_WORKFLOW_INVALID",
+      { cause: error }
+    );
+  }
+  const providerKind = workflowRegistryProviderKind(providers);
+  for (const name of reachable.names()) {
+    const candidate = reachable.get(name)!;
+    let validation: ReturnType<typeof validateAgentFlowWorkflow>;
+    try {
+      validation = validateAgentFlowWorkflow(candidate, providerKind);
+    } catch (error) {
+      if (name === registryName) {
+        rootIsPersistable = false;
+        continue;
+      }
+      throw new AgentFlowRunStateError(
+        `Agent Flow run ${run.id} cannot start because registered workflow ${name} is malformed: ${error instanceof Error ? error.message : String(error)}`,
+        "AGENT_FLOW_WORKFLOW_INVALID",
+        { cause: error }
+      );
+    }
+    if (validation.valid) continue;
+    if (name === registryName) {
+      // Lifecycle creation already validates the entry workflow. If external
+      // state has since made it invalid, leave it unpinned so the ordinary
+      // step preflight can persist its controlled rejection.
+      rootIsPersistable = false;
+      continue;
+    }
+    throw new AgentFlowRunStateError(
+      `Agent Flow run ${run.id} cannot start because registered workflow ${name} failed validation:\n${formatAgentFlowWorkflowIssues(validation.errors)}`,
+      "AGENT_FLOW_WORKFLOW_INVALID"
+    );
+  }
+  if (!rootIsPersistable) return { run, workflows: reachable };
+  const updated = store.updateRun(run.id, {
     context: {
       ...run.context,
       workflowRegistryName: registryName,
       workflowRegistry: serializeWorkflowRegistryForRun(reachable)
     }
   });
-  return reachable;
+  return { run: updated, workflows: reachable };
+}
+
+function workflowRegistryProviderKind(
+  providers: AgentFlowSessionProviderRegistry
+): AgentFlowProviderKindResolver {
+  return (provider) => {
+    const descriptor = providers.describe(provider);
+    if (descriptor?.kind !== "local" && descriptor?.kind !== "frontier") return undefined;
+    return {
+      kind: descriptor.kind,
+      ...(descriptor.driver === undefined ? {} : { driver: descriptor.driver })
+    };
+  };
 }
 
 function persistedOrSuppliedWorkflowRegistryName(

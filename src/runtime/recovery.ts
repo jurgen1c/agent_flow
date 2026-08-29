@@ -134,6 +134,14 @@ export function createAgentFlowWorkflowRegistryFromSnapshot(
   return registry;
 }
 
+export function assertAgentFlowWorkflowRegistryContracts(
+  registry: AgentFlowWorkflowRegistry,
+  roots: string[] = registry.names()
+): void {
+  assertAcyclicWorkflowRegistry(registry, roots);
+  assertWorkflowStepInputContracts(registry, roots);
+}
+
 function workflowFiles(source: string): string[] {
   const stat = fs.statSync(source);
   if (stat.isFile()) return [source];
