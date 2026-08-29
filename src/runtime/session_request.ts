@@ -846,6 +846,7 @@ async function executeAgentFlowSessionStep(
   let sourceContextChecksum: string | undefined;
   let providerContextChecksum: string | undefined;
   let contextWasRedacted = false;
+  let hasStructuredContext = false;
   let promptWasRedacted = false;
   try {
     const secureGeneratedField = (value: string, field: string): string => {
@@ -919,6 +920,7 @@ async function executeAgentFlowSessionStep(
     sourcePromptChecksum = sourcePrompt.checksum;
     if (kind === "session_request") {
       const preparedContext = prepareAgentFlowSessionContext(workflow, step.context, run.inputs, stepId);
+      hasStructuredContext = preparedContext !== undefined;
       sourceContextChecksum = preparedContext === undefined
         ? undefined
         : `sha256:${digest(stableJson(preparedContext.source))}`;
@@ -964,10 +966,14 @@ async function executeAgentFlowSessionStep(
     throw error;
   }
   if (Buffer.byteLength(rawPrompt.content, "utf8") > MAX_AGENT_FLOW_SESSION_PROMPT_BYTES) {
-    throw promptTooLarge(rawPrompt.path);
+    throw hasStructuredContext
+      ? promptWithStructuredContextTooLarge(rawPrompt.path, "source")
+      : promptTooLarge(rawPrompt.path);
   }
   if (Buffer.byteLength(prompt.content, "utf8") > MAX_AGENT_FLOW_SESSION_PROMPT_BYTES) {
-    throw promptTooLarge(prompt.path);
+    throw hasStructuredContext
+      ? promptWithStructuredContextTooLarge(prompt.path, "provider")
+      : promptTooLarge(prompt.path);
   }
   const resolvedSessionInputs = kind === "session_request"
     ? resolveSessionInputPaths(rawInputs, run.inputs, stepId)
@@ -1697,6 +1703,19 @@ export function readAgentFlowSessionPrompt(
 function promptTooLarge(declaredPath: string): AgentFlowSessionRequestError {
   return new AgentFlowSessionRequestError(
     `Prompt ${declaredPath} exceeds the ${MAX_AGENT_FLOW_SESSION_PROMPT_BYTES}-byte session prompt limit.`,
+    "AGENT_FLOW_SESSION_PROMPT_TOO_LARGE"
+  );
+}
+
+function promptWithStructuredContextTooLarge(
+  declaredPath: string,
+  stage: "source" | "provider"
+): AgentFlowSessionRequestError {
+  const handlingStage = stage === "source"
+    ? "before sensitive-data handling"
+    : "after sensitive-data handling";
+  return new AgentFlowSessionRequestError(
+    `Prompt ${declaredPath} with structured context exceeds the ${MAX_AGENT_FLOW_SESSION_PROMPT_BYTES}-byte session prompt limit ${handlingStage}.`,
     "AGENT_FLOW_SESSION_PROMPT_TOO_LARGE"
   );
 }

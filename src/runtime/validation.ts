@@ -2162,7 +2162,7 @@ function validateArtifactPaths(contexts: StepContext[], errors: AgentFlowWorkflo
                 context,
                 "workflow.session_request.context.value.invalid",
                 field,
-                `Session request context value "${key}" must be a string, number, boolean, or null.`
+                `Session request context value "${key}" must be a string, finite number, boolean, or null.`
               );
               continue;
             }

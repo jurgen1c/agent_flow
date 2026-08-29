@@ -225,6 +225,14 @@ steps:
       "workflow.session_request.context.expression.invalid"
     ]);
 
+    invalid.steps[0]!.context = { invalid_number: Number.NaN };
+    expect(validateAgentFlowWorkflow(invalid).errors).toContainEqual({
+      code: "workflow.session_request.context.value.invalid",
+      message: 'Session request context value "invalid_number" must be a string, finite number, boolean, or null.',
+      path: "steps[0].context.invalid_number",
+      stepId: "fetch"
+    });
+
     const schema = JSON.parse(fs.readFileSync(path.join(repoRoot, "schemas/workflow.schema.json"), "utf8")) as {
       $defs: {
         scalarContext: unknown;

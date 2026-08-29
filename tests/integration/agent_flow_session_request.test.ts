@@ -24,6 +24,7 @@ import {
   type AgentFlowSessionProviderRequest
 } from "../../src/runtime";
 import {
+  appendAgentFlowSessionContext,
   invokeAgentFlowSessionProvider,
   readAgentFlowSessionPrompt,
   reserveAgentFlowSessionModelCallBudgets
@@ -2516,6 +2517,102 @@ steps:
     expect(result.message).toContain("session prompt limit");
     expect(calls).toBe(0);
     expect(store.getSession("oversized-prompt", "writer")).toMatchObject({ status: "paused" });
+    store.close();
+  });
+
+  test("attributes source prompt overages caused by structured context", async () => {
+    const root = temporaryRepo();
+    fs.mkdirSync(path.join(root, "prompts"), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, "prompts", "draft.md"),
+      Buffer.alloc(MAX_AGENT_FLOW_SESSION_PROMPT_BYTES, "x")
+    );
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: oversized-source-context
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  writer: { provider: fixture }
+steps:
+  - id: draft
+    type: session_request
+    session: writer
+    prompt: prompts/draft.md
+    context: { ticket_key: IAN-42 }
+    inputs: []
+    outputs: [response.md]
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "oversized-source-context", workflow });
+    let calls = 0;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+      calls += 1;
+      return { outputs: { "response.md": "Response" } };
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      "oversized-source-context",
+      workflow,
+      undefined,
+      providers
+    );
+
+    expect(result).toMatchObject({ status: "paused", failedStep: "draft" });
+    expect(result.message).toContain("with structured context");
+    expect(result.message).toContain("before sensitive-data handling");
+    expect(calls).toBe(0);
+    store.close();
+  });
+
+  test("attributes provider prompt overages caused by redacted structured context", async () => {
+    const root = temporaryRepo();
+    fs.mkdirSync(path.join(root, "prompts"), { recursive: true });
+    const sourceSuffixBytes = Buffer.byteLength(appendAgentFlowSessionContext({
+      path: "prompts/draft.md",
+      content: "",
+      checksum: "sha256:unused"
+    }, { api_token: "x" }).content, "utf8");
+    fs.writeFileSync(
+      path.join(root, "prompts", "draft.md"),
+      Buffer.alloc(MAX_AGENT_FLOW_SESSION_PROMPT_BYTES - sourceSuffixBytes, "x")
+    );
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: oversized-provider-context
+version: 1
+style: pipeline
+maturity: experimental
+policies: { sensitive_inputs: redact }
+sessions:
+  writer: { provider: fixture }
+steps:
+  - id: draft
+    type: session_request
+    session: writer
+    prompt: prompts/draft.md
+    context: { api_token: x }
+    inputs: []
+    outputs: [response.md]
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "oversized-provider-context", workflow });
+    let calls = 0;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", () => {
+      calls += 1;
+      return { outputs: { "response.md": "Response" } };
+    });
+
+    const result = await executeAgentFlowCommandPipeline(
+      store,
+      "oversized-provider-context",
+      workflow,
+      undefined,
+      providers
+    );
+
+    expect(result).toMatchObject({ status: "paused", failedStep: "draft" });
+    expect(result.message).toContain("with structured context");
+    expect(result.message).toContain("after sensitive-data handling");
+    expect(calls).toBe(0);
     store.close();
   });
 
