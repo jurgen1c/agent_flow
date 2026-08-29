@@ -151,6 +151,69 @@ steps:
     store.close();
   });
 
+  test("keeps a plain-paused child paused when its resume lease is held", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-plain-pause-lock-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: lease-paused-child
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: publish, type: command, command: "test -f ready.txt && printf done > child.txt", outputs: [child.txt] }
+`);
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: lease-paused-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: child, type: workflow, workflow: lease-paused-child, inputs: {}, outputs: [child.txt] }
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register(parent.name, parent)
+      .register(child.name, child);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    const competitor = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, { id: "lease-paused-parent", workflow: parent });
+    expect(await executeAgentFlowCommandPipeline(
+      store, "lease-paused-parent", parent, undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({ status: "paused" });
+    const childRunId = (store.getRun("lease-paused-parent")!.context.waiting as { childRunId: string }).childRunId;
+    fs.writeFileSync(path.join(repo, "ready.txt"), "ready\n");
+
+    let entered!: () => void;
+    let release!: () => void;
+    const lockEntered = new Promise<void>((resolve) => { entered = resolve; });
+    const lockRelease = new Promise<void>((resolve) => { release = resolve; });
+    const heldLock = competitor.withRunLock(childRunId, "run", async () => {
+      entered();
+      await lockRelease;
+    });
+    await lockEntered;
+    const snapshot = buildAgentFlowRunActionSnapshot(store, "lease-paused-parent");
+
+    await expect(executeAgentFlowRunAction(
+      store,
+      "lease-paused-parent",
+      { action: "resume", guard: snapshot.guard },
+      { workflows }
+    )).rejects.toMatchObject({ code: "AGENT_FLOW_RUN_LOCKED" });
+    expect(store.getRun(childRunId)?.status).toBe("paused");
+    expect(store.getRun("lease-paused-parent")?.status).toBe("paused");
+
+    release();
+    await heldLock;
+    expect(await executeAgentFlowRunAction(
+      store,
+      "lease-paused-parent",
+      { action: "resume", guard: buildAgentFlowRunActionSnapshot(store, "lease-paused-parent").guard },
+      { workflows }
+    )).toMatchObject({ status: "completed" });
+    competitor.close();
+    store.close();
+  });
+
   test("promotes child outputs before immediate success retention", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-retention-"));
     fs.mkdirSync(path.join(repo, ".git"));

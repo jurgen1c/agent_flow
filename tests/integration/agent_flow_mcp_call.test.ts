@@ -33,6 +33,21 @@ const repoRoot = path.resolve(".");
 const examplePath = path.join(repoRoot, "examples/workflows/jira-ticket-spec.yml");
 const fixturePath = path.join(repoRoot, "tests/fixtures/agent-flow/simulation/jira-ticket.json");
 
+function completedCodexMcpCall(
+  server: string,
+  tool: string,
+  arguments_: Record<string, unknown>,
+  result: string
+) {
+  return {
+    server,
+    tool,
+    arguments: arguments_,
+    status: "completed",
+    resultHash: `sha256:${createHash("sha256").update(result, "utf8").digest("hex")}`
+  };
+}
+
 describe("Agent Flow MCP call steps", () => {
   test("routes a Codex-mediated call through a named resumable session and requires matching JSONL evidence", async () => {
     const root = temporaryRepo();
@@ -62,7 +77,7 @@ steps:
       return {
         externalSessionId: "codex-thread-1",
         outputs: { "ticket.json": '{"key":"AF-1"}\n' },
-        metadata: { mcpCalls: [{ server: "atlassian", tool: "get_issue", arguments: { key: "AF-1" }, status: "completed" }] }
+        metadata: { mcpCalls: [completedCodexMcpCall("atlassian", "get_issue", { key: "AF-1" }, '{"key":"AF-1"}\n')] }
       };
     });
     const store = await openAgentFlowRunState({ cwd: root });
@@ -107,7 +122,7 @@ steps:
             }
           },
           metadata: {
-            mcpCalls: [{ server: "jira", tool: "get", arguments: { key: "AF-1" }, status: "completed" }]
+            mcpCalls: [completedCodexMcpCall("jira", "get", { key: "AF-1" }, '{"key":"AF-1"}\n')]
           }
         };
       }
@@ -186,7 +201,7 @@ steps:
       return {
         externalSessionId: "return-thread",
         outputs: { "ticket.json": "{}\n" },
-        metadata: { mcpCalls: [{ server: "jira", tool: "get", arguments: {}, status: "completed" }] }
+        metadata: { mcpCalls: [completedCodexMcpCall("jira", "get", {}, "{}\n")] }
       };
     });
 
@@ -226,7 +241,7 @@ steps:
             ? { externalSessionId: "Authorization: Bearer codex-mcp-session-secret" }
             : {}),
           outputs: { "ticket.json": "{}\n" },
-          metadata: { mcpCalls: [{ server: "jira", tool: "get", arguments: {}, status: "completed" }] }
+          metadata: { mcpCalls: [completedCodexMcpCall("jira", "get", {}, "{}\n")] }
         };
       });
       const store = await openAgentFlowRunState({ cwd: root });
@@ -283,6 +298,42 @@ steps:
     store.close();
   });
 
+  test("rejects Codex-mediated output that does not match the completed tool result", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: codex-mcp-result-mismatch
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  agent: { provider: codex, resume: true }
+limits: { max_frontier_calls: 1 }
+steps:
+  - { id: fetch, type: mcp_call, via: codex, session: agent, server: jira, tool: get, arguments: { key: AF-1 }, outputs: [ticket.json] }
+`);
+    const providers = createAgentFlowSessionProviderRegistry().register("codex", async (request) => {
+      request.reportExternalSessionId?.("mismatch-thread");
+      return {
+        externalSessionId: "mismatch-thread",
+        outputs: { "ticket.json": '{"key":"FABRICATED"}\n' },
+        metadata: {
+          mcpCalls: [completedCodexMcpCall("jira", "get", { key: "AF-1" }, '{"key":"AF-1"}\n')]
+        }
+      };
+    });
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "codex-mcp-result-mismatch", workflow });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "codex-mcp-result-mismatch", workflow, undefined, providers
+    )).toMatchObject({ status: "paused", failedStep: "fetch" });
+    expect(store.getSession("codex-mcp-result-mismatch", "agent")).toMatchObject({
+      status: "failed",
+      state: { error: "mcp_result_mismatch" }
+    });
+    expect(store.getArtifact("codex-mcp-result-mismatch", "ticket.json")).toBeNull();
+    store.close();
+  });
+
   test("leaves a Codex MCP session reclaimable when its output contract is malformed", async () => {
     const root = temporaryRepo();
     const workflow = parseAgentFlowWorkflowOrThrow(`name: codex-mcp-invalid-output
@@ -300,7 +351,7 @@ steps:
       return {
         externalSessionId: "invalid-output-thread",
         outputs: { "unexpected.json": "{}\n" },
-        metadata: { mcpCalls: [{ server: "jira", tool: "get", arguments: {}, status: "completed" }] }
+        metadata: { mcpCalls: [completedCodexMcpCall("jira", "get", {}, "{}\n")] }
       };
     });
     const store = await openAgentFlowRunState({ cwd: root });
@@ -344,7 +395,7 @@ steps:
         externalSessionId: "retry-thread",
         outputs: calls === 1 ? {} : { "ticket.json": '{"key":"AF-1"}\n' },
         metadata: {
-          mcpCalls: [{ server: "jira", tool: "get", arguments: { key: "AF-1" }, status: "completed" }]
+          mcpCalls: [completedCodexMcpCall("jira", "get", { key: "AF-1" }, '{"key":"AF-1"}\n')]
         }
       };
     });
@@ -364,15 +415,16 @@ steps:
   });
 
   test("rejects wrong arguments, duplicate calls, and additional Codex MCP operations", async () => {
+    const result = '{"key":"AF-1"}\n';
     const evidenceCases = [
-      [{ server: "atlassian", tool: "get_issue", arguments: { key: "AF-2" }, status: "completed" }],
+      [completedCodexMcpCall("atlassian", "get_issue", { key: "AF-2" }, result)],
       [
-        { server: "atlassian", tool: "get_issue", arguments: { key: "AF-1" }, status: "completed" },
-        { server: "atlassian", tool: "get_issue", arguments: { key: "AF-1" }, status: "completed" }
+        completedCodexMcpCall("atlassian", "get_issue", { key: "AF-1" }, result),
+        completedCodexMcpCall("atlassian", "get_issue", { key: "AF-1" }, result)
       ],
       [
-        { server: "atlassian", tool: "search", arguments: { query: "AF-1" }, status: "completed" },
-        { server: "atlassian", tool: "get_issue", arguments: { key: "AF-1" }, status: "completed" }
+        completedCodexMcpCall("atlassian", "search", { query: "AF-1" }, result),
+        completedCodexMcpCall("atlassian", "get_issue", { key: "AF-1" }, result)
       ]
     ];
     for (const [index, mcpCalls] of evidenceCases.entries()) {
@@ -400,7 +452,7 @@ steps:
         request.reportExternalSessionId?.(`thread-${index}`);
         return {
           externalSessionId: `thread-${index}`,
-          outputs: { "ticket.json": '{"key":"AF-1"}\n' },
+          outputs: { "ticket.json": result },
           metadata: { mcpCalls }
         };
       });
@@ -447,12 +499,7 @@ steps:
         externalSessionId: "durable-thread",
         outputs: { "ticket.json": '{"key":"AF-1"}\n' },
         metadata: {
-          mcpCalls: [{
-            server: "atlassian",
-            tool: "get_issue",
-            arguments: { key: "AF-1" },
-            status: "completed"
-          }]
+          mcpCalls: [completedCodexMcpCall("atlassian", "get_issue", { key: "AF-1" }, '{"key":"AF-1"}\n')]
         }
       };
     });
@@ -496,7 +543,7 @@ steps:
       return {
         externalSessionId: "budget-thread",
         outputs: { [output]: JSON.stringify({ key }) },
-        metadata: { mcpCalls: [{ server: "jira", tool: "get", arguments: { key }, status: "completed" }] }
+        metadata: { mcpCalls: [completedCodexMcpCall("jira", "get", { key }, JSON.stringify({ key }))] }
       };
     });
     const store = await openAgentFlowRunState({ cwd: root });
@@ -627,7 +674,7 @@ steps:
       return {
         externalSessionId: thread,
         outputs: { [request.outputs[0]!]: JSON.stringify({ key }) },
-        metadata: { mcpCalls: [{ server: "jira", tool: "get", arguments: { key }, status: "completed" }] }
+        metadata: { mcpCalls: [completedCodexMcpCall("jira", "get", { key }, JSON.stringify({ key }))] }
       };
     });
     const store = await openAgentFlowRunState({ cwd: root });

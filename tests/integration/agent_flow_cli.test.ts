@@ -501,7 +501,7 @@ fs.writeFileSync(outputPath, JSON.stringify({ outputs }));
 const resume = args.indexOf("resume");
 const thread = resume > 0 ? args[args.length - 2] : "thread-e2e";
 fs.writeSync(1, JSON.stringify({ type: "thread.started", thread_id: thread }) + "\\n");
-fs.writeSync(1, JSON.stringify({ type: "item.completed", item: { type: "mcp_tool_call", server: "atlassian", tool: "get_issue", arguments: { key: "AF-9" }, status: "completed" } }) + "\\n");
+fs.writeSync(1, JSON.stringify({ type: "item.completed", item: { type: "mcp_tool_call", server: "atlassian", tool: "get_issue", arguments: { key: "AF-9" }, result: { content: [{ type: "text", text: '{"key":"AF-9"}' }], structured_content: { key: "AF-9" } }, status: "completed" } }) + "\\n");
 fs.writeSync(1, JSON.stringify({ type: "turn.completed" }) + "\\n");
 `, { mode: 0o755 });
     fs.writeFileSync(path.join(repo, "parent.yml"), `

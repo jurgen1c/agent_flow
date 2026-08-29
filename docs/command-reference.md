@@ -60,7 +60,9 @@ repository `.agent-flow.yml` sets a repository-relative `workflows` file or
 directory. Reachable children are validated before execution, run as linked
 children, and resume through the parent run. A direct `mcp_call` requires a
 programmatic host adapter; the stock CLI supports `via: codex` with a named,
-resumable Codex session and the MCP server configured in the installed Codex.
+resumable Codex session, exactly one output artifact, and the MCP server
+configured in the installed Codex. That artifact is bound to the completed MCP
+event result rather than Codex's final model-authored message.
 
 ## Retention and portability commands
 

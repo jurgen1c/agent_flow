@@ -861,6 +861,15 @@ function validateRequiredStepFields(context: StepContext, errors: AgentFlowWorkf
     if (via === "codex" && nonEmptyString(context.step.session) === undefined) {
       addStepIssue(errors, context, "workflow.mcp_call.session.required", "session", "Codex-mediated MCP calls require a named session.");
     }
+    if (via === "codex" && Array.isArray(context.step.outputs) && context.step.outputs.length !== 1) {
+      addStepIssue(
+        errors,
+        context,
+        "workflow.mcp_call.outputs.single",
+        "outputs",
+        "Codex-mediated MCP calls require exactly one output artifact."
+      );
+    }
   }
 
   if (context.type === "command" && context.step.timeout_seconds !== undefined &&

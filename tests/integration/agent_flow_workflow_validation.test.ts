@@ -2019,6 +2019,44 @@ steps:
     });
   });
 
+  test("requires Codex-mediated MCP calls to declare exactly one output", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: multi-output-codex-mcp
+version: 1
+style: pipeline
+maturity: experimental
+limits: { max_frontier_calls: 1 }
+sessions:
+  agent: { provider: codex, resume: true }
+steps:
+  - { id: fetch, type: mcp_call, via: codex, session: agent, server: jira, tool: get, arguments: {}, outputs: [one.json, two.json] }
+`);
+
+    expect(validateAgentFlowWorkflow(workflow).errors).toContainEqual({
+      code: "workflow.mcp_call.outputs.single",
+      message: "Codex-mediated MCP calls require exactly one output artifact.",
+      path: "steps[0].outputs",
+      stepId: "fetch"
+    });
+
+    const schema = JSON.parse(fs.readFileSync(path.join(repoRoot, "schemas/workflow.schema.json"), "utf8")) as {
+      $defs: { step: { allOf: unknown[] } };
+    };
+    expect(schema.$defs.step.allOf).toContainEqual({
+      if: {
+        properties: {
+          type: { const: "mcp_call" },
+          via: { const: "codex" }
+        },
+        required: ["type", "via"]
+      },
+      then: {
+        properties: {
+          outputs: { type: "array", minItems: 1, maxItems: 1 }
+        }
+      }
+    });
+  });
+
   test("requires Codex-mediated MCP calls to use known Codex providers", () => {
     const workflow = parseAgentFlowWorkflowOrThrow(`name: incompatible-codex-mcp-providers
 version: 1

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 
@@ -141,6 +141,7 @@ async function invokeCodexCli(
     fs.writeFileSync(schemaPath, `${JSON.stringify(outputSchema(request))}\n`, { mode: 0o600 });
     let observedThreadId: string | undefined;
     const observedMcpCalls: AgentFlowRunStateValue[] = [];
+    const observedMcpResults: Array<string | undefined> = [];
     const reportThread = (candidate: unknown): void => {
       if (typeof candidate !== "string" || candidate.trim().length === 0) {
         throw providerError("Codex CLI emitted an invalid thread ID.");
@@ -205,13 +206,16 @@ async function invokeCodexCli(
               && isRecord(event) && event.type === "item.completed" && isRecord(event.item)
               && event.item.type === "mcp_tool_call") {
             const arguments_ = codexMcpArguments(event.item.arguments);
+            const result = codexMcpResultContent(event.item.result);
+            observedMcpResults.push(result);
             observedMcpCalls.push({
               ...(typeof event.item.server === "string" ? { server: event.item.server } : {}),
               ...(typeof event.item.tool === "string" ? { tool: event.item.tool } : {}),
               ...(arguments_ === undefined ? {} : { arguments: arguments_ }),
               status: typeof event.item.status === "string"
                 ? event.item.status
-                : event.item.error === undefined || event.item.error === null ? "completed" : "failed"
+                : event.item.error === undefined || event.item.error === null ? "completed" : "failed",
+              ...(result === undefined ? {} : { resultHash: sha256(result) })
             });
           }
         }
@@ -229,7 +233,7 @@ async function invokeCodexCli(
         throw providerError("Codex CLI completed without reporting a resumable thread ID.");
       }
       const structured = readBoundedNativeOutput(outputPath, "Codex CLI");
-      return responseFromStructuredText(
+      const response = responseFromStructuredText(
         structured,
         request,
         binding,
@@ -242,6 +246,13 @@ async function invokeCodexCli(
           ...(observedMcpCalls.length === 0 ? {} : { mcpCalls: observedMcpCalls })
         }
       );
+      if (request.captureMcpCallEvidence === true
+          && request.outputs.length === 1
+          && observedMcpCalls.length === 1
+          && observedMcpResults[0] !== undefined) {
+        response.outputs[request.outputs[0]!] = observedMcpResults[0]!;
+      }
+      return response;
     } finally {
       fs.rmSync(temporaryDirectory, { recursive: true, force: true });
     }
@@ -1258,6 +1269,36 @@ function codexMcpArguments(value: unknown): AgentFlowRunStateValue | undefined {
     return value as AgentFlowRunStateValue;
   }
   return undefined;
+}
+
+function codexMcpResultContent(value: unknown): string | undefined {
+  if (!isRecord(value)) return undefined;
+  if (Object.hasOwn(value, "structured_content")) {
+    const structured = codexMcpArguments(value.structured_content);
+    if (structured !== undefined) return `${stableJson(structured)}\n`;
+  }
+  if (!Array.isArray(value.content) || value.content.length === 0) return undefined;
+  const blocks = value.content.map((entry) =>
+    isRecord(entry) && entry.type === "text" && typeof entry.text === "string"
+      ? entry.text
+      : undefined
+  );
+  return blocks.every((entry): entry is string => entry !== undefined)
+    ? blocks.join("\n")
+    : undefined;
+}
+
+function stableJson(value: AgentFlowRunStateValue): string {
+  return JSON.stringify(value, (_key, entry) => {
+    if (entry !== null && typeof entry === "object" && !Array.isArray(entry)) {
+      return Object.fromEntries(Object.keys(entry).sort().map((key) => [key, entry[key]]));
+    }
+    return entry;
+  });
+}
+
+function sha256(value: string): string {
+  return `sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
 }
 
 function optionalString(value: unknown): string | undefined {

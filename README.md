@@ -203,6 +203,10 @@ plugins, and MCP servers. Agent Flow does not add an outer `bubblewrap` or
 `flock` boundary and does not suppress ambient Codex features. Claude and HTTP
 provider boundaries are unchanged.
 
+Codex-mediated `mcp_call` steps declare one output artifact. Agent Flow verifies
+the exact completed MCP event and derives that artifact from the tool result,
+not from the model's final response.
+
 Run inputs can come from a fixture, a JSON object file, or repeatable CLI flags:
 
 ```bash

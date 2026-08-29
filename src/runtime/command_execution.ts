@@ -8179,6 +8179,9 @@ function validateMcpCallStep(step: AgentFlowWorkflowStep): string | undefined {
   if (via === "codex" && normalizedTarget(step.session) === undefined) {
     return "Codex-mediated MCP calls require a named session.";
   }
+  if (via === "codex" && Array.isArray(step.outputs) && step.outputs.length !== 1) {
+    return "Codex-mediated MCP calls require exactly one output artifact.";
+  }
   try {
     validateAgentFlowMcpArgumentExpressions(step.arguments, typeof step.id === "string" ? step.id.trim() : "(unnamed)");
     validateAgentFlowMcpOutputPaths(step.outputs, typeof step.id === "string" ? step.id.trim() : "(unnamed)");
@@ -8838,21 +8841,6 @@ async function restartPlainPausedNestedWorkflow(
   prepareResume: (() => void) | undefined,
   beforeSuccessfulFinalization: () => void
 ): Promise<AgentFlowCommandPipelineResult> {
-  store.withRunStateTransaction(childRunId, () => {
-    prepareResume?.();
-    const child = assertPersistedWorkflowIdentity(store, childRunId, childWorkflow);
-    if (child.status !== "paused" || child.context.waiting !== undefined) {
-      throw new AgentFlowRunStateError(
-        `Child workflow run ${childRunId} is no longer plain-paused. Refresh the parent run before resuming.`,
-        "AGENT_FLOW_RESUME_STATE"
-      );
-    }
-    store.transitionRunWithEvent(childRunId, {
-      status: "pending",
-      allowedFrom: ["paused"],
-      event: { type: "run.resume", payload: { status: "pending", parentRunId } }
-    });
-  });
   return executeAgentFlowCommandPipeline(
     store,
     childRunId,
@@ -8862,7 +8850,23 @@ async function restartPlainPausedNestedWorkflow(
     mcpCalls,
     notifications,
     workflows,
-    undefined,
+    () => {
+      store.withRunStateTransaction(childRunId, () => {
+        prepareResume?.();
+        const child = assertPersistedWorkflowIdentity(store, childRunId, childWorkflow);
+        if (child.status !== "paused" || child.context.waiting !== undefined) {
+          throw new AgentFlowRunStateError(
+            `Child workflow run ${childRunId} is no longer plain-paused. Refresh the parent run before resuming.`,
+            "AGENT_FLOW_RESUME_STATE"
+          );
+        }
+        store.transitionRunWithEvent(childRunId, {
+          status: "pending",
+          allowedFrom: ["paused"],
+          event: { type: "run.resume", payload: { status: "pending", parentRunId } }
+        });
+      });
+    },
     undefined,
     beforeSuccessfulFinalization
   );
@@ -9072,7 +9076,9 @@ function codexMcpCallRegistry(
       && call.status === "completed"
       && call.server === mcpRequest.server
       && call.tool === mcpRequest.tool
-      && isDeepStrictEqual(call.arguments, mcpRequest.arguments);
+      && isDeepStrictEqual(call.arguments, mcpRequest.arguments)
+      && typeof call.resultHash === "string"
+      && /^sha256:[0-9a-f]{64}$/.test(call.resultHash);
     if (!matched) {
       store.upsertSession({
         id: sessionId, runId, stepId: mcpRequest.stepId, provider, status: "failed",
@@ -9099,6 +9105,22 @@ function codexMcpCallRegistry(
         state: { resume: true, lastStepId: mcpRequest.stepId, mcp: true, error: message }
       });
       throw error;
+    }
+    const output = validatedOutputs.get(mcpRequest.outputs[0]!)!;
+    const outputContent = typeof output.content === "string"
+      ? Buffer.from(output.content, "utf8")
+      : Buffer.from(output.content);
+    const outputHash = `sha256:${createHash("sha256").update(outputContent).digest("hex")}`;
+    if (call.resultHash !== outputHash) {
+      store.upsertSession({
+        id: sessionId, runId, stepId: mcpRequest.stepId, provider, status: "failed",
+        externalSessionId: externalSessionId ?? null,
+        state: { resume: true, lastStepId: mcpRequest.stepId, mcp: true, error: "mcp_result_mismatch" }
+      });
+      throw new AgentFlowMcpCallError(
+        `Codex MCP output for ${mcpRequest.server}.${mcpRequest.tool} does not match the completed tool result.`,
+        "AGENT_FLOW_MCP_CODEX_RESULT_MISMATCH"
+      );
     }
     const contentTypes = Object.fromEntries(
       [...validatedOutputs].flatMap(([outputPath, output]) =>

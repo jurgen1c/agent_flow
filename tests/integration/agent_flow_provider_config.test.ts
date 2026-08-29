@@ -881,6 +881,22 @@ providers:
       "ambient skill\n"
     ]);
     expect(invocations[1]!.args).toContain("resume");
+
+    fs.unlinkSync(path.join(fake.root, "emit-ambient-mcp"));
+    fs.writeFileSync(path.join(fake.root, "emit-captured-mcp"), "enabled\n");
+    const captured = await registry.get("coder")!({
+      ...request,
+      externalSessionId: undefined,
+      captureMcpCallEvidence: true
+    });
+    expect(captured.outputs).toEqual({ "draft.md": '{"key":"AF-1"}\n' });
+    expect(captured.metadata?.mcpCalls).toEqual([{
+      server: "atlassian",
+      tool: "get_issue",
+      arguments: { key: "AF-1" },
+      status: "completed",
+      resultHash: `sha256:${createHash("sha256").update('{"key":"AF-1"}\n').digest("hex")}`
+    }]);
   });
 
   test("preserves Claude Code's default login file while isolating it from model tools", async () => {
@@ -1993,6 +2009,22 @@ if (splitUtf8) {
         server: "ambient",
         tool: "lookup",
         arguments: { token: "ambient-secret" },
+        status: "completed"
+      }
+    }) + "\n");
+  }
+  if (fs.existsSync(path.join(root, "emit-captured-mcp"))) {
+    fs.writeSync(1, JSON.stringify({
+      type: "item.completed",
+      item: {
+        type: "mcp_tool_call",
+        server: "atlassian",
+        tool: "get_issue",
+        arguments: { key: "AF-1" },
+        result: {
+          content: [{ type: "text", text: "model-visible fallback" }],
+          structured_content: { key: "AF-1" }
+        },
         status: "completed"
       }
     }) + "\n");

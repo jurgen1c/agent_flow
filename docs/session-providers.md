@@ -179,9 +179,12 @@ CLI/config flags and persists the selected run overrides for resume.
 For MCP, ordinary Codex session requests may use any ambient server Codex has
 configured. An `mcp_call` uses `via: direct` by default and requires a
 programmatically registered host adapter. `via: codex` requires `session:` to
-name a resumable Codex session. Agent Flow asks Codex to call the exact static
-server/tool with the resolved arguments and publishes outputs only after the
-JSONL stream reports a matching completed MCP call.
+name a resumable Codex session and exactly one declared output artifact. Agent
+Flow asks Codex to call the exact static server/tool with the resolved arguments
+and publishes the completed MCP event's canonical structured result, or its
+text-only content when no structured result exists. The runtime verifies the
+event count, server, tool, arguments, completion status, and output digest; the
+model's final narration is not accepted as the tool result.
 
 See the official Codex [profile documentation](https://learn.chatgpt.com/docs/config-file/config-advanced#profiles),
 [`model_reasoning_effort` reference](https://learn.chatgpt.com/docs/config-file/config-reference),
