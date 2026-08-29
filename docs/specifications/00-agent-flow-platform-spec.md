@@ -128,7 +128,7 @@ Valid run statuses:
 | `command` | Run a deterministic shell command |
 | `session_request` | Send prompt/artifacts to a named model session |
 | `mcp_call` | Call an MCP tool through a direct host adapter or a named Codex session |
-| `workflow` | Execute a linked child run and promote its declared outputs |
+| `workflow` | Execute a linked child run and promote parent-selected outputs that the child declares |
 | `condition` | Branch based on state or artifacts |
 | `loop` | Repeat steps until a condition or limit |
 | `manual_gate` | Ask user for approval |

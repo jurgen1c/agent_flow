@@ -154,9 +154,17 @@ export function buildAgentFlowRunActionSnapshot(
   let approvalEvidenceValid = true;
   try {
     const guardedRuns = nestedActionApprovalLineage(store, run, waitingRun);
+    const guardedRunIds = new Set(guardedRuns.map((entry) => entry.id));
     if (waitingResult.waiting?.kind === "workflow" && waitingResult.waiting.childStatus === "completed") {
-      guardedRuns.push(...completedPromotedDescendants(store, waitingRun, new Set(guardedRuns.map((entry) => entry.id))));
+      const completedWaitingDescendants = completedPromotedDescendants(store, waitingRun, guardedRunIds);
+      completedWaitingDescendants.forEach((entry) => guardedRunIds.add(entry.id));
+      guardedRuns.push(...completedWaitingDescendants);
     }
+    guardedRuns.push(...completedPromotedDescendants(
+      store,
+      run,
+      guardedRunIds
+    ));
     guardedLineage = guardedRuns.map((lineageRun) => ({
       run: lineageRun,
       approvals: lineageRun.id === waitingRun.id ? approvals : store.listApprovals(lineageRun.id)

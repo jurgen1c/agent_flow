@@ -1,9 +1,12 @@
 import {
   AgentFlowRunStateError,
   MAX_AGENT_FLOW_RECOVERY_CONTEXT_BYTES,
+  normalizeAgentFlowArtifactPath,
   type AgentFlowRunStateStore,
   type AgentFlowSessionRecord
 } from "./run_state";
+import { defaultAgentFlowApprovalOutputPath } from "./approval";
+import { defaultAgentFlowDecisionRecordPath } from "./decision_record";
 import { parseAgentFlowWorkflowOrThrow, type AgentFlowWorkflow, type AgentFlowWorkflowStep } from "./workflow";
 
 export type AgentFlowRecoveryStatus = "remediated" | "unresolved";
@@ -244,8 +247,50 @@ function assertWorkflowStepInputContracts(
           `Workflow ${parentName} step ${String(step.id ?? "(unnamed)")} omits required inputs for ${childName}: ${missing.join(", ")}.`
         );
       }
+      const declaredOutputs = workflowDeclaredOutputPaths(child);
+      const undeclaredOutputs = Array.isArray(step.outputs)
+        ? step.outputs.flatMap((output) => {
+            if (typeof output !== "string") return [];
+            try {
+              const normalized = normalizeAgentFlowArtifactPath(output);
+              return declaredOutputs.has(normalized) ? [] : [normalized];
+            } catch {
+              return [];
+            }
+          })
+        : [];
+      if (undeclaredOutputs.length > 0) {
+        throw new Error(
+          `Workflow ${parentName} step ${String(step.id ?? "(unnamed)")} requests output${undeclaredOutputs.length === 1 ? "" : "s"} `
+            + `${undeclaredOutputs.map((output) => JSON.stringify(output)).join(", ")} that child workflow ${childName} does not declare.`
+        );
+      }
     }
   }
+}
+
+function workflowDeclaredOutputPaths(workflow: AgentFlowWorkflow): Set<string> {
+  const outputs = new Set<string>();
+  for (const step of workflowSteps(workflow.steps)) {
+    const stepId = typeof step.id === "string" ? step.id.trim() : "";
+    const type = typeof step.type === "string" ? step.type.trim() : "";
+    const candidates: unknown[] = [
+      step.output,
+      step.save_as,
+      ...(Array.isArray(step.outputs) ? step.outputs : []),
+      ...(stepId.length > 0 && type === "approval" && step.output === undefined
+        ? [defaultAgentFlowApprovalOutputPath(stepId)]
+        : []),
+      ...(stepId.length > 0 && type === "decision_record" && step.output === undefined
+        ? [defaultAgentFlowDecisionRecordPath(stepId)]
+        : [])
+    ];
+    for (const candidate of candidates) {
+      if (typeof candidate !== "string") continue;
+      try { outputs.add(normalizeAgentFlowArtifactPath(candidate)); } catch { /* Validation reports malformed paths. */ }
+    }
+  }
+  return outputs;
 }
 
 export function validateAgentFlowWorkflowStepInputExpressions(

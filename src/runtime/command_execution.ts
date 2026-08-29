@@ -290,6 +290,26 @@ function pinnedWorkflowRegistry(
         "AGENT_FLOW_WORKFLOW_REGISTRY_STATE"
       );
     }
+    const providerKind = workflowRegistryProviderKind(providers);
+    for (const name of persisted.names()) {
+      const candidate = persisted.get(name)!;
+      let validation: ReturnType<typeof validateAgentFlowWorkflow>;
+      try {
+        validation = validateAgentFlowWorkflow(candidate, providerKind);
+      } catch (error) {
+        throw new AgentFlowRunStateError(
+          `Agent Flow run ${run.id} cannot start because persisted workflow ${name} is malformed: ${error instanceof Error ? error.message : String(error)}`,
+          "AGENT_FLOW_WORKFLOW_INVALID",
+          { cause: error }
+        );
+      }
+      if (!validation.valid) {
+        throw new AgentFlowRunStateError(
+          `Agent Flow run ${run.id} cannot start because persisted workflow ${name} failed validation:\n${formatAgentFlowWorkflowIssues(validation.errors)}`,
+          "AGENT_FLOW_WORKFLOW_INVALID"
+        );
+      }
+    }
     return { run, workflows: persisted };
   }
 

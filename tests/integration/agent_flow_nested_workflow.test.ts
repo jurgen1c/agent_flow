@@ -674,6 +674,14 @@ steps:
     const evidence = store.getArtifact(childRunId, "evidence.txt")!;
     fs.writeFileSync(path.join(repo, evidence.storagePath), "changed");
 
+    const snapshot = buildAgentFlowRunActionSnapshot(store, "promoted-stale-parent");
+    expect(snapshot.staleApprovals).toContainEqual(expect.objectContaining({
+      id: expect.stringContaining("approval:approve"),
+      detected: true
+    }));
+    expect(snapshot.actions.find((action) => action.action === "approve"))
+      .toMatchObject({ enabled: false });
+
     const result = await resumeAgentFlowCommandPipeline(
       store, "promoted-stale-parent", parent, { outcome: "approve" },
       undefined, undefined, undefined, undefined, workflows
@@ -772,7 +780,7 @@ maturity: experimental
 steps:
   - { id: evidence, type: command, command: "printf original > evidence.txt", outputs: [evidence.txt] }
   - { id: approve, type: approval, reviewer: human, subject: Check, artifacts: [evidence.txt] }
-  - { id: crash, type: command, command: "exit 1", on_failure: { then: fail } }
+  - { id: crash, type: command, command: "exit 1", outputs: [never.txt], on_failure: { then: fail } }
 `);
     const parent = parseAgentFlowWorkflowOrThrow(`
 name: stale-failed-parent
@@ -946,6 +954,7 @@ maturity: experimental
 steps:
   - { id: first, type: manual_gate, message: First?, options: [approve, cancel] }
   - { id: second, type: manual_gate, message: Second?, options: [approve, cancel] }
+  - { id: publish, type: command, command: "printf unused > unused.txt", outputs: [unused.txt] }
 `);
     const parent = parseAgentFlowWorkflowOrThrow(`
 name: guarded-parent
@@ -1004,6 +1013,7 @@ steps:
     question: Same prompt
     save_as: answer.txt
     goto: ask
+  - { id: publish, type: command, command: "printf never > never.txt", outputs: [never.txt] }
 `);
     const parent = parseAgentFlowWorkflowOrThrow(`
 name: repeated-input-parent
@@ -1049,6 +1059,7 @@ style: pipeline
 maturity: experimental
 steps:
   - { id: approve, type: manual_gate, message: Continue?, options: [approve, cancel] }
+  - { id: publish, type: command, command: "printf never > never.txt", outputs: [never.txt] }
 `);
     const parent = parseAgentFlowWorkflowOrThrow(`
 name: cancelled-parent
@@ -1086,7 +1097,7 @@ version: 1
 style: pipeline
 maturity: experimental
 steps:
-  - { id: wait, type: command, command: sleep 2 }
+  - { id: wait, type: command, command: sleep 2, outputs: [never.txt] }
 `);
     const parent = parseAgentFlowWorkflowOrThrow(`
 name: running-cancel-parent
@@ -1168,7 +1179,7 @@ steps:
   test("pins providers from distinct registry aliases that share an internal workflow name", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-provider-aliases-"));
     fs.mkdirSync(path.join(repo, ".git"));
-    const child = (provider: string) => parseAgentFlowWorkflowOrThrow(`
+    const child = (provider: string, output: string) => parseAgentFlowWorkflowOrThrow(`
 name: shared-internal-name
 version: 1
 style: pipeline
@@ -1176,7 +1187,7 @@ maturity: experimental
 sessions:
   worker: { provider: ${provider} }
 steps:
-  - { id: done, type: result, status: completed }
+  - { id: publish, type: command, command: "printf done > ${output}", outputs: [${output}] }
 `);
     const parent = parseAgentFlowWorkflowOrThrow(`
 name: aliased-provider-parent
@@ -1190,8 +1201,8 @@ steps:
 `);
     const workflows = createAgentFlowWorkflowRegistry()
       .register(parent.name, parent)
-      .register("first-alias", child("first-provider"))
-      .register("second-alias", child("second-provider"));
+      .register("first-alias", child("first-provider", "first.txt"))
+      .register("second-alias", child("second-provider", "second.txt"));
     const providers = (secondFingerprint: string) => createAgentFlowSessionProviderRegistry()
       .registerConfigured({
         name: "first-provider", kind: "local", target: "first-target", driver: "test-driver",
@@ -1596,7 +1607,7 @@ steps:
     store.close();
   });
 
-  test("does not promote a copied child input as a declared child output", async () => {
+  test("rejects a copied child input that is not a declared child output", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-input-output-"));
     fs.mkdirSync(path.join(repo, ".git"));
     const child = parseAgentFlowWorkflowOrThrow(`
@@ -1642,16 +1653,14 @@ steps:
       content: "parent input\n"
     });
 
-    expect(await executeAgentFlowCommandPipeline(
+    await expect(executeAgentFlowCommandPipeline(
       store, "input-output-parent", parent, undefined, undefined, undefined, undefined, workflows
-    )).toMatchObject({
-      status: "failed",
-      failedStep: "child",
-      message: expect.stringContaining("did not publish required output source.txt")
+    )).rejects.toMatchObject({
+      code: "AGENT_FLOW_WORKFLOW_INVALID",
+      message: expect.stringContaining("child workflow input-output-child does not declare")
     });
-    const childRun = store.listRuns().find((run) => run.parentRunId === "input-output-parent")!;
-    expect(childRun.status).toBe("failed");
-    expect(store.getArtifact(childRun.id, "source.txt")?.kind).toBe("recovery_input");
+    expect(store.listRuns().filter((run) => run.parentRunId === "input-output-parent")).toHaveLength(0);
+    expect(store.getRun("input-output-parent")?.status).toBe("pending");
     expect(store.readArtifact("input-output-parent", "source.txt").content.toString()).toBe("parent input\n");
     store.close();
   });
@@ -1668,6 +1677,7 @@ inputs:
   ticket: { required: true }
 steps:
   - { id: done, type: result, status: completed }
+  - { id: publish, type: command, command: "printf missing > missing.txt", outputs: [missing.txt] }
 `);
     const parent = parseAgentFlowWorkflowOrThrow(`
 name: setup-failure-parent
@@ -1713,6 +1723,7 @@ steps:
   - id: repair
     type: command
     command: exit 1
+    outputs: [never.txt]
     on_failure:
       route_to: { session: fixer, prompt: fix.md }
       on_remediated: { then: complete }
@@ -1760,6 +1771,7 @@ maturity: experimental
 inputs: { payload: { required: true } }
 steps:
   - { id: done, type: result, status: completed }
+  - { id: publish, type: command, command: "printf never > never.txt", outputs: [never.txt] }
 `);
     const parent = parseAgentFlowWorkflowOrThrow(`
 name: copy-failure-parent
@@ -1978,6 +1990,89 @@ steps:
     store.close();
   });
 
+  test("rejects undeclared child outputs before earlier parent steps can run", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-undeclared-output-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: undeclared-output-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: effect, type: command, command: "printf side-effect > marker.txt", outputs: [marker.txt] }
+  - { id: child, type: workflow, workflow: declared-output-child, inputs: {}, outputs: [typo.txt] }
+`);
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: declared-output-child
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: publish, type: command, command: "touch child-side-effect && printf done > done.txt", outputs: [done.txt] }
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register(parent.name, parent)
+      .register(child.name, child);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, { id: "undeclared-output-parent", workflow: parent });
+
+    await expect(executeAgentFlowCommandPipeline(
+      store, "undeclared-output-parent", parent, undefined, undefined, undefined, undefined, workflows
+    )).rejects.toMatchObject({
+      code: "AGENT_FLOW_WORKFLOW_INVALID",
+      message: expect.stringContaining("child workflow declared-output-child does not declare")
+    });
+    expect(store.getRun("undeclared-output-parent")?.status).toBe("pending");
+    expect(fs.existsSync(path.join(repo, "marker.txt"))).toBe(false);
+    expect(fs.existsSync(path.join(repo, "child-side-effect"))).toBe(false);
+    store.close();
+  });
+
+  test("revalidates persisted child workflows before earlier parent steps can run", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-invalid-snapshot-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: invalid-snapshot-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: effect, type: command, command: "printf side-effect > marker.txt", outputs: [marker.txt] }
+  - { id: child, type: workflow, workflow: invalid-snapshot-child, inputs: {}, outputs: [result.txt] }
+`);
+    const child = {
+      name: "invalid-snapshot-child",
+      version: 1,
+      style: "pipeline",
+      maturity: "experimental",
+      steps: [
+        { id: "unknown", type: "unsupported" },
+        { id: "publish", type: "command", command: "printf result > result.txt", outputs: ["result.txt"] }
+      ]
+    } as const;
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, {
+      id: "invalid-snapshot-parent",
+      workflow: parent,
+      context: {
+        workflowRegistry: {
+          [parent.name]: parent,
+          [child.name]: child
+        } as never
+      }
+    });
+
+    await expect(executeAgentFlowCommandPipeline(
+      store, "invalid-snapshot-parent", parent
+    )).rejects.toMatchObject({
+      code: "AGENT_FLOW_WORKFLOW_INVALID",
+      message: expect.stringContaining("persisted workflow invalid-snapshot-child failed validation")
+    });
+    expect(store.getRun("invalid-snapshot-parent")?.status).toBe("pending");
+    expect(fs.existsSync(path.join(repo, "marker.txt"))).toBe(false);
+    store.close();
+  });
+
   test("rejects unauthorized nested failure continuation before launching the child", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-invalid-failure-policy-"));
     fs.mkdirSync(path.join(repo, ".git"));
@@ -1987,7 +2082,7 @@ version: 1
 style: pipeline
 maturity: experimental
 steps:
-  - { id: terminal, type: result, status: failed }
+  - { id: terminal, type: result, status: failed, output: never.txt }
 `);
     const parent = parseAgentFlowWorkflowOrThrow(`
 name: invalid-failure-policy-parent
@@ -2222,7 +2317,7 @@ version: 1
 style: pipeline
 maturity: experimental
 steps:
-  - { id: break, type: command, command: exit 1, on_failure: { then: fail } }
+  - { id: break, type: command, command: exit 1, outputs: [never.txt], on_failure: { then: fail } }
 `);
     const parent = parseAgentFlowWorkflowOrThrow(`
 name: retry-parent
@@ -2266,7 +2361,7 @@ style: pipeline
 maturity: experimental
 steps:
   - { id: approve, type: manual_gate, message: Continue?, options: [approve, cancel] }
-  - { id: break, type: command, command: exit 1, on_failure: { then: fail } }
+  - { id: break, type: command, command: exit 1, outputs: [never.txt], on_failure: { then: fail } }
 `);
     const parent = parseAgentFlowWorkflowOrThrow(`
 name: resumed-retry-parent

@@ -271,7 +271,9 @@ does not make a paid API call or generate model output.
 The optional `workflows` path is relative to the repository root. A
 `type: workflow` step names a workflow found there (or, when omitted, beside
 the entry workflow), supplies its declared inputs, and lists the exact child
-artifacts to promote after completion. Child approvals and input requests pause
+artifacts to promote after completion. Every listed path must be declared by a
+child step, so registry validation rejects output typos before either workflow
+can produce side effects. Child approvals and input requests pause
 the parent and continue when the parent run is resumed. A child input expression
 occupies its complete value and uses `step.id`, `inputs.<name>`, or
 `artifacts.<path>`; strings without `{{ ... }}` are passed literally.
