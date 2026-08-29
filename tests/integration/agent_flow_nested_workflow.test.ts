@@ -1316,6 +1316,58 @@ steps:
     store.close();
   });
 
+  test("copies artifact paths nested in aggregate workflow input values", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-aggregate-input-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: aggregate-input-child
+version: 1
+style: pipeline
+maturity: experimental
+inputs:
+  sources: { required: true }
+steps:
+  - { id: publish, type: command, command: "printf done > done.txt", outputs: [done.txt] }
+`);
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: aggregate-input-parent
+version: 1
+style: pipeline
+maturity: experimental
+inputs:
+  sources: { required: true }
+steps:
+  - id: child
+    type: workflow
+    workflow: aggregate-input-child
+    inputs: { sources: "{{ inputs.sources }}" }
+    outputs: [done.txt]
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register(parent.name, parent)
+      .register(child.name, child);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    const sources = { primary: "inputs/one.txt", more: ["inputs/two.txt"] };
+    createAgentFlowLifecycleRun(store, { id: "aggregate-input-parent", workflow: parent, inputs: { sources } });
+    store.writeArtifact({
+      id: "aggregate-one", runId: "aggregate-input-parent", stepId: "fixture",
+      path: "inputs/one.txt", kind: "fixture", contentType: "text/plain", content: "one"
+    });
+    store.writeArtifact({
+      id: "aggregate-two", runId: "aggregate-input-parent", stepId: "fixture",
+      path: "inputs/two.txt", kind: "fixture", contentType: "text/plain", content: "two"
+    });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "aggregate-input-parent", parent, undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({ status: "completed" });
+    const childRun = store.listRuns().find((run) => run.parentRunId === "aggregate-input-parent")!;
+    expect(childRun.inputs).toEqual({ sources });
+    expect(store.readArtifact(childRun.id, "inputs/one.txt").content.toString()).toBe("one");
+    expect(store.readArtifact(childRun.id, "inputs/two.txt").content.toString()).toBe("two");
+    store.close();
+  });
+
   test("does not copy literal child input strings that happen to name parent artifacts", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-literal-input-"));
     fs.mkdirSync(path.join(repo, ".git"));

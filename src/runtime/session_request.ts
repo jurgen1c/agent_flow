@@ -1951,7 +1951,7 @@ function descriptorForExplicitProviderName(name: string): AgentFlowSessionProvid
 }
 
 function isReservedSessionProviderName(name: string): boolean {
-  return name === "fixture" || name === "local" || name === "frontier"
+  return name === "fixture" || name === "local" || name === "frontier" || name === "codex"
     || name.startsWith("codex:");
 }
 

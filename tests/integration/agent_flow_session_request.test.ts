@@ -64,6 +64,9 @@ describe("Agent Flow session request steps", () => {
       { kind: "custom", name: "codex:reviewer", adapter }
     ])).toThrow("is reserved");
     expect(() => createAgentFlowSessionProviderRegistry([
+      { kind: "custom", name: "codex", adapter }
+    ])).toThrow("is reserved");
+    expect(() => createAgentFlowSessionProviderRegistry([
       { kind: "custom", name: "fixture", adapter }
     ])).toThrow("is reserved");
     expect(() => createAgentFlowSessionProviderRegistry().register(

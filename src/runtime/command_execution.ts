@@ -5909,7 +5909,7 @@ function collectWorkflowStepArtifactPaths(
 ): void {
   if (typeof declared === "string") {
     const reference = /^\{\{\s*inputs\.[A-Za-z_][A-Za-z0-9_-]*\s*}}$/.exec(declared);
-    if (reference !== null && typeof resolved === "string") {
+    if (reference !== null) {
       collectRecoveryArtifactPaths(store, runId, resolved, paths);
     }
     return;
