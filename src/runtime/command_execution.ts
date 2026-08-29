@@ -231,7 +231,7 @@ export async function executeAgentFlowCommandPipeline(
   return store.withRunLock(runId, "run", (lock) => {
     beforeRecovery?.();
     let run = assertPersistedWorkflowIdentity(store, runId, workflow);
-    ({ run, workflows } = pinnedWorkflowRegistry(store, run, workflow, workflows, sessionProviders));
+    ({ run, workflow, workflows } = pinnedWorkflowRegistry(store, run, workflow, workflows, sessionProviders));
     assertOrPersistConfiguredProviderBindings(store, run, workflow, sessionProviders, workflows);
     const recoveredExecution = recoverInterruptedExecution(store, lock);
     prepareExecution?.();
@@ -260,7 +260,7 @@ export async function resumeAgentFlowCommandPipeline(
   return store.withRunLock(runId, "resume", (lock) => {
     prepareResume?.();
     let run = assertPersistedWorkflowIdentity(store, runId, workflow);
-    ({ run, workflows } = pinnedWorkflowRegistry(store, run, workflow, workflows, sessionProviders));
+    ({ run, workflow, workflows } = pinnedWorkflowRegistry(store, run, workflow, workflows, sessionProviders));
     assertOrPersistConfiguredProviderBindings(store, run, workflow, sessionProviders, workflows);
     const recoveredExecution = recoverInterruptedExecution(store, lock);
     const effectiveResponse = recoveredExecution === undefined ? response : undefined;
@@ -279,7 +279,7 @@ function pinnedWorkflowRegistry(
   workflow: AgentFlowWorkflow,
   supplied: AgentFlowWorkflowRegistry,
   providers: AgentFlowSessionProviderRegistry
-): { run: AgentFlowRunRecord; workflows: AgentFlowWorkflowRegistry } {
+): { run: AgentFlowRunRecord; workflow: AgentFlowWorkflow; workflows: AgentFlowWorkflowRegistry } {
   const registryName = persistedOrSuppliedWorkflowRegistryName(run, workflow, supplied);
   if (run.context.workflowRegistry !== undefined) {
     const persisted = createAgentFlowWorkflowRegistryFromSnapshot(run.context.workflowRegistry);
@@ -310,7 +310,7 @@ function pinnedWorkflowRegistry(
         );
       }
     }
-    return { run, workflows: persisted };
+    return { run, workflow: pinnedWorkflow, workflows: persisted };
   }
 
   const reachable = createAgentFlowWorkflowRegistry().register(registryName, workflow);
@@ -371,7 +371,7 @@ function pinnedWorkflowRegistry(
       "AGENT_FLOW_WORKFLOW_INVALID"
     );
   }
-  if (!rootIsPersistable) return { run, workflows: reachable };
+  if (!rootIsPersistable) return { run, workflow, workflows: reachable };
   const updated = store.updateRun(run.id, {
     context: {
       ...run.context,
@@ -379,7 +379,12 @@ function pinnedWorkflowRegistry(
       workflowRegistry: serializeWorkflowRegistryForRun(reachable)
     }
   });
-  return { run: updated, workflows: reachable };
+  const persisted = createAgentFlowWorkflowRegistryFromSnapshot(updated.context.workflowRegistry);
+  return {
+    run: updated,
+    workflow: persisted.get(registryName)!,
+    workflows: persisted
+  };
 }
 
 function workflowRegistryProviderKind(
@@ -8781,7 +8786,9 @@ function assertNestedWorkflowNotInLineage(
 function serializeWorkflowRegistryForRun(
   workflows: AgentFlowWorkflowRegistry
 ): AgentFlowRunStateValue {
-  return Object.fromEntries(workflows.names().map((name) => [name, workflows.get(name)!])) as unknown as AgentFlowRunStateValue;
+  return Object.fromEntries(
+    workflows.names().map((name) => [name, structuredClone(workflows.get(name)!)])
+  ) as unknown as AgentFlowRunStateValue;
 }
 
 function nestedWorkflowRunContext(

@@ -2218,6 +2218,55 @@ steps:
     store.close();
   });
 
+  test("executes the persisted registry snapshot when caller-owned workflows mutate after pinning", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-registry-mutation-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: registry-mutation-child
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: publish, type: command, command: "printf original > result.txt", outputs: [result.txt] }
+`);
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: registry-mutation-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: child, type: workflow, workflow: child-alias, inputs: {}, outputs: [result.txt] }
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register("parent-alias", parent)
+      .register("child-alias", child);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, {
+      id: "registry-mutation-parent",
+      workflow: parent,
+      context: { workflowRegistryName: "parent-alias" }
+    });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store,
+      "registry-mutation-parent",
+      parent,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      workflows,
+      () => {
+        parent.steps[0]!.workflow = "mutated-child-alias";
+        child.steps[0]!.command = "printf changed > result.txt";
+      }
+    )).toMatchObject({ status: "completed" });
+    expect(store.readArtifact("registry-mutation-parent", "result.txt").content.toString()).toBe("original");
+    expect(store.listRuns().find((run) => run.parentRunId === "registry-mutation-parent")?.context.workflow)
+      .toMatchObject({ steps: [expect.objectContaining({ command: "printf original > result.txt" })] });
+    store.close();
+  });
+
   test("propagates a live nested child lease without failing or retrying the parent step", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-child-lock-"));
     fs.mkdirSync(path.join(repo, ".git"));

@@ -555,6 +555,10 @@ function runStep(step: AgentFlowWorkflowStep, state: SimulationState, insideLoop
       if (contractError !== undefined) {
         return simulatedMcpContractFailure(step, stepFixture, id, state, contractError);
       }
+      const collisionError = simulationMcpOutputCollisionError(step, id, state);
+      if (collisionError !== undefined) {
+        return simulatedMcpContractFailure(step, stepFixture, id, state, collisionError);
+      }
       if (nonEmptyString(step.via) === "codex") {
         const budgetControl = simulationModelBudgetControl(step, id, state);
         if (budgetControl !== undefined) return budgetControl;
@@ -1080,6 +1084,10 @@ function simulateMcpCallStep(
       contractError
     );
   }
+  const collisionError = simulationMcpOutputCollisionError(step, stepId, state);
+  if (collisionError !== undefined) {
+    return simulatedMcpContractFailure(step, fixture, stepId, state, collisionError);
+  }
   if (nonEmptyString(step.via) === "codex") {
     const budgetControl = simulationModelBudgetControl(step, stepId, state);
     if (budgetControl !== undefined) {
@@ -1108,19 +1116,26 @@ function simulateMcpCallStep(
       `MCP fixture outputs must match declared outputs exactly; invalid output ${invalidOutput}.`
     );
   }
-  for (const output of declaredOutputs) {
-    if (state.artifacts.has(output) && state.artifactProducers.get(output) !== stepId && step.overwrite !== true) {
-      return simulatedMcpContractFailure(
-        step,
-        fixture,
-        stepId,
-        state,
-        `Artifact ${output} already exists; declare overwrite: true to replace it during simulation.`
-      );
-    }
-  }
   recordOutputs(step, fixture, stepId, state);
   return { kind: "done" };
+}
+
+function simulationMcpOutputCollisionError(
+  step: AgentFlowWorkflowStep,
+  stepId: string,
+  state: SimulationState
+): string | undefined {
+  for (const output of Array.isArray(step.outputs) ? step.outputs : []) {
+    const name = nonEmptyString(output);
+    if (name === undefined) continue;
+    const artifact = canonicalArtifactName(name);
+    if (state.artifacts.has(artifact)
+        && state.artifactProducers.get(artifact) !== stepId
+        && step.overwrite !== true) {
+      return `Artifact ${artifact} already exists; declare overwrite: true to replace it during simulation.`;
+    }
+  }
+  return undefined;
 }
 
 function simulationMcpContractError(

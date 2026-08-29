@@ -654,6 +654,28 @@ steps:
         { id: "second", outcome: "succeeded" }
       ]
     });
+
+    for (const firstOutcome of [undefined, "failed"] as const) {
+      const collisionFirst = structuredClone(workflow);
+      collisionFirst.steps[0]!.outputs = ["occupied.json"];
+      collisionFirst.steps[0]!.on_failure = { then: "continue" };
+      expect(simulateAgentFlowWorkflow(collisionFirst, {
+        artifacts: { "occupied.json": { existing: true } },
+        steps: {
+          first: {
+            ...(firstOutcome === undefined ? {} : { outcome: firstOutcome }),
+            outputs: { "occupied.json": { replacement: true } }
+          },
+          second: { outputs: { "second.json": { key: "AF-2" } } }
+        }
+      })).toMatchObject({
+        status: "completed",
+        visitedSteps: [
+          { id: "first", outcome: "failed" },
+          { id: "second", outcome: "succeeded" }
+        ]
+      });
+    }
   });
 
   test("does not reserve Codex MCP budgets when the session claim conflicts", async () => {
