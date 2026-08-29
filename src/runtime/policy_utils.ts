@@ -3,7 +3,7 @@ import path from "node:path";
 import type { AgentFlowYamlMapping, AgentFlowYamlValue } from "./workflow";
 
 export interface AgentFlowProviderIdentity {
-  kind: "local" | "frontier";
+  kind: "local" | "frontier" | "custom";
   driver?: string;
 }
 
@@ -16,7 +16,7 @@ export function agentFlowProviderIdentity(
   resolver?: AgentFlowProviderKindResolver
 ): AgentFlowProviderIdentity | undefined {
   const resolved = resolver?.(provider);
-  if (resolved === "local" || resolved === "frontier") return { kind: resolved };
+  if (resolved === "local" || resolved === "frontier" || resolved === "custom") return { kind: resolved };
   return resolved;
 }
 

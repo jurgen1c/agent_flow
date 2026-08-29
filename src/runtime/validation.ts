@@ -853,6 +853,19 @@ function validateRequiredStepFields(context: StepContext, errors: AgentFlowWorkf
 
   validateArtifactFieldShapes(context, errors);
 
+  if (context.type === "workflow") {
+    const target = nonEmptyString(context.step.workflow);
+    if (target !== undefined && (target.includes("{{") || target.includes("}}"))) {
+      addStepIssue(
+        errors,
+        context,
+        "workflow.workflow.target.dynamic",
+        "workflow",
+        "Nested workflow targets must be static non-empty names."
+      );
+    }
+  }
+
   if (context.type === "mcp_call") {
     const via = context.step.via === undefined ? "direct" : nonEmptyString(context.step.via);
     if (via !== "direct" && via !== "codex") {
@@ -860,6 +873,16 @@ function validateRequiredStepFields(context: StepContext, errors: AgentFlowWorkf
     }
     if (via === "codex" && nonEmptyString(context.step.session) === undefined) {
       addStepIssue(errors, context, "workflow.mcp_call.session.required", "session", "Codex-mediated MCP calls require a named session.");
+    }
+    const session = nonEmptyString(context.step.session);
+    if (via === "codex" && session !== undefined && (session.includes("{{") || session.includes("}}"))) {
+      addStepIssue(
+        errors,
+        context,
+        "workflow.mcp_call.session.dynamic",
+        "session",
+        "Codex-mediated MCP calls require a static declared session."
+      );
     }
     if (via === "codex" && Array.isArray(context.step.outputs) && context.step.outputs.length !== 1) {
       addStepIssue(
@@ -1467,7 +1490,7 @@ function validateSessionReferences(
       if (provider !== undefined && !isDynamicReference(provider)
           && provider !== "codex" && !provider.startsWith("codex:")
           && (["fixture", "local", "frontier"].includes(provider)
-            || (identity?.driver !== undefined && identity.driver !== "codex-cli"))) {
+            || (identity !== undefined && identity.driver !== "codex-cli"))) {
         addStepIssue(
           errors,
           context,

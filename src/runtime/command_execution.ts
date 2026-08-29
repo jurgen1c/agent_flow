@@ -367,6 +367,7 @@ function workflowRegistryProviderKind(
 ): AgentFlowProviderKindResolver {
   return (provider) => {
     const descriptor = providers.describe(provider);
+    if (descriptor?.kind === "custom") return { kind: "custom" };
     if (descriptor?.kind !== "local" && descriptor?.kind !== "frontier") return undefined;
     return {
       kind: descriptor.kind,

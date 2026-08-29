@@ -2019,6 +2019,38 @@ steps:
     });
   });
 
+  test("requires static nested-workflow and Codex MCP targets", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: dynamic-linked-targets
+version: 1
+style: pipeline
+maturity: experimental
+limits: { max_frontier_calls: 1 }
+inputs:
+  child: { required: true }
+  session_name: { required: true }
+sessions:
+  agent: { provider: codex, resume: true }
+steps:
+  - { id: child, type: workflow, workflow: "{{ inputs.child }}", inputs: {}, outputs: [child.json] }
+  - { id: fetch, type: mcp_call, via: codex, session: "{{ inputs.session_name }}", server: jira, tool: get, arguments: {}, outputs: [ticket.json] }
+`);
+
+    expect(validateAgentFlowWorkflow(workflow).errors).toEqual(expect.arrayContaining([
+      {
+        code: "workflow.workflow.target.dynamic",
+        message: "Nested workflow targets must be static non-empty names.",
+        path: "steps[0].workflow",
+        stepId: "child"
+      },
+      {
+        code: "workflow.mcp_call.session.dynamic",
+        message: "Codex-mediated MCP calls require a static declared session.",
+        path: "steps[1].session",
+        stepId: "fetch"
+      }
+    ]));
+  });
+
   test("requires Codex-mediated MCP calls to declare exactly one output", () => {
     const workflow = parseAgentFlowWorkflowOrThrow(`name: multi-output-codex-mcp
 version: 1
@@ -2066,14 +2098,16 @@ limits: { max_frontier_calls: 2 }
 sessions:
   fixture_agent: { provider: fixture, resume: true }
   api_agent: { provider: api, resume: true }
+  custom_agent: { provider: custom-session-adapter, resume: true }
 steps:
   - { id: fixture_call, type: mcp_call, via: codex, session: fixture_agent, server: jira, tool: get, arguments: {}, outputs: [fixture.json] }
   - { id: api_call, type: mcp_call, via: codex, session: api_agent, server: jira, tool: get, arguments: {}, outputs: [api.json] }
+  - { id: custom_call, type: mcp_call, via: codex, session: custom_agent, server: jira, tool: get, arguments: {}, outputs: [custom.json] }
 `);
 
     const validation = validateAgentFlowWorkflow(workflow, (provider) => provider === "api"
       ? { kind: "frontier", driver: "openai-responses" }
-      : undefined);
+      : provider === "custom-session-adapter" ? { kind: "custom" } : undefined);
     expect(validation.errors.filter((issue) => issue.code === "workflow.mcp_call.session.provider.invalid"))
       .toEqual([
         {
@@ -2087,6 +2121,12 @@ steps:
           message: 'Codex-mediated MCP call session "api_agent" must use the built-in Codex provider, a Codex profile, or a configured codex-cli provider.',
           path: "steps[1].session",
           stepId: "api_call"
+        },
+        {
+          code: "workflow.mcp_call.session.provider.invalid",
+          message: 'Codex-mediated MCP call session "custom_agent" must use the built-in Codex provider, a Codex profile, or a configured codex-cli provider.',
+          path: "steps[2].session",
+          stepId: "custom_call"
         }
       ]);
   });
