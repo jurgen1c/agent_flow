@@ -407,15 +407,20 @@ async function runLifecycleCommand(
     if (command === "run") {
       const runArgs = parsedRun as ParsedRunLifecycleArgs;
       const existingRun = store.getRun(runArgs.runId);
+      const workflowRegistryName = existingRun !== null
+          && typeof existingRun.context.workflowRegistryName === "string"
+          && existingRun.context.workflowRegistryName.trim().length > 0
+        ? existingRun.context.workflowRegistryName.trim()
+        : existingRun?.workflowName ?? workflowResult!.workflow.name;
       const availableWorkflows = existingRun === null
         ? loadAgentFlowWorkflowRegistry(workflowPath, { cwd: options.cwd })
         : createAgentFlowWorkflowRegistryFromSnapshot(
             existingRun.context.workflowRegistry
-              ?? { [workflowResult!.workflow.name]: workflowResult!.workflow } as unknown as import("../runtime/index").AgentFlowRunStateValue
+              ?? { [workflowRegistryName]: workflowResult!.workflow } as unknown as import("../runtime/index").AgentFlowRunStateValue
           );
       const workflows = reachableWorkflowRegistry(
         availableWorkflows,
-        existingRun?.workflowName ?? workflowResult!.workflow.name
+        workflowRegistryName
       );
       const registeredWorkflows = workflows.names().map((name) => workflows.get(name)!);
       const directMcp = registeredWorkflows.flatMap((registeredWorkflow) =>
@@ -472,9 +477,11 @@ async function runLifecycleCommand(
       const inputs = existingRun?.inputs ?? providedInputs;
       const inputError = validateRunInputs(workflowResult!.workflow, inputs);
       if (inputError !== undefined) return { exitCode: 2, stderr: inputError };
-      const sessionRequestSteps = registeredWorkflows.flatMap((registeredWorkflow) =>
-        collectSessionRequestSteps(registeredWorkflow.steps).map((step) => ({ workflow: registeredWorkflow, step }))
-      );
+      const sessionRequestSteps = workflows.names().flatMap((registryName) => {
+        const registeredWorkflow = workflows.get(registryName)!;
+        return collectSessionRequestSteps(registeredWorkflow.steps)
+          .map((step) => ({ registryName, workflow: registeredWorkflow, step }));
+      });
       const requiredProviders = registeredWorkflows.flatMap((registeredWorkflow) =>
         collectRequiredWorkflowProviders(registeredWorkflow)
       );
@@ -710,9 +717,11 @@ async function runLifecycleCommand(
         };
       }
       if (fixture !== null) {
-        const sessionRequestSteps = registeredWorkflows.flatMap((registeredWorkflow) =>
-          collectSessionRequestSteps(registeredWorkflow.steps).map((step) => ({ workflow: registeredWorkflow, step }))
-        );
+        const sessionRequestSteps = workflows.names().flatMap((registryName) => {
+          const registeredWorkflow = workflows.get(registryName)!;
+          return collectSessionRequestSteps(registeredWorkflow.steps)
+            .map((step) => ({ registryName, workflow: registeredWorkflow, step }));
+        });
         const duplicateFixtureStep = duplicateFixtureSessionStep(sessionRequestSteps);
         if (duplicateFixtureStep !== undefined) {
           return {
@@ -1645,17 +1654,18 @@ function collectRequiredWorkflowProviders(
 
 function duplicateFixtureSessionStep(
   entries: Array<{
+    registryName: string;
     workflow: import("../runtime/index").AgentFlowWorkflow;
     step: import("../runtime/index").AgentFlowWorkflowStep;
   }>
 ): { stepId: string; workflows: string[] } | undefined {
   const workflowsByStep = new Map<string, Set<string>>();
-  for (const { workflow, step } of entries) {
+  for (const { registryName, workflow, step } of entries) {
     if (!fixtureProviderHandlesSessionStep(workflow, step)) continue;
     const stepId = String(step.id ?? "").trim();
     if (stepId.length === 0) continue;
     const workflows = workflowsByStep.get(stepId) ?? new Set<string>();
-    workflows.add(workflow.name);
+    workflows.add(registryName);
     workflowsByStep.set(stepId, workflows);
   }
   for (const [stepId, workflows] of [...workflowsByStep].sort(([left], [right]) => left.localeCompare(right))) {

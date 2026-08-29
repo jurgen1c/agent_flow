@@ -686,6 +686,46 @@ steps:
     expect((await captureCli(["logs", "cli-recovery"], repo)).stdout).toContain("run.execution_recovered");
   });
 
+  test("recovers an interrupted aliased child through the documented run command", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-alias-recovery-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.writeFileSync(path.join(repo, "child.yml"), `
+name: internal-child-name
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: publish, type: command, command: "printf recovered > child.txt", outputs: [child.txt] }
+`);
+    const child = parseAgentFlowWorkflowOrThrow(fs.readFileSync(path.join(repo, "child.yml"), "utf8"));
+    const registry = createAgentFlowWorkflowRegistry().register("child-alias", child);
+    const interrupted = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(interrupted, {
+      id: "alias-recovery",
+      workflow: child,
+      context: {
+        workflowRegistry: serializeAgentFlowWorkflowRegistry(registry) as never,
+        workflowRegistryName: "child-alias"
+      }
+    });
+    interrupted.acquireRunLock("alias-recovery", "run", { ttlMs: 60_000 });
+    interrupted.transitionRunWithEvent("alias-recovery", {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    interrupted.close();
+
+    const recovered = await captureCli(["run", "child.yml", "--id", "alias-recovery"], repo);
+
+    expect(recovered).toMatchObject({ exitCode: 0, stderr: "" });
+    expect(recovered.stdout).toContain("Reused Agent Flow run alias-recovery");
+    const store = await openAgentFlowRunState({ cwd: repo });
+    expect(store.getRun("alias-recovery")?.status).toBe("completed");
+    expect(store.readArtifact("alias-recovery", "child.txt").content.toString()).toBe("recovered");
+    store.close();
+  });
+
   test("recovers child providers and workflow definitions from the persisted registry", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-child-recovery-"));
     fs.mkdirSync(path.join(repo, ".git"));
@@ -930,6 +970,62 @@ steps:
       expect(store.getRun(`fixture-disagreement-${strategy}`)).toBeNull();
       store.close();
     }
+  });
+
+  test("preserves registry aliases when checking fixture step ID collisions", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-fixture-alias-id-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: internal-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: gate, type: manual_gate, message: Continue?, options: [approve, cancel] }
+  - { id: first, type: workflow, workflow: child-a, inputs: {}, outputs: [a.txt] }
+  - { id: second, type: workflow, workflow: child-b, inputs: {}, outputs: [b.txt] }
+`);
+    const child = (output: string) => parseAgentFlowWorkflowOrThrow(`
+name: shared-internal-child
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  writer: { provider: fixture }
+limits: { max_model_calls: 1 }
+steps:
+  - { id: generate, type: session_request, session: writer, prompt: prompt.md, inputs: [input.md], outputs: [${output}] }
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register("parent-alias", parent)
+      .register("child-a", child("a.txt"))
+      .register("child-b", child("b.txt"));
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, {
+      id: "fixture-alias-collision",
+      workflow: parent,
+      context: {
+        workflowRegistry: serializeAgentFlowWorkflowRegistry(workflows) as never,
+        workflowRegistryName: "parent-alias"
+      }
+    });
+    expect(await executeAgentFlowCommandPipeline(
+      store, "fixture-alias-collision", parent, undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({ status: "paused" });
+    store.close();
+    fs.writeFileSync(path.join(repo, "fixture.json"), JSON.stringify({
+      steps: { generate: { outputs: { "a.txt": "a" } } }
+    }));
+
+    const result = await captureCli([
+      "resume", "fixture-alias-collision", "--outcome", "approve", "--fixture", "fixture.json"
+    ], repo);
+
+    expect(result).toMatchObject({ exitCode: 2 });
+    expect(result.stderr).toContain("multiple reachable workflows (child-a, child-b)");
+    const inspected = await openAgentFlowRunState({ cwd: repo });
+    expect(inspected.getRun("fixture-alias-collision")?.status).toBe("paused");
+    inspected.close();
   });
 
   test("ignores providers and validation in unrelated workflow registry entries", async () => {
