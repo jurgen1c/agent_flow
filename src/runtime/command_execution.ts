@@ -8734,7 +8734,21 @@ async function resumeNestedWorkflowWaitingStep(
               ? terminalFailureMessage(persistedChild.error)
               : `Child workflow run ${waiting.childRunId} was cancelled.` })
       }
-    : await resumeAgentFlowCommandPipeline(
+    : persistedChild.status === "paused" && persistedChild.context.waiting === undefined
+      ? await restartPlainPausedNestedWorkflow(
+          store,
+          runId,
+          waiting.childRunId,
+          childWorkflow,
+          transforms,
+          sessionProviders,
+          mcpCalls,
+          notifications,
+          workflows,
+          prepareResume,
+          promoteOutputs
+        )
+      : await resumeAgentFlowCommandPipeline(
         store, waiting.childRunId, childWorkflow, response,
         transforms, sessionProviders, mcpCalls, notifications, workflows, prepareResume, promoteOutputs
       );
@@ -8809,6 +8823,49 @@ async function resumeNestedWorkflowWaitingStep(
   );
   if ("result" in routed) return routed;
   return { ...routed, completedSteps, routingBudget };
+}
+
+async function restartPlainPausedNestedWorkflow(
+  store: AgentFlowRunStateStore,
+  parentRunId: string,
+  childRunId: string,
+  childWorkflow: AgentFlowWorkflow,
+  transforms: AgentFlowArtifactTransformRegistry,
+  sessionProviders: AgentFlowSessionProviderRegistry,
+  mcpCalls: AgentFlowMcpCallRegistry,
+  notifications: AgentFlowNotificationRegistry,
+  workflows: AgentFlowWorkflowRegistry,
+  prepareResume: (() => void) | undefined,
+  beforeSuccessfulFinalization: () => void
+): Promise<AgentFlowCommandPipelineResult> {
+  store.withRunStateTransaction(childRunId, () => {
+    prepareResume?.();
+    const child = assertPersistedWorkflowIdentity(store, childRunId, childWorkflow);
+    if (child.status !== "paused" || child.context.waiting !== undefined) {
+      throw new AgentFlowRunStateError(
+        `Child workflow run ${childRunId} is no longer plain-paused. Refresh the parent run before resuming.`,
+        "AGENT_FLOW_RESUME_STATE"
+      );
+    }
+    store.transitionRunWithEvent(childRunId, {
+      status: "pending",
+      allowedFrom: ["paused"],
+      event: { type: "run.resume", payload: { status: "pending", parentRunId } }
+    });
+  });
+  return executeAgentFlowCommandPipeline(
+    store,
+    childRunId,
+    childWorkflow,
+    transforms,
+    sessionProviders,
+    mcpCalls,
+    notifications,
+    workflows,
+    undefined,
+    undefined,
+    beforeSuccessfulFinalization
+  );
 }
 
 function persistWorkflowStepFailure(

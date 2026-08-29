@@ -20,7 +20,7 @@ for a future runtime surface and is not active.
 | `agent-flow lint <workflow>` | Report complexity and risky authoring patterns. |
 | `agent-flow explain <workflow>` | Explain normalized steps, artifacts, policies, collaboration, and warnings. |
 | `agent-flow graph <workflow>` | Print a deterministic workflow graph. |
-| `agent-flow simulate <workflow> --fixture <file>` | Traverse fixture-defined paths and materialize a simulation summary without executing workflow steps. |
+| `agent-flow simulate <workflow> --fixture <file>` | Load and validate the reachable workflow registry, then traverse fixture-defined paths and materialize a summary without executing workflow steps. |
 
 The authoring skills help create and review workflow YAML. They do not invoke
 lifecycle commands.
@@ -31,7 +31,7 @@ lifecycle commands.
 |---|---|
 | `agent-flow run <workflow> --id <run-id> [--fixture <file>] [--input-file <json>] [--input <key=value>]... [--config <file>] [--provider <alias=target>]...` | Create or reuse a persistent run, merge validated inputs, load configured providers, and execute supported steps. Input and provider flags are repeatable; provider overrides are new-run only. |
 | `agent-flow run <workflow> --id <run-id> [--profile <name>] [--model <name>] [--reasoning-effort <level>]` | Start a run with optional Codex overrides. The selected values are persisted and reused when the run resumes. |
-| `agent-flow resume <run-id> --outcome <choice> [--fixture <file>] [--config <file>]` | Continue a paused approval or other choice-based interaction after verifying pinned provider bindings. |
+| `agent-flow resume <run-id> --outcome <choice> [--fixture <file>] [--config <file>]` | Continue a paused approval or other choice-based interaction, or settle/resume a linked child workflow, after verifying pinned provider bindings. |
 | `agent-flow resume <run-id> --answer <value> [--fixture <file>] [--config <file>]` | Continue a paused input request after verifying pinned provider bindings. JSON scalar, array, and object values are parsed; other input remains text. |
 | `agent-flow resume <run-id> --reset-session <session-name> [--fixture <file>] [--config <file>]` | Explicitly discard a missing native CLI session ID and retry the waiting step in a fresh Codex or Claude session. |
 | `agent-flow inject <run-id> <session-name> <context>` | Persist additional context for an active recovery session and mark it dirty for rerun. |

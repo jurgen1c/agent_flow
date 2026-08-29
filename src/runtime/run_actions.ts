@@ -75,7 +75,7 @@ export interface AgentFlowRunActionWaitingState {
   approvalId: string | null;
   sessionId?: string;
   childRunId?: string;
-  childStatus?: "completed" | "failed" | "cancelled";
+  childStatus?: "paused" | "completed" | "failed" | "cancelled";
   nestedKind?: Exclude<AgentFlowRunActionWaitingState["kind"], "workflow">;
 }
 
@@ -645,19 +645,21 @@ function actionAvailability(
     && (interactionKind === "approval" || interactionKind === "manual_gate" || interactionKind === "disagreement")
     && waiting.validOutcomes.includes(interactionKind === "disagreement" ? "request_changes" : "reject");
   const canInput = actionStateValid && !hasStaleApprovals && interactionKind === "input_request";
-  const canSettleWorkflow = waiting?.kind === "workflow" && waiting.childStatus !== undefined;
+  const canContinueWorkflow = waiting?.kind === "workflow" && waiting.childStatus !== undefined;
   const canResume = actionStateValid && !hasStaleApprovals && run.status === "paused"
-    && (waiting === null || canSettleWorkflow);
+    && (waiting === null || canContinueWorkflow);
   const canPause = actionStateValid && ["pending", "running", "waiting"].includes(run.status);
   const canCancel = actionStateValid && ["pending", "running", "waiting", "paused"].includes(run.status);
   return [
     action("approve", "Approve", canApprove, unavailable ?? activeApprovalBlockReason ?? outcomeReason ?? "Approve is not a valid outcome for this gate.", "Confirm approval after reviewing the warnings and evidence shown above."),
     action("reject", "Reject", canReject, unavailable ?? activeApprovalBlockReason ?? outcomeReason ?? "Reject is not a valid outcome for this gate.", "Reject this gate and continue along its configured rejection path?"),
     action("provide_input", "Provide input", canInput, unavailable ?? "This run is not waiting for input.", null),
-    action("resume", canSettleWorkflow ? "Settle child" : "Resume", canResume, unavailable ?? (waiting === null
+    action("resume", canContinueWorkflow
+      ? waiting?.childStatus === "paused" ? "Resume child" : "Settle child"
+      : "Resume", canResume, unavailable ?? (waiting === null
       ? "Only a paused run can resume."
-      : canSettleWorkflow
-        ? "The linked child workflow has not reached a terminal state."
+      : canContinueWorkflow
+        ? "The linked child workflow cannot be continued."
       : interactionKind === "provider_session"
         ? `Reset the unavailable provider session with agent-flow resume ${run.id} --reset-session ${waiting.sessionId}.`
         : "Respond to the waiting interaction instead of using plain resume."), null),
@@ -747,8 +749,15 @@ function resolveNestedActionWaitingState(
       return { waiting: null, error: "The nested child workflow is no longer paused.", run };
     }
     const parsed = parseWaitingState(run.context.waiting);
-    if (parsed.error !== null || parsed.waiting === null) {
-      return { waiting: null, error: parsed.error ?? "The nested child workflow has no waiting interaction.", run };
+    if (parsed.error !== null) {
+      return { waiting: null, error: parsed.error, run };
+    }
+    if (parsed.waiting === null) {
+      return {
+        waiting: { ...waiting, childRunId: run.id, childStatus: "paused" },
+        error: null,
+        run
+      };
     }
     try {
       validateAgentFlowPipelineWaitingState(run.context.waiting!);

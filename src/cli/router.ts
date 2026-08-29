@@ -1354,15 +1354,30 @@ function simulateWorkflow(args: string[], options: AgentFlowCliOptions): AgentFl
   const [workflowPath, , fixturePath] = args;
   const workflowResult = readWorkflow(workflowPath, "simulate");
   if ("exitCode" in workflowResult) return workflowResult;
-  const providerResult = configuredProviderResolver([workflowResult.workflow], options);
+  let workflows: import("../runtime/index").AgentFlowWorkflow[];
+  try {
+    const registry = reachableWorkflowRegistry(
+      loadAgentFlowWorkflowRegistry(workflowPath, { cwd: options.cwd }),
+      workflowResult.workflow.name
+    );
+    workflows = registry.names().map((name) => registry.get(name)!);
+  } catch (error) {
+    return {
+      exitCode: 2,
+      stderr: `Agent Flow simulate failed: ${workflowPath}\n${error instanceof Error ? error.message : String(error)}`
+    };
+  }
+  const providerResult = configuredProviderResolver(workflows, options);
   if (!providerResult.ok) return providerResult.result;
   const providerKind = providerResult.providerKind;
-  const configuredValidation = validateAgentFlowWorkflow(
-    workflowResult.workflow,
-    providerKind
-  );
-  if (!configuredValidation.valid) {
-    return { exitCode: 2, stderr: formatAgentFlowWorkflowIssues(configuredValidation.errors) };
+  const invalidConfiguredWorkflow = workflows
+    .map((workflow) => ({ workflow, validation: validateAgentFlowWorkflow(workflow, providerKind) }))
+    .find(({ validation }) => !validation.valid);
+  if (invalidConfiguredWorkflow !== undefined) {
+    return {
+      exitCode: 2,
+      stderr: `Agent Flow simulate failed: ${workflowPath} (${invalidConfiguredWorkflow.workflow.name})\n${formatAgentFlowWorkflowIssues(invalidConfiguredWorkflow.validation.errors)}`
+    };
   }
 
   let fixtureSource: string;

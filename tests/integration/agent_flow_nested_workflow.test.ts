@@ -93,6 +93,64 @@ steps:
     store.close();
   });
 
+  test("resumes a plain-paused child through its parent action", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-plain-pause-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: plain-paused-child
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: publish
+    type: command
+    command: if test -f ready.txt; then printf done > child.txt; else exit 1; fi
+    outputs: [child.txt]
+`);
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: plain-paused-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: child, type: workflow, workflow: plain-paused-child, inputs: {}, outputs: [child.txt] }
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register(parent.name, parent)
+      .register(child.name, child);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, {
+      id: "plain-paused-parent",
+      workflow: parent,
+      context: { workflowRegistry: serializeAgentFlowWorkflowRegistry(workflows) as never }
+    });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "plain-paused-parent", parent, undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({ status: "paused", failedStep: "child" });
+    const childRunId = (store.getRun("plain-paused-parent")!.context.waiting as { childRunId: string }).childRunId;
+    expect(store.getRun(childRunId)?.status).toBe("paused");
+    expect(store.getRun(childRunId)?.context.waiting).toBeUndefined();
+
+    const snapshot = buildAgentFlowRunActionSnapshot(store, "plain-paused-parent");
+    expect(snapshot.waiting).toMatchObject({ kind: "workflow", childRunId, childStatus: "paused" });
+    expect(snapshot.actions.find((action) => action.action === "resume")).toMatchObject({
+      enabled: true,
+      label: "Resume child"
+    });
+
+    fs.writeFileSync(path.join(repo, "ready.txt"), "ready\n");
+    expect(await executeAgentFlowRunAction(
+      store,
+      "plain-paused-parent",
+      { action: "resume", guard: snapshot.guard },
+      { workflows }
+    )).toMatchObject({ status: "completed" });
+    expect(store.getRun(childRunId)?.status).toBe("completed");
+    expect(store.readArtifact("plain-paused-parent", "child.txt").content.toString("utf8")).toBe("done");
+    store.close();
+  });
+
   test("promotes child outputs before immediate success retention", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-retention-"));
     fs.mkdirSync(path.join(repo, ".git"));

@@ -129,6 +129,13 @@ steps:
     const missing = dispatch(["validate", parentPath], { cwd: repo });
     expect(missing).toMatchObject({ exitCode: 2 });
     expect(missing.stderr).toContain("references missing workflow registry-child");
+    const simulationFixture = path.join(repo, "simulation.json");
+    fs.writeFileSync(simulationFixture, JSON.stringify({
+      steps: { child: { outputs: { "out.txt": "simulated" } } }
+    }));
+    const missingSimulation = dispatch(["simulate", parentPath, "--fixture", simulationFixture], { cwd: repo });
+    expect(missingSimulation).toMatchObject({ exitCode: 2 });
+    expect(missingSimulation.stderr).toContain("references missing workflow registry-child");
 
     fs.writeFileSync(path.join(repo, "child.yml"), `
 name: registry-child
@@ -143,6 +150,9 @@ steps:
     const invalidInputs = dispatch(["validate", parentPath], { cwd: repo });
     expect(invalidInputs).toMatchObject({ exitCode: 2 });
     expect(invalidInputs.stderr).toContain("supplies unknown inputs to registry-child: typo");
+    const invalidSimulation = dispatch(["simulate", parentPath, "--fixture", simulationFixture], { cwd: repo });
+    expect(invalidSimulation).toMatchObject({ exitCode: 2 });
+    expect(invalidSimulation.stderr).toContain("supplies unknown inputs to registry-child: typo");
 
     const run = await captureCli(["run", parentPath, "--id", "invalid-child-contract"], repo);
     expect(run).toMatchObject({ exitCode: 1 });
@@ -150,6 +160,28 @@ steps:
     const store = await openAgentFlowRunState({ cwd: repo });
     expect(store.getRun("invalid-child-contract")).toBeNull();
     store.close();
+
+    fs.writeFileSync(parentPath, `
+name: registry-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: child, type: workflow, workflow: registry-child, inputs: { ticket: value }, outputs: [out.txt] }
+`);
+    fs.writeFileSync(path.join(repo, "child.yml"), `
+name: registry-child
+version: 1
+style: pipeline
+maturity: experimental
+inputs:
+  ticket: { required: true }
+steps:
+  - { id: parent, type: workflow, workflow: registry-parent, inputs: {}, outputs: [parent.txt] }
+`);
+    const recursiveSimulation = dispatch(["simulate", parentPath, "--fixture", simulationFixture], { cwd: repo });
+    expect(recursiveSimulation).toMatchObject({ exitCode: 2 });
+    expect(recursiveSimulation.stderr).toContain("Recursive workflow reference detected");
   });
 
   test("uses configured target drivers when validating Codex-mediated MCP calls", () => {
