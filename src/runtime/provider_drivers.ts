@@ -164,10 +164,10 @@ async function invokeCodexCli(
         "--json",
         "--output-schema", schemaPath,
         "--output-last-message", outputPath,
-        ...(model === undefined ? [] : ["--model", model])
+        ...(model === undefined ? [] : [`--model=${model}`])
       ];
       const codexConfigurationArguments = [
-        ...(profile === undefined ? [] : ["--profile", profile]),
+        ...(profile === undefined ? [] : [`--profile=${profile}`]),
         ...(reasoningEffort === undefined
           ? []
           : ["--config", `model_reasoning_effort=${JSON.stringify(reasoningEffort)}`])

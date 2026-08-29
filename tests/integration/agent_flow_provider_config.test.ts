@@ -874,7 +874,7 @@ providers:
       provider: "coder",
       providerKind: "frontier" as const,
       resume: true,
-      codexOptions: { profile: "run-profile", model: "run-model", reasoningEffort: "high" },
+      codexOptions: { profile: "-run-profile", model: "-run-model", reasoningEffort: "high" },
       reportExternalSessionId: (id: string) => ids.push(id)
     };
     const first = await registry.get("coder")!(request);
@@ -886,9 +886,8 @@ providers:
     expect(ids).toEqual(["codex-thread-1", "codex-thread-1"]);
     const invocations = fs.readFileSync(fake.log, "utf8").trim().split("\n")
       .map((line) => JSON.parse(line) as { args: string[]; unrelatedSecret?: string; hostReads?: Array<string | null> });
-    expect(invocations[0]!.args).toContain("--profile");
-    expect(invocations[0]!.args).toContain("run-profile");
-    expect(invocations[0]!.args).toContain("run-model");
+    expect(invocations[0]!.args).toContain("--profile=-run-profile");
+    expect(invocations[0]!.args).toContain("--model=-run-model");
     expect(invocations[0]!.args).toContain('model_reasoning_effort="high"');
     expect(invocations[0]!.args).not.toContain("--ignore-user-config");
     expect(invocations[0]!.args).not.toContain("--ignore-rules");
@@ -1203,8 +1202,8 @@ limits:
     expect(started).toMatchObject({ exitCode: 3 });
     const recoveryInvocations = fs.readFileSync(fake.log, "utf8").trim().split("\n")
       .map((line) => JSON.parse(line) as { args: string[] });
-    expect(recoveryInvocations[0]!.args).toContain("run-profile");
-    expect(recoveryInvocations[0]!.args).toContain("run-model");
+    expect(recoveryInvocations[0]!.args).toContain("--profile=run-profile");
+    expect(recoveryInvocations[0]!.args).toContain("--model=run-model");
     expect(recoveryInvocations[0]!.args).toContain('model_reasoning_effort="medium"');
     expect(recoveryInvocations[0]!.args).not.toContain("workflow-profile");
     expect(recoveryInvocations[0]!.args).not.toContain("workflow-model");
