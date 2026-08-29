@@ -180,13 +180,16 @@ export function transitionAgentFlowLifecycleRun(
 function cancelNonterminalChildRuns(
   store: AgentFlowRunStateStore,
   parentRunId: string,
-  notifications: AgentFlowNotificationRegistry
+  notifications: AgentFlowNotificationRegistry,
+  visited: Set<string> = new Set([parentRunId])
 ): void {
   const children = store.listRuns().filter((run) => run.parentRunId === parentRunId);
   for (const child of children) {
+    if (visited.has(child.id)) continue;
+    visited.add(child.id);
     const current = store.getRun(child.id);
     if (current === null || ["completed", "failed", "cancelled"].includes(current.status)) {
-      cancelNonterminalChildRuns(store, child.id, notifications);
+      cancelNonterminalChildRuns(store, child.id, notifications, visited);
       continue;
     }
     try {
@@ -197,7 +200,7 @@ function cancelNonterminalChildRuns(
           || error.code !== "AGENT_FLOW_RUN_TRANSITION"
           || settled === null
           || !["completed", "failed", "cancelled"].includes(settled.status)) throw error;
-      cancelNonterminalChildRuns(store, child.id, notifications);
+      cancelNonterminalChildRuns(store, child.id, notifications, visited);
     }
   }
 }

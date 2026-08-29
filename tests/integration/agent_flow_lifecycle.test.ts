@@ -155,6 +155,22 @@ describe("Agent Flow run lifecycle", () => {
     store.close();
   });
 
+  test("terminates cancellation traversal for a self-parented run", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(WORKFLOW_SOURCE);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, {
+      id: "self-parented",
+      workflow,
+      parentRunId: "self-parented"
+    });
+
+    expect(transitionAgentFlowLifecycleRun(store, "self-parented", "cancel"))
+      .toMatchObject({ run: { status: "cancelled" } });
+    expect(store.getRun("self-parented")?.status).toBe("cancelled");
+    store.close();
+  });
+
   test("requires initial lifecycle context to match when reusing a run ID", async () => {
     const repoRoot = temporaryRepo();
     const workflow = parseAgentFlowWorkflowOrThrow(WORKFLOW_SOURCE);

@@ -279,6 +279,7 @@ function assertOrPersistConfiguredProviderBindings(
       if (session === null || typeof session !== "object" || Array.isArray(session)) continue;
       const provider = normalizedTarget((session as AgentFlowYamlMapping).provider);
       if (provider === undefined || Object.hasOwn(bindings, provider)) continue;
+      if (provider === "codex") continue;
       const descriptor = providers.describe(provider);
       if (descriptor?.target === undefined || descriptor.driver === undefined
           || descriptor.fingerprint === undefined) continue;
