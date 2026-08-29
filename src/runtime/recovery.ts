@@ -138,7 +138,9 @@ export function assertAgentFlowWorkflowRegistryContracts(
   registry: AgentFlowWorkflowRegistry,
   roots: string[] = registry.names()
 ): void {
-  assertAcyclicWorkflowRegistry(registry, roots);
+  // Recovery workflows are bounded by the runtime lineage guard and may route
+  // back to an ancestor. Only direct nested-workflow edges must be acyclic.
+  assertAcyclicWorkflowRegistry(registry, roots, referencedNestedWorkflowNames);
   assertWorkflowStepInputContracts(registry, roots);
 }
 
@@ -164,7 +166,8 @@ function siblingWorkflowFiles(source: string): string[] {
 
 function assertAcyclicWorkflowRegistry(
   registry: AgentFlowWorkflowRegistry,
-  roots: string[] = registry.names()
+  roots: string[] = registry.names(),
+  references: (steps: AgentFlowWorkflowStep[]) => string[] = referencedWorkflowNames
 ): void {
   const visiting = new Set<string>();
   const visited = new Set<string>();
@@ -176,7 +179,7 @@ function assertAcyclicWorkflowRegistry(
     const workflow = registry.get(name);
     if (workflow === undefined) throw new Error(`Referenced workflow ${name} is not registered.`);
     visiting.add(name);
-    for (const child of referencedWorkflowNames(workflow.steps)) {
+    for (const child of references(workflow.steps)) {
       if (registry.get(child) === undefined) throw new Error(`Workflow ${name} references missing workflow ${child}.`);
       visit(child, [...lineage, name]);
     }
@@ -184,6 +187,15 @@ function assertAcyclicWorkflowRegistry(
     visited.add(name);
   };
   roots.forEach((name) => visit(name, []));
+}
+
+function referencedNestedWorkflowNames(steps: AgentFlowWorkflowStep[]): string[] {
+  return [...new Set(workflowSteps(steps).flatMap((step) =>
+    typeof step.type === "string" && step.type.trim() === "workflow"
+      && typeof step.workflow === "string" && step.workflow.trim().length > 0
+      ? [step.workflow.trim()]
+      : []
+  ))].sort();
 }
 
 function assertWorkflowStepInputContracts(
