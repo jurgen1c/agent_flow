@@ -19,8 +19,11 @@ persisted definition before invoking an adapter or shell.
   required, model budgets are checked before calls, and output paths must be
   normalized repository-contained artifact paths.
 - API provider credentials are read only from the named `api_key_env` variable.
-  The three built-in HTTP drivers are artifact-only, cannot write or inspect the
-  checkout, and receive only declared prompt and input artifact content. The
+  The three built-in HTTP drivers cannot write or inspect the checkout and
+  receive only the declared prompt, scalar session context appended to that
+  prompt, and input artifact content. Scalar context uses the same sensitive
+  input policy and prompt byte limit; request evidence stores checksums instead
+  of context values. The
   Codex runs without a shell at the repository root and owns its normal config,
   login, permissions/sandbox, rules, plugins, and MCP servers. Agent Flow does
   not wrap Codex with `bubblewrap`/`flock` or filter its environment. Claude's

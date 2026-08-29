@@ -104,6 +104,32 @@ steps:
     outputs: [implementation-summary.md]
 ```
 
+Artifact inputs and scalar context are separate request channels. `inputs`
+always names artifacts. `context` is a non-empty mapping with at most 64
+string, finite-number, boolean, or `null` values:
+
+```yaml
+- id: fetch_ticket
+  type: session_request
+  session: planner
+  prompt: prompts/fetch-ticket.md
+  context:
+    ticket_key: "{{ inputs.ticket_key }}"
+  inputs: []
+  outputs: [ticket.json]
+```
+
+Exact `{{ inputs.<name> }}` references retain their scalar type; references
+embedded in a larger string are rendered as text. Agent Flow resolves and
+sensitivity-checks the mapping, appends stable JSON to the prompt, and persists
+only context checksums in request evidence. A request may use both artifact
+inputs and scalar context.
+
+For pass-through Codex sessions, the prompt can direct Codex to use an MCP
+server already registered in the user's Codex configuration. Agent Flow supplies
+the bounded context but does not install, configure, or credential that MCP
+server, and a hard-coded Agent Flow `mcp_call` is not required.
+
 A new run may replace one or more alias defaults:
 
 ```bash

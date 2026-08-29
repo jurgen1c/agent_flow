@@ -217,6 +217,31 @@ agent-flow run workflow.yml --id AF-123 \
 They merge in that order, with later sources winning. Duplicate `--input` keys,
 unknown inputs, and missing required inputs fail before run creation.
 
+Inside a `session_request`, `inputs` remains an artifact-path list. Use
+`context` for scalar run values; both may be supplied together. Context values
+may be strings, finite numbers, booleans, or `null`, and exact
+`{{ inputs.<name> }}` references preserve that scalar type. Agent Flow appends
+the resolved mapping to the provider prompt as deterministic JSON after applying
+the workflow's sensitive-input policy.
+
+```yaml
+- id: fetch_jira_ticket
+  type: session_request
+  session: jira_reader
+  prompt: prompts/fetch-jira-ticket.md
+  context:
+    ticket_key: "{{ inputs.ticket_key }}"
+  inputs: []
+  outputs:
+    - jira/ticket.json
+    - jira/ticket.md
+```
+
+With a Codex-backed `jira_reader`, the prompt may ask Codex to use its installed
+Atlassian MCP server. Agent Flow supplies the ticket key as bounded context; it
+does not require a hard-coded `mcp_call`. Use `inputs` as well when the same
+request also needs artifact content.
+
 Ordinary custom registrations preserve the previous behavior: Agent Flow pins
 the provider name in the workflow but cannot fingerprint changes inside
 application-owned adapter code. Applications that want configured-provider

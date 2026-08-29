@@ -34,7 +34,9 @@ import {
   MAX_AGENT_FLOW_SESSION_INPUT_BYTES,
   MAX_AGENT_FLOW_SESSION_INPUTS,
   MAX_AGENT_FLOW_SESSION_PROMPT_BYTES,
-  MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES
+  MAX_AGENT_FLOW_SESSION_TOTAL_INPUT_BYTES,
+  appendAgentFlowSessionContext,
+  prepareAgentFlowSessionContext
 } from "./session_request";
 import {
   AgentFlowConditionError,
@@ -1464,7 +1466,31 @@ function preflightSimulationGeneratedSessionPrompt(
   state: SimulationState
 ): void {
   const type = nonEmptyString(step.type);
-  if (type === "session_request" || !["approval", "review", "consult", "challenge"].includes(type ?? "")) return;
+  if (type === "session_request") {
+    const preparedContext = prepareAgentFlowSessionContext(
+      state.workflow,
+      step.context,
+      (state.fixture.inputs ?? {}) as Record<string, AgentFlowRunStateValue>,
+      stepId
+    );
+    if (preparedContext === undefined) return;
+    for (const [phase, context] of [
+      ["before", preparedContext.source],
+      ["after", preparedContext.value]
+    ] as const) {
+      const rendered = appendAgentFlowSessionContext(
+        { path: String(step.prompt), content: "", checksum: "sha256:simulation" },
+        context
+      );
+      if (Buffer.byteLength(rendered.content, "utf8") > MAX_AGENT_FLOW_SESSION_PROMPT_BYTES) {
+        throw new Error(
+          `Session request ${stepId} context exceeds the ${MAX_AGENT_FLOW_SESSION_PROMPT_BYTES}-byte session prompt limit ${phase} sensitive-data handling.`
+        );
+      }
+    }
+    return;
+  }
+  if (!["approval", "review", "consult", "challenge"].includes(type ?? "")) return;
   const secureGeneratedField = (value: string, field: string): string =>
     secureAgentFlowTextInput(state.workflow, `${type} ${stepId} ${field}`, value).value;
   const createGeneratedPrompt = (transformField: (value: string, field: string) => string) => type === "approval"

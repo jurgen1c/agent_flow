@@ -50,6 +50,13 @@ a JSON object. Each CLI value uses `key=value`; JSON values are parsed and
 other values remain text. Duplicate CLI keys, unknown inputs, missing required
 inputs, and attempts to change a persisted run input fail closed.
 
+Run inputs are not artifact declarations. A `session_request.inputs` list always
+names artifact paths, including when an entry resolves from a run input. To pass
+scalar run values to a model session, declare `session_request.context`; its
+scalar mapping is resolved and appended to the provider prompt as deterministic
+JSON. `inputs` may be empty when a non-empty `context` is present, and artifact
+inputs plus scalar context may be used together.
+
 Codex precedence is step, run flags, session, configured target, then Codex's
 normal configuration. Profiles contain only letters, numbers, hyphens, and
 underscores. Reasoning effort is `minimal`, `low`, `medium`, `high`, or

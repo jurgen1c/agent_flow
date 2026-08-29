@@ -1,0 +1,38 @@
+name: jira-ticket-session
+version: 1
+style: pipeline
+maturity: experimental
+
+description: Let an installed Codex session use its configured Atlassian MCP server with scalar ticket context.
+
+inputs:
+  ticket_key:
+    required: true
+
+sessions:
+  jira_reader:
+    provider: codex
+    resume: true
+    role: jira_reader
+
+policies:
+  model_usage:
+    allowed_providers: [codex]
+
+limits:
+  max_model_calls: 1
+  max_frontier_calls: 1
+
+steps:
+  - id: fetch_jira_ticket
+    type: session_request
+    session: jira_reader
+    prompt: examples/prompts/fetch-jira-ticket-session.md
+    context:
+      ticket_key: "{{ inputs.ticket_key }}"
+    inputs: []
+    outputs:
+      - jira/ticket.json
+      - jira/ticket.md
+    on_failure:
+      then: pause

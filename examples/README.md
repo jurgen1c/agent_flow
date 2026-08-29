@@ -8,6 +8,7 @@ These examples show how Agent Flow workflows can start simple and grow into reco
 |---|---|---|
 | `workflows/simple-ci.yml` | Pipeline | Run deterministic local checks |
 | `workflows/jira-ticket-spec.yml` | Pipeline | Use Codex MCP to fetch Jira ticket JSON, transform it to Markdown, and create a concise spec |
+| `workflows/jira-ticket-session.yml` | Pipeline | Pass a scalar ticket key to Codex and let its configured Atlassian MCP server produce ticket artifacts |
 | `workflows/ticket-lifecycle.yml` | Recovery pipeline | LM/FM ticket implementation lifecycle with CI and PR feedback |
 | `workflows/ci-triage.yml` | Recovery pipeline | Reusable nested workflow for failed CI |
 | `workflows/pr-feedback-loop.yml` | Recovery pipeline | Poll PR comments and route actionable feedback to FM |
@@ -98,6 +99,18 @@ The stock CLI cannot execute the default `via: direct` MCP mode because direct
 adapters are application code registered by a programmatic host. The example
 uses `via: codex`, so the installed Codex supplies its configured MCP adapter
 and credentials.
+
+`jira-ticket-session.yml` shows the alternative session-oriented contract. It
+passes `ticket_key` through `session_request.context`, keeps artifact `inputs`
+empty, and asks the installed Codex session to choose and invoke its configured
+Atlassian MCP tool. This avoids coupling the workflow to a specific MCP server
+and tool name:
+
+```sh
+agent-flow run examples/workflows/jira-ticket-session.yml \
+  --id jira-ticket-session-demo \
+  --input ticket_key=AF-123
+```
 
 `ci-triage.yml` has offline fixtures for flake, formatting, implementation,
 environment, unknown, and user-required classifications. From the repository

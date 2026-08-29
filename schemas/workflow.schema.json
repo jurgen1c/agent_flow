@@ -168,6 +168,14 @@
           "then": { "$ref": "#/$defs/decisionRecordStep" }
         },
         {
+          "if": { "properties": { "type": { "const": "session_request" } }, "required": ["type"] },
+          "then": {
+            "properties": {
+              "context": { "$ref": "#/$defs/scalarContext" }
+            }
+          }
+        },
+        {
           "if": {
             "properties": {
               "type": { "const": "mcp_call" },
@@ -219,6 +227,15 @@
       "minItems": 1,
       "uniqueItems": true,
       "items": { "$ref": "#/$defs/artifactPath" }
+    },
+    "scalarContext": {
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 64,
+      "propertyNames": { "pattern": "^[A-Za-z_][A-Za-z0-9_-]*$" },
+      "additionalProperties": {
+        "type": ["string", "number", "boolean", "null"]
+      }
     },
     "sessionNameList": {
       "type": "array",

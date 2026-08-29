@@ -8170,10 +8170,15 @@ function validateTransformStep(step: AgentFlowWorkflowStep): string | undefined 
 }
 
 function validateSessionRequestStep(step: AgentFlowWorkflowStep): string | undefined {
+  const inputs = Array.isArray(step.inputs)
+    && step.inputs.every((value) => typeof value === "string" && value.trim().length > 0);
+  const inputCount = Array.isArray(step.inputs) ? step.inputs.length : -1;
+  const context = mapping(step.context);
   if (typeof step.session !== "string" || step.session.trim().length === 0
       || typeof step.prompt !== "string" || step.prompt.trim().length === 0
-      || !nonEmptyStringArray(step.inputs) || !nonEmptyStringArray(step.outputs)) {
-    return "Session request requires a non-empty session, prompt, inputs list, and outputs list.";
+      || !inputs || inputCount === 0 && (context === undefined || Object.keys(context).length === 0)
+      || !nonEmptyStringArray(step.outputs)) {
+    return "Session request requires a non-empty session and prompt, an inputs list, at least one artifact input or scalar context value, and a non-empty outputs list.";
   }
   const onFailure = mapping(step.on_failure);
   const retry = onFailure?.retry;

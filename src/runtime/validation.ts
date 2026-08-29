@@ -13,7 +13,10 @@ import {
   type AgentFlowProviderKindResolver
 } from "./policy_utils";
 import { normalizeAgentFlowArtifactPath } from "./run_state";
-import { MAX_AGENT_FLOW_SESSION_INPUTS } from "./session_request";
+import {
+  MAX_AGENT_FLOW_SESSION_CONTEXT_ENTRIES,
+  MAX_AGENT_FLOW_SESSION_INPUTS
+} from "./session_request";
 import {
   agentFlowConditionArtifactAlias,
   agentFlowConditionExpressionError,
@@ -121,7 +124,7 @@ const STEP_REQUIREMENTS: Readonly<Record<string, ReadonlyArray<readonly [string,
   mcp_call: [["server", "string"], ["tool", "string"], ["arguments", "mapping"], ["outputs", "array"]],
   result: [["status", "string"]],
   review: [["reviewer", "string"], ["subject", "string"], ["artifacts", "array"], ["outputs", "array"]],
-  session_request: [["session", "string"], ["prompt", "string"], ["inputs", "array"], ["outputs", "array"]],
+  session_request: [["session", "string"], ["prompt", "string"], ["outputs", "array"]],
   workflow: [["workflow", "string"], ["inputs", "mapping"], ["outputs", "array"]]
 };
 
@@ -847,6 +850,26 @@ function validateRequiredStepFields(context: StepContext, errors: AgentFlowWorkf
         "workflow.step.field.required",
         field,
         `Step type "${context.type}" requires ${field} to be ${kind === "string" ? "a non-empty string" : kind === "array" ? "a non-empty list" : "a mapping"}.`
+      );
+    }
+  }
+
+  if (context.type === "session_request") {
+    if (!Array.isArray(context.step.inputs)) {
+      addStepIssue(
+        errors,
+        context,
+        "workflow.step.field.required",
+        "inputs",
+        "Step type \"session_request\" requires inputs to be a list of artifact paths, which may be empty when context is present."
+      );
+    } else if (context.step.inputs.length === 0 && context.step.context === undefined) {
+      addStepIssue(
+        errors,
+        context,
+        "workflow.session_request.payload.required",
+        "inputs",
+        "Session requests must declare at least one artifact input or a non-empty scalar context mapping."
       );
     }
   }
@@ -2101,6 +2124,66 @@ function validateArtifactPaths(contexts: StepContext[], errors: AgentFlowWorkflo
           `Session request prompt "${prompt}" must be a normalized repo-relative file path.`
         );
       }
+      if (context.step.context !== undefined) {
+        if (!isRecord(context.step.context) || Object.keys(context.step.context).length === 0) {
+          addStepIssue(
+            errors,
+            context,
+            "workflow.session_request.context.invalid",
+            "context",
+            "Session request context must be a non-empty mapping of scalar values."
+          );
+        } else {
+          const entries = Object.entries(context.step.context);
+          if (entries.length > MAX_AGENT_FLOW_SESSION_CONTEXT_ENTRIES) {
+            addStepIssue(
+              errors,
+              context,
+              "workflow.session_request.context.limit",
+              "context",
+              `Session requests may declare at most ${MAX_AGENT_FLOW_SESSION_CONTEXT_ENTRIES} context entries.`
+            );
+          }
+          for (const [key, value] of entries) {
+            const field = `context.${key}`;
+            if (!/^[A-Za-z_][A-Za-z0-9_-]*$/.test(key)) {
+              addStepIssue(
+                errors,
+                context,
+                "workflow.session_request.context.key.invalid",
+                field,
+                `Session request context key "${key}" must start with a letter or underscore and contain only letters, digits, underscores, or hyphens.`
+              );
+            }
+            if (!(value === null || typeof value === "string" || typeof value === "boolean"
+                || typeof value === "number" && Number.isFinite(value))) {
+              addStepIssue(
+                errors,
+                context,
+                "workflow.session_request.context.value.invalid",
+                field,
+                `Session request context value "${key}" must be a string, number, boolean, or null.`
+              );
+              continue;
+            }
+            if (typeof value === "string") {
+              const remainder = value.replace(
+                /(?<!\{)\{\{\s*inputs\.([A-Za-z_][A-Za-z0-9_-]*)\s*}}(?!})/g,
+                ""
+              );
+              if (remainder.includes("{{") || remainder.includes("}}")) {
+                addStepIssue(
+                  errors,
+                  context,
+                  "workflow.session_request.context.expression.invalid",
+                  field,
+                  `Session request context value "${key}" contains an unsupported input expression.`
+                );
+              }
+            }
+          }
+        }
+      }
       for (const field of ["inputs", "outputs"] as const) {
         const seen = new Set<string>();
         const values = stringList(context.step[field]);
@@ -2918,6 +3001,9 @@ function lintCommands(contexts: StepContext[], warnings: AgentFlowWorkflowIssue[
         : []),
       ...(context.type === "session_request" && nonEmptyString(context.step.prompt) !== undefined
         ? [{ value: String(context.step.prompt), field: "prompt" }]
+        : []),
+      ...(context.type === "session_request"
+        ? nestedStrings(context.step.context).map((value) => ({ value, field: "context" }))
         : []),
       ...(["challenge", "consult"].includes(context.type ?? "") && nonEmptyString(context.step.question) !== undefined
         ? [{ value: String(context.step.question), field: "question" }]
