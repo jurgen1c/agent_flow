@@ -1921,6 +1921,103 @@ steps:
     store.close();
   });
 
+  test("rejects unauthorized nested failure continuation before launching the child", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-invalid-failure-policy-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: failing-policy-child
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: terminal, type: result, status: failed }
+`);
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: invalid-failure-policy-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: child
+    type: workflow
+    workflow: failing-policy-child
+    inputs: {}
+    outputs: [never.txt]
+    on_failure: { then: continue }
+  - { id: after, type: command, command: "touch continued" }
+`);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    store.createRunWithEvent({
+      id: "invalid-failure-policy-parent",
+      workflow: { name: parent.name, version: parent.version, style: parent.style, maturity: parent.maturity },
+      context: { workflow: parent as never }
+    }, { type: "run.created", payload: { status: "pending" } });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store,
+      "invalid-failure-policy-parent",
+      parent,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      createAgentFlowWorkflowRegistry().register(child.name, child)
+    )).toMatchObject({
+      status: "failed",
+      failedStep: "child",
+      message: expect.stringContaining("on_failure.allowed is true")
+    });
+    expect(store.listRuns()).toHaveLength(1);
+    expect(fs.existsSync(path.join(repo, "continued"))).toBe(false);
+    store.close();
+  });
+
+  test("rejects noncanonical and duplicate nested outputs before launching the child", async () => {
+    for (const [suffix, outputs, message] of [
+      ["noncanonical", "[a/../done.txt]", "must use its normalized path"],
+      ["duplicate", "[done.txt, done.txt]", "must not contain duplicate artifact path"]
+    ] as const) {
+      const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", `agent-flow-nested-${suffix}-outputs-`));
+      fs.mkdirSync(path.join(repo, ".git"));
+      const child = parseAgentFlowWorkflowOrThrow(`
+name: output-contract-child
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: publish, type: command, command: "touch child-side-effect && printf done > done.txt", outputs: [done.txt] }
+`);
+      const parent = parseAgentFlowWorkflowOrThrow(`
+name: ${suffix}-outputs-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: child, type: workflow, workflow: output-contract-child, inputs: {}, outputs: ${outputs}, on_failure: { then: fail } }
+`);
+      const store = await openAgentFlowRunState({ cwd: repo });
+      store.createRunWithEvent({
+        id: `${suffix}-outputs-parent`,
+        workflow: { name: parent.name, version: parent.version, style: parent.style, maturity: parent.maturity },
+        context: { workflow: parent as never }
+      }, { type: "run.created", payload: { status: "pending" } });
+
+      expect(await executeAgentFlowCommandPipeline(
+        store,
+        `${suffix}-outputs-parent`,
+        parent,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        createAgentFlowWorkflowRegistry().register(child.name, child)
+      )).toMatchObject({ status: "failed", failedStep: "child", message: expect.stringContaining(message) });
+      expect(store.listRuns()).toHaveLength(1);
+      expect(fs.existsSync(path.join(repo, "child-side-effect"))).toBe(false);
+      store.close();
+    }
+  });
+
   test("pins the reachable workflow registry across programmatic resumes", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-registry-drift-"));
     fs.mkdirSync(path.join(repo, ".git"));

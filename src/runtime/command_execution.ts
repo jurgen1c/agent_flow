@@ -8380,10 +8380,39 @@ function validateWorkflowStep(
   const missing = requiredWorkflowInputNames(workflow).filter((name) => !Object.hasOwn(inputs, name));
   if (missing.length > 0) return `Child workflow ${workflowName} is missing required inputs: ${missing.join(", ")}.`;
   if (!nonEmptyStringArray(step.outputs)) return "Workflow step outputs must declare at least one child artifact path.";
+  const seenOutputs = new Set<string>();
   try {
-    for (const output of step.outputs) normalizeAgentFlowArtifactPath(output);
+    for (const output of step.outputs) {
+      const normalized = normalizeAgentFlowArtifactPath(output);
+      if (normalized !== output) {
+        return `Workflow step output ${JSON.stringify(output)} must use its normalized path ${JSON.stringify(normalized)}.`;
+      }
+      if (seenOutputs.has(normalized)) {
+        return `Workflow step outputs must not contain duplicate artifact path ${JSON.stringify(normalized)}.`;
+      }
+      seenOutputs.add(normalized);
+    }
   } catch (error) {
     return error instanceof Error ? error.message : String(error);
+  }
+  if (step.on_failure !== undefined && mapping(step.on_failure) === undefined) {
+    return "Workflow step on_failure must be a mapping.";
+  }
+  const onFailure = mapping(step.on_failure);
+  const retry = onFailure?.retry;
+  if (retry !== undefined
+      && (!Number.isSafeInteger(retry) || Number(retry) < 0 || Number(retry) > MAX_AGENT_FLOW_COMMAND_RETRIES)) {
+    return `Workflow on_failure.retry must be an integer from 0 through ${MAX_AGENT_FLOW_COMMAND_RETRIES}.`;
+  }
+  if (["continue", "ignore"].includes(normalizedFailureThen(onFailure) ?? "") && onFailure?.allowed !== true) {
+    return "Workflow failures may continue or be ignored only when on_failure.allowed is true.";
+  }
+  if (onFailure !== undefined) {
+    const then = normalizedFailureThen(onFailure);
+    if ((then !== undefined && !["continue", "ignore", "fail", "pause"].includes(then))
+        || ["goto", "return_to"].some((field) => onFailure[field] !== undefined)) {
+      return "Workflow runtime supports only retry, recovery routes, and then: continue, ignore, fail, or pause.";
+    }
   }
   return undefined;
 }
