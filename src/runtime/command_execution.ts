@@ -8645,7 +8645,7 @@ function staleApprovalStepIdsAcrossDescendants(
   const pending = [rootRunId];
   const childrenByParent = new Map<string, string[]>();
   for (const run of store.listRuns()) {
-    if (run.parentRunId === null) continue;
+    if (run.parentRunId === null || run.status !== "completed") continue;
     const children = childrenByParent.get(run.parentRunId) ?? [];
     children.push(run.id);
     childrenByParent.set(run.parentRunId, children);

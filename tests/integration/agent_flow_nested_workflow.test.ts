@@ -696,6 +696,79 @@ steps:
     store.close();
   });
 
+  test("ignores stale approvals from superseded descendant retry attempts", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-stale-retry-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const grandchild = parseAgentFlowWorkflowOrThrow(`
+name: retry-grandchild
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  reviewer: { provider: fixture, authority: { can_approve: true } }
+policies: { unsafe_operations: allow }
+steps:
+  - { id: evidence, type: command, command: "printf original > evidence.txt", outputs: [evidence.txt] }
+  - { id: approve, type: approval, reviewer: reviewer, artifacts: [evidence.txt] }
+  - id: publish
+    type: command
+    command: "if [ ! -f retry-sentinel ]; then touch retry-sentinel; exit 1; else printf result > result.txt; fi"
+    outputs: [result.txt]
+    on_failure: { then: fail }
+`);
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: retry-middle
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: grandchild
+    type: workflow
+    workflow: retry-grandchild
+    inputs: {}
+    outputs: [result.txt]
+    on_failure: { retry: 1, then: fail }
+`);
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: retry-root
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: child, type: workflow, workflow: retry-middle, inputs: {}, outputs: [result.txt], on_failure: { then: fail } }
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register(parent.name, parent)
+      .register(child.name, child)
+      .register(grandchild.name, grandchild);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    let approvalCalls = 0;
+    const providers = createAgentFlowSessionProviderRegistry().register("fixture", (request) => {
+      approvalCalls += 1;
+      if (approvalCalls === 2) {
+        const superseded = store.listRuns().find((run) =>
+          run.id.includes(":workflow:grandchild-") && run.id.endsWith(":attempt-1")
+        )!;
+        const evidence = store.getArtifact(superseded.id, "evidence.txt")!;
+        fs.writeFileSync(path.join(repo, evidence.storagePath), "stale");
+      }
+      return { outputs: { [request.outputs[0]!]: JSON.stringify({ status: "approved", decision: "ok" }) } };
+    });
+    createAgentFlowLifecycleRun(store, { id: "retry-root", workflow: parent });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "retry-root", parent, undefined, providers, undefined, undefined, workflows
+    )).toMatchObject({ status: "completed", completedSteps: ["child"] });
+    const superseded = store.listRuns().find((run) =>
+      run.id.includes(":workflow:grandchild-") && run.id.endsWith(":attempt-1")
+    )!;
+    store.getArtifact(superseded.id, "evidence.txt");
+    expect(store.listApprovals(superseded.id).find((approval) => approval.stepId === "approve")?.status)
+      .toBe("stale");
+    expect(store.readArtifact("retry-root", "result.txt").content.toString("utf8")).toBe("result");
+    store.close();
+  });
+
   test("promotes retained outputs when a paused child is registered under an alias", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-alias-"));
     fs.mkdirSync(path.join(repo, ".git"));
