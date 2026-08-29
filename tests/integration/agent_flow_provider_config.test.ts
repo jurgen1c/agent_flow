@@ -926,6 +926,18 @@ providers:
       status: "completed",
       resultHash: `sha256:${createHash("sha256").update("model-visible fallback").digest("hex")}`
     })]);
+
+    fs.writeFileSync(path.join(fake.root, "emit-empty-mcp-content"), "enabled\n");
+    const empty = await registry.get("coder")!({
+      ...request,
+      externalSessionId: undefined,
+      captureMcpCallEvidence: true
+    });
+    expect(empty.outputs).toEqual({ "draft.md": "" });
+    expect(empty.metadata?.mcpCalls).toEqual([expect.objectContaining({
+      status: "completed",
+      resultHash: `sha256:${createHash("sha256").update("").digest("hex")}`
+    })]);
   });
 
   test("preserves Claude Code's default login file while isolating it from model tools", async () => {
@@ -2051,7 +2063,9 @@ if (splitUtf8) {
         tool: "get_issue",
         arguments: { key: "AF-1" },
         result: {
-          content: [{ type: "text", text: "model-visible fallback" }],
+          content: fs.existsSync(path.join(root, "emit-empty-mcp-content"))
+            ? []
+            : [{ type: "text", text: "model-visible fallback" }],
           structured_content: fs.existsSync(path.join(root, "emit-null-structured-mcp"))
             ? null
             : { key: "AF-1" }

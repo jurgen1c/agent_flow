@@ -1277,7 +1277,7 @@ function codexMcpResultContent(value: unknown): string | undefined {
     const structured = codexMcpArguments(value.structured_content);
     if (structured !== undefined) return `${stableJson(structured)}\n`;
   }
-  if (!Array.isArray(value.content) || value.content.length === 0) return undefined;
+  if (!Array.isArray(value.content)) return undefined;
   const blocks = value.content.map((entry) =>
     isRecord(entry) && entry.type === "text" && typeof entry.text === "string"
       ? entry.text
