@@ -92,7 +92,7 @@ const STEP_TYPES = new Set([
 
 const TERMINAL_TARGETS = new Set(["cancel", "complete", "completed", "continue", "fail", "ignore", "pause"]);
 const TARGET_FIELDS = new Set(["else", "goto", "on_approve", "on_cancel", "on_reject", "return_to", "then"]);
-const RECOVERY_ROUTE_STEP_TYPES = new Set(["artifact_transform", "command", "mcp_call", "session_request"]);
+const RECOVERY_ROUTE_STEP_TYPES = new Set(["artifact_transform", "command", "mcp_call", "session_request", "workflow"]);
 const SHELL_EXECUTABLES = new Set(["bash", "dash", "ksh", "sh", "zsh"]);
 const SHELL_ANALYSIS_BUDGET = 65_536;
 const CODEX_REASONING_EFFORTS = new Set(["minimal", "low", "medium", "high", "xhigh"]);

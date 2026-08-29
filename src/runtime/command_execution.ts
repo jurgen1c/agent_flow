@@ -121,6 +121,7 @@ import {
 import {
   AgentFlowWorkflowRegistry,
   createAgentFlowWorkflowRegistry,
+  createAgentFlowWorkflowRegistryFromSnapshot,
   validateAgentFlowWorkflowStepInputExpressions,
   type AgentFlowRecoveryStatus
 } from "./recovery";
@@ -225,7 +226,9 @@ export async function executeAgentFlowCommandPipeline(
 ): Promise<AgentFlowCommandPipelineResult> {
   return store.withRunLock(runId, "run", (lock) => {
     beforeRecovery?.();
-    const run = assertPersistedWorkflowIdentity(store, runId, workflow);
+    let run = assertPersistedWorkflowIdentity(store, runId, workflow);
+    workflows = pinnedWorkflowRegistry(store, run, workflow, workflows);
+    run = store.getRun(runId)!;
     assertOrPersistConfiguredProviderBindings(store, run, workflow, sessionProviders, workflows);
     const recoveredExecution = recoverInterruptedExecution(store, lock);
     prepareExecution?.();
@@ -253,7 +256,9 @@ export async function resumeAgentFlowCommandPipeline(
 ): Promise<AgentFlowCommandPipelineResult> {
   return store.withRunLock(runId, "resume", (lock) => {
     prepareResume?.();
-    const run = assertPersistedWorkflowIdentity(store, runId, workflow);
+    let run = assertPersistedWorkflowIdentity(store, runId, workflow);
+    workflows = pinnedWorkflowRegistry(store, run, workflow, workflows);
+    run = store.getRun(runId)!;
     assertOrPersistConfiguredProviderBindings(store, run, workflow, sessionProviders, workflows);
     const recoveredExecution = recoverInterruptedExecution(store, lock);
     const effectiveResponse = recoveredExecution === undefined ? response : undefined;
@@ -264,6 +269,81 @@ export async function resumeAgentFlowCommandPipeline(
       finalization, recoveredExecution, prepareResume
     );
   });
+}
+
+function pinnedWorkflowRegistry(
+  store: AgentFlowRunStateStore,
+  run: AgentFlowRunRecord,
+  workflow: AgentFlowWorkflow,
+  supplied: AgentFlowWorkflowRegistry
+): AgentFlowWorkflowRegistry {
+  const registryName = persistedOrSuppliedWorkflowRegistryName(run, workflow, supplied);
+  if (run.context.workflowRegistry !== undefined) {
+    const persisted = createAgentFlowWorkflowRegistryFromSnapshot(run.context.workflowRegistry);
+    const pinnedWorkflow = persisted.get(registryName);
+    if (pinnedWorkflow === undefined || !isDeepStrictEqual(pinnedWorkflow, workflow)) {
+      throw new AgentFlowRunStateError(
+        `Agent Flow run ${run.id} persisted workflow registry does not contain its workflow under ${registryName}.`,
+        "AGENT_FLOW_WORKFLOW_REGISTRY_STATE"
+      );
+    }
+    return persisted;
+  }
+
+  const reachable = createAgentFlowWorkflowRegistry().register(registryName, workflow);
+  const visited = new Set<string>([registryName]);
+  const visit = (candidate: AgentFlowWorkflow): void => {
+    for (const { name, recovery } of referencedRuntimeWorkflowReferences(candidate.steps)) {
+      if (visited.has(name)) continue;
+      const referenced = supplied.get(name);
+      if (referenced === undefined) {
+        throw new AgentFlowRunStateError(
+          `${recovery ? "Recovery workflow" : "Referenced workflow"} ${name} is not registered.`,
+          recovery ? "AGENT_FLOW_RECOVERY_WORKFLOW_UNKNOWN" : "AGENT_FLOW_WORKFLOW_REGISTRY_INCOMPLETE"
+        );
+      }
+      visited.add(name);
+      reachable.register(name, referenced);
+      visit(referenced);
+    }
+  };
+  visit(workflow);
+  store.updateRun(run.id, {
+    context: {
+      ...run.context,
+      workflowRegistryName: registryName,
+      workflowRegistry: serializeWorkflowRegistryForRun(reachable)
+    }
+  });
+  return reachable;
+}
+
+function persistedOrSuppliedWorkflowRegistryName(
+  run: AgentFlowRunRecord,
+  workflow: AgentFlowWorkflow,
+  supplied: AgentFlowWorkflowRegistry
+): string {
+  const persisted = normalizedTarget(run.context.workflowRegistryName);
+  if (persisted !== undefined) return persisted;
+  const source = run.context.workflowRegistry;
+  if (source !== null && typeof source === "object" && !Array.isArray(source)) {
+    const matching = Object.entries(source)
+      .filter(([, candidate]) => isDeepStrictEqual(candidate, workflow))
+      .map(([name]) => name)
+      .sort();
+    if (matching.includes(workflow.name)) return workflow.name;
+    if (matching.length === 1) return matching[0]!;
+  }
+  const suppliedMatches = supplied.names().filter((name) => isDeepStrictEqual(supplied.get(name), workflow));
+  if (suppliedMatches.includes(workflow.name)) return workflow.name;
+  if (suppliedMatches.length === 1) return suppliedMatches[0]!;
+  if (suppliedMatches.length > 1) {
+    throw new AgentFlowRunStateError(
+      `Agent Flow run ${run.id} workflow is registered under multiple aliases; persist workflowRegistryName explicitly.`,
+      "AGENT_FLOW_WORKFLOW_REGISTRY_STATE"
+    );
+  }
+  return workflow.name;
 }
 
 function assertOrPersistConfiguredProviderBindings(

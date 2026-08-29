@@ -2150,6 +2150,29 @@ steps:
     });
   });
 
+  test("allows nested workflow failures to use recovery routes", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: nested-workflow-recovery-route
+version: 1
+style: recovery_pipeline
+maturity: experimental
+sessions:
+  fixer: { provider: local }
+steps:
+  - id: child
+    type: workflow
+    workflow: nested
+    inputs: {}
+    outputs: [result.json]
+    on_failure:
+      route_to: { session: fixer, prompt: fix.md }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+
+    expect(validateAgentFlowWorkflow(workflow).errors.map((issue) => issue.code))
+      .not.toContain("workflow.recovery.step.unsupported");
+  });
+
   test("rejects malformed session authority mappings and capability flags", () => {
     const workflow = parseAgentFlowWorkflowOrThrow(`name: malformed-session-authority
 version: 1

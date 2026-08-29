@@ -1877,6 +1877,52 @@ steps:
     store.close();
   });
 
+  test("pins the reachable workflow registry across programmatic resumes", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-registry-drift-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: registry-drift-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: gate, type: manual_gate, message: Continue?, options: [approve, cancel] }
+  - { id: child, type: workflow, workflow: child-alias, inputs: {}, outputs: [result.txt] }
+`);
+    const child = (value: string) => parseAgentFlowWorkflowOrThrow(`
+name: registry-drift-child
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: publish, type: command, command: "printf ${value} > result.txt", outputs: [result.txt] }
+`);
+    const original = createAgentFlowWorkflowRegistry()
+      .register("parent-alias", parent)
+      .register("child-alias", child("original"));
+    const changed = createAgentFlowWorkflowRegistry()
+      .register("parent-alias", parent)
+      .register("child-alias", child("changed"));
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, {
+      id: "registry-drift-parent",
+      workflow: parent,
+      context: { workflowRegistryName: "parent-alias" }
+    });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "registry-drift-parent", parent, undefined, undefined, undefined, undefined, original
+    )).toMatchObject({ status: "paused" });
+    expect(await resumeAgentFlowCommandPipeline(
+      store, "registry-drift-parent", parent, { outcome: "approve" },
+      undefined, undefined, undefined, undefined, changed
+    )).toMatchObject({ status: "completed" });
+    expect(store.readArtifact("registry-drift-parent", "result.txt").content.toString()).toBe("original");
+    expect(store.getRun("registry-drift-parent")?.context.workflowRegistry)
+      .toMatchObject({ "child-alias": expect.objectContaining({ name: "registry-drift-child" }) });
+    store.close();
+  });
+
   test("propagates a live nested child lease without failing or retrying the parent step", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-child-lock-"));
     fs.mkdirSync(path.join(repo, ".git"));
