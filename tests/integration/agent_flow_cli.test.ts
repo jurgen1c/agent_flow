@@ -869,6 +869,69 @@ steps:
     store.close();
   });
 
+  test("rejects ambiguous fixture disagreement step IDs across reachable workflows", async () => {
+    for (const strategy of ["arbiter", "owner_decides"] as const) {
+      const repo = fs.mkdtempSync(path.join(
+        process.env.TMPDIR ?? "/tmp",
+        `agent-flow-cli-fixture-disagreement-id-${strategy}-`
+      ));
+      fs.mkdirSync(path.join(repo, ".git"));
+      fs.writeFileSync(path.join(repo, "parent.yml"), `
+name: fixture-disagreement-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: first, type: workflow, workflow: fixture-disagreement-a, inputs: {}, outputs: [a.json] }
+  - { id: second, type: workflow, workflow: fixture-disagreement-b, inputs: {}, outputs: [b.json] }
+`);
+      for (const [name, output] of [["fixture-disagreement-a", "a.json"], ["fixture-disagreement-b", "b.json"]]) {
+        const policy = strategy === "arbiter"
+          ? "{ strategy: arbiter, arbiter: arbiter, max_rounds: 1 }"
+          : "{ strategy: owner_decides }";
+        const arbiter = strategy === "arbiter"
+          ? "  arbiter: { provider: fixture, role: arbiter, authority: { can_request_changes: true, can_approve: true } }\n"
+          : "";
+        fs.writeFileSync(path.join(repo, `${name}.yml`), `
+name: ${name}
+version: 1
+style: collaborative
+maturity: experimental
+collaboration:
+  enabled: true
+  max_review_cycles: 1
+  on_disagreement: ${policy}
+sessions:
+  implementer: { provider: ${strategy === "owner_decides" ? "fixture" : "codex"}, role: implementer, authority: { can_request_changes: true, can_approve: true } }
+  reviewer: { provider: codex, role: reviewer, authority: { can_request_changes: true, can_approve: true } }
+${arbiter}limits: { max_frontier_calls: 4 }
+steps:
+  - { id: review, type: review, reviewer: reviewer, subject: implementer, artifacts: [implementation.md], outputs: [${output}], then: route }
+  - id: route
+    type: condition
+    branches:
+      - { if: 'artifacts.${output.slice(0, -5)}.status == "approved"', then: done }
+      - { if: 'artifacts.${output.slice(0, -5)}.status == "changes_requested"', then: revise }
+    else: fail
+  - { id: revise, type: command, command: "true", then: review }
+  - { id: done, type: result, status: completed }
+`);
+      }
+      fs.writeFileSync(path.join(repo, "fixture.json"), JSON.stringify({
+        steps: { review: { disagreement: "approved" } }
+      }));
+
+      const result = await captureCli([
+        "run", "parent.yml", "--id", `fixture-disagreement-${strategy}`, "--fixture", "fixture.json"
+      ], repo);
+      expect(result).toMatchObject({ exitCode: 2 });
+      expect(result.stderr).toContain("fixture-backed session step IDs must be unique");
+      const store = await openAgentFlowRunState({ cwd: repo });
+      expect(store.getRun(`fixture-disagreement-${strategy}`)).toBeNull();
+      store.close();
+    }
+  });
+
   test("ignores providers and validation in unrelated workflow registry entries", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-reachable-registry-"));
     fs.mkdirSync(path.join(repo, ".git"));

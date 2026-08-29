@@ -1651,7 +1651,7 @@ function duplicateFixtureSessionStep(
 ): { stepId: string; workflows: string[] } | undefined {
   const workflowsByStep = new Map<string, Set<string>>();
   for (const { workflow, step } of entries) {
-    if (providerForSessionRequestStep(workflow, step) !== "fixture") continue;
+    if (!fixtureProviderHandlesSessionStep(workflow, step)) continue;
     const stepId = String(step.id ?? "").trim();
     if (stepId.length === 0) continue;
     const workflows = workflowsByStep.get(stepId) ?? new Set<string>();
@@ -1662,6 +1662,26 @@ function duplicateFixtureSessionStep(
     if (workflows.size > 1) return { stepId, workflows: [...workflows].sort() };
   }
   return undefined;
+}
+
+function fixtureProviderHandlesSessionStep(
+  workflow: import("../runtime/index").AgentFlowWorkflow,
+  step: import("../runtime/index").AgentFlowWorkflowStep
+): boolean {
+  if (providerForSessionRequestStep(workflow, step) === "fixture") return true;
+  if (String(step.type ?? "").trim() !== "review") return false;
+  const stepId = String(step.id ?? "").trim();
+  if (!collectAgentFlowReviewCycleStepIds(workflow.steps).has(stepId)) return false;
+  const collaboration = workflow.collaboration;
+  if (collaboration === null || typeof collaboration !== "object" || Array.isArray(collaboration)
+      || collaboration.on_disagreement === undefined) return false;
+  const policy = parseAgentFlowDisagreementPolicy(collaboration.on_disagreement);
+  const resolver = policy.arbiter
+    ?? (policy.strategy === "owner_decides" ? String(step.subject ?? "").trim() : "");
+  if (resolver.length === 0) return false;
+  const session = workflow.sessions?.[resolver];
+  return session !== null && typeof session === "object" && !Array.isArray(session)
+    && String((session as Record<string, unknown>).provider ?? "").trim() === "fixture";
 }
 
 function collectWorkflowSteps(
