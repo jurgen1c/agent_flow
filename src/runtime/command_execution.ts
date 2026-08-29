@@ -8949,7 +8949,16 @@ function codexMcpCallRegistry(
       sessionId,
       provider,
       ...(descriptor?.kind === undefined ? {} : { providerKind: descriptor.kind }),
+      ...(descriptor?.profile === undefined ? {} : { providerProfile: descriptor.profile }),
+      ...(descriptor?.reasoningEffort === undefined
+        ? {}
+        : { providerReasoningEffort: descriptor.reasoningEffort }),
+      ...(descriptor?.target === undefined ? {} : { providerTarget: descriptor.target }),
       ...(descriptor?.driver === undefined ? {} : { providerDriver: descriptor.driver }),
+      ...(descriptor?.model === undefined
+        ? {}
+        : { providerModel: `sha256:${createHash("sha256").update(descriptor.model).digest("hex")}` }),
+      ...(descriptor?.fingerprint === undefined ? {} : { providerFingerprint: descriptor.fingerprint }),
       ...codexOptions,
       kind: "session_request",
       resume: true,

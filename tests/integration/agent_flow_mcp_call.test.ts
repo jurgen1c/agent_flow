@@ -112,6 +112,10 @@ steps:
       profile: "reviewer",
       enabled: true,
       adapter: async (request) => {
+        expect(request).toMatchObject({
+          providerKind: "codex_profile",
+          providerProfile: "reviewer"
+        });
         request.reportExternalSessionId?.("profile-thread");
         return {
           externalSessionId: "profile-thread",
@@ -138,6 +142,56 @@ steps:
     });
     expect(store.getArtifact("codex-profile-mcp", "ticket.json")?.contentType)
       .toBe("application/vnd.agent-flow.ticket+json");
+    store.close();
+  });
+
+  test("preserves configured Codex provider descriptors for mediated calls", async () => {
+    const root = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: configured-codex-mcp
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  agent: { provider: codex-target, resume: true }
+limits: { max_frontier_calls: 1 }
+steps:
+  - { id: fetch, type: mcp_call, via: codex, session: agent, server: jira, tool: get, arguments: {}, outputs: [ticket.json] }
+`);
+    const model = "gpt-test";
+    const providers = createAgentFlowSessionProviderRegistry().registerConfigured({
+      name: "codex-target",
+      kind: "frontier",
+      target: "codex-host",
+      driver: "codex-cli",
+      model,
+      profile: "reviewer",
+      reasoningEffort: "high",
+      fingerprint: "configured-fingerprint"
+    }, async (request) => {
+      expect(request).toMatchObject({
+        providerKind: "frontier",
+        providerProfile: "reviewer",
+        providerReasoningEffort: "high",
+        providerTarget: "codex-host",
+        providerDriver: "codex-cli",
+        providerModel: `sha256:${createHash("sha256").update(model).digest("hex")}`,
+        providerFingerprint: "configured-fingerprint"
+      });
+      request.reportExternalSessionId?.("configured-thread");
+      return {
+        externalSessionId: "configured-thread",
+        outputs: { "ticket.json": "{}\n" },
+        metadata: { mcpCalls: [completedCodexMcpCall("jira", "get", {}, "{}\n")] }
+      };
+    });
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "configured-codex-mcp", workflow });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "configured-codex-mcp", workflow, undefined, providers
+    )).toMatchObject({ status: "completed" });
+    expect(store.getRun("configured-codex-mcp")?.context.providerBindings)
+      .toHaveProperty("codex-target");
     store.close();
   });
 
