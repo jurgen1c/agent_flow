@@ -688,11 +688,15 @@ async function runLifecycleCommand(
       const fixture = fixturePath === undefined ? null : readRunFixture(fixturePath, options.cwd);
       if (fixture !== null && "exitCode" in fixture) return fixture;
       const persistedWorkflow = workflow as unknown as import("../runtime/index").AgentFlowWorkflow;
+      const workflowRegistryName = typeof run.context.workflowRegistryName === "string"
+        && run.context.workflowRegistryName.trim().length > 0
+        ? run.context.workflowRegistryName.trim()
+        : persistedWorkflow.name;
       const workflows = reachableWorkflowRegistry(
         createAgentFlowWorkflowRegistryFromSnapshot(
-          run.context.workflowRegistry ?? { [persistedWorkflow.name]: persistedWorkflow } as unknown as import("../runtime/index").AgentFlowRunStateValue
+          run.context.workflowRegistry ?? { [workflowRegistryName]: persistedWorkflow } as unknown as import("../runtime/index").AgentFlowRunStateValue
         ),
-        persistedWorkflow.name
+        workflowRegistryName
       );
       const registeredWorkflows = workflows.names().map((name) => workflows.get(name)!);
       const directMcp = registeredWorkflows.flatMap((registeredWorkflow) =>

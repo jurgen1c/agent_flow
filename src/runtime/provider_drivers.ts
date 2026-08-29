@@ -1273,7 +1273,7 @@ function codexMcpArguments(value: unknown): AgentFlowRunStateValue | undefined {
 
 function codexMcpResultContent(value: unknown): string | undefined {
   if (!isRecord(value)) return undefined;
-  if (Object.hasOwn(value, "structured_content")) {
+  if (Object.hasOwn(value, "structured_content") && value.structured_content !== null) {
     const structured = codexMcpArguments(value.structured_content);
     if (structured !== undefined) return `${stableJson(structured)}\n`;
   }

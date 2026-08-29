@@ -507,6 +507,49 @@ steps:
     inspected.close();
   });
 
+  test("resumes a nested child directly when its registry key is an alias", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-child-alias-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: internal-child-name
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: approve, type: manual_gate, message: Continue?, options: [approve, cancel] }
+  - { id: publish, type: command, command: "printf done > child.txt", outputs: [child.txt] }
+`);
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: alias-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: child, type: workflow, workflow: child-alias, inputs: {}, outputs: [child.txt] }
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register(parent.name, parent)
+      .register("child-alias", child);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, {
+      id: "alias-parent",
+      workflow: parent,
+      context: { workflowRegistry: serializeAgentFlowWorkflowRegistry(workflows) as never }
+    });
+    expect(await executeAgentFlowCommandPipeline(
+      store, "alias-parent", parent, undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({ status: "paused" });
+    const childRunId = (store.getRun("alias-parent")!.context.waiting as { childRunId: string }).childRunId;
+    store.close();
+
+    expect(await captureCli(["resume", childRunId, "--outcome", "approve"], repo))
+      .toMatchObject({ exitCode: 0 });
+    const inspected = await openAgentFlowRunState({ cwd: repo });
+    expect(inspected.getRun(childRunId)).toMatchObject({ status: "completed" });
+    expect(inspected.readArtifact("alias-parent", "child.txt").content.toString("utf8")).toBe("done");
+    inspected.close();
+  });
+
   test("runs input through Codex MCP, a nested workflow, and approval resume end to end", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-e2e-"));
     fs.mkdirSync(path.join(repo, ".git"));
