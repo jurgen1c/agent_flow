@@ -16,7 +16,12 @@ import {
   isAgentFlowWorkspaceWriteLockManaged,
   withAgentFlowWorkspaceWriteLock
 } from "./workspace_lock";
-import type { AgentFlowWorkflow, AgentFlowWorkflowStep, AgentFlowYamlMapping } from "./workflow";
+import type {
+  AgentFlowWorkflow,
+  AgentFlowWorkflowStep,
+  AgentFlowYamlMapping,
+  AgentFlowYamlValue
+} from "./workflow";
 import { createAgentFlowReviewPrompt, parseAgentFlowReviewResult } from "./review";
 import {
   createAgentFlowChallengePrompt,
@@ -81,6 +86,11 @@ export interface AgentFlowSessionProviderRequest {
   providerDriver?: string;
   providerModel?: string;
   providerFingerprint?: string;
+  codexOptions?: {
+    profile?: string;
+    model?: string;
+    reasoningEffort?: string;
+  };
   kind?: "review" | "consult" | "challenge" | "approval" | "disagreement" | "session_request" | "recovery";
   resume: boolean;
   externalSessionId?: string;
@@ -94,6 +104,7 @@ export interface AgentFlowSessionProviderRequest {
   };
   signal: AbortSignal;
   reportExternalSessionId?: (externalSessionId: string) => void;
+  captureMcpCallEvidence?: boolean;
 }
 
 export interface AgentFlowSessionProviderOutput {
@@ -1052,6 +1063,7 @@ async function executeAgentFlowSessionStep(
       ? {}
       : { providerModel: `sha256:${digest(providerDescriptor.model)}` }),
     ...(providerDescriptor.fingerprint === undefined ? {} : { providerFingerprint: providerDescriptor.fingerprint }),
+    ...resolveAgentFlowCodexOptions(step.codex, run.context.codexOptions, session.codex),
     kind,
     resume,
     ...(priorExternalSessionId === undefined
@@ -1424,6 +1436,56 @@ async function executeAgentFlowSessionStep(
       { cause: sanitizedErrorCause(error) }
     );
   }
+}
+
+function optionalCodexString(value: unknown, label: string): string | undefined {
+  if (value === undefined) return undefined;
+  const normalized = requiredName(value, label);
+  if (normalized !== value || /[\u0000-\u001F\u007F-\u009F]/u.test(normalized)) {
+    throw new AgentFlowSessionRequestError(`${label} must not contain surrounding whitespace or control characters.`);
+  }
+  return normalized;
+}
+
+export function resolveAgentFlowCodexOptions(
+  stepValue: unknown,
+  runValue: unknown,
+  sessionValue: unknown
+): Pick<AgentFlowSessionProviderRequest, "codexOptions"> | Record<string, never> {
+  const stepOptions = mapping(stepValue as AgentFlowYamlValue | undefined);
+  const runOptions = mapping(runValue as AgentFlowYamlValue | undefined);
+  const sessionOptions = mapping(sessionValue as AgentFlowYamlValue | undefined);
+  const profile = optionalCodexString(
+    stepOptions?.profile ?? runOptions?.profile ?? sessionOptions?.profile,
+    "Codex profile"
+  );
+  const model = optionalCodexString(
+    stepOptions?.model ?? runOptions?.model ?? sessionOptions?.model,
+    "Codex model"
+  );
+  const reasoningEffort = optionalCodexString(
+    stepOptions?.reasoning_effort ?? runOptions?.reasoningEffort ?? sessionOptions?.reasoning_effort,
+    "Codex reasoning effort"
+  );
+  if (profile !== undefined && !CODEX_PROFILE_PATTERN.test(profile)) {
+    throw new AgentFlowSessionRequestError(
+      "Codex profile must contain only letters, numbers, hyphens, and underscores.",
+      "AGENT_FLOW_CODEX_PROFILE_INVALID"
+    );
+  }
+  if (reasoningEffort !== undefined && !CODEX_REASONING_EFFORTS.has(reasoningEffort)) {
+    throw new AgentFlowSessionRequestError(
+      "Codex reasoning effort must be one of: minimal, low, medium, high, xhigh.",
+      "AGENT_FLOW_CODEX_REASONING_EFFORT_INVALID"
+    );
+  }
+  return profile === undefined && model === undefined && reasoningEffort === undefined ? {} : {
+    codexOptions: {
+      ...(profile === undefined ? {} : { profile }),
+      ...(model === undefined ? {} : { model }),
+      ...(reasoningEffort === undefined ? {} : { reasoningEffort })
+    }
+  };
 }
 
 export async function invokeAgentFlowSessionProvider(
@@ -1876,11 +1938,20 @@ function requiredCodexProfile(value: unknown): string {
 
 function descriptorForExplicitProviderName(name: string): AgentFlowSessionProviderDescriptor {
   if (name === "fixture") return { name, kind: "fixture" };
+  if (name === "codex") {
+    return {
+      name,
+      kind: "frontier",
+      target: "codex",
+      driver: "codex-cli",
+      fingerprint: "native-codex-config"
+    };
+  }
   return { name, kind: "custom" };
 }
 
 function isReservedSessionProviderName(name: string): boolean {
-  return name === "fixture" || name === "local" || name === "frontier"
+  return name === "fixture" || name === "local" || name === "frontier" || name === "codex"
     || name.startsWith("codex:");
 }
 

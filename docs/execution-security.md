@@ -13,32 +13,26 @@ persisted definition before invoking an adapter or shell.
   reviewed workflow. Arbitrary shell commands cannot be confined by
   `file_scope`, so command execution fails when a global file scope is present.
 - `session_request` providers and `mcp_call` servers are capabilities. Providers
-  must resolve through an explicit config alias or programmatic registration;
-  MCP adapters remain programmatic. Static provider, server, and tool names are
+  must use the reserved Codex provider, resolve through an explicit config
+  alias, or come from programmatic registration. Direct MCP adapters remain
+  programmatic. Static provider, server, and tool names are
   required, model budgets are checked before calls, and output paths must be
   normalized repository-contained artifact paths.
 - API provider credentials are read only from the named `api_key_env` variable.
   The three built-in HTTP drivers are artifact-only, cannot write or inspect the
   checkout, and receive only declared prompt and input artifact content. The
-  built-in Codex and Claude CLI drivers run without a shell at the repository
-  root, inherit their CLI login, and use read-only/plan mode unless explicit
-  session authority permits writes. Other coding CLIs require a custom
+  Codex runs without a shell at the repository root and owns its normal config,
+  login, permissions/sandbox, rules, plugins, and MCP servers. Agent Flow does
+  not wrap Codex with `bubblewrap`/`flock` or filter its environment. Claude's
+  existing host sandbox remains unchanged. Other coding CLIs require a custom
   programmatic adapter with a host-enforced filesystem and process boundary.
-  Built-in native drivers currently require Linux with `bubblewrap` and
-  `flock`. The host sandbox keeps `.git` read-only, hides `.agent-flow`, and
-  leaves unrelated host paths unmounted. It exposes only the native CLI state
-  directory and invocation temp directory as additional writable locations;
-  the selected executable and required interpreter/toolchain files are
-  read-only. Audited invocations share a per-repository write lock with command
-  steps and file-writing custom adapters. Native children receive a
-  driver-specific environment allowlist instead of the full Agent Flow process
-  environment.
 - Workflow and session file writes require explicit authority and effective
-  `file_scope` includes. Artifact, prompt, cleanup, archive, and export paths
-  reject absolute, escaping, non-canonical, and unsafe symlink paths.
-  Native CLI executions are snapshot-audited after success or failure. An
-  out-of-scope change fails the step but remains in the checkout for inspection;
-  Agent Flow does not attempt a potentially destructive rollback.
+  `file_scope` declarations. Agent Flow enforces those scopes for Claude and
+  participating custom adapters; pass-through Codex delegates
+  filesystem enforcement to Codex. Artifact, prompt, cleanup, archive, and
+  export paths reject absolute, escaping, non-canonical, and unsafe symlink paths.
+  Custom and Claude adapters retain their existing scope enforcement. Codex
+  filesystem authority is enforced by Codex itself.
 - Cleanup is limited by the persisted workflow retention rule. Protected run
   state, summaries, failure evidence, decisions, and approved evidence are not
   removed by broad artifact rules.

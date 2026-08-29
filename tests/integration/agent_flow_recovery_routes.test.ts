@@ -11,7 +11,9 @@ import {
   createAgentFlowNotificationRegistry,
   createAgentFlowSessionProviderRegistry,
   createAgentFlowWorkflowRegistry,
+  createAgentFlowWorkflowRegistryFromSnapshot,
   executeAgentFlowCommandPipeline,
+  loadAgentFlowWorkflowRegistry,
   openAgentFlowRunState,
   parseAgentFlowWorkflowOrThrow,
   transitionAgentFlowLifecycleRun,
@@ -20,6 +22,86 @@ import {
 import { preflightAgentFlowSessionProviderEvidence } from "../../src/runtime/session_request";
 
 describe("Agent Flow recovery routes", () => {
+  test("routes a failed nested workflow step through a recovery workflow", async () => {
+    const root = temporaryRepo();
+    const parent = parseAgentFlowWorkflowOrThrow(`name: nested-step-recovery-parent
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - id: child
+    type: workflow
+    workflow: failing-child
+    inputs: {}
+    outputs: [never.txt]
+    on_failure:
+      route_to: { workflow: repair-child }
+      on_remediated: { then: complete }
+      on_unresolved: { then: fail }
+`);
+    const child = parseAgentFlowWorkflowOrThrow(`name: failing-child
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: terminal, type: result, status: failed }
+  - { id: unreachable, type: command, command: "printf never > never.txt", outputs: [never.txt] }
+`);
+    const repair = parseAgentFlowWorkflowOrThrow(`name: repair-child
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: repaired, type: result, status: remediated }
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register(parent.name, parent)
+      .register(child.name, child)
+      .register(repair.name, repair);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, { id: "nested-step-recovery", workflow: parent });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "nested-step-recovery", parent, undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({ status: "completed" });
+    expect(store.listRuns().filter((run) => run.parentRunId === "nested-step-recovery"))
+      .toHaveLength(2);
+    store.close();
+  });
+
+  test("loads registries whose only cycle is formed by recovery routes", () => {
+    const root = temporaryRepo();
+    fs.writeFileSync(path.join(root, "repair-a.yml"), `name: repair-a
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - id: check-a
+    type: command
+    command: exit 1
+    on_failure:
+      route_to: { workflow: repair-b }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+    fs.writeFileSync(path.join(root, "repair-b.yml"), `name: repair-b
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - id: check-b
+    type: command
+    command: exit 1
+    on_failure:
+      route_to: { workflow: repair-a }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+
+    expect(loadAgentFlowWorkflowRegistry("repair-a.yml", { cwd: root }).names())
+      .toEqual(["repair-a", "repair-b"]);
+  });
+
   test("validates recovery targets, outcome handlers, and result statuses", () => {
     const workflow = parseAgentFlowWorkflowOrThrow(`name: invalid-recovery
 version: 1
@@ -1451,6 +1533,53 @@ steps:
     store.close();
   });
 
+  test("applies failed-step Codex overrides to recovery sessions", async () => {
+    const root = temporaryRepo();
+    fs.writeFileSync(path.join(root, "fix.md"), "Fix the failure.\n");
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: codex-step-recovery-options
+version: 1
+style: recovery_pipeline
+maturity: experimental
+limits: { max_frontier_calls: 1, max_recovery_cycles: 1 }
+sessions:
+  fixer:
+    provider: codex
+    codex: { profile: session-profile, model: session-model, reasoning_effort: low }
+steps:
+  - id: check
+    type: command
+    command: exit 1
+    codex: { profile: step-profile, model: step-model, reasoning_effort: xhigh }
+    on_failure:
+      route_to: { session: fixer, prompt: fix.md }
+      on_remediated: { return_to: check }
+      on_unresolved: { then: pause }
+`);
+    const store = await openAgentFlowRunState({ cwd: root });
+    createAgentFlowLifecycleRun(store, {
+      id: "codex-step-recovery-options",
+      workflow,
+      context: {
+        codexOptions: { profile: "run-profile", model: "run-model", reasoningEffort: "medium" }
+      }
+    });
+    let receivedOptions: unknown;
+    const providers = createAgentFlowSessionProviderRegistry().register("codex", (request) => {
+      receivedOptions = request.codexOptions;
+      return { outputs: {}, metadata: { recovery_status: "unresolved" } };
+    });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "codex-step-recovery-options", workflow, undefined, providers
+    )).toMatchObject({ status: "paused" });
+    expect(receivedOptions).toEqual({
+      profile: "step-profile",
+      model: "step-model",
+      reasoningEffort: "xhigh"
+    });
+    store.close();
+  });
+
   test("rejects reported and returned identity switches for resumable recovery sessions", async () => {
     for (const mode of ["report", "return"] as const) {
       const root = temporaryRepo();
@@ -2004,6 +2133,10 @@ steps:
     const workflows = createAgentFlowWorkflowRegistry()
       .register("repair-a", parent)
       .register("repair-b", child);
+    expect(createAgentFlowWorkflowRegistryFromSnapshot({
+      "repair-a": parent,
+      "repair-b": child
+    }).names()).toEqual(["repair-a", "repair-b"]);
     const store = await openAgentFlowRunState({ cwd: root });
     createAgentFlowLifecycleRun(store, { id: "recursive-recovery", workflow: parent });
 

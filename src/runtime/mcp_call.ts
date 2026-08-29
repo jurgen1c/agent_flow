@@ -17,6 +17,10 @@ import {
   secureAgentFlowSensitiveJsonInputValue
 } from "./execution_security";
 import { agentFlowInputKeyLooksSensitive, redactAgentFlowSensitiveText } from "./failure_payload";
+import {
+  AgentFlowSessionPolicyError,
+  AgentFlowSessionRequestError
+} from "./session_request";
 
 export const MAX_AGENT_FLOW_MCP_OUTPUT_BYTES = 10 * 1024 * 1024;
 export const MAX_AGENT_FLOW_MCP_METADATA_BYTES = 1024 * 1024;
@@ -39,9 +43,11 @@ export interface AgentFlowMcpCallResponse {
   metadata?: Record<string, AgentFlowRunStateValue>;
 }
 
-export type AgentFlowMcpCallAdapter = (
+export type AgentFlowMcpCallAdapter = ((
   request: AgentFlowMcpCallRequest
-) => AgentFlowMcpCallResponse | Promise<AgentFlowMcpCallResponse>;
+) => AgentFlowMcpCallResponse | Promise<AgentFlowMcpCallResponse>) & {
+  waitForAbort?: boolean;
+};
 
 export interface AgentFlowMcpCallExecutionResult {
   server: string;
@@ -228,6 +234,14 @@ export async function executeAgentFlowMcpCall(
     response = await invokeAdapter(adapter, request, options.stopStatus, options.interruptError);
   } catch (error) {
     if (error instanceof AgentFlowMcpCallInterruptedError) throw error;
+    const codexMediated = typeof step.via === "string" && step.via.trim() === "codex";
+    if (codexMediated && error instanceof AgentFlowSessionPolicyError) {
+      throw new AgentFlowSessionPolicyError(errorMessage(error), error.code, error.status);
+    }
+    if (codexMediated && error instanceof AgentFlowSessionRequestError
+        && error.code === "AGENT_FLOW_PROVIDER_SESSION_UNAVAILABLE") {
+      throw new AgentFlowSessionRequestError(errorMessage(error), error.code);
+    }
     if (error instanceof AgentFlowMcpCallError) {
       throw new AgentFlowMcpCallError(errorMessage(error), error.code, { cause: sanitizedErrorCause(error) });
     }
@@ -430,8 +444,10 @@ async function invokeAdapter(
   const controller = new AbortController();
   request.signal = controller.signal;
   let timer: ReturnType<typeof setInterval> | undefined;
+  let monitoring = true;
   const interrupted = new Promise<never>((_resolve, reject) => {
     timer = setInterval(() => {
+      if (!monitoring) return;
       try {
         const status = stopStatus?.();
         const error = status === undefined ? interruptError?.() : new AgentFlowMcpCallInterruptedError(status);
@@ -444,9 +460,16 @@ async function invokeAdapter(
       }
     }, 25);
   });
+  const adapterResult = Promise.resolve().then(() => adapter(request));
   try {
-    return await Promise.race([Promise.resolve(adapter(request)), interrupted]);
+    return await Promise.race([adapterResult, interrupted]);
+  } catch (error) {
+    if (controller.signal.aborted && adapter.waitForAbort === true) {
+      try { await adapterResult; } catch { /* The interruption remains authoritative. */ }
+    }
+    throw error;
   } finally {
+    monitoring = false;
     if (timer !== undefined) clearInterval(timer);
   }
 }

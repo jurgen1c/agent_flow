@@ -74,7 +74,9 @@ agent-flow providers doctor [--config path/to/config.yml]
 ```
 
 `list` is redacted. `doctor` checks environment-variable presence and target
-readiness without calling a model.
+readiness without calling a model. For Codex, readiness verifies the executable
+but does not assume `codex login` is authoritative because ambient custom model
+providers may use their own authentication.
 
 ## Per-step selection and swapping
 
@@ -111,11 +113,13 @@ agent-flow run workflow.yml --id alternate \
 ```
 
 An override must preserve the alias kind. Resumes do not accept overrides.
-Each run persists a fingerprint of its target, driver, model, endpoint
-identity, and permission-relevant settings. Codex base configuration, selected
-profile contents, and reasoning effort are included when a profile is used.
-Resume fails closed if those settings drift; credential rotation is
-intentionally excluded.
+Each configured alias persists a fingerprint of its target, driver, model,
+endpoint identity, profile name, and reasoning effort. Resume fails closed if
+those configured fields drift; credential rotation is intentionally excluded.
+The reserved `codex` provider persists explicit run overrides but intentionally
+does not fingerprint ambient Codex config, authentication, permissions, rules,
+skills, plugins, or MCP servers. Codex owns drift and trust decisions for those
+pass-through inputs.
 
 ## Built-in drivers
 
@@ -124,7 +128,7 @@ intentionally excluded.
 | `openai-responses` | `frontier` | `api_key_env` | Non-resumable |
 | `anthropic-messages` | `frontier` | `api_key_env` | Non-resumable |
 | `openai-compatible` | `local` or `frontier` | Optional `api_key_env` | Non-resumable |
-| `codex-cli` | `frontier` | Existing Codex CLI login | Native thread ID |
+| `codex-cli` | `frontier` | Existing Codex CLI configuration | Native thread ID |
 | `claude-code` | `frontier` | Existing Claude Code login | Native session ID |
 
 Driver request shapes follow the official
@@ -145,76 +149,46 @@ exactly the declared output paths. Missing, extra, malformed, or oversized
 outputs fail before artifact publication. Drivers add no hidden retries.
 
 The HTTP drivers generate artifacts only, reject file-modification authority,
-and send only the declared prompt and input artifact content. The native CLI
-drivers run with the repository root as their working directory. They use
-read-only/plan mode unless the session grants `can_modify_files`; writers also
-need a non-empty effective file scope. Agent Flow audits the workspace after
-every native invocation, including failed ones, and rejects any changed path
-not allowed by every scope layer. It preserves those changes for inspection
-rather than attempting rollback.
+and send only declared prompt and artifact content. Claude keeps its existing
+host isolation. Codex is intentionally pass-through: Agent Flow starts the
+installed `codex exec` at the repository root with the normal environment and
+does not suppress user/repository configuration, rules, skills, plugins, MCP,
+permissions, or sandbox settings. Codex therefore owns its authentication and
+execution boundary; `bubblewrap` and `flock` are not Agent Flow prerequisites
+for Codex.
 
-Built-in native execution currently requires Linux, `bubblewrap`, and `flock`.
-The host sandbox mounts the checkout read-only for read-only sessions and
-writable for authorized writers, keeps `.git` read-only, hides `.agent-flow`,
-and leaves unrelated host paths unmounted. Only a per-invocation temporary
-directory and the selected CLI's own state directory (`CODEX_HOME`/`~/.codex`
-or `CLAUDE_CONFIG_DIR`/`~/.claude`) remain writable so native sessions can
-persist; the selected executable and required interpreter/toolchain files are
-read-only. Audited native invocations share a per-repository write lock with
-command steps and file-writing custom adapters. Inside that host boundary, the
-CLI's own agent-facing OS sandbox denies reads and writes to its mounted login
-and session-state directory and fails closed if that sandbox is unavailable.
-Agent Flow forwards only basic process/locale variables, proxy and certificate
-settings, and authentication/provider variables for the selected CLI. It does
-not pass arbitrary environment variables to the native agent.
+A workflow may use the reserved provider directly:
 
-`model` is required for native CLI targets. A `codex-cli` target may additionally
-set `profile` and `reasoning_effort`. Profile names contain only letters,
-numbers, hyphens, and underscores and resolve to
-`$CODEX_HOME/<profile>.config.toml` (or `~/.codex/<profile>.config.toml`). The
-profile must be a regular file no larger than 1 MiB. `CODEX_HOME` must resolve
-outside the repository and cannot be a filesystem root. Agent Flow fingerprints
-the profile contents plus the base `$CODEX_HOME/config.toml` when present, and
-verifies both identities before and after each invocation. `providers doctor`
-also asks the installed Codex CLI to strict-load the selected profile without
-starting a model request, catching unsupported profile fields or CLI versions
-early.
+```yaml
+sessions:
+  implementer:
+    provider: codex
+    resume: true
+    codex:
+      profile: implementation
+      reasoning_effort: high
+```
 
-Agent Flow disables ambient Codex user config for targets without a profile.
-Profile targets load Codex's base-plus-profile layers. Agent Flow still disables
-repository-local `.codex/config.toml`, user/project rules, user skills, hooks,
-MCP servers, apps, plugins, web search, analytics/telemetry, notifications, and
-other ambient hosted tools. It also owns Codex's shell environment policy so
-model-spawned commands inherit only core process variables, not the credentials
-forwarded to the Codex process. Agent Flow then passes `--profile`, `--model`, and
-`--config model_reasoning_effort=...` explicitly. Model and reasoning CLI
-overrides therefore take precedence over base and profile values. Allowed
-reasoning values are `minimal`, `low`, `medium`, `high`, and `xhigh`; Codex
-still enforces whether the selected model supports a particular value. Current
-Codex versions use separate profile files instead of legacy
-`[profiles.<name>]` tables. See the official Codex
-[profile documentation](https://learn.chatgpt.com/docs/config-file/config-advanced#profiles)
-and [`model_reasoning_effort` reference](https://learn.chatgpt.com/docs/config-file/config-reference).
+`model`, `profile`, and `reasoning_effort` are optional Codex overrides. Their
+precedence is step, `agent-flow run` flags, session, configured target, then
+Codex's normal config. Run flags are `--model`, `--profile`, and
+`--reasoning-effort`. Allowed reasoning values are `minimal`, `low`, `medium`,
+`high`, and `xhigh`. Agent Flow passes overrides through using Codex's supported
+CLI/config flags and persists the selected run overrides for resume.
 
-Keep Agent Flow profiles self-contained. Agent Flow rejects Codex config layers
-that reference mutable instruction, project-document discovery, model-catalog,
-sub-agent, skill, or SQLite files because changing those files would otherwise
-bypass resumable-run drift detection. Put prompt context in workflow inputs and
-prompts instead. For a selected custom model provider, only environment
-variables named by `env_key` or `env_http_headers` are forwarded; doctor and
-workflow execution preflight fail closed when one is missing, and unrelated `OPENAI_*` credentials are omitted
-unless that provider declares `requires_openai_auth = true`. Profiled
-`openai_base_url` and selected model-provider `base_url` values must be HTTPS
-URLs without embedded credentials, queries, or fragments. Command-backed
-provider authentication, the built-in `amazon-bedrock` provider, custom
-`shell_environment_policy`, and configuration of Agent Flow's reserved
-`permissions.agent_flow_native` profile are rejected. MCP server IDs must use
-letters, numbers, hyphens, or underscores so Agent Flow can reliably disable
-each inherited server before startup.
+For MCP, ordinary Codex session requests may use any ambient server Codex has
+configured. An `mcp_call` uses `via: direct` by default and requires a
+programmatically registered host adapter. `via: codex` requires `session:` to
+name a resumable Codex session and exactly one declared output artifact. Agent
+Flow asks Codex to call the exact static server/tool with the resolved arguments
+and publishes the completed MCP event's canonical structured result, or its
+text-only content when no structured result exists. The runtime verifies the
+event count, server, tool, arguments, completion status, and output digest; the
+model's final narration is not accepted as the tool result.
 
-Claude user/project/local settings remain disabled, and its model is passed
-explicitly. These controls keep persisted target identity independent of
-unselected CLI defaults.
+See the official Codex [profile documentation](https://learn.chatgpt.com/docs/config-file/config-advanced#profiles),
+[`model_reasoning_effort` reference](https://learn.chatgpt.com/docs/config-file/config-reference),
+and [MCP documentation](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
 The CLI receives prompts on standard input, never through a shell, and output
 is bounded and schema-validated before Agent Flow publishes artifacts.
 
@@ -331,7 +305,9 @@ Provider-native transcripts can support resume, but durable Agent Flow state
 remains authoritative.
 
 Built-in HTTP drivers never launch a shell or give the provider ambient
-filesystem access. Built-in Codex and Claude CLI integrations use the authority,
-session, subprocess, and post-execution audit boundary described above. Other
-native CLI integrations remain a programmatic extension boundary so the host
-application can supply isolation appropriate to that CLI and platform.
+filesystem access. Claude uses Agent Flow's authority, subprocess sandbox,
+workspace audit, and write-lock boundary. Codex uses the durable session and
+bounded-output contract but delegates configuration, filesystem authority,
+sandboxing, and MCP access to the installed Codex. Other native CLI integrations
+remain a programmatic extension boundary so the host application can supply
+isolation appropriate to that CLI and platform.

@@ -156,8 +156,9 @@ export function transitionAgentFlowLifecycleRun(
       "AGENT_FLOW_WORKFLOW_INVALID"
     );
   }
+  let result: AgentFlowRunMutationResult;
   if (action === "pause" || (workflow.style === "pipeline" && action === "cancel")) {
-    return withAgentFlowPipelineFinalization(
+    result = withAgentFlowPipelineFinalization(
       store,
       runId,
       () => ({ changed: false, run: store.getRun(runId)! }),
@@ -166,11 +167,42 @@ export function transitionAgentFlowLifecycleRun(
         return transitionAgentFlowLifecycleRunUnlocked(store, runId, action, notifications);
       }
     );
+  } else {
+    result = store.withRunStateTransaction(runId, () => {
+      prepareTransition?.();
+      return transitionAgentFlowLifecycleRunUnlocked(store, runId, action, notifications);
+    });
   }
-  return store.withRunStateTransaction(runId, () => {
-    prepareTransition?.();
-    return transitionAgentFlowLifecycleRunUnlocked(store, runId, action, notifications);
-  });
+  if (action === "cancel") cancelNonterminalChildRuns(store, runId, notifications);
+  return result;
+}
+
+function cancelNonterminalChildRuns(
+  store: AgentFlowRunStateStore,
+  parentRunId: string,
+  notifications: AgentFlowNotificationRegistry,
+  visited: Set<string> = new Set([parentRunId])
+): void {
+  const children = store.listRuns().filter((run) => run.parentRunId === parentRunId);
+  for (const child of children) {
+    if (visited.has(child.id)) continue;
+    visited.add(child.id);
+    const current = store.getRun(child.id);
+    if (current === null || ["completed", "failed", "cancelled"].includes(current.status)) {
+      cancelNonterminalChildRuns(store, child.id, notifications, visited);
+      continue;
+    }
+    try {
+      transitionAgentFlowLifecycleRun(store, child.id, "cancel", notifications);
+    } catch (error) {
+      const settled = store.getRun(child.id);
+      if (!(error instanceof AgentFlowRunStateError)
+          || error.code !== "AGENT_FLOW_RUN_TRANSITION"
+          || settled === null
+          || !["completed", "failed", "cancelled"].includes(settled.status)) throw error;
+      cancelNonterminalChildRuns(store, child.id, notifications, visited);
+    }
+  }
 }
 
 function transitionAgentFlowLifecycleRunUnlocked(
@@ -534,6 +566,11 @@ function providerKindResolverFromBindings(
     if (!Object.hasOwn(value, provider)) return undefined;
     const binding = value[provider];
     if (binding === null || typeof binding !== "object" || Array.isArray(binding)) return undefined;
-    return binding.kind === "local" || binding.kind === "frontier" ? binding.kind : undefined;
+    return binding.kind === "local" || binding.kind === "frontier"
+      ? {
+          kind: binding.kind,
+          ...(typeof binding.driver === "string" ? { driver: binding.driver } : {})
+        }
+      : undefined;
   };
 }

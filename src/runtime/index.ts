@@ -149,14 +149,19 @@ export type {
   AgentFlowProviderAlias,
   AgentFlowProviderCatalog,
   AgentFlowProviderDriver,
-  AgentFlowResolvedCodexProfile,
   AgentFlowResolvedProviderBinding,
   LoadAgentFlowProviderCatalogOptions
 } from "./provider_config";
 export {
+  createAgentFlowCodexCliProvider,
   createAgentFlowConfiguredProviderAdapter,
   createAgentFlowConfiguredProviderRegistry
 } from "./provider_drivers";
+export {
+  createAgentFlowWorkflowRegistryFromSnapshot,
+  loadAgentFlowWorkflowRegistry,
+  serializeAgentFlowWorkflowRegistry
+} from "./recovery";
 export {
   AGENT_FLOW_APPROVAL_STATUSES,
   AgentFlowApprovalError,
@@ -353,7 +358,7 @@ export type {
   AgentFlowPolicyRequest,
   AgentFlowPolicyStatus
 } from "./policy";
-export type { AgentFlowProviderKindResolver } from "./policy_utils";
+export type { AgentFlowProviderIdentity, AgentFlowProviderKindResolver } from "./policy_utils";
 export type {
   AgentFlowApprovalRecord,
   AgentFlowApprovalStatus,

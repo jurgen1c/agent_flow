@@ -76,6 +76,12 @@ or inconsistent collaboration rules. Important controls include:
 - durable pauses for human input or approval instead of implicit consent;
 - retention rules that are evaluated from the workflow persisted with the run.
 
+The built-in Codex provider is an explicit exception to Agent Flow's
+session-filesystem boundary. Agent Flow invokes the installed Codex with its
+normal environment, so Codex configuration and sandboxing—not Agent Flow
+`file_scope`—enforce its repository access. Direct MCP and other custom adapters
+remain host-provided capabilities.
+
 Validation proves the declaration is internally safe; it does not make an
 arbitrary shell command safe. Review commands, scripts, model prompts, MCP
 targets, notification adapters, file scopes, and artifact inputs as code before

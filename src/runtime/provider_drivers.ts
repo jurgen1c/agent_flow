@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 
@@ -15,7 +15,6 @@ import {
 } from "./session_request";
 import {
   agentFlowNativeProviderEnvironment,
-  fingerprintAgentFlowCodexProfile,
   hashAgentFlowProviderModel,
   selectedCodexProviderEnvironment,
   type AgentFlowConfiguredTarget,
@@ -31,6 +30,7 @@ import {
   markAgentFlowWorkspaceWriteLockManaged,
   withAgentFlowWorkspaceWriteLock
 } from "./workspace_lock";
+import type { AgentFlowRunStateValue } from "./run_state";
 
 const MAX_PROVIDER_RESPONSE_BYTES = 12 * 1024 * 1024;
 const NATIVE_SESSION_UNAVAILABLE = "AGENT_FLOW_PROVIDER_SESSION_UNAVAILABLE";
@@ -58,7 +58,33 @@ export function createAgentFlowConfiguredProviderRegistry(
       fingerprint: binding.fingerprint
     }, createAgentFlowConfiguredProviderAdapter(binding, options));
   }
+  if (!registry.names().includes("codex")) {
+    registry.register("codex", createAgentFlowCodexCliProvider(options));
+  }
   return registry;
+}
+
+export function createAgentFlowCodexCliProvider(
+  options: CreateAgentFlowConfiguredProviderRegistryOptions = {}
+): AgentFlowSessionProviderAdapter {
+  const binding: AgentFlowResolvedProviderBinding = {
+    alias: "codex",
+    target: "codex",
+    kind: "frontier",
+    fingerprint: "native-codex-config",
+    config: { kind: "frontier", driver: "codex-cli", model: "", enabled: true }
+  };
+  const adapter: AgentFlowSessionProviderAdapter = (request) =>
+    invokeCodexCli(binding, request, options.env ?? process.env);
+  adapter.preflight = (request) => {
+    if (request.repoRoot === undefined || !path.isAbsolute(request.repoRoot)) {
+      throw providerError("Codex CLI requires an absolute repository root.");
+    }
+    assertUtf8Inputs(request);
+  };
+  adapter.waitForAbort = true;
+  markAgentFlowWorkspaceWriteLockManaged(adapter);
+  return adapter;
 }
 
 export function createAgentFlowConfiguredProviderAdapter(
@@ -81,21 +107,22 @@ export function createAgentFlowConfiguredProviderAdapter(
     throw providerError("Unsupported configured provider driver.");
   }
   adapter.preflight = (request) => {
-    if (binding.config.driver === "codex-cli" || binding.config.driver === "claude-code") {
-      assertNativeAuthority(request, binding);
-      if (binding.config.driver === "codex-cli") {
-        assertCodexProfileIdentity(binding);
-        for (const name of binding.codexProfile?.providerEnvironmentNames ?? []) {
-          requiredNativeCredential(name, env);
-        }
+    if (binding.config.driver === "codex-cli") {
+      if (request.repoRoot === undefined || !path.isAbsolute(request.repoRoot)) {
+        throw providerError(`Configured codex-cli target ${binding.alias} requires an absolute repository root.`);
       }
+    } else if (binding.config.driver === "claude-code") {
+      assertNativeAuthority(request, binding);
     } else {
       assertApiAuthority(request, binding);
       if (binding.config.api_key_env !== undefined) requiredCredential(binding.config, env);
     }
     assertUtf8Inputs(request);
   };
-  if (binding.config.driver === "codex-cli" || binding.config.driver === "claude-code") {
+  if (binding.config.driver === "claude-code") {
+    adapter.waitForAbort = true;
+    markAgentFlowWorkspaceWriteLockManaged(adapter);
+  } else if (binding.config.driver === "codex-cli") {
     adapter.waitForAbort = true;
     markAgentFlowWorkspaceWriteLockManaged(adapter);
   }
@@ -107,13 +134,14 @@ async function invokeCodexCli(
   request: AgentFlowSessionProviderRequest,
   env: Readonly<Record<string, string | undefined>>
 ): Promise<AgentFlowSessionProviderResponse> {
-  assertNativeAuthority(request, binding);
-  return auditNativeWorkspace(request, binding, async () => {
+  {
     const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-flow-codex-"));
     const schemaPath = path.join(temporaryDirectory, "output-schema.json");
     const outputPath = path.join(temporaryDirectory, "output.json");
     fs.writeFileSync(schemaPath, `${JSON.stringify(outputSchema(request))}\n`, { mode: 0o600 });
     let observedThreadId: string | undefined;
+    const observedMcpCalls: AgentFlowRunStateValue[] = [];
+    const observedMcpResults: Array<string | undefined> = [];
     const reportThread = (candidate: unknown): void => {
       if (typeof candidate !== "string" || candidate.trim().length === 0) {
         throw providerError("Codex CLI emitted an invalid thread ID.");
@@ -129,38 +157,25 @@ async function invokeCodexCli(
       if (request.resume) request.reportExternalSessionId?.(threadId);
     };
     try {
-      const sandbox = nativeProcessSandbox(
-        request,
-        env,
-        temporaryDirectory,
-        "codex",
-        binding.codexProfile?.home,
-        binding.codexProfile?.providerEnvironmentNames,
-        binding.codexProfile?.requiresOpenAiAuth !== false
-      );
-      assertCodexProfileIdentity(binding);
+      const profile = request.codexOptions?.profile ?? binding.config.profile;
+      const model = request.codexOptions?.model ?? (binding.config.model || undefined);
+      const reasoningEffort = request.codexOptions?.reasoningEffort ?? binding.config.reasoning_effort;
       const commonArguments = [
         "--json",
         "--output-schema", schemaPath,
         "--output-last-message", outputPath,
-        "--model", binding.config.model
+        ...(model === undefined ? [] : [`--model=${model}`])
       ];
       const codexConfigurationArguments = [
-        ...(binding.config.profile === undefined ? [] : ["--profile", binding.config.profile]),
-        ...(binding.config.reasoning_effort === undefined
+        ...(profile === undefined ? [] : [`--profile=${profile}`]),
+        ...(reasoningEffort === undefined
           ? []
-          : ["--config", `model_reasoning_effort=${JSON.stringify(binding.config.reasoning_effort)}`])
+          : ["--config", `model_reasoning_effort=${JSON.stringify(reasoningEffort)}`])
       ];
-      const hardeningArguments = codexHardeningArguments(
-        sandbox,
-        binding.codexProfile?.mcpServerIds ?? [],
-        binding.config.profile === undefined
-      );
       const arguments_ = request.externalSessionId === undefined
         ? [
             "exec",
             ...codexConfigurationArguments,
-            ...hardeningArguments,
             ...commonArguments,
             ...(request.resume ? [] : ["--ephemeral"]),
             "-"
@@ -168,7 +183,6 @@ async function invokeCodexCli(
         : [
             "exec",
             ...codexConfigurationArguments,
-            ...hardeningArguments,
             "resume",
             ...commonArguments,
             request.externalSessionId,
@@ -181,16 +195,31 @@ async function invokeCodexCli(
         request.repoRoot!,
         env,
         request.signal,
-        sandbox,
+        undefined,
         (line) => {
           let event: unknown;
           try { event = JSON.parse(line); } catch {
             throw providerError("Codex CLI emitted malformed JSONL output.");
           }
           if (isRecord(event) && event.type === "thread.started") reportThread(event.thread_id);
+          if (request.captureMcpCallEvidence === true
+              && isRecord(event) && event.type === "item.completed" && isRecord(event.item)
+              && event.item.type === "mcp_tool_call") {
+            const arguments_ = codexMcpArguments(event.item.arguments);
+            const result = codexMcpResultContent(event.item.result);
+            observedMcpResults.push(result);
+            observedMcpCalls.push({
+              ...(typeof event.item.server === "string" ? { server: event.item.server } : {}),
+              ...(typeof event.item.tool === "string" ? { tool: event.item.tool } : {}),
+              ...(arguments_ === undefined ? {} : { arguments: arguments_ }),
+              status: typeof event.item.status === "string"
+                ? event.item.status
+                : event.item.error === undefined || event.item.error === null ? "completed" : "failed",
+              ...(result === undefined ? {} : { resultHash: sha256(result) })
+            });
+          }
         }
       );
-      assertCodexProfileIdentity(binding);
       if (observedThreadId === undefined) {
         for (const line of result.stdout.toString("utf8").split(/\r?\n/)) {
           if (line.length === 0) continue;
@@ -204,58 +233,29 @@ async function invokeCodexCli(
         throw providerError("Codex CLI completed without reporting a resumable thread ID.");
       }
       const structured = readBoundedNativeOutput(outputPath, "Codex CLI");
-      return responseFromStructuredText(
+      const response = responseFromStructuredText(
         structured,
         request,
         binding,
         request.resume ? observedThreadId : undefined,
-        { cli: "codex" }
+        {
+          cli: "codex",
+          ...(profile === undefined ? {} : { profile }),
+          ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+          ...(model === undefined ? {} : { modelHash: hashAgentFlowProviderModel(model) }),
+          ...(observedMcpCalls.length === 0 ? {} : { mcpCalls: observedMcpCalls })
+        }
       );
+      if (request.captureMcpCallEvidence === true
+          && request.outputs.length === 1
+          && observedMcpCalls.length === 1
+          && observedMcpResults[0] !== undefined) {
+        response.outputs[request.outputs[0]!] = observedMcpResults[0]!;
+      }
+      return response;
     } finally {
       fs.rmSync(temporaryDirectory, { recursive: true, force: true });
     }
-  });
-}
-
-function assertCodexProfileIdentity(binding: AgentFlowResolvedProviderBinding): void {
-  if (binding.config.profile === undefined) return;
-  if (binding.codexProfile === undefined) {
-    throw providerError(`Codex profile ${JSON.stringify(binding.config.profile)} has no resolved identity.`);
-  }
-  let fingerprint: string;
-  try {
-    fingerprint = fingerprintAgentFlowCodexProfile(binding.codexProfile.path);
-  } catch (error) {
-    throw providerError(
-      `Could not verify Codex profile ${JSON.stringify(binding.config.profile)}: ${error instanceof Error ? error.message : String(error)}.`
-    );
-  }
-  if (fingerprint !== binding.codexProfile.fingerprint) {
-    throw providerError(
-      `Codex profile ${JSON.stringify(binding.config.profile)} changed after the provider catalog was loaded.`
-    );
-  }
-  assertCodexBaseConfigIdentity(binding);
-}
-
-function assertCodexBaseConfigIdentity(binding: AgentFlowResolvedProviderBinding): void {
-  const profile = binding.codexProfile!;
-  let fingerprint: string | undefined;
-  try {
-    fingerprint = fingerprintAgentFlowCodexProfile(profile.baseConfigPath);
-  } catch (error) {
-    if (error !== null && typeof error === "object" && "code" in error && error.code === "ENOENT") {
-      fingerprint = undefined;
-    } else {
-      throw providerError(
-        `Could not verify Codex base config for profile ${JSON.stringify(binding.config.profile)}: ${error instanceof Error ? error.message : String(error)}.`
-      );
-    }
-  }
-  if (fingerprint !== profile.baseConfigFingerprint) {
-    throw providerError(
-      `Codex base config for profile ${JSON.stringify(binding.config.profile)} changed after the provider catalog was loaded.`
-    );
   }
 }
 
@@ -342,53 +342,6 @@ interface NativeProcessSandbox {
   executableMountPaths: string[];
 }
 
-function codexHardeningArguments(
-  sandbox: NativeProcessSandbox,
-  mcpServerIds: readonly string[],
-  ignoreUserConfig: boolean
-): string[] {
-  const profile = "agent_flow_native";
-  const filesystem = sandbox.providerStatePaths
-    .map((statePath) => `${JSON.stringify(statePath)} = "deny"`)
-    .join(", ");
-  return [
-    ...(ignoreUserConfig ? ["--ignore-user-config"] : []),
-    "--ignore-rules",
-    ...[
-      "apps",
-      "browser_use",
-      "browser_use_external",
-      "browser_use_full_cdp_access",
-      "computer_use",
-      "hooks",
-      "image_generation",
-      "memories",
-      "multi_agent",
-      "plugins",
-      "remote_plugin",
-      "skill_mcp_dependency_install",
-      "skill_search"
-    ].flatMap((feature) => ["--disable", feature]),
-    "--strict-config",
-    "--config", "analytics.enabled=false",
-    "--config", "agents.enabled=false",
-    "--config", "apps._default.enabled=false",
-    ...mcpServerIds.flatMap((serverId) => [
-      "--config", `mcp_servers.${serverId}.enabled=false`
-    ]),
-    "--config", "notify=[]",
-    "--config", 'otel.exporter="none"',
-    "--config", 'otel.metrics_exporter="none"',
-    "--config", 'otel.trace_exporter="none"',
-    "--config", 'shell_environment_policy.inherit="core"',
-    "--config", "shell_environment_policy.ignore_default_excludes=false",
-    "--config", 'web_search="disabled"',
-    "--config", `default_permissions=${JSON.stringify(profile)}`,
-    "--config", `permissions.${profile}.extends=${JSON.stringify(sandbox.canModifyFiles ? ":workspace" : ":read-only")}`,
-    "--config", `permissions.${profile}.filesystem={ ${filesystem} }`
-  ];
-}
-
 function claudeHardeningSettings(sandbox: NativeProcessSandbox): Record<string, unknown> {
   const permissionPaths = sandbox.providerStatePaths
     .map((statePath) => `//${statePath.replace(/^\/+/, "")}`);
@@ -419,7 +372,7 @@ function runNativeProviderProcess(
   cwd: string,
   env: Readonly<Record<string, string | undefined>>,
   signal: AbortSignal,
-  sandbox: NativeProcessSandbox,
+  sandbox?: NativeProcessSandbox,
   onStdoutLine?: (line: string) => void
 ): Promise<NativeProviderProcessResult> {
   return new Promise((resolve, reject) => {
@@ -434,12 +387,14 @@ function runNativeProviderProcess(
     let failure: Error | undefined;
     let child: ChildProcess;
     try {
-      const invocation = sandboxedNativeInvocation(command, arguments_, sandbox);
+      const invocation = sandbox === undefined
+        ? { command: resolveNativeExecutable(command, env.PATH), arguments: arguments_ }
+        : sandboxedNativeInvocation(command, arguments_, sandbox);
       child = spawn(invocation.command, invocation.arguments, {
         cwd,
         shell: false,
         detached: process.platform !== "win32",
-        env: {
+        env: sandbox === undefined ? definedProviderEnvironment(env) : {
           ...agentFlowNativeProviderEnvironment(command, env, sandbox.includeOpenAiCredentials),
           ...(sandbox.providerStateEnvironment === undefined
             ? {}
@@ -513,6 +468,15 @@ function runNativeProviderProcess(
     child.stdin?.end(input);
     if (signal.aborted) abort();
   });
+}
+
+function definedProviderEnvironment(
+  env: Readonly<Record<string, string | undefined>>
+): NodeJS.ProcessEnv {
+  return {
+    HOME: env.HOME ?? os.homedir(),
+    ...Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined))
+  };
 }
 
 function nativeProcessSandbox(
@@ -1136,7 +1100,7 @@ function responseFromStructuredText(
   request: AgentFlowSessionProviderRequest,
   binding: AgentFlowResolvedProviderBinding,
   externalSessionId?: string,
-  extraMetadata?: Record<string, string>
+  extraMetadata?: Record<string, AgentFlowRunStateValue>
 ): AgentFlowSessionProviderResponse {
   const parsed = parseJsonObject(source, `${binding.config.driver} structured output`);
   if (!isRecord(parsed.outputs)) throw providerError(`${binding.config.driver} structured output must contain an outputs object.`);
@@ -1158,7 +1122,7 @@ function responseFromStructuredText(
     metadata: {
       target: binding.target,
       driver: binding.config.driver,
-      ...(binding.config.model === undefined ? {} : { modelHash: hashAgentFlowProviderModel(binding.config.model) }),
+      ...(binding.config.model.length === 0 ? {} : { modelHash: hashAgentFlowProviderModel(binding.config.model) }),
       ...(binding.config.profile === undefined ? {} : { profile: binding.config.profile }),
       ...(binding.config.reasoning_effort === undefined
         ? {}
@@ -1250,16 +1214,6 @@ function requiredCredential(
   return value;
 }
 
-function requiredNativeCredential(
-  name: string,
-  env: Readonly<Record<string, string | undefined>>
-): string {
-  const candidate = Object.hasOwn(env, name) ? env[name] : undefined;
-  const value = typeof candidate === "string" ? candidate.trim() : undefined;
-  if (!value) throw providerError(`Credential environment variable ${name} is not set.`);
-  return value;
-}
-
 function assertProviderCompletion(value: unknown, allowed: readonly string[], label: string): void {
   if (typeof value !== "string" || !allowed.includes(value)) {
     throw providerError(`${label} response stopped before completing the declared outputs.`);
@@ -1300,6 +1254,51 @@ function parseJsonObject(source: string, label: string): Record<string, unknown>
   try { value = JSON.parse(source); } catch { throw providerError(`${label} is not valid JSON.`); }
   if (!isRecord(value)) throw providerError(`${label} must be a JSON object.`);
   return value;
+}
+
+function codexMcpArguments(value: unknown): AgentFlowRunStateValue | undefined {
+  if (typeof value === "string") {
+    try {
+      return JSON.parse(value) as AgentFlowRunStateValue;
+    } catch {
+      return undefined;
+    }
+  }
+  if (value === null || typeof value === "boolean" || typeof value === "number"
+      || Array.isArray(value) || isRecord(value)) {
+    return value as AgentFlowRunStateValue;
+  }
+  return undefined;
+}
+
+function codexMcpResultContent(value: unknown): string | undefined {
+  if (!isRecord(value)) return undefined;
+  if (Object.hasOwn(value, "structured_content") && value.structured_content !== null) {
+    const structured = codexMcpArguments(value.structured_content);
+    if (structured !== undefined) return `${stableJson(structured)}\n`;
+  }
+  if (!Array.isArray(value.content)) return undefined;
+  const blocks = value.content.map((entry) =>
+    isRecord(entry) && entry.type === "text" && typeof entry.text === "string"
+      ? entry.text
+      : undefined
+  );
+  return blocks.every((entry): entry is string => entry !== undefined)
+    ? blocks.join("\n")
+    : undefined;
+}
+
+function stableJson(value: AgentFlowRunStateValue): string {
+  return JSON.stringify(value, (_key, entry) => {
+    if (entry !== null && typeof entry === "object" && !Array.isArray(entry)) {
+      return Object.fromEntries(Object.keys(entry).sort().map((key) => [key, entry[key]]));
+    }
+    return entry;
+  });
+}
+
+function sha256(value: string): string {
+  return `sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
 }
 
 function optionalString(value: unknown): string | undefined {

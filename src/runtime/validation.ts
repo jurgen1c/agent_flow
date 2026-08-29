@@ -6,7 +6,12 @@ import type {
   AgentFlowYamlValue
 } from "./workflow";
 import { validateAgentFlowPolicyPrimitives } from "./policy";
-import { isAgentFlowFrontierProvider, policyGlobLayersHaveWritablePath, type AgentFlowProviderKindResolver } from "./policy_utils";
+import {
+  agentFlowProviderIdentity,
+  isAgentFlowFrontierProvider,
+  policyGlobLayersHaveWritablePath,
+  type AgentFlowProviderKindResolver
+} from "./policy_utils";
 import { normalizeAgentFlowArtifactPath } from "./run_state";
 import { MAX_AGENT_FLOW_SESSION_INPUTS } from "./session_request";
 import {
@@ -87,9 +92,10 @@ const STEP_TYPES = new Set([
 
 const TERMINAL_TARGETS = new Set(["cancel", "complete", "completed", "continue", "fail", "ignore", "pause"]);
 const TARGET_FIELDS = new Set(["else", "goto", "on_approve", "on_cancel", "on_reject", "return_to", "then"]);
-const RECOVERY_ROUTE_STEP_TYPES = new Set(["artifact_transform", "command", "mcp_call", "session_request"]);
+const RECOVERY_ROUTE_STEP_TYPES = new Set(["artifact_transform", "command", "mcp_call", "session_request", "workflow"]);
 const SHELL_EXECUTABLES = new Set(["bash", "dash", "ksh", "sh", "zsh"]);
 const SHELL_ANALYSIS_BUDGET = 65_536;
+const CODEX_REASONING_EFFORTS = new Set(["minimal", "low", "medium", "high", "xhigh"]);
 export const AGENT_FLOW_COLLABORATION_AUTHORITY_CAPABILITIES = [
   "can_advise",
   "can_approve",
@@ -116,7 +122,7 @@ const STEP_REQUIREMENTS: Readonly<Record<string, ReadonlyArray<readonly [string,
   result: [["status", "string"]],
   review: [["reviewer", "string"], ["subject", "string"], ["artifacts", "array"], ["outputs", "array"]],
   session_request: [["session", "string"], ["prompt", "string"], ["inputs", "array"], ["outputs", "array"]],
-  workflow: [["workflow", "string"]]
+  workflow: [["workflow", "string"], ["inputs", "mapping"], ["outputs", "array"]]
 };
 
 export function validateAgentFlowWorkflow(
@@ -144,7 +150,7 @@ export function validateAgentFlowWorkflow(
   validateTargetShapes(executableContexts, errors);
   validateTargets(executableContexts, ids, errors);
   validateCommands(workflow, executableContexts, errors);
-  validateSessionReferences(workflow, runtimeContexts, errors);
+  validateSessionReferences(workflow, runtimeContexts, errors, providerKind);
   validateCollaborationAuthority(workflow, runtimeContexts, errors);
   validateControlStepShapes(workflow, executableContexts, errors);
   validateConditionExpressions(workflow, executableContexts, errors);
@@ -540,6 +546,8 @@ function validateSessionDefinitions(workflow: AgentFlowWorkflow, errors: AgentFl
         }
       }
 
+      validateCodexOptions(value.codex, `sessions.${name}.codex`, errors);
+
       if (value.resume !== undefined && typeof value.resume !== "boolean") {
         errors.push({
           code: "workflow.session.resume.invalid",
@@ -767,6 +775,61 @@ function validateStepShapes(contexts: StepContext[], errors: AgentFlowWorkflowIs
     }
 
     validateRequiredStepFields(context, errors);
+    validateCodexOptions(context.step.codex, `${context.path}.codex`, errors, context.id);
+  }
+}
+
+function validateCodexOptions(
+  value: unknown,
+  pathPrefix: string,
+  errors: AgentFlowWorkflowIssue[],
+  stepId?: string
+): void {
+  if (value === undefined) return;
+  if (!isRecord(value)) {
+    errors.push({
+      code: "workflow.codex.options.invalid",
+      message: "Codex options must be a mapping.",
+      path: pathPrefix,
+      ...(stepId === undefined ? {} : { stepId })
+    });
+    return;
+  }
+  for (const field of Object.keys(value).filter((field) => !["profile", "model", "reasoning_effort"].includes(field))) {
+    errors.push({
+      code: "workflow.codex.option.unsupported",
+      message: `Codex option ${JSON.stringify(field)} is not supported.`,
+      path: `${pathPrefix}.${field}`,
+      ...(stepId === undefined ? {} : { stepId })
+    });
+  }
+  if (value.profile !== undefined
+      && (typeof value.profile !== "string" || !/^[A-Za-z0-9_-]+$/.test(value.profile))) {
+    errors.push({
+      code: "workflow.codex.profile.invalid",
+      message: "Codex profile must contain only letters, numbers, hyphens, and underscores.",
+      path: `${pathPrefix}.profile`,
+      ...(stepId === undefined ? {} : { stepId })
+    });
+  }
+  if (value.model !== undefined
+      && (typeof value.model !== "string" || value.model.trim().length === 0 || value.model !== value.model.trim()
+        || /[\u0000-\u001F\u007F-\u009F]/u.test(value.model))) {
+    errors.push({
+      code: "workflow.codex.model.invalid",
+      message: "Codex model must be non-empty text without surrounding whitespace or control characters.",
+      path: `${pathPrefix}.model`,
+      ...(stepId === undefined ? {} : { stepId })
+    });
+  }
+  if (value.reasoning_effort !== undefined
+      && (typeof value.reasoning_effort !== "string" || !CODEX_REASONING_EFFORTS.has(value.reasoning_effort))) {
+    errors.push({
+      code: "workflow.codex.reasoning_effort.invalid",
+      message: "Codex reasoning_effort must be minimal, low, medium, high, or xhigh.",
+      path: `${pathPrefix}.reasoning_effort`,
+      ...(stepId === undefined ? {} : { stepId })
+    });
   }
 }
 
@@ -790,6 +853,48 @@ function validateRequiredStepFields(context: StepContext, errors: AgentFlowWorkf
 
   validateArtifactFieldShapes(context, errors);
 
+  if (context.type === "workflow") {
+    const target = nonEmptyString(context.step.workflow);
+    if (target !== undefined && (target.includes("{{") || target.includes("}}"))) {
+      addStepIssue(
+        errors,
+        context,
+        "workflow.workflow.target.dynamic",
+        "workflow",
+        "Nested workflow targets must be static non-empty names."
+      );
+    }
+  }
+
+  if (context.type === "mcp_call") {
+    const via = context.step.via === undefined ? "direct" : nonEmptyString(context.step.via);
+    if (via !== "direct" && via !== "codex") {
+      addStepIssue(errors, context, "workflow.mcp_call.via.invalid", "via", "MCP call via must be direct or codex.");
+    }
+    if (via === "codex" && nonEmptyString(context.step.session) === undefined) {
+      addStepIssue(errors, context, "workflow.mcp_call.session.required", "session", "Codex-mediated MCP calls require a named session.");
+    }
+    const session = nonEmptyString(context.step.session);
+    if (via === "codex" && session !== undefined && (session.includes("{{") || session.includes("}}"))) {
+      addStepIssue(
+        errors,
+        context,
+        "workflow.mcp_call.session.dynamic",
+        "session",
+        "Codex-mediated MCP calls require a static declared session."
+      );
+    }
+    if (via === "codex" && Array.isArray(context.step.outputs) && context.step.outputs.length !== 1) {
+      addStepIssue(
+        errors,
+        context,
+        "workflow.mcp_call.outputs.single",
+        "outputs",
+        "Codex-mediated MCP calls require exactly one output artifact."
+      );
+    }
+  }
+
   if (context.type === "command" && context.step.timeout_seconds !== undefined &&
       (typeof context.step.timeout_seconds !== "number" || !Number.isFinite(context.step.timeout_seconds) || context.step.timeout_seconds <= 0)) {
     addStepIssue(
@@ -812,15 +917,16 @@ function validateRequiredStepFields(context: StepContext, errors: AgentFlowWorkf
   }
 
   const sessionApproval = context.type === "approval" && nonEmptyString(context.step.reviewer) !== "human";
-  if ((context.type === "command" || context.type === "artifact_transform" || context.type === "session_request" || context.type === "mcp_call" || sessionApproval) && isRecord(context.step.on_failure)) {
+  if ((context.type === "command" || context.type === "artifact_transform" || context.type === "session_request"
+      || context.type === "mcp_call" || context.type === "workflow" || sessionApproval) && isRecord(context.step.on_failure)) {
     const failureLabel = context.type === "command"
       ? "Command"
       : context.type === "artifact_transform" ? "Artifact transform" : context.type === "mcp_call" ? "MCP call"
-        : context.type === "approval" ? "Approval" : "Session request";
+        : context.type === "workflow" ? "Workflow" : context.type === "approval" ? "Approval" : "Session request";
     const failureCode = context.type === "command"
       ? "workflow.command"
       : context.type === "artifact_transform" ? "workflow.artifact_transform" : context.type === "mcp_call" ? "workflow.mcp_call"
-        : context.type === "approval" ? "workflow.approval" : "workflow.session_request";
+        : context.type === "workflow" ? "workflow.workflow" : context.type === "approval" ? "workflow.approval" : "workflow.session_request";
     const retry = context.step.on_failure.retry;
     const failureThen = typeof context.step.on_failure.then === "string"
       ? context.step.on_failure.then.trim()
@@ -843,7 +949,8 @@ function validateRequiredStepFields(context: StepContext, errors: AgentFlowWorkf
         `${failureLabel} failures may continue or be ignored only when on_failure.allowed is true.`
       );
     }
-    if (context.type === "artifact_transform" || context.type === "session_request" || context.type === "mcp_call" || sessionApproval) {
+    if (context.type === "artifact_transform" || context.type === "session_request" || context.type === "mcp_call"
+        || context.type === "workflow" || sessionApproval) {
       const unsupportedTarget = unsupportedTransformFailureTarget(context.step.on_failure);
       if (unsupportedTarget !== undefined) {
         addStepIssue(
@@ -1340,12 +1447,15 @@ export function agentFlowCommandUnsafeReason(command: string): string | undefine
 function validateSessionReferences(
   workflow: AgentFlowWorkflow,
   contexts: StepContext[],
-  errors: AgentFlowWorkflowIssue[]
+  errors: AgentFlowWorkflowIssue[],
+  providerKind?: AgentFlowProviderKindResolver
 ): void {
   const sessions = new Set(Object.keys(workflow.sessions ?? {}));
 
   for (const context of contexts) {
-    const fields = sessionReferenceFields(context.type);
+    const fields = context.type === "mcp_call" && nonEmptyString(context.step.via) === "codex"
+      ? ["session"]
+      : sessionReferenceFields(context.type);
 
     for (const field of fields) {
       const value = nonEmptyString(context.step[field]);
@@ -1358,6 +1468,35 @@ function validateSessionReferences(
           "workflow.session.undeclared",
           field,
           `Session "${value}" is referenced but not declared in workflow sessions.`
+        );
+      }
+    }
+
+    if (context.type === "mcp_call" && nonEmptyString(context.step.via) === "codex") {
+      const sessionName = nonEmptyString(context.step.session);
+      const session = sessionName === undefined ? undefined : workflow.sessions?.[sessionName];
+      if (sessionName !== undefined && !isDynamicReference(sessionName) && sessions.has(sessionName)
+          && (!isRecord(session) || session.resume !== true)) {
+        addStepIssue(
+          errors,
+          context,
+          "workflow.mcp_call.session.not_resumable",
+          "session",
+          `Codex-mediated MCP call session ${JSON.stringify(sessionName)} must declare resume: true.`
+        );
+      }
+      const provider = isRecord(session) ? nonEmptyString(session.provider) : undefined;
+      const identity = provider === undefined ? undefined : agentFlowProviderIdentity(provider, providerKind);
+      if (provider !== undefined && !isDynamicReference(provider)
+          && provider !== "codex" && !provider.startsWith("codex:")
+          && (["fixture", "local", "frontier"].includes(provider)
+            || (identity !== undefined && identity.driver !== "codex-cli"))) {
+        addStepIssue(
+          errors,
+          context,
+          "workflow.mcp_call.session.provider.invalid",
+          "session",
+          `Codex-mediated MCP call session ${JSON.stringify(sessionName)} must use the built-in Codex provider, a Codex profile, or a configured codex-cli provider.`
         );
       }
     }
@@ -1913,6 +2052,34 @@ function validateArtifactPaths(contexts: StepContext[], errors: AgentFlowWorkflo
             "workflow.mcp_call.output.duplicate",
             `outputs[${index}]`,
             `MCP call outputs must not contain duplicate artifact path "${normalized}".`
+          );
+        }
+        seen.add(normalized);
+      }
+      continue;
+    }
+    if (context.type === "workflow") {
+      const rawOutputs = Array.isArray(context.step.outputs) ? context.step.outputs : [];
+      const seen = new Set<string>();
+      for (const [index, value] of rawOutputs.entries()) {
+        const normalized = typeof value === "string" ? normalizedStaticArtifactPath(value) : undefined;
+        if (normalized === undefined) {
+          addStepIssue(
+            errors,
+            context,
+            "workflow.workflow.output.invalid",
+            `outputs[${index}]`,
+            "Nested workflow outputs must contain normalized static repo-relative artifact paths."
+          );
+          continue;
+        }
+        if (seen.has(normalized)) {
+          addStepIssue(
+            errors,
+            context,
+            "workflow.workflow.output.duplicate",
+            `outputs[${index}]`,
+            `Nested workflow outputs must not contain duplicate artifact path "${normalized}".`
           );
         }
         seen.add(normalized);

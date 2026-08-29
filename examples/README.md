@@ -7,7 +7,7 @@ These examples show how Agent Flow workflows can start simple and grow into reco
 | File | Style | Shows |
 |---|---|---|
 | `workflows/simple-ci.yml` | Pipeline | Run deterministic local checks |
-| `workflows/jira-ticket-spec.yml` | Pipeline | Fetch Jira ticket JSON, transform it to Markdown, and ask LM to create a concise spec |
+| `workflows/jira-ticket-spec.yml` | Pipeline | Use Codex MCP to fetch Jira ticket JSON, transform it to Markdown, and create a concise spec |
 | `workflows/ticket-lifecycle.yml` | Recovery pipeline | LM/FM ticket implementation lifecycle with CI and PR feedback |
 | `workflows/ci-triage.yml` | Recovery pipeline | Reusable nested workflow for failed CI |
 | `workflows/pr-feedback-loop.yml` | Recovery pipeline | Poll PR comments and route actionable feedback to FM |
@@ -19,7 +19,7 @@ These examples show how Agent Flow workflows can start simple and grow into reco
 ## Suggested Demo Order
 
 1. Run `simple-ci.yml` to show Agent Flow can run normal commands.
-2. Run `jira-ticket-spec.yml` to show LM summarization with MCP.
+2. Run `jira-ticket-spec.yml` to show Codex-mediated MCP and summarization.
 3. Run `ticket-lifecycle.yml` to show LM/FM orchestration.
 4. Trigger a fake CI failure and show `ci-triage.yml`.
 5. Run `pr-feedback-loop.yml` to show bounded PR comment and CI recovery.
@@ -74,15 +74,30 @@ agent-flow run examples/workflows/multi-provider.yml \
 
 `native-cli-session.yml` uses the `implementer` alias and `resume: true`, so its
 implement, review, and fix steps reuse one native CLI conversation. Point that
-alias at `codex-main` or `claude-main` in `.agent-flow.yml`. The session can edit
-only its declared file scope; customize those paths before using it in another
-repository.
+alias at `codex-main` or `claude-main` in `.agent-flow.yml`. Customize the
+declared scope before using the workflow elsewhere. Agent Flow enforces it for
+Claude; when the alias selects Codex, configure matching restrictions in Codex
+because the declared Agent Flow scope does not sandbox pass-through Codex.
 
 ## Notes
 
 `jira-ticket-spec.yml` uses the built-in `jira_ticket_to_markdown` transform.
 Fixture simulation can provide `ticket.json` and inspect the derived `ticket.md`
 without network access or free-form scripting.
+
+For a live run, install and authenticate Codex, configure its
+`atlassian-rovo-mcp` server, and provide the workflow input explicitly:
+
+```sh
+agent-flow run examples/workflows/jira-ticket-spec.yml \
+  --id jira-ticket-spec-demo \
+  --input ticket_key=AF-123
+```
+
+The stock CLI cannot execute the default `via: direct` MCP mode because direct
+adapters are application code registered by a programmatic host. The example
+uses `via: codex`, so the installed Codex supplies its configured MCP adapter
+and credentials.
 
 `ci-triage.yml` has offline fixtures for flake, formatting, implementation,
 environment, unknown, and user-required classifications. From the repository

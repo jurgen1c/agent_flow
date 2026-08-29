@@ -20,7 +20,7 @@ for a future runtime surface and is not active.
 | `agent-flow lint <workflow>` | Report complexity and risky authoring patterns. |
 | `agent-flow explain <workflow>` | Explain normalized steps, artifacts, policies, collaboration, and warnings. |
 | `agent-flow graph <workflow>` | Print a deterministic workflow graph. |
-| `agent-flow simulate <workflow> --fixture <file>` | Traverse fixture-defined paths and materialize a simulation summary without executing workflow steps. |
+| `agent-flow simulate <workflow> --fixture <file>` | Load and validate the reachable workflow registry, then traverse fixture-defined paths and materialize a summary without executing workflow steps. |
 
 The authoring skills help create and review workflow YAML. They do not invoke
 lifecycle commands.
@@ -29,8 +29,9 @@ lifecycle commands.
 
 | Command | Purpose |
 |---|---|
-| `agent-flow run <workflow> --id <run-id> [--fixture <file>] [--config <file>] [--provider <alias=target>]...` | Create or reuse a persistent run, load configured providers, and execute supported steps. Overrides are repeatable and new-run only. |
-| `agent-flow resume <run-id> --outcome <choice> [--fixture <file>] [--config <file>]` | Continue a paused approval or other choice-based interaction after verifying pinned provider bindings. |
+| `agent-flow run <workflow> --id <run-id> [--fixture <file>] [--input-file <json>] [--input <key=value>]... [--config <file>] [--provider <alias=target>]...` | Create or reuse a persistent run, merge validated inputs, load configured providers, and execute supported steps. Input and provider flags are repeatable; provider overrides are new-run only. |
+| `agent-flow run <workflow> --id <run-id> [--profile <name>] [--model <name>] [--reasoning-effort <level>]` | Start a run with optional Codex overrides. The selected values are persisted and reused when the run resumes. |
+| `agent-flow resume <run-id> --outcome <choice> [--fixture <file>] [--config <file>]` | Continue a paused approval or other choice-based interaction, or settle/resume a linked child workflow, after verifying pinned provider bindings. |
 | `agent-flow resume <run-id> --answer <value> [--fixture <file>] [--config <file>]` | Continue a paused input request after verifying pinned provider bindings. JSON scalar, array, and object values are parsed; other input remains text. |
 | `agent-flow resume <run-id> --reset-session <session-name> [--fixture <file>] [--config <file>]` | Explicitly discard a missing native CLI session ID and retry the waiting step in a fresh Codex or Claude session. |
 | `agent-flow inject <run-id> <session-name> <context>` | Persist additional context for an active recovery session and mark it dirty for rerun. |
@@ -42,6 +43,28 @@ lifecycle commands.
 
 Run IDs beginning with an option-like prefix can be separated from options
 with `--` where the command synopsis shows `[--]`.
+
+Run inputs merge from `--fixture`, then `--input-file`, then repeatable
+`--input` flags, so the later source wins across sources. An input file must be
+a JSON object. Each CLI value uses `key=value`; JSON values are parsed and
+other values remain text. Duplicate CLI keys, unknown inputs, missing required
+inputs, and attempts to change a persisted run input fail closed.
+
+Codex precedence is step, run flags, session, configured target, then Codex's
+normal configuration. Profiles contain only letters, numbers, hyphens, and
+underscores. Reasoning effort is `minimal`, `low`, `medium`, `high`, or
+`xhigh`.
+
+The CLI resolves `type: workflow` children beside the entry workflow unless
+repository `.agent-flow.yml` sets a repository-relative `workflows` file or
+directory. Reachable children are validated before execution, run as linked
+children, and resume through the parent run. Nested input expressions must be
+whole values using `step.id`, `inputs.<name>`, or `artifacts.<path>`; embedded
+expressions are rejected during preflight. A direct `mcp_call` requires a
+programmatic host adapter; the stock CLI supports `via: codex` with a named,
+resumable Codex session, exactly one output artifact, and the MCP server
+configured in the installed Codex. That artifact is bound to the completed MCP
+event result rather than Codex's final model-authored message.
 
 ## Retention and portability commands
 

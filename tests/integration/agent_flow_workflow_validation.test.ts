@@ -1933,6 +1933,286 @@ steps:
     ]);
   });
 
+  test("validates Codex profile and reasoning options on sessions and steps", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: invalid-codex-options
+version: 1
+style: pipeline
+maturity: experimental
+limits: { max_frontier_calls: 1 }
+sessions:
+  worker:
+    provider: codex
+    codex: { profile: ../bad, reasoning_effort: extreme }
+steps:
+  - id: ask
+    type: session_request
+    session: worker
+    prompt: request.md
+    inputs: [input.md]
+    outputs: [output.md]
+    codex: { profile: ../step, reasoning_effort: extreme }
+`);
+
+    expect(validateAgentFlowWorkflow(workflow).errors).toEqual([
+      {
+        code: "workflow.codex.profile.invalid",
+        message: "Codex profile must contain only letters, numbers, hyphens, and underscores.",
+        path: "sessions.worker.codex.profile"
+      },
+      {
+        code: "workflow.codex.reasoning_effort.invalid",
+        message: "Codex reasoning_effort must be minimal, low, medium, high, or xhigh.",
+        path: "sessions.worker.codex.reasoning_effort"
+      },
+      {
+        code: "workflow.codex.profile.invalid",
+        message: "Codex profile must contain only letters, numbers, hyphens, and underscores.",
+        path: "steps[0].codex.profile",
+        stepId: "ask"
+      },
+      {
+        code: "workflow.codex.reasoning_effort.invalid",
+        message: "Codex reasoning_effort must be minimal, low, medium, high, or xhigh.",
+        path: "steps[0].codex.reasoning_effort",
+        stepId: "ask"
+      }
+    ]);
+  });
+
+  test("publishes the runtime Codex model constraints in the workflow schema", () => {
+    const schema = JSON.parse(fs.readFileSync(path.join(repoRoot, "schemas/workflow.schema.json"), "utf8")) as {
+      $defs: { codexOptions: { properties: { model: unknown } } };
+    };
+
+    expect(schema.$defs.codexOptions.properties.model).toEqual({
+      type: "string",
+      minLength: 1,
+      pattern: "^\\S(?:.*\\S)?$",
+      not: { pattern: "[\\u0000-\\u001F\\u007F-\\u009F]" }
+    });
+  });
+
+  test("requires Codex-mediated MCP sessions to be resumable", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: non-resumable-codex-mcp
+version: 1
+style: pipeline
+maturity: experimental
+limits: { max_frontier_calls: 1 }
+sessions:
+  agent: { provider: codex, resume: false }
+steps:
+  - id: fetch
+    type: mcp_call
+    via: codex
+    session: agent
+    server: atlassian
+    tool: get_issue
+    arguments: { key: AF-1 }
+    outputs: [ticket.json]
+`);
+
+    expect(validateAgentFlowWorkflow(workflow).errors).toContainEqual({
+      code: "workflow.mcp_call.session.not_resumable",
+      message: 'Codex-mediated MCP call session "agent" must declare resume: true.',
+      path: "steps[0].session",
+      stepId: "fetch"
+    });
+  });
+
+  test("requires static nested-workflow and Codex MCP targets", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: dynamic-linked-targets
+version: 1
+style: pipeline
+maturity: experimental
+limits: { max_frontier_calls: 1 }
+inputs:
+  child: { required: true }
+  session_name: { required: true }
+sessions:
+  agent: { provider: codex, resume: true }
+steps:
+  - { id: child, type: workflow, workflow: "{{ inputs.child }}", inputs: {}, outputs: [child.json] }
+  - { id: fetch, type: mcp_call, via: codex, session: "{{ inputs.session_name }}", server: jira, tool: get, arguments: {}, outputs: [ticket.json] }
+`);
+
+    expect(validateAgentFlowWorkflow(workflow).errors).toEqual(expect.arrayContaining([
+      {
+        code: "workflow.workflow.target.dynamic",
+        message: "Nested workflow targets must be static non-empty names.",
+        path: "steps[0].workflow",
+        stepId: "child"
+      },
+      {
+        code: "workflow.mcp_call.session.dynamic",
+        message: "Codex-mediated MCP calls require a static declared session.",
+        path: "steps[1].session",
+        stepId: "fetch"
+      }
+    ]));
+  });
+
+  test("requires Codex-mediated MCP calls to declare exactly one output", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: multi-output-codex-mcp
+version: 1
+style: pipeline
+maturity: experimental
+limits: { max_frontier_calls: 1 }
+sessions:
+  agent: { provider: codex, resume: true }
+steps:
+  - { id: fetch, type: mcp_call, via: codex, session: agent, server: jira, tool: get, arguments: {}, outputs: [one.json, two.json] }
+`);
+
+    expect(validateAgentFlowWorkflow(workflow).errors).toContainEqual({
+      code: "workflow.mcp_call.outputs.single",
+      message: "Codex-mediated MCP calls require exactly one output artifact.",
+      path: "steps[0].outputs",
+      stepId: "fetch"
+    });
+
+    const schema = JSON.parse(fs.readFileSync(path.join(repoRoot, "schemas/workflow.schema.json"), "utf8")) as {
+      $defs: { step: { allOf: unknown[] } };
+    };
+    expect(schema.$defs.step.allOf).toContainEqual({
+      if: {
+        properties: {
+          type: { const: "mcp_call" },
+          via: { const: "codex" }
+        },
+        required: ["type", "via"]
+      },
+      then: {
+        properties: {
+          outputs: { type: "array", minItems: 1, maxItems: 1 }
+        }
+      }
+    });
+  });
+
+  test("requires Codex-mediated MCP calls to use known Codex providers", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: incompatible-codex-mcp-providers
+version: 1
+style: pipeline
+maturity: experimental
+limits: { max_frontier_calls: 2 }
+sessions:
+  fixture_agent: { provider: fixture, resume: true }
+  api_agent: { provider: api, resume: true }
+  custom_agent: { provider: custom-session-adapter, resume: true }
+steps:
+  - { id: fixture_call, type: mcp_call, via: codex, session: fixture_agent, server: jira, tool: get, arguments: {}, outputs: [fixture.json] }
+  - { id: api_call, type: mcp_call, via: codex, session: api_agent, server: jira, tool: get, arguments: {}, outputs: [api.json] }
+  - { id: custom_call, type: mcp_call, via: codex, session: custom_agent, server: jira, tool: get, arguments: {}, outputs: [custom.json] }
+`);
+
+    const validation = validateAgentFlowWorkflow(workflow, (provider) => provider === "api"
+      ? { kind: "frontier", driver: "openai-responses" }
+      : provider === "custom-session-adapter" ? { kind: "custom" } : undefined);
+    expect(validation.errors.filter((issue) => issue.code === "workflow.mcp_call.session.provider.invalid"))
+      .toEqual([
+        {
+          code: "workflow.mcp_call.session.provider.invalid",
+          message: 'Codex-mediated MCP call session "fixture_agent" must use the built-in Codex provider, a Codex profile, or a configured codex-cli provider.',
+          path: "steps[0].session",
+          stepId: "fixture_call"
+        },
+        {
+          code: "workflow.mcp_call.session.provider.invalid",
+          message: 'Codex-mediated MCP call session "api_agent" must use the built-in Codex provider, a Codex profile, or a configured codex-cli provider.',
+          path: "steps[1].session",
+          stepId: "api_call"
+        },
+        {
+          code: "workflow.mcp_call.session.provider.invalid",
+          message: 'Codex-mediated MCP call session "custom_agent" must use the built-in Codex provider, a Codex profile, or a configured codex-cli provider.',
+          path: "steps[2].session",
+          stepId: "custom_call"
+        }
+      ]);
+  });
+
+  test("rejects noncanonical nested-workflow output paths", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: invalid-nested-outputs
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: child
+    type: workflow
+    workflow: nested
+    inputs: {}
+    outputs: [../x, a/../x, " x "]
+`);
+
+    expect(validateAgentFlowWorkflow(workflow).errors.filter((issue) =>
+      issue.code === "workflow.workflow.output.invalid"
+    )).toEqual([
+      {
+        code: "workflow.workflow.output.invalid",
+        message: "Nested workflow outputs must contain normalized static repo-relative artifact paths.",
+        path: "steps[0].outputs[0]",
+        stepId: "child"
+      },
+      {
+        code: "workflow.workflow.output.invalid",
+        message: "Nested workflow outputs must contain normalized static repo-relative artifact paths.",
+        path: "steps[0].outputs[1]",
+        stepId: "child"
+      },
+      {
+        code: "workflow.workflow.output.invalid",
+        message: "Nested workflow outputs must contain normalized static repo-relative artifact paths.",
+        path: "steps[0].outputs[2]",
+        stepId: "child"
+      }
+    ]);
+  });
+
+  test("rejects duplicate nested-workflow output paths", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: duplicate-nested-outputs
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - id: child
+    type: workflow
+    workflow: nested
+    inputs: {}
+    outputs: [result.json, result.json]
+    overwrite: true
+`);
+
+    expect(validateAgentFlowWorkflow(workflow).errors).toContainEqual({
+      code: "workflow.workflow.output.duplicate",
+      message: 'Nested workflow outputs must not contain duplicate artifact path "result.json".',
+      path: "steps[0].outputs[1]",
+      stepId: "child"
+    });
+  });
+
+  test("allows nested workflow failures to use recovery routes", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: nested-workflow-recovery-route
+version: 1
+style: recovery_pipeline
+maturity: experimental
+sessions:
+  fixer: { provider: local }
+steps:
+  - id: child
+    type: workflow
+    workflow: nested
+    inputs: {}
+    outputs: [result.json]
+    on_failure:
+      route_to: { session: fixer, prompt: fix.md }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+
+    expect(validateAgentFlowWorkflow(workflow).errors.map((issue) => issue.code))
+      .not.toContain("workflow.recovery.step.unsupported");
+  });
+
   test("rejects malformed session authority mappings and capability flags", () => {
     const workflow = parseAgentFlowWorkflowOrThrow(`name: malformed-session-authority
 version: 1
@@ -3273,7 +3553,7 @@ steps: []
       enum: ["ask_user", "arbiter", "arbiter_then_user", "owner_decides", "fail"]
     });
     expect(Object.keys(schema.$defs.session.properties ?? {}).sort()).toEqual([
-      "authority", "file_scope", "owns", "provider", "resume", "role"
+      "authority", "codex", "file_scope", "owns", "provider", "resume", "role"
     ]);
     expect(schema.$defs.step.properties).toMatchObject({
       allow_overlap: { type: "boolean" },

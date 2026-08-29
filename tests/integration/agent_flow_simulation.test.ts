@@ -1546,7 +1546,7 @@ steps:
     expect(result.availableArtifacts).toEqual(["body.json", "steps.json"]);
   });
 
-  test("checks artifact references nested in mapped inputs", () => {
+  test("treats literal nested-workflow inputs as values rather than artifact references", () => {
     const workflow = parseAgentFlowWorkflowOrThrow(`name: mapped-input
 version: 1
 style: pipeline
@@ -1559,10 +1559,142 @@ steps:
 `);
     const result = simulateAgentFlowWorkflow(workflow, {});
 
-    expect(result.status).toBe("unresolved");
-    expect(result.missingArtifacts).toEqual([
-      { stepId: "nested", artifact: "missing.json", kind: "input" }
+    expect(result.status).toBe("completed");
+    expect(result.missingArtifacts).toEqual([]);
+  });
+
+  test("checks explicit artifact references in nested-workflow inputs", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: mapped-artifact-input
+version: 1
+style: pipeline
+maturity: draft
+steps:
+  - id: nested
+    type: workflow
+    workflow: child
+    inputs: { payload: "{{ artifacts.github.pr_url }}" }
+`);
+    const missing = simulateAgentFlowWorkflow(workflow, {});
+    const available = simulateAgentFlowWorkflow(workflow, {
+      artifacts: { "github/pr_url": "https://example.test/pull/1" }
+    });
+
+    expect(missing.status).toBe("unresolved");
+    expect(missing.missingArtifacts).toEqual([
+      { stepId: "nested", artifact: "github/pr_url", kind: "input" }
     ]);
+    expect(available.status).toBe("completed");
+    expect(available.missingArtifacts).toEqual([]);
+  });
+
+  test("rejects nested-workflow artifact expressions whose property is missing", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: missing-mapped-artifact-property
+version: 1
+style: pipeline
+maturity: draft
+steps:
+  - id: nested
+    type: workflow
+    workflow: child
+    inputs: { payload: "{{ artifacts.config.missing }}" }
+    outputs: [done.txt]
+`);
+    const result = simulateAgentFlowWorkflow(workflow, {
+      artifacts: { "config.json": { present: true } },
+      steps: { nested: { outputs: { "done.txt": "unexpected" } } }
+    });
+
+    expect(result.status).toBe("unresolved");
+    expect(result.visitedSteps).toEqual([{ id: "nested", type: "workflow", outcome: "failed" }]);
+    expect(result.availableArtifacts).toEqual(["config.json"]);
+    expect(result.unresolvedBranches[0]?.reason)
+      .toContain("does not resolve a published artifact value");
+  });
+
+  test("routes nested-workflow input resolution failures through on_failure", () => {
+    for (const input of [
+      "{{ artifacts.missing }}",
+      "{{ artifacts.config.missing }}"
+    ]) {
+      const workflow = parseAgentFlowWorkflowOrThrow(`name: routed-nested-input-failure
+version: 1
+style: pipeline
+maturity: draft
+steps:
+  - id: nested
+    type: workflow
+    workflow: child
+    inputs: { payload: "${input}" }
+    on_failure: { retry: 1, then: continue, allowed: true }
+  - { id: done, type: result, status: completed }
+`);
+      const result = simulateAgentFlowWorkflow(workflow, {
+        artifacts: { "config.json": { present: true } }
+      });
+
+      expect(result.status).toBe("completed");
+      expect(result.visitedSteps).toEqual([
+        { id: "nested", type: "workflow", outcome: "failed" },
+        { id: "nested", type: "workflow", outcome: "failed" },
+        { id: "done", type: "result", outcome: "succeeded" }
+      ]);
+      expect(result.unresolvedBranches).toEqual([]);
+    }
+  });
+
+  test("rejects ambiguous artifact aliases in nested-workflow inputs", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: ambiguous-mapped-artifact-input
+version: 1
+style: pipeline
+maturity: draft
+steps:
+  - id: nested
+    type: workflow
+    workflow: child
+    inputs: { payload: "{{ artifacts.foo_bar }}" }
+`);
+    const result = simulateAgentFlowWorkflow(workflow, {
+      artifacts: {
+        "foo-bar.json": { source: "hyphen" },
+        "foo_bar.json": { source: "underscore" }
+      }
+    });
+
+    expect(result.status).toBe("unresolved");
+    expect(result.unresolvedBranches).toEqual([{
+      stepId: "nested",
+      reason: "Workflow input artifact reference {{ artifacts.foo_bar }} matches multiple published artifacts: foo-bar.json, foo_bar.json."
+    }]);
+  });
+
+  test("requires overwrite authority for nested-workflow output collisions", () => {
+    const workflow = (overwrite: boolean) => parseAgentFlowWorkflowOrThrow(`name: nested-output-collision-${overwrite}
+version: 1
+style: pipeline
+maturity: draft
+steps:
+  - id: nested
+    type: workflow
+    workflow: child
+    inputs: {}
+    outputs: [shared.txt]
+    overwrite: ${overwrite}
+`);
+    const fixture = {
+      artifacts: { "shared.txt": "parent" },
+      steps: { nested: { outputs: { "shared.txt": "child" } } }
+    };
+    const rejected = simulateAgentFlowWorkflow(workflow(false), fixture);
+    const allowed = simulateAgentFlowWorkflow(workflow(true), fixture);
+
+    expect(rejected.status).toBe("unresolved");
+    expect(rejected.unresolvedBranches).toEqual([{
+      stepId: "nested",
+      reason: "Artifact shared.txt already exists; declare overwrite: true to replace it during simulation."
+    }]);
+    expect(rejected.artifactValues["shared.txt"]).toBe("parent");
+    expect(allowed.status).toBe("completed");
+    expect(allowed.artifactValues["shared.txt"]).toBe("child");
   });
 
   test("marks exhausted retry-only failures as failed", () => {

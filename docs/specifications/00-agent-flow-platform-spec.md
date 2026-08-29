@@ -43,7 +43,8 @@ One executable unit. A step can run a command, call a model session, call MCP, e
 
 ### Session
 
-A resumable model interaction context. Sessions may use a local model, frontier model, or named Codex profile.
+A resumable model interaction context. Sessions may use a local model, frontier
+model, the built-in pass-through Codex provider, or a named Codex profile.
 
 ### Artifact
 
@@ -126,8 +127,8 @@ Valid run statuses:
 |---|---|
 | `command` | Run a deterministic shell command |
 | `session_request` | Send prompt/artifacts to a named model session |
-| `mcp_call` | Call an MCP tool directly |
-| `workflow` | Invoke another workflow as a step |
+| `mcp_call` | Call an MCP tool through a direct host adapter or a named Codex session |
+| `workflow` | Execute a linked child run and promote parent-selected outputs that the child declares |
 | `condition` | Branch based on state or artifacts |
 | `loop` | Repeat steps until a condition or limit |
 | `manual_gate` | Ask user for approval |
@@ -351,7 +352,7 @@ agent-flow validate <workflow>
 agent-flow lint <workflow>
 agent-flow graph <workflow>
 agent-flow simulate <workflow>
-agent-flow run <workflow> --input key=value
+agent-flow run <workflow> --id <run-id> [--input key=value] [--input-file inputs.json]
 agent-flow resume <run-id> --outcome <choice> [--fixture <file>]
 agent-flow resume <run-id> --answer <value> [--fixture <file>]
 agent-flow resume <run-id> --reset-session <session-name> [--fixture <file>] [--config <file>]
@@ -374,7 +375,7 @@ agent-flow cleanup <run-id>
 3. Command, session, condition, manual gate, and input request runners.
 4. Pipeline workflow support.
 5. Failure payloads and recovery workflows.
-6. Nested workflows and loops.
+6. Nested workflows. Loop execution remains a later phase.
 7. Collaboration model.
 8. Notifications.
 9. Cleanup and archival.

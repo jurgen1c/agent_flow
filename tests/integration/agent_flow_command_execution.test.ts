@@ -2393,6 +2393,7 @@ steps:
 
   test("preserves failed status when a running command is interrupted by terminal finalization", async () => {
     const repoRoot = temporaryRepo();
+    const commandCompletedMarker = path.join(repoRoot, "wait-command-completed");
     const marker = path.join(repoRoot, "second-step-started");
     const workflow = parseAgentFlowWorkflowOrThrow(`
 name: failed-run
@@ -2402,7 +2403,7 @@ maturity: experimental
 steps:
   - id: wait
     type: command
-    command: sleep 2
+    command: sleep 2; touch wait-command-completed
   - id: mutate
     type: command
     command: touch second-step-started
@@ -2410,7 +2411,6 @@ steps:
     const store = await openAgentFlowRunState({ cwd: repoRoot });
     createAgentFlowLifecycleRun(store, { id: "run-failed", workflow });
 
-    const startedAt = Date.now();
     const execution = executeAgentFlowCommandPipeline(store, "run-failed", workflow);
     setTimeout(() => {
       store.updateRun("run-failed", {
@@ -2434,7 +2434,7 @@ steps:
       status: "failed",
       message: "Required lifecycle notification failed."
     });
-    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    expect(fs.existsSync(commandCompletedMarker)).toBe(false);
     expect(fs.existsSync(marker)).toBe(false);
     expect(store.listEvents("run-failed")).toContainEqual(expect.objectContaining({
       type: "step.interrupted",

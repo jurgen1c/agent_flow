@@ -11,17 +11,19 @@ inputs:
 
 sessions:
   lm:
-    provider: local
+    provider: codex
     resume: true
     role: orchestrator
   fm:
-    provider: frontier
+    provider: codex
     resume: true
     role: implementer
 
 steps:
   - id: fetch_ticket
     type: mcp_call
+    via: codex
+    session: lm
     server: atlassian-rovo-mcp
     tool: get_issue
     arguments:
@@ -96,6 +98,8 @@ steps:
     workflow: pr-feedback-loop
     inputs:
       pr_url: "{{ artifacts.github.pr_url }}"
+    outputs:
+      - github/pr-state.json
     on_failure:
       then: pause
 

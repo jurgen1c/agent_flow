@@ -23,6 +23,7 @@ import {
   type AgentFlowSessionProviderRegistry
 } from "./session_request";
 import {
+  createAgentFlowWorkflowRegistryFromSnapshot,
   createAgentFlowWorkflowRegistry,
   type AgentFlowWorkflowRegistry
 } from "./recovery";
@@ -66,13 +67,16 @@ export interface AgentFlowRunActionAvailability {
 }
 
 export interface AgentFlowRunActionWaitingState {
-  kind: "approval" | "manual_gate" | "input_request" | "disagreement" | "provider_session";
+  kind: "approval" | "manual_gate" | "input_request" | "disagreement" | "provider_session" | "workflow";
   stepId: string;
   prompt: string;
   validOutcomes: string[];
   saveAs: string | null;
   approvalId: string | null;
   sessionId?: string;
+  childRunId?: string;
+  childStatus?: "paused" | "completed" | "failed" | "cancelled";
+  nestedKind?: Exclude<AgentFlowRunActionWaitingState["kind"], "workflow">;
 }
 
 export interface AgentFlowRunActionSnapshot {
@@ -121,6 +125,7 @@ export function buildAgentFlowRunActionSnapshot(
     throw new AgentFlowRunStateError(`Agent Flow run ${runId} was not found.`, "AGENT_FLOW_RUN_NOT_FOUND");
   }
   let waitingResult = parseWaitingState(run.context.waiting);
+  let waitingRun = run;
   if (waitingResult.error === null && run.context.waiting !== undefined) {
     try {
       validateAgentFlowPipelineWaitingState(run.context.waiting);
@@ -131,16 +136,46 @@ export function buildAgentFlowRunActionSnapshot(
       };
     }
   }
-  const approvals = store.listApprovals(runId);
+  if (waitingResult.error === null && waitingResult.waiting?.kind === "workflow") {
+    const nested = resolveNestedActionWaitingState(store, waitingResult.waiting);
+    waitingResult = { waiting: nested.waiting, error: nested.error };
+    waitingRun = nested.run ?? run;
+  }
+  const approvals = store.listApprovals(waitingRun.id);
+  let guardedLineage: Array<{
+    run: AgentFlowRunRecord;
+    approvals: AgentFlowApprovalRecord[];
+  }> = [{
+    run,
+    approvals: run.id === waitingRun.id ? approvals : store.listApprovals(run.id)
+  }];
   const warnings: AgentFlowRunActionWarning[] = [];
   let staleApprovals: AgentFlowRunActionSnapshot["staleApprovals"] = [];
   let approvalEvidenceValid = true;
   try {
-    staleApprovals = detectStaleApprovals(
+    const guardedRuns = nestedActionApprovalLineage(store, run, waitingRun);
+    const guardedRunIds = new Set(guardedRuns.map((entry) => entry.id));
+    if (waitingResult.waiting?.kind === "workflow" && waitingResult.waiting.childStatus === "completed") {
+      const completedWaitingDescendants = completedPromotedDescendants(store, waitingRun, guardedRunIds);
+      completedWaitingDescendants.forEach((entry) => guardedRunIds.add(entry.id));
+      guardedRuns.push(...completedWaitingDescendants);
+    }
+    guardedRuns.push(...completedPromotedDescendants(
       store,
-      runId,
-      approvals,
-      waitingResult.waiting?.approvalId ?? undefined
+      run,
+      guardedRunIds
+    ));
+    guardedLineage = guardedRuns.map((lineageRun) => ({
+      run: lineageRun,
+      approvals: lineageRun.id === waitingRun.id ? approvals : store.listApprovals(lineageRun.id)
+    }));
+    staleApprovals = guardedLineage.flatMap(({ run: lineageRun, approvals: lineageApprovals }) =>
+      detectStaleApprovals(
+        store,
+        lineageRun.id,
+        lineageApprovals,
+        lineageRun.id === waitingRun.id ? waitingResult.waiting?.approvalId ?? undefined : undefined
+      )
     );
   } catch (error) {
     approvalEvidenceValid = false;
@@ -186,6 +221,7 @@ export function buildAgentFlowRunActionSnapshot(
       });
     }
   }
+
   if (waitingResult.error !== null) {
     warnings.push({
       code: "action.waiting.invalid",
@@ -209,11 +245,11 @@ export function buildAgentFlowRunActionSnapshot(
     status: string;
   }> = [];
   let disagreementEvidenceValid = true;
-  if (waiting?.kind === "disagreement") {
+  if (effectiveWaitingKind(waiting) === "disagreement") {
     try {
-      const persistedWaiting = run.context.waiting as Record<string, AgentFlowRunStateValue>;
+      const persistedWaiting = waitingRun.context.waiting as Record<string, AgentFlowRunStateValue>;
       disagreementEvidence = validatedApprovalEvidence(persistedWaiting.evidence, true).map((entry) => {
-        const metadata = store.getArtifactMetadataForInspection(runId, entry.path);
+        const metadata = store.getArtifactMetadataForInspection(waitingRun.id, entry.path);
         if (metadata === null) {
           return { ...entry, expectedChecksum: entry.checksum, currentChecksum: null, status: "missing" };
         }
@@ -249,9 +285,10 @@ export function buildAgentFlowRunActionSnapshot(
   const activeApproval = waiting?.approvalId === null || waiting?.approvalId === undefined
     ? null
     : approvals.find((approval) => approval.id === waiting.approvalId) ?? null;
-  if (waiting?.kind === "approval" && activeApproval !== null) {
+  const interactionKind = effectiveWaitingKind(waiting);
+  if (interactionKind === "approval" && activeApproval !== null) {
     try {
-      const persistedWaiting = run.context.waiting as Record<string, AgentFlowRunStateValue>;
+      const persistedWaiting = waitingRun.context.waiting as Record<string, AgentFlowRunStateValue>;
       const waitingEvidence = validatedApprovalEvidence(persistedWaiting.evidence, true);
       const approvalEvidence = validatedApprovalEvidence(activeApproval.context.evidence, true);
       if (!isDeepStrictEqual(approvalEvidence, waitingEvidence)) {
@@ -290,8 +327,7 @@ export function buildAgentFlowRunActionSnapshot(
     activeApprovalBlockReason
   );
   const guardPayload = {
-    run,
-    approvals,
+    lineage: guardedLineage,
     waiting,
     disagreementEvidence,
     staleApprovals,
@@ -368,6 +404,7 @@ export async function executeAgentFlowRunAction(
       409
     );
   }
+  const workflows = runtime.workflows ?? persistedWorkflowRegistry(run, workflow);
 
   let changed = true;
   let completedSteps: string[] = [];
@@ -376,7 +413,7 @@ export async function executeAgentFlowRunAction(
     const response = input.action === "provide_input"
       ? { answer: input.answer! }
       : {
-          outcome: input.action === "reject" && initialSnapshot.waiting?.kind === "disagreement"
+          outcome: input.action === "reject" && effectiveWaitingKind(initialSnapshot.waiting) === "disagreement"
             ? "request_changes"
             : input.action,
           decidedBy: "local-ui"
@@ -390,33 +427,48 @@ export async function executeAgentFlowRunAction(
       runtime.sessionProviders ?? createAgentFlowSessionProviderRegistry(),
       runtime.mcpCalls ?? createAgentFlowMcpCallRegistry(),
       runtime.notifications ?? createAgentFlowNotificationRegistry(),
-      runtime.workflows ?? createAgentFlowWorkflowRegistry(),
+      workflows,
       assertCurrent
     );
     completedSteps = execution.completedSteps;
     message = execution.message ?? null;
   } else if (input.action === "resume") {
-    const execution = await executeAgentFlowCommandPipeline(
-      store,
-      runId,
-      workflow,
-      runtime.transforms ?? createAgentFlowArtifactTransformRegistry(),
-      runtime.sessionProviders ?? createAgentFlowSessionProviderRegistry(),
-      runtime.mcpCalls ?? createAgentFlowMcpCallRegistry(),
-      runtime.notifications ?? createAgentFlowNotificationRegistry(),
-      runtime.workflows ?? createAgentFlowWorkflowRegistry(),
-      () => {
-        store.withRunStateTransaction(runId, () => {
-          assertCurrent();
-          store.transitionRunWithEvent(runId, {
-            status: "pending",
-            allowedFrom: ["paused"],
-            event: { type: "run.resume", payload: { status: "pending" } }
-          });
-        });
-      },
-      assertCurrent
-    );
+    const nestedTerminal = initialSnapshot.waiting?.kind === "workflow"
+      && initialSnapshot.waiting.childStatus !== undefined;
+    const execution = nestedTerminal
+      ? await resumeAgentFlowCommandPipeline(
+          store,
+          runId,
+          workflow,
+          { outcome: "continue" },
+          runtime.transforms ?? createAgentFlowArtifactTransformRegistry(),
+          runtime.sessionProviders ?? createAgentFlowSessionProviderRegistry(),
+          runtime.mcpCalls ?? createAgentFlowMcpCallRegistry(),
+          runtime.notifications ?? createAgentFlowNotificationRegistry(),
+          workflows,
+          assertCurrent
+        )
+      : await executeAgentFlowCommandPipeline(
+          store,
+          runId,
+          workflow,
+          runtime.transforms ?? createAgentFlowArtifactTransformRegistry(),
+          runtime.sessionProviders ?? createAgentFlowSessionProviderRegistry(),
+          runtime.mcpCalls ?? createAgentFlowMcpCallRegistry(),
+          runtime.notifications ?? createAgentFlowNotificationRegistry(),
+          workflows,
+          undefined,
+          () => {
+            store.withRunStateTransaction(runId, () => {
+              assertCurrent();
+              store.transitionRunWithEvent(runId, {
+                status: "pending",
+                allowedFrom: ["paused"],
+                event: { type: "run.resume", payload: { status: "pending" } }
+              });
+            });
+          }
+        );
     completedSteps = execution.completedSteps;
     message = execution.message ?? null;
   } else {
@@ -504,6 +556,56 @@ function detectStaleApprovals(
   return [...stale.values()].sort((left, right) => left.id.localeCompare(right.id));
 }
 
+function nestedActionApprovalLineage(
+  store: AgentFlowRunStateStore,
+  rootRun: AgentFlowRunRecord,
+  waitingRun: AgentFlowRunRecord
+): AgentFlowRunRecord[] {
+  const lineage: AgentFlowRunRecord[] = [];
+  const visited = new Set<string>();
+  let current: AgentFlowRunRecord | null = waitingRun;
+  while (current !== null && !visited.has(current.id)) {
+    visited.add(current.id);
+    lineage.push(current);
+    if (current.id === rootRun.id) return lineage.reverse();
+    current = current.parentRunId === null ? null : store.getRun(current.parentRunId);
+  }
+  throw new AgentFlowRunStateError(
+    `Nested action run ${waitingRun.id} is not in run ${rootRun.id}'s parent lineage.`,
+    "AGENT_FLOW_RUN_LINEAGE_INVALID"
+  );
+}
+
+function completedPromotedDescendants(
+  store: AgentFlowRunStateStore,
+  rootRun: AgentFlowRunRecord,
+  visited: Set<string>
+): AgentFlowRunRecord[] {
+  const descendants: AgentFlowRunRecord[] = [];
+  const pending = [rootRun];
+  while (pending.length > 0) {
+    const parent = pending.pop()!;
+    const latestChildByStep = new Map<string, string>();
+    for (const event of store.listEvents(parent.id)) {
+      if (event.type !== "workflow.outputs.promoted" || event.stepId === null
+          || event.payload === null || typeof event.payload !== "object" || Array.isArray(event.payload)) continue;
+      const childRunId = event.payload.childRunId;
+      if (typeof childRunId === "string" && childRunId.trim().length > 0) {
+        latestChildByStep.set(event.stepId, childRunId.trim());
+      }
+    }
+    for (const childRunId of latestChildByStep.values()) {
+      if (visited.has(childRunId)) continue;
+      const child = store.getRun(childRunId);
+      if (child?.parentRunId !== parent.id || child.status !== "completed") continue;
+      visited.add(child.id);
+      descendants.push(child);
+      pending.push(child);
+    }
+  }
+  return descendants;
+}
+
 function relevantApprovals(
   approvals: AgentFlowApprovalRecord[],
   activeApprovalId?: string
@@ -575,23 +677,34 @@ function actionAvailability(
     : waiting === null
       ? "This run is not waiting for a gate decision."
       : null;
+  const interactionKind = effectiveWaitingKind(waiting);
   const canApprove = actionStateValid && !hasStaleApprovals && activeApprovalBlockReason === null
-    && (waiting?.kind === "approval" || waiting?.kind === "manual_gate" || waiting?.kind === "disagreement")
+    && waiting !== null
+    && (interactionKind === "approval" || interactionKind === "manual_gate" || interactionKind === "disagreement")
     && waiting.validOutcomes.includes("approve");
   const canReject = actionStateValid && !hasStaleApprovals && activeApprovalBlockReason === null
-    && (waiting?.kind === "approval" || waiting?.kind === "manual_gate" || waiting?.kind === "disagreement")
-    && waiting.validOutcomes.includes(waiting.kind === "disagreement" ? "request_changes" : "reject");
-  const canInput = actionStateValid && !hasStaleApprovals && waiting?.kind === "input_request";
-  const canResume = actionStateValid && !hasStaleApprovals && run.status === "paused" && waiting === null;
+    && waiting !== null
+    && (interactionKind === "approval" || interactionKind === "manual_gate" || interactionKind === "disagreement")
+    && waiting.validOutcomes.includes(interactionKind === "disagreement" ? "request_changes" : "reject");
+  const canInput = actionStateValid && !hasStaleApprovals && interactionKind === "input_request";
+  const canContinueWorkflow = waiting?.kind === "workflow" && waiting.childStatus !== undefined;
+  const staleApprovalBlocksResume = hasStaleApprovals
+    && (!canContinueWorkflow || waiting.childStatus === "paused" || waiting.childStatus === "completed");
+  const canResume = actionStateValid && !staleApprovalBlocksResume && run.status === "paused"
+    && (waiting === null || canContinueWorkflow);
   const canPause = actionStateValid && ["pending", "running", "waiting"].includes(run.status);
   const canCancel = actionStateValid && ["pending", "running", "waiting", "paused"].includes(run.status);
   return [
     action("approve", "Approve", canApprove, unavailable ?? activeApprovalBlockReason ?? outcomeReason ?? "Approve is not a valid outcome for this gate.", "Confirm approval after reviewing the warnings and evidence shown above."),
     action("reject", "Reject", canReject, unavailable ?? activeApprovalBlockReason ?? outcomeReason ?? "Reject is not a valid outcome for this gate.", "Reject this gate and continue along its configured rejection path?"),
     action("provide_input", "Provide input", canInput, unavailable ?? "This run is not waiting for input.", null),
-    action("resume", "Resume", canResume, unavailable ?? (waiting === null
+    action("resume", canContinueWorkflow
+      ? waiting?.childStatus === "paused" ? "Resume child" : "Settle child"
+      : "Resume", canResume, unavailable ?? (waiting === null
       ? "Only a paused run can resume."
-      : waiting.kind === "provider_session"
+      : canContinueWorkflow
+        ? "The linked child workflow cannot be continued."
+      : interactionKind === "provider_session"
         ? `Reset the unavailable provider session with agent-flow resume ${run.id} --reset-session ${waiting.sessionId}.`
         : "Respond to the waiting interaction instead of using plain resume."), null),
     action("pause", "Pause", canPause, unavailable ?? "Only a pending, running, or waiting run can pause.", null),
@@ -621,11 +734,12 @@ function parseWaitingState(value: AgentFlowRunStateValue | undefined): {
   const stepId = value.stepId;
   const prompt = value.prompt;
   const validOutcomes = value.validOutcomes;
-  if (!["approval", "manual_gate", "input_request", "disagreement", "provider_session"].includes(String(kind))
+  if (!["approval", "manual_gate", "input_request", "disagreement", "provider_session", "workflow"].includes(String(kind))
       || typeof stepId !== "string" || stepId.length === 0
       || typeof prompt !== "string" || prompt.length === 0
       || !Array.isArray(validOutcomes) || validOutcomes.some((outcome) => typeof outcome !== "string")
-      || (kind === "provider_session" && (typeof value.sessionId !== "string" || value.sessionId.length === 0))) {
+      || (kind === "provider_session" && (typeof value.sessionId !== "string" || value.sessionId.length === 0))
+      || (kind === "workflow" && (typeof value.childRunId !== "string" || value.childRunId.length === 0))) {
     return { waiting: null, error: "The persisted waiting state is malformed, so interaction actions are disabled." };
   }
   return {
@@ -636,10 +750,86 @@ function parseWaitingState(value: AgentFlowRunStateValue | undefined): {
       validOutcomes: validOutcomes as string[],
       saveAs: typeof value.saveAs === "string" ? value.saveAs : null,
       approvalId: typeof value.approvalId === "string" ? value.approvalId : null,
-      ...(kind === "provider_session" ? { sessionId: value.sessionId as string } : {})
+      ...(kind === "provider_session" ? { sessionId: value.sessionId as string } : {}),
+      ...(kind === "workflow" ? { childRunId: value.childRunId as string } : {})
     },
     error: null
   };
+}
+
+function resolveNestedActionWaitingState(
+  store: AgentFlowRunStateStore,
+  parentWaiting: AgentFlowRunActionWaitingState
+): {
+  waiting: AgentFlowRunActionWaitingState | null;
+  error: string | null;
+  run: AgentFlowRunRecord | null;
+} {
+  const visited = new Set<string>();
+  let waiting = parentWaiting;
+  let run: AgentFlowRunRecord | null = null;
+  while (waiting.kind === "workflow") {
+    const childRunId = waiting.childRunId!;
+    if (visited.has(childRunId)) {
+      return { waiting: null, error: "The nested workflow waiting lineage is recursive.", run };
+    }
+    visited.add(childRunId);
+    run = store.getRun(childRunId);
+    if (run === null) {
+      return { waiting: null, error: "The nested child workflow is missing.", run };
+    }
+    if (["completed", "failed", "cancelled"].includes(run.status)) {
+      return {
+        waiting: {
+          ...waiting,
+          childRunId: run.id,
+          childStatus: run.status as "completed" | "failed" | "cancelled"
+        },
+        error: null,
+        run
+      };
+    }
+    if (run.status !== "paused") {
+      return { waiting: null, error: "The nested child workflow is no longer paused.", run };
+    }
+    const parsed = parseWaitingState(run.context.waiting);
+    if (parsed.error !== null) {
+      return { waiting: null, error: parsed.error, run };
+    }
+    if (parsed.waiting === null) {
+      return {
+        waiting: { ...waiting, childRunId: run.id, childStatus: "paused" },
+        error: null,
+        run
+      };
+    }
+    try {
+      validateAgentFlowPipelineWaitingState(run.context.waiting!);
+    } catch (error) {
+      return {
+        waiting: null,
+        error: `The nested child waiting state is incomplete or malformed: ${error instanceof Error ? error.message : String(error)}`,
+        run
+      };
+    }
+    waiting = parsed.waiting;
+  }
+  return {
+    waiting: {
+      ...waiting,
+      kind: "workflow",
+      nestedKind: waiting.kind,
+      childRunId: run?.id
+    },
+    error: null,
+    run
+  };
+}
+
+function effectiveWaitingKind(
+  waiting: AgentFlowRunActionWaitingState | null
+): Exclude<AgentFlowRunActionWaitingState["kind"], "workflow"> | undefined {
+  return waiting?.kind === "workflow" ? waiting.nestedKind : waiting?.kind;
 }
 
 function persistedWorkflow(run: AgentFlowRunRecord): AgentFlowWorkflow | null {
@@ -647,6 +837,15 @@ function persistedWorkflow(run: AgentFlowRunRecord): AgentFlowWorkflow | null {
   return workflow !== null && typeof workflow === "object" && !Array.isArray(workflow)
     ? workflow as unknown as AgentFlowWorkflow
     : null;
+}
+
+function persistedWorkflowRegistry(
+  run: AgentFlowRunRecord,
+  workflow: AgentFlowWorkflow
+): AgentFlowWorkflowRegistry {
+  return run.context.workflowRegistry === undefined
+    ? createAgentFlowWorkflowRegistry().register(workflow.name, workflow)
+    : createAgentFlowWorkflowRegistryFromSnapshot(run.context.workflowRegistry);
 }
 
 function assertRunAction(value: string): asserts value is AgentFlowRunAction {

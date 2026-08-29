@@ -9,11 +9,15 @@ import {
   MAX_AGENT_FLOW_PORTABLE_ARCHIVE_CONTENT_BYTES,
   applyAgentFlowRetention,
   createAgentFlowLifecycleRun,
+  createAgentFlowWorkflowRegistry,
   defaultAgentFlowArchivePath,
   defaultAgentFlowExportPath,
+  executeAgentFlowCommandPipeline,
+  loadAgentFlowWorkflowRegistry,
   openAgentFlowRunState,
   parseAgentFlowWorkflowOrThrow,
   plannedAgentFlowRuntimeCommands,
+  serializeAgentFlowWorkflowRegistry,
   writeAgentFlowPortableArchive,
   writeAgentFlowFinalSummary
 } from "../../src/runtime";
@@ -75,7 +79,7 @@ describe("Agent Flow CLI", () => {
     });
     expect(dispatch(["help", "run"])).toEqual({
       exitCode: 0,
-      stdout: "agent-flow run\n\nUsage: agent-flow run <workflow> --id <run-id> [--fixture <file>]"
+      stdout: "agent-flow run\n\nUsage: agent-flow run <workflow> --id <run-id> [--fixture <file>] [--input <key=value>] [--input-file <json>] [--profile <name>] [--model <name>] [--reasoning-effort <level>]"
     });
     expect(dispatch(["help", "inject"])).toEqual({
       exitCode: 0,
@@ -107,6 +111,145 @@ describe("Agent Flow CLI", () => {
     expect(invalid.exitCode).toBe(2);
     expect(invalid.stderr).toContain("workflow.command.unsafe");
     expect(invalid.stderr).toContain("workflow.loop.unbounded");
+  });
+
+  test("validates reachable workflow registries and child input contracts before run creation", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-registry-validation-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const parentPath = path.join(repo, "parent.yml");
+    fs.writeFileSync(parentPath, `
+name: registry-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: child, type: workflow, workflow: registry-child, inputs: { typo: value }, outputs: [out.txt] }
+`);
+
+    const missing = dispatch(["validate", parentPath], { cwd: repo });
+    expect(missing).toMatchObject({ exitCode: 2 });
+    expect(missing.stderr).toContain("references missing workflow registry-child");
+    const simulationFixture = path.join(repo, "simulation.json");
+    fs.writeFileSync(simulationFixture, JSON.stringify({
+      steps: { child: { outputs: { "out.txt": "simulated" } } }
+    }));
+    const missingSimulation = dispatch(["simulate", parentPath, "--fixture", simulationFixture], { cwd: repo });
+    expect(missingSimulation).toMatchObject({ exitCode: 2 });
+    expect(missingSimulation.stderr).toContain("references missing workflow registry-child");
+
+    fs.writeFileSync(path.join(repo, "child.yml"), `
+name: registry-child
+version: 1
+style: pipeline
+maturity: experimental
+inputs:
+  ticket: { required: true }
+steps:
+  - { id: done, type: result, status: completed }
+`);
+    const invalidInputs = dispatch(["validate", parentPath], { cwd: repo });
+    expect(invalidInputs).toMatchObject({ exitCode: 2 });
+    expect(invalidInputs.stderr).toContain("supplies unknown inputs to registry-child: typo");
+    const invalidSimulation = dispatch(["simulate", parentPath, "--fixture", simulationFixture], { cwd: repo });
+    expect(invalidSimulation).toMatchObject({ exitCode: 2 });
+    expect(invalidSimulation.stderr).toContain("supplies unknown inputs to registry-child: typo");
+
+    const run = await captureCli(["run", parentPath, "--id", "invalid-child-contract"], repo);
+    expect(run).toMatchObject({ exitCode: 1 });
+    expect(run.stderr).toContain("supplies unknown inputs to registry-child: typo");
+    const store = await openAgentFlowRunState({ cwd: repo });
+    expect(store.getRun("invalid-child-contract")).toBeNull();
+    store.close();
+
+    fs.writeFileSync(parentPath, `
+name: registry-parent
+version: 1
+style: pipeline
+maturity: experimental
+inputs:
+  id: { required: true }
+steps:
+  - { id: before, type: command, command: "touch before-child.txt" }
+  - { id: child, type: workflow, workflow: registry-child, inputs: { ticket: "prefix-{{ inputs.id }}" }, outputs: [out.txt] }
+`);
+    const invalidExpression = dispatch(["validate", parentPath], { cwd: repo });
+    expect(invalidExpression).toMatchObject({ exitCode: 2 });
+    expect(invalidExpression.stderr).toContain("expressions must occupy the whole value");
+    const expressionRun = await captureCli([
+      "run", parentPath, "--id", "invalid-child-expression", "--input", "id=AF-1"
+    ], repo);
+    expect(expressionRun).toMatchObject({ exitCode: 1 });
+    expect(expressionRun.stderr).toContain("expressions must occupy the whole value");
+    expect(fs.existsSync(path.join(repo, "before-child.txt"))).toBe(false);
+    const expressionStore = await openAgentFlowRunState({ cwd: repo });
+    expect(expressionStore.getRun("invalid-child-expression")).toBeNull();
+    expressionStore.close();
+
+    fs.writeFileSync(parentPath, `
+name: registry-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: child, type: workflow, workflow: registry-child, inputs: { ticket: value }, outputs: [out.txt] }
+`);
+    fs.writeFileSync(path.join(repo, "child.yml"), `
+name: registry-child
+version: 1
+style: pipeline
+maturity: experimental
+inputs:
+  ticket: { required: true }
+steps:
+  - { id: parent, type: workflow, workflow: registry-parent, inputs: {}, outputs: [parent.txt] }
+`);
+    const recursiveSimulation = dispatch(["simulate", parentPath, "--fixture", simulationFixture], { cwd: repo });
+    expect(recursiveSimulation).toMatchObject({ exitCode: 2 });
+    expect(recursiveSimulation.stderr).toContain("Recursive workflow reference detected");
+  });
+
+  test("uses configured target drivers when validating Codex-mediated MCP calls", () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-codex-driver-validation-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const configHome = path.join(repo, "config");
+    fs.mkdirSync(path.join(configHome, "agent-flow"), { recursive: true });
+    fs.writeFileSync(path.join(repo, ".agent-flow.yml"), `
+version: 1
+providers:
+  wrong: { kind: frontier, target: claude-main }
+`);
+    fs.writeFileSync(path.join(configHome, "agent-flow", "config.yml"), `
+version: 1
+targets:
+  claude-main:
+    kind: frontier
+    driver: claude-code
+    model: claude-test
+    enabled: true
+`);
+    const workflowPath = path.join(repo, "workflow.yml");
+    fs.writeFileSync(workflowPath, `
+name: wrong-codex-driver
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  agent: { provider: wrong, resume: true }
+limits: { max_frontier_calls: 1 }
+steps:
+  - { id: fetch, type: mcp_call, via: codex, session: agent, server: jira, tool: get, arguments: {}, outputs: [out.json] }
+`);
+    const fixturePath = path.join(repo, "fixture.json");
+    fs.writeFileSync(fixturePath, JSON.stringify({ artifacts: {} }));
+    const options = { cwd: repo, env: { XDG_CONFIG_HOME: configHome } };
+
+    for (const result of [
+      dispatch(["validate", workflowPath], options),
+      dispatch(["simulate", workflowPath, "--fixture", fixturePath], options)
+    ]) {
+      expect(result).toMatchObject({ exitCode: 2 });
+      expect(result.stderr).toContain("workflow.mcp_call.session.provider.invalid");
+    }
   });
 
   test("lints workflows without rewriting them", () => {
@@ -205,6 +348,287 @@ steps:
     expect(await captureCli(["pause", "missing"], repo)).toMatchObject({ exitCode: 4 });
   });
 
+  test("merges fixture, JSON-file, and repeatable CLI inputs before creating a run", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-inputs-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.writeFileSync(path.join(repo, "workflow.yml"), `
+name: cli-inputs
+version: 1
+style: pipeline
+maturity: experimental
+inputs:
+  ticket: { required: true }
+  count: {}
+  enabled: {}
+  __proto__: {}
+steps:
+  - { id: done, type: result, status: completed }
+`);
+    fs.writeFileSync(path.join(repo, "fixture.json"), JSON.stringify({ inputs: { ticket: "fixture", count: 1 } }));
+    fs.writeFileSync(path.join(repo, "inputs.json"), JSON.stringify({ ticket: "file", count: 2, enabled: false }));
+
+    expect(await captureCli([
+      "run", "workflow.yml", "--id", "input-run", "--fixture", "fixture.json",
+      "--input-file", "inputs.json", "--input", "ticket=CLI-7", "--input", "enabled=true",
+      "--input", "__proto__=prototype-safe"
+    ], repo)).toMatchObject({ exitCode: 0 });
+    const store = await openAgentFlowRunState({ cwd: repo });
+    const persistedInputs = store.getRun("input-run")?.inputs;
+    expect(persistedInputs).toMatchObject({ ticket: "CLI-7", count: 2, enabled: true });
+    expect(Object.hasOwn(persistedInputs!, "__proto__")).toBe(true);
+    expect(persistedInputs?.__proto__).toBe("prototype-safe");
+    store.close();
+
+    const duplicate = await captureCli([
+      "run", "workflow.yml", "--id", "duplicate", "--input", "ticket=A", "--input", "ticket=B"
+    ], repo);
+    expect(duplicate).toMatchObject({ exitCode: 2 });
+    expect(duplicate.stderr).toContain("provided more than once");
+    const unknown = await captureCli([
+      "run", "workflow.yml", "--id", "unknown", "--input", "ticket=A", "--input", "extra=1"
+    ], repo);
+    expect(unknown).toMatchObject({ exitCode: 2 });
+    expect(unknown.stderr).toContain("unknown inputs: extra");
+    const missing = await captureCli(["run", "workflow.yml", "--id", "missing"], repo);
+    expect(missing).toMatchObject({ exitCode: 2 });
+    expect(missing.stderr).toContain("missing required inputs: ticket");
+  });
+
+  test("rejects direct MCP in the stock CLI before creating run state", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-direct-mcp-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.writeFileSync(path.join(repo, "workflow.yml"), `
+name: direct-mcp
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: fetch
+    type: mcp_call
+    server: atlassian
+    tool: get_issue
+    arguments: { key: AF-1 }
+    outputs: [ticket.json]
+`);
+    const result = await captureCli(["run", "workflow.yml", "--id", "direct"], repo);
+    expect(result).toMatchObject({ exitCode: 1 });
+    expect(result.stderr).toContain("use via: codex");
+    expect(fs.existsSync(path.join(repo, ".agent-flow"))).toBe(false);
+  });
+
+  test("rejects invalid Codex model overrides before creating run state", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-model-override-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.writeFileSync(path.join(repo, "workflow.yml"), `
+name: model-override
+version: 1
+style: pipeline
+maturity: experimental
+steps: []
+`);
+
+    for (const [index, model] of ["   ", " padded ", "bad\nmodel"].entries()) {
+      expect(await captureCli([
+        "run", "workflow.yml", "--id", `invalid-model-${index}`, "--model", model
+      ], repo)).toMatchObject({ exitCode: 1 });
+    }
+    expect(fs.existsSync(path.join(repo, ".agent-flow"))).toBe(false);
+  });
+
+  test("rejects direct MCP in reachable child workflows before creating a run", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-child-direct-mcp-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.writeFileSync(path.join(repo, "parent.yml"), `
+name: direct-mcp-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: child
+    type: workflow
+    workflow: direct-mcp-child
+    inputs: {}
+    outputs: [ticket.json]
+`);
+    fs.writeFileSync(path.join(repo, "child.yml"), `
+name: direct-mcp-child
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: fetch
+    type: mcp_call
+    server: atlassian
+    tool: get_issue
+    arguments: { key: AF-1 }
+    outputs: [ticket.json]
+`);
+
+    const result = await captureCli(["run", "parent.yml", "--id", "nested-direct"], repo);
+    expect(result).toMatchObject({ exitCode: 1 });
+    expect(result.stderr).toContain("direct MCP step fetch in workflow direct-mcp-child");
+    const store = await openAgentFlowRunState({ cwd: repo });
+    expect(store.getRun("nested-direct")).toBeNull();
+    store.close();
+  });
+
+  test("rejects direct MCP before a CLI resume mutates the paused run", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-resume-direct-mcp-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const workflow = parseAgentFlowWorkflowOrThrow(`
+name: resume-direct-mcp
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: approve, type: manual_gate, message: Continue?, options: [approve, cancel] }
+  - id: fetch
+    type: mcp_call
+    server: atlassian
+    tool: get_issue
+    arguments: { key: AF-1 }
+    outputs: [ticket.json]
+`);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, { id: "resume-direct", workflow });
+    expect(await executeAgentFlowCommandPipeline(store, "resume-direct", workflow))
+      .toMatchObject({ status: "paused" });
+    const eventsBefore = store.listEvents("resume-direct");
+    store.close();
+
+    const result = await captureCli(["resume", "resume-direct", "--outcome", "approve"], repo);
+    expect(result).toMatchObject({ exitCode: 1 });
+    expect(result.stderr).toContain("direct MCP step fetch in workflow resume-direct-mcp");
+
+    const inspected = await openAgentFlowRunState({ cwd: repo });
+    expect(inspected.getRun("resume-direct")).toMatchObject({ status: "paused" });
+    expect(inspected.getRun("resume-direct")?.context.waiting).toMatchObject({ stepId: "approve" });
+    expect(inspected.listEvents("resume-direct")).toEqual(eventsBefore);
+    inspected.close();
+  });
+
+  test("resumes a nested child directly when its registry key is an alias", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-child-alias-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: internal-child-name
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: approve, type: manual_gate, message: Continue?, options: [approve, cancel] }
+  - { id: publish, type: command, command: "printf done > child.txt", outputs: [child.txt] }
+`);
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: alias-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: child, type: workflow, workflow: child-alias, inputs: {}, outputs: [child.txt] }
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register(parent.name, parent)
+      .register("child-alias", child);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, {
+      id: "alias-parent",
+      workflow: parent,
+      context: { workflowRegistry: serializeAgentFlowWorkflowRegistry(workflows) as never }
+    });
+    expect(await executeAgentFlowCommandPipeline(
+      store, "alias-parent", parent, undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({ status: "paused" });
+    const childRunId = (store.getRun("alias-parent")!.context.waiting as { childRunId: string }).childRunId;
+    store.close();
+
+    expect(await captureCli(["resume", childRunId, "--outcome", "approve"], repo))
+      .toMatchObject({ exitCode: 0 });
+    const inspected = await openAgentFlowRunState({ cwd: repo });
+    expect(inspected.getRun(childRunId)).toMatchObject({ status: "completed" });
+    expect(inspected.readArtifact("alias-parent", "child.txt").content.toString("utf8")).toBe("done");
+    inspected.close();
+  });
+
+  test("runs input through Codex MCP, a nested workflow, and approval resume end to end", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-e2e-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const bin = path.join(repo, "bin");
+    const codexHome = path.join(repo, "codex-home");
+    fs.mkdirSync(bin);
+    fs.mkdirSync(codexHome);
+    fs.writeFileSync(path.join(bin, "codex"), `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const schema = JSON.parse(fs.readFileSync(args[args.indexOf("--output-schema") + 1], "utf8"));
+const outputPath = args[args.indexOf("--output-last-message") + 1];
+const outputs = {};
+for (const name of schema.properties.outputs.required) outputs[name] = name.endsWith(".json") ? '{"key":"AF-9"}\\n' : 'codex output\\n';
+fs.writeFileSync(outputPath, JSON.stringify({ outputs }));
+const resume = args.indexOf("resume");
+const thread = resume > 0 ? args[args.length - 2] : "thread-e2e";
+fs.writeSync(1, JSON.stringify({ type: "thread.started", thread_id: thread }) + "\\n");
+fs.writeSync(1, JSON.stringify({ type: "item.completed", item: { type: "mcp_tool_call", server: "atlassian", tool: "get_issue", arguments: { key: "AF-9" }, result: { content: [{ type: "text", text: '{"key":"AF-9"}' }], structured_content: { key: "AF-9" } }, status: "completed" } }) + "\\n");
+fs.writeSync(1, JSON.stringify({ type: "turn.completed" }) + "\\n");
+`, { mode: 0o755 });
+    fs.writeFileSync(path.join(repo, "parent.yml"), `
+name: parent-e2e
+version: 1
+style: pipeline
+maturity: experimental
+inputs:
+  ticket: { required: true }
+sessions:
+  agent: { provider: codex, resume: true }
+limits:
+  max_frontier_calls: 1
+steps:
+  - id: fetch
+    type: mcp_call
+    via: codex
+    session: agent
+    server: atlassian
+    tool: get_issue
+    arguments: { key: "{{ inputs.ticket }}" }
+    outputs: [ticket.json]
+  - id: child
+    type: workflow
+    workflow: child-e2e
+    inputs: { ticket: "{{ inputs.ticket }}" }
+    outputs: [child.txt]
+`);
+    fs.writeFileSync(path.join(repo, "child.yml"), `
+name: child-e2e
+version: 1
+style: pipeline
+maturity: experimental
+inputs:
+  ticket: { required: true }
+steps:
+  - id: approve
+    type: manual_gate
+    message: Approve child?
+    options: [approve, pause, cancel]
+  - id: publish
+    type: command
+    command: printf 'nested complete\\n' > child.txt
+    outputs: [child.txt]
+`);
+    const env = { PATH: `${bin}:${process.env.PATH ?? ""}`, CODEX_HOME: codexHome };
+    const started = await captureCli([
+      "run", "parent.yml", "--id", "e2e", "--input", "ticket=AF-9", "--model", "test-model"
+    ], repo, env);
+    expect(started).toMatchObject({ exitCode: 3 });
+    expect(started.stdout).toContain("Status: paused");
+    const resumed = await captureCli(["resume", "e2e", "--outcome", "approve"], repo, env);
+    expect(resumed).toMatchObject({ exitCode: 0 });
+    const store = await openAgentFlowRunState({ cwd: repo });
+    expect(store.getRun("e2e")?.inputs).toEqual({ ticket: "AF-9" });
+    expect(store.getSession("e2e", "agent")?.externalSessionId).toBe("thread-e2e");
+    expect(store.readArtifact("e2e", "child.txt").content.toString("utf8")).toBe("nested complete\n");
+    store.close();
+  });
+
   test("recovers an interrupted running execution through the documented run command", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-recovery-"));
     fs.mkdirSync(path.join(repo, ".git"));
@@ -213,12 +637,21 @@ name: cli-recovery
 version: 1
 style: pipeline
 maturity: experimental
+inputs:
+  ticket: { required: true }
 steps:
   - { id: check, type: command, command: "echo recovered >> effects.txt" }
 `);
     const workflow = parseAgentFlowWorkflowOrThrow(fs.readFileSync(path.join(repo, "workflow.yml"), "utf8"));
     const interrupted = await openAgentFlowRunState({ cwd: repo });
-    createAgentFlowLifecycleRun(interrupted, { id: "cli-recovery", workflow });
+    createAgentFlowLifecycleRun(interrupted, {
+      id: "cli-recovery",
+      workflow,
+      inputs: { ticket: "AF-1" },
+      context: {
+        codexOptions: { profile: "persisted", model: "gpt-5", reasoningEffort: "high" }
+      }
+    });
     interrupted.acquireRunLock("cli-recovery", "run", { ttlMs: 60_000 });
     interrupted.transitionRunWithEvent("cli-recovery", {
       status: "running",
@@ -227,13 +660,465 @@ steps:
     });
     interrupted.close();
 
-    const recovered = await captureCli(["run", "workflow.yml", "--id", "cli-recovery"], repo);
+    const changed = await captureCli([
+      "run", "workflow.yml", "--id", "cli-recovery", "--input", "ticket=AF-2"
+    ], repo);
+    expect(changed).toMatchObject({ exitCode: 2 });
+    expect(changed.stderr).toContain("differs from its persisted value");
+
+    const changedCodex = await captureCli([
+      "run", "workflow.yml", "--id", "cli-recovery", "--profile", "different"
+    ], repo);
+    expect(changedCodex).toMatchObject({ exitCode: 2 });
+    expect(changedCodex.stderr).toContain('Codex option "profile" differs from its persisted value');
+
+    const recovered = await captureCli([
+      "run", "workflow.yml", "--id", "cli-recovery", "--profile", "persisted"
+    ], repo);
 
     expect(recovered).toMatchObject({ exitCode: 0, stderr: "" });
     expect(recovered.stdout).toContain("Reused Agent Flow run cli-recovery");
     expect(recovered.stdout).toContain("Status: completed");
+    const recoveredStore = await openAgentFlowRunState({ cwd: repo });
+    expect(recoveredStore.getRun("cli-recovery")?.inputs).toEqual({ ticket: "AF-1" });
+    recoveredStore.close();
     expect(fs.readFileSync(path.join(repo, "effects.txt"), "utf8")).toBe("recovered\n");
     expect((await captureCli(["logs", "cli-recovery"], repo)).stdout).toContain("run.execution_recovered");
+  });
+
+  test("recovers an interrupted aliased child through the documented run command", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-alias-recovery-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.writeFileSync(path.join(repo, "child.yml"), `
+name: internal-child-name
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: publish, type: command, command: "printf recovered > child.txt", outputs: [child.txt] }
+`);
+    const child = parseAgentFlowWorkflowOrThrow(fs.readFileSync(path.join(repo, "child.yml"), "utf8"));
+    const registry = createAgentFlowWorkflowRegistry().register("child-alias", child);
+    const interrupted = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(interrupted, {
+      id: "alias-recovery",
+      workflow: child,
+      context: {
+        workflowRegistry: serializeAgentFlowWorkflowRegistry(registry) as never,
+        workflowRegistryName: "child-alias"
+      }
+    });
+    interrupted.acquireRunLock("alias-recovery", "run", { ttlMs: 60_000 });
+    interrupted.transitionRunWithEvent("alias-recovery", {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    interrupted.close();
+
+    const recovered = await captureCli(["run", "child.yml", "--id", "alias-recovery"], repo);
+
+    expect(recovered).toMatchObject({ exitCode: 0, stderr: "" });
+    expect(recovered.stdout).toContain("Reused Agent Flow run alias-recovery");
+    const store = await openAgentFlowRunState({ cwd: repo });
+    expect(store.getRun("alias-recovery")?.status).toBe("completed");
+    expect(store.readArtifact("alias-recovery", "child.txt").content.toString()).toBe("recovered");
+    store.close();
+  });
+
+  test("recovers child providers and workflow definitions from the persisted registry", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-child-recovery-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.mkdirSync(path.join(repo, "prompts"));
+    fs.writeFileSync(path.join(repo, "prompts", "write.md"), "Write the response.\n");
+    fs.writeFileSync(path.join(repo, "parent.yml"), `
+name: recovered-parent
+version: 1
+style: pipeline
+maturity: experimental
+inputs:
+  request: { required: true }
+steps:
+  - id: child
+    type: workflow
+    workflow: recovered-child
+    inputs: { request: "{{ inputs.request }}" }
+    outputs: [response.md]
+`);
+    const originalChildSource = `
+name: recovered-child
+version: 1
+style: pipeline
+maturity: experimental
+inputs:
+  request: { required: true }
+sessions:
+  writer: { provider: fixture }
+limits: { max_model_calls: 1 }
+steps:
+  - id: write
+    type: session_request
+    session: writer
+    prompt: prompts/write.md
+    inputs: [request.md]
+    outputs: [response.md]
+`;
+    fs.writeFileSync(path.join(repo, "child.yml"), originalChildSource);
+    fs.writeFileSync(path.join(repo, "fixture.json"), JSON.stringify({
+      artifacts: { "request.md": "request" },
+      steps: { write: { outputs: { "response.md": "persisted child response\n" } } }
+    }));
+    const parent = parseAgentFlowWorkflowOrThrow(fs.readFileSync(path.join(repo, "parent.yml"), "utf8"));
+    const child = parseAgentFlowWorkflowOrThrow(originalChildSource);
+    const registry = createAgentFlowWorkflowRegistry().register(parent.name, parent).register(child.name, child);
+    const interrupted = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(interrupted, {
+      id: "child-recovery",
+      workflow: parent,
+      inputs: { request: "request.md" },
+      context: { workflowRegistry: serializeAgentFlowWorkflowRegistry(registry) as never }
+    });
+    interrupted.acquireRunLock("child-recovery", "run", { ttlMs: 60_000 });
+    interrupted.transitionRunWithEvent("child-recovery", {
+      status: "running",
+      allowedFrom: ["pending"],
+      event: { type: "run.started", payload: { status: "running" } }
+    });
+    interrupted.writeArtifact({
+      id: "request",
+      runId: "child-recovery",
+      stepId: "fixture",
+      path: "request.md",
+      kind: "fixture",
+      contentType: "text/plain; charset=utf-8",
+      content: "request"
+    });
+    interrupted.close();
+    fs.writeFileSync(path.join(repo, "child.yml"), `
+name: recovered-child
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: changed
+    type: command
+    command: printf 'changed child\\n' > response.md
+    outputs: [response.md]
+`);
+
+    const recovered = await captureCli([
+      "run", "parent.yml", "--id", "child-recovery", "--fixture", "fixture.json"
+    ], repo);
+
+    expect(recovered).toMatchObject({ exitCode: 0 });
+    const store = await openAgentFlowRunState({ cwd: repo });
+    expect(store.readArtifact("child-recovery", "response.md").content.toString("utf8"))
+      .toBe("persisted child response\n");
+    store.close();
+  });
+
+  test("pins configured providers used only by a reachable child workflow", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-child-provider-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.mkdirSync(path.join(repo, "workflows"));
+    fs.writeFileSync(path.join(repo, "config.yml"), `version: 1
+targets:
+  child-local:
+    kind: local
+    driver: openai-compatible
+    base_url: http://127.0.0.1:11434/v1
+    model: child-model
+    enabled: true
+`);
+    fs.writeFileSync(path.join(repo, ".agent-flow.yml"), `version: 1
+workflows: workflows
+providers:
+  child-writer: { kind: local, target: child-local }
+`);
+    fs.writeFileSync(path.join(repo, "workflows", "parent.yml"), `
+name: child-provider-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: child
+    type: workflow
+    workflow: child-provider-child
+    inputs: {}
+    outputs: [response.md]
+`);
+    fs.writeFileSync(path.join(repo, "workflows", "child.yml"), `
+name: child-provider-child
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  writer: { provider: child-writer }
+limits: { max_model_calls: 1 }
+steps:
+  - { id: approve, type: manual_gate, message: Continue?, options: [approve, cancel] }
+  - { id: write, type: session_request, session: writer, prompt: prompt.md, inputs: [input.md], outputs: [response.md] }
+`);
+
+    expect(await captureCli([
+      "run", "workflows/parent.yml", "--id", "child-provider", "--config", "config.yml"
+    ], repo)).toMatchObject({ exitCode: 3 });
+    const store = await openAgentFlowRunState({ cwd: repo });
+    expect(store.getRun("child-provider")?.context.providerBindings).toMatchObject({
+      "child-writer": { target: "child-local", kind: "local", driver: "openai-compatible" }
+    });
+    store.close();
+  });
+
+  test("rejects ambiguous fixture step IDs across reachable workflows", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-fixture-step-id-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.writeFileSync(path.join(repo, "parent.yml"), `
+name: fixture-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: first, type: workflow, workflow: fixture-child-a, inputs: {}, outputs: [a.txt] }
+  - { id: second, type: workflow, workflow: fixture-child-b, inputs: {}, outputs: [b.txt] }
+`);
+    for (const [name, output] of [["fixture-child-a", "a.txt"], ["fixture-child-b", "b.txt"]]) {
+      fs.writeFileSync(path.join(repo, `${name}.yml`), `
+name: ${name}
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  writer: { provider: fixture }
+limits: { max_model_calls: 1 }
+steps:
+  - { id: generate, type: session_request, session: writer, prompt: prompt.md, inputs: [input.md], outputs: [${output}] }
+`);
+    }
+    fs.writeFileSync(path.join(repo, "fixture.json"), JSON.stringify({
+      steps: { generate: { outputs: { "a.txt": "a" } } }
+    }));
+
+    const result = await captureCli([
+      "run", "parent.yml", "--id", "fixture-duplicates", "--fixture", "fixture.json"
+    ], repo);
+    expect(result).toMatchObject({ exitCode: 2 });
+    expect(result.stderr).toContain("fixture-backed session step IDs must be unique");
+    const store = await openAgentFlowRunState({ cwd: repo });
+    expect(store.getRun("fixture-duplicates")).toBeNull();
+    store.close();
+  });
+
+  test("rejects ambiguous fixture disagreement step IDs across reachable workflows", async () => {
+    for (const strategy of ["arbiter", "owner_decides"] as const) {
+      const repo = fs.mkdtempSync(path.join(
+        process.env.TMPDIR ?? "/tmp",
+        `agent-flow-cli-fixture-disagreement-id-${strategy}-`
+      ));
+      fs.mkdirSync(path.join(repo, ".git"));
+      fs.writeFileSync(path.join(repo, "parent.yml"), `
+name: fixture-disagreement-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: first, type: workflow, workflow: fixture-disagreement-a, inputs: {}, outputs: [a.json] }
+  - { id: second, type: workflow, workflow: fixture-disagreement-b, inputs: {}, outputs: [b.json] }
+`);
+      for (const [name, output] of [["fixture-disagreement-a", "a.json"], ["fixture-disagreement-b", "b.json"]]) {
+        const policy = strategy === "arbiter"
+          ? "{ strategy: arbiter, arbiter: arbiter, max_rounds: 1 }"
+          : "{ strategy: owner_decides }";
+        const arbiter = strategy === "arbiter"
+          ? "  arbiter: { provider: fixture, role: arbiter, authority: { can_request_changes: true, can_approve: true } }\n"
+          : "";
+        fs.writeFileSync(path.join(repo, `${name}.yml`), `
+name: ${name}
+version: 1
+style: collaborative
+maturity: experimental
+collaboration:
+  enabled: true
+  max_review_cycles: 1
+  on_disagreement: ${policy}
+sessions:
+  implementer: { provider: ${strategy === "owner_decides" ? "fixture" : "codex"}, role: implementer, authority: { can_request_changes: true, can_approve: true } }
+  reviewer: { provider: codex, role: reviewer, authority: { can_request_changes: true, can_approve: true } }
+${arbiter}limits: { max_frontier_calls: 4 }
+steps:
+  - { id: review, type: review, reviewer: reviewer, subject: implementer, artifacts: [implementation.md], outputs: [${output}], then: route }
+  - id: route
+    type: condition
+    branches:
+      - { if: 'artifacts.${output.slice(0, -5)}.status == "approved"', then: done }
+      - { if: 'artifacts.${output.slice(0, -5)}.status == "changes_requested"', then: revise }
+    else: fail
+  - { id: revise, type: command, command: "true", then: review }
+  - { id: done, type: result, status: completed }
+`);
+      }
+      fs.writeFileSync(path.join(repo, "fixture.json"), JSON.stringify({
+        steps: { review: { disagreement: "approved" } }
+      }));
+
+      const result = await captureCli([
+        "run", "parent.yml", "--id", `fixture-disagreement-${strategy}`, "--fixture", "fixture.json"
+      ], repo);
+      expect(result).toMatchObject({ exitCode: 2 });
+      expect(result.stderr).toContain("fixture-backed session step IDs must be unique");
+      const store = await openAgentFlowRunState({ cwd: repo });
+      expect(store.getRun(`fixture-disagreement-${strategy}`)).toBeNull();
+      store.close();
+    }
+  });
+
+  test("preserves registry aliases when checking fixture step ID collisions", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-fixture-alias-id-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: internal-parent
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: gate, type: manual_gate, message: Continue?, options: [approve, cancel] }
+  - { id: first, type: workflow, workflow: child-a, inputs: {}, outputs: [a.txt] }
+  - { id: second, type: workflow, workflow: child-b, inputs: {}, outputs: [b.txt] }
+`);
+    const child = (output: string) => parseAgentFlowWorkflowOrThrow(`
+name: shared-internal-child
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  writer: { provider: fixture }
+limits: { max_model_calls: 1 }
+steps:
+  - { id: generate, type: session_request, session: writer, prompt: prompt.md, inputs: [input.md], outputs: [${output}] }
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register("parent-alias", parent)
+      .register("child-a", child("a.txt"))
+      .register("child-b", child("b.txt"));
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, {
+      id: "fixture-alias-collision",
+      workflow: parent,
+      context: {
+        workflowRegistry: serializeAgentFlowWorkflowRegistry(workflows) as never,
+        workflowRegistryName: "parent-alias"
+      }
+    });
+    expect(await executeAgentFlowCommandPipeline(
+      store, "fixture-alias-collision", parent, undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({ status: "paused" });
+    store.close();
+    fs.writeFileSync(path.join(repo, "fixture.json"), JSON.stringify({
+      steps: { generate: { outputs: { "a.txt": "a" } } }
+    }));
+
+    const result = await captureCli([
+      "resume", "fixture-alias-collision", "--outcome", "approve", "--fixture", "fixture.json"
+    ], repo);
+
+    expect(result).toMatchObject({ exitCode: 2 });
+    expect(result.stderr).toContain("multiple reachable workflows (child-a, child-b)");
+    const inspected = await openAgentFlowRunState({ cwd: repo });
+    expect(inspected.getRun("fixture-alias-collision")?.status).toBe("paused");
+    inspected.close();
+  });
+
+  test("ignores providers and validation in unrelated workflow registry entries", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-reachable-registry-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.mkdirSync(path.join(repo, "workflows"));
+    fs.writeFileSync(path.join(repo, ".agent-flow.yml"), "version: 1\nworkflows: workflows\n");
+    fs.writeFileSync(path.join(repo, "workflows", "entry.yml"), `
+name: reachable-entry
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: done, type: result, status: completed }
+`);
+    fs.writeFileSync(path.join(repo, "workflows", "unrelated.yml"), `
+name: unrelated-entry
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  writer: { provider: fixture }
+steps:
+  - { id: write, type: session_request, session: writer, prompt: prompt.md, inputs: [input.md], outputs: [output.md] }
+`);
+
+    expect(await captureCli([
+      "run", "workflows/entry.yml", "--id", "reachable-only"
+    ], repo)).toMatchObject({ exitCode: 0 });
+    const store = await openAgentFlowRunState({ cwd: repo });
+    expect(Object.keys(store.getRun("reachable-only")?.context.workflowRegistry as object))
+      .toEqual(["reachable-entry"]);
+    store.close();
+  });
+
+  test("does not discover nested repository YAML when no workflow directory is configured", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-sibling-registry-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.mkdirSync(path.join(repo, ".github", "workflows"), { recursive: true });
+    fs.writeFileSync(path.join(repo, "workflow.yml"), `
+name: sibling-entry
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: child, type: " workflow ", workflow: sibling-child, inputs: {}, outputs: [child.txt] }
+`);
+    fs.writeFileSync(path.join(repo, "child.yml"), `
+name: sibling-child
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: publish, type: command, command: "printf sibling > child.txt", outputs: [child.txt] }
+`);
+    fs.writeFileSync(path.join(repo, "docker-compose.yml"), `
+services:
+  database: { image: postgres }
+`);
+    fs.writeFileSync(path.join(repo, ".github", "workflows", "ci.yml"), `
+name: CI
+on: [push]
+jobs: {}
+`);
+
+    expect(await captureCli([
+      "run", "workflow.yml", "--id", "sibling-only"
+    ], repo)).toMatchObject({ exitCode: 0, stderr: "" });
+    const store = await openAgentFlowRunState({ cwd: repo });
+    expect(Object.keys(store.getRun("sibling-only")?.context.workflowRegistry as object))
+      .toEqual(["sibling-child", "sibling-entry"]);
+    expect(store.readArtifact("sibling-only", "child.txt").content.toString("utf8")).toBe("sibling");
+    store.close();
+  });
+
+  test("keeps configured workflow registries inside the repository", () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-registry-containment-"));
+    const outside = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-registry-outside-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.writeFileSync(path.join(repo, "workflow.yml"), `
+name: contained-entry
+version: 1
+style: pipeline
+maturity: experimental
+steps: []
+`);
+    fs.symlinkSync(outside, path.join(repo, "linked-workflows"), "dir");
+
+    for (const configuredPath of ["../outside", outside, "linked-workflows"]) {
+      fs.writeFileSync(path.join(repo, ".agent-flow.yml"), `version: 1\nworkflows: ${JSON.stringify(configuredPath)}\n`);
+      expect(() => loadAgentFlowWorkflowRegistry("workflow.yml", { cwd: repo }))
+        .toThrow("must be repository-relative and stay inside");
+    }
   });
 
   test("does not rewrite fixture state before acquiring an active run lease", async () => {
@@ -1617,13 +2502,17 @@ steps:
 
 });
 
-async function captureCli(args: string[], cwd: string): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+async function captureCli(
+  args: string[],
+  cwd: string,
+  env?: Readonly<Record<string, string | undefined>>
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   let stdout = "";
   let stderr = "";
   const exitCode = await runCli(args, {
     stdout: { write: (chunk: string) => { stdout += chunk; return true; } },
     stderr: { write: (chunk: string) => { stderr += chunk; return true; } }
-  }, { cwd });
+  }, { cwd, ...(env === undefined ? {} : { env }) });
   return { exitCode, stdout, stderr };
 }
 

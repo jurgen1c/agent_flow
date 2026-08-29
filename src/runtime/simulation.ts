@@ -516,7 +516,16 @@ function runStep(step: AgentFlowWorkflowStep, state: SimulationState, insideLoop
       );
     }
   }
-  checkInputs(step, id, state);
+  const unresolvedBeforeInputs = state.unresolvedBranches.length;
+  const missingStepInputs = checkInputs(step, id, state);
+  if (type === "workflow"
+      && (state.unresolvedBranches.length > unresolvedBeforeInputs || missingStepInputs.length > 0)) {
+    const inputDiagnostics = state.unresolvedBranches.splice(unresolvedBeforeInputs);
+    missingStepInputs.forEach((entry) => state.handledMissingArtifacts.add(missingArtifactKey(entry)));
+    const message = inputDiagnostics[0]?.reason
+      ?? `Fixture does not provide declared workflow input ${missingStepInputs[0]!.artifact}.`;
+    return simulatedTransformFailure(step, stepFixture, id, state, message);
+  }
   const evidenceCollision = evidenceBoundOutputCollision(step, id);
   if (evidenceCollision !== undefined) {
     state.visitedSteps.at(-1)!.outcome = "failed";
@@ -542,6 +551,18 @@ function runStep(step: AgentFlowWorkflowStep, state: SimulationState, insideLoop
       return simulateSessionRequestStep(step, stepFixture, id, state, true);
     }
     if (type === "mcp_call") {
+      const contractError = simulationMcpContractError(step, id, state);
+      if (contractError !== undefined) {
+        return simulatedMcpContractFailure(step, stepFixture, id, state, contractError);
+      }
+      const collisionError = simulationMcpOutputCollisionError(step, id, state);
+      if (collisionError !== undefined) {
+        return simulatedMcpContractFailure(step, stepFixture, id, state, collisionError);
+      }
+      if (nonEmptyString(step.via) === "codex") {
+        const budgetControl = simulationModelBudgetControl(step, id, state);
+        if (budgetControl !== undefined) return budgetControl;
+      }
       return simulatedSessionFailure(step, stepFixture, id, state, "Fixture marks the MCP call as failed.");
     }
     return failureControl(step, stepFixture, id, state);
@@ -560,6 +581,19 @@ function runStep(step: AgentFlowWorkflowStep, state: SimulationState, insideLoop
     const mcpControl = simulateMcpCallStep(step, stepFixture, id, state);
     if (mcpControl.kind !== "done") return mcpControl;
     state.retryAttempts.delete(id);
+  } else if (type === "workflow") {
+    const collision = declaredOutputArtifacts(step).find((artifact) =>
+      state.artifacts.has(artifact)
+      && state.artifactProducers.get(artifact) !== id
+      && step.overwrite !== true
+    );
+    if (collision !== undefined) {
+      state.visitedSteps.at(-1)!.outcome = "failed";
+      addUnresolved(state, id, `Artifact ${collision} already exists; declare overwrite: true to replace it during simulation.`);
+      return { kind: "terminal", status: "unresolved" };
+    }
+    state.retryAttempts.delete(id);
+    recordOutputs(step, stepFixture, id, state);
   } else if (type === "command") {
     const fixtureOutputs = canonicalFixtureOutputValues(stepFixture);
     const collision = declaredOutputArtifacts(step).find((artifact) =>
@@ -1040,30 +1074,27 @@ function simulateMcpCallStep(
   stepId: string,
   state: SimulationState
 ): SequenceControl {
-  try {
-    const server = requiredSimulationPromptField(step.server, `MCP call ${stepId} server`);
-    const tool = requiredSimulationPromptField(step.tool, `MCP call ${stepId} tool`);
-    assertAgentFlowAdapterStringSafe(state.workflow, "MCP adapter step ID", stepId);
-    assertAgentFlowAdapterStringSafe(state.workflow, "MCP adapter server", server);
-    assertAgentFlowAdapterStringSafe(state.workflow, "MCP adapter tool", tool);
-    for (const output of Array.isArray(step.outputs) ? step.outputs : []) {
-      const outputPath = requiredSimulationPromptField(output, `MCP call ${stepId} output`);
-      assertAgentFlowAdapterStringSafe(state.workflow, "MCP adapter output path", outputPath);
-    }
-    prepareAgentFlowMcpArguments(
-      state.workflow,
-      step.arguments,
-      (state.fixture.inputs ?? {}) as Record<string, AgentFlowRunStateValue>,
-      stepId
-    );
-  } catch (error) {
+  const contractError = simulationMcpContractError(step, stepId, state);
+  if (contractError !== undefined) {
     return simulatedMcpContractFailure(
       step,
       fixture,
       stepId,
       state,
-      error instanceof Error ? error.message : String(error)
+      contractError
     );
+  }
+  const collisionError = simulationMcpOutputCollisionError(step, stepId, state);
+  if (collisionError !== undefined) {
+    return simulatedMcpContractFailure(step, fixture, stepId, state, collisionError);
+  }
+  if (nonEmptyString(step.via) === "codex") {
+    const budgetControl = simulationModelBudgetControl(step, stepId, state);
+    if (budgetControl !== undefined) {
+      const visit = state.visitedSteps.at(-1);
+      if (visit?.id === stepId && visit.outcome === "succeeded") visit.outcome = "failed";
+      return budgetControl;
+    }
   }
   const declaredOutputs = new Set(
     (Array.isArray(step.outputs) ? step.outputs : [])
@@ -1085,19 +1116,53 @@ function simulateMcpCallStep(
       `MCP fixture outputs must match declared outputs exactly; invalid output ${invalidOutput}.`
     );
   }
-  for (const output of declaredOutputs) {
-    if (state.artifacts.has(output) && state.artifactProducers.get(output) !== stepId && step.overwrite !== true) {
-      return simulatedMcpContractFailure(
-        step,
-        fixture,
-        stepId,
-        state,
-        `Artifact ${output} already exists; declare overwrite: true to replace it during simulation.`
-      );
-    }
-  }
   recordOutputs(step, fixture, stepId, state);
   return { kind: "done" };
+}
+
+function simulationMcpOutputCollisionError(
+  step: AgentFlowWorkflowStep,
+  stepId: string,
+  state: SimulationState
+): string | undefined {
+  for (const output of Array.isArray(step.outputs) ? step.outputs : []) {
+    const name = nonEmptyString(output);
+    if (name === undefined) continue;
+    const artifact = canonicalArtifactName(name);
+    if (state.artifacts.has(artifact)
+        && state.artifactProducers.get(artifact) !== stepId
+        && step.overwrite !== true) {
+      return `Artifact ${artifact} already exists; declare overwrite: true to replace it during simulation.`;
+    }
+  }
+  return undefined;
+}
+
+function simulationMcpContractError(
+  step: AgentFlowWorkflowStep,
+  stepId: string,
+  state: SimulationState
+): string | undefined {
+  try {
+    const server = requiredSimulationPromptField(step.server, `MCP call ${stepId} server`);
+    const tool = requiredSimulationPromptField(step.tool, `MCP call ${stepId} tool`);
+    assertAgentFlowAdapterStringSafe(state.workflow, "MCP adapter step ID", stepId);
+    assertAgentFlowAdapterStringSafe(state.workflow, "MCP adapter server", server);
+    assertAgentFlowAdapterStringSafe(state.workflow, "MCP adapter tool", tool);
+    for (const output of Array.isArray(step.outputs) ? step.outputs : []) {
+      const outputPath = requiredSimulationPromptField(output, `MCP call ${stepId} output`);
+      assertAgentFlowAdapterStringSafe(state.workflow, "MCP adapter output path", outputPath);
+    }
+    prepareAgentFlowMcpArguments(
+      state.workflow,
+      step.arguments,
+      (state.fixture.inputs ?? {}) as Record<string, AgentFlowRunStateValue>,
+      stepId
+    );
+    return undefined;
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
 }
 
 function simulatedMcpContractFailure(
@@ -2060,8 +2125,14 @@ function collectSimulationReferencedSensitiveArtifactPaths(
   if (typeof declared === "string") {
     const expression = /^\{\{\s*inputs\.([A-Za-z_][A-Za-z0-9_-]*)\s*}}$/.exec(declared);
     const referencedSensitiveInput = expression !== null && agentFlowInputKeyLooksSensitive(expression[1]!);
-    if (sensitive || referencedSensitiveInput) {
-      collectSimulationRecoveryArtifactPaths(resolved, state, new Set(), sensitivePaths, true);
+    if (expression !== null || sensitive) {
+      collectSimulationRecoveryArtifactPaths(
+        resolved,
+        state,
+        new Set(),
+        sensitivePaths,
+        sensitive || referencedSensitiveInput
+      );
     }
     return;
   }
@@ -2086,16 +2157,26 @@ function collectSimulationReferencedSensitiveArtifactPaths(
   }
 }
 
-function checkInputs(step: AgentFlowWorkflowStep, stepId: string, state: SimulationState): void {
+function checkInputs(
+  step: AgentFlowWorkflowStep,
+  stepId: string,
+  state: SimulationState
+): AgentFlowSimulationMissingArtifact[] {
   const values: string[] = [];
   if (Array.isArray(step.inputs)) values.push(...step.inputs.flatMap((value) => artifactName(value, state)));
-  if (isRecord(step.inputs)) values.push(...nestedArtifactNames(step.inputs, state));
+  if (isRecord(step.inputs)) {
+    values.push(...(nonEmptyString(step.type) === "workflow"
+      ? workflowInputArtifactNames(step.inputs, state, stepId)
+      : nestedArtifactNames(step.inputs, state)));
+  }
   if (Array.isArray(step.artifacts)) values.push(...step.artifacts.flatMap((value) => artifactName(value, state)));
   if (step.type === "artifact_transform") values.push(...transformArtifactName(step.input, state));
 
-  for (const artifact of values) {
-    if (!state.artifacts.has(artifact)) addMissingArtifact(state, { stepId, artifact, kind: "input" });
-  }
+  const missing = values
+    .filter((artifact) => !state.artifacts.has(artifact))
+    .map((artifact): AgentFlowSimulationMissingArtifact => ({ stepId, artifact, kind: "input" }));
+  missing.forEach((entry) => addMissingArtifact(state, entry));
+  return missing;
 }
 
 function hasMissingDeclaredArtifacts(step: AgentFlowWorkflowStep, state: SimulationState): boolean {
@@ -2356,6 +2437,71 @@ function nestedArtifactNames(value: AgentFlowYamlValue | undefined, state: Simul
   if (Array.isArray(value)) return value.flatMap((entry) => nestedArtifactNames(entry, state));
   if (isRecord(value)) return Object.values(value).flatMap((entry) => nestedArtifactNames(entry, state));
   return artifactName(value, state);
+}
+
+function workflowInputArtifactNames(
+  value: AgentFlowYamlValue | undefined,
+  state: SimulationState,
+  stepId: string
+): string[] {
+  if (typeof value === "string") {
+    const reference = /^\{\{\s*artifacts\.([A-Za-z0-9_.-]+)\s*}}$/.exec(value);
+    if (reference === null) return [];
+    const segments = reference[1]!.split(".");
+    const published = [...state.artifacts]
+      .map((artifact) => ({ artifact, alias: agentFlowConditionArtifactAlias(artifact) }))
+      .filter(({ alias }) => alias.length <= segments.length
+        && alias.every((segment, index) => segment === segments[index]))
+      .sort((left, right) => right.alias.length - left.alias.length);
+    if (published[0] === undefined) return [segments.join("/")];
+    const best = published.filter(({ alias }) => alias.length === published[0]!.alias.length);
+    if (best.length > 1) {
+      addUnresolved(
+        state,
+        stepId,
+        `Workflow input artifact reference ${value} matches multiple published artifacts: ${best.map(({ artifact }) => artifact).sort().join(", ")}.`
+      );
+      return [];
+    }
+    if (state.artifactValues.has(published[0].artifact)
+        && !workflowInputArtifactValueResolves(
+          state.artifactValues.get(published[0].artifact)!,
+          segments.slice(published[0].alias.length)
+        )) {
+      addUnresolved(
+        state,
+        stepId,
+        `Workflow step input expression ${value} does not resolve a published artifact value.`
+      );
+      return [];
+    }
+    return [published[0].artifact];
+  }
+  if (Array.isArray(value)) return value.flatMap((entry) => workflowInputArtifactNames(entry, state, stepId));
+  if (isRecord(value)) return Object.values(value).flatMap((entry) => workflowInputArtifactNames(entry, state, stepId));
+  return [];
+}
+
+function workflowInputArtifactValueResolves(value: AgentFlowYamlValue, segments: string[]): boolean {
+  if (segments.length === 0) return true;
+  let resolved: AgentFlowYamlValue | undefined = value;
+  if (typeof resolved === "string") {
+    try {
+      resolved = JSON.parse(resolved) as AgentFlowYamlValue;
+    } catch {
+      return false;
+    }
+  }
+  for (const segment of segments) {
+    if (Array.isArray(resolved)) {
+      const index = /^(?:0|[1-9][0-9]*)$/.test(segment) ? Number(segment) : -1;
+      resolved = index >= 0 && index < resolved.length ? resolved[index] : undefined;
+    } else {
+      resolved = isRecord(resolved) && Object.hasOwn(resolved, segment) ? resolved[segment] : undefined;
+    }
+    if (resolved === undefined) return false;
+  }
+  return true;
 }
 
 function checkTargetBudget(control: Extract<SequenceControl, { kind: "target" }>, state: SimulationState): SequenceControl {
