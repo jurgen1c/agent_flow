@@ -43,7 +43,8 @@ One executable unit. A step can run a command, call a model session, call MCP, e
 
 ### Session
 
-A resumable model interaction context. Sessions may use a local model, frontier model, or named Codex profile.
+A resumable model interaction context. Sessions may use a local model, frontier
+model, the built-in pass-through Codex provider, or a named Codex profile.
 
 ### Artifact
 

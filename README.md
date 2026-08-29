@@ -231,7 +231,9 @@ as the final `executeAgentFlowCommandPipeline` argument.
 Recovery session providers
 report `metadata.recovery_status` as `remediated` or `unresolved`.
 Routed remediation that writes repository files must explicitly authorize them
-through the existing session authority and layered `file_scope` policy. Context
+through the existing session authority and layered `file_scope` policy. Codex
+remediation still requires those declarations, but Codex's own sandbox is the
+filesystem enforcement boundary for the pass-through provider. Context
 injected into an active recovery session marks it dirty and reruns the provider
 with a persisted `recovery-context/injected.md` input.
 

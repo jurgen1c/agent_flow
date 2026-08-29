@@ -3,7 +3,7 @@ version: 1
 style: pipeline
 maturity: draft
 
-description: Fetch a Jira ticket through MCP and ask a local model to create an implementation spec.
+description: Fetch a Jira ticket through Codex MCP and ask Codex to create an implementation spec.
 
 inputs:
   ticket_key:
@@ -11,13 +11,19 @@ inputs:
 
 sessions:
   lm:
-    provider: local
+    provider: codex
     resume: true
     role: spec_writer
+
+limits:
+  max_model_calls: 3
+  max_frontier_calls: 3
 
 steps:
   - id: fetch_ticket
     type: mcp_call
+    via: codex
+    session: lm
     server: atlassian-rovo-mcp
     tool: get_issue
     arguments:

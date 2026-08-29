@@ -113,11 +113,13 @@ agent-flow run workflow.yml --id alternate \
 ```
 
 An override must preserve the alias kind. Resumes do not accept overrides.
-Each run persists a fingerprint of its target, driver, model, endpoint
-identity, and permission-relevant settings. Codex base configuration, selected
-profile contents, and reasoning effort are included when a profile is used.
-Resume fails closed if those settings drift; credential rotation is
-intentionally excluded.
+Each configured alias persists a fingerprint of its target, driver, model,
+endpoint identity, profile name, and reasoning effort. Resume fails closed if
+those configured fields drift; credential rotation is intentionally excluded.
+The reserved `codex` provider persists explicit run overrides but intentionally
+does not fingerprint ambient Codex config, authentication, permissions, rules,
+skills, plugins, or MCP servers. Codex owns drift and trust decisions for those
+pass-through inputs.
 
 ## Built-in drivers
 
@@ -126,7 +128,7 @@ intentionally excluded.
 | `openai-responses` | `frontier` | `api_key_env` | Non-resumable |
 | `anthropic-messages` | `frontier` | `api_key_env` | Non-resumable |
 | `openai-compatible` | `local` or `frontier` | Optional `api_key_env` | Non-resumable |
-| `codex-cli` | `frontier` | Existing Codex CLI login | Native thread ID |
+| `codex-cli` | `frontier` | Existing Codex CLI configuration | Native thread ID |
 | `claude-code` | `frontier` | Existing Claude Code login | Native session ID |
 
 Driver request shapes follow the official
@@ -300,7 +302,9 @@ Provider-native transcripts can support resume, but durable Agent Flow state
 remains authoritative.
 
 Built-in HTTP drivers never launch a shell or give the provider ambient
-filesystem access. Built-in Codex and Claude CLI integrations use the authority,
-session, subprocess, and post-execution audit boundary described above. Other
-native CLI integrations remain a programmatic extension boundary so the host
-application can supply isolation appropriate to that CLI and platform.
+filesystem access. Claude uses Agent Flow's authority, subprocess sandbox,
+workspace audit, and write-lock boundary. Codex uses the durable session and
+bounded-output contract but delegates configuration, filesystem authority,
+sandboxing, and MCP access to the installed Codex. Other native CLI integrations
+remain a programmatic extension boundary so the host application can supply
+isolation appropriate to that CLI and platform.

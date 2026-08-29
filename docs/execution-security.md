@@ -13,8 +13,9 @@ persisted definition before invoking an adapter or shell.
   reviewed workflow. Arbitrary shell commands cannot be confined by
   `file_scope`, so command execution fails when a global file scope is present.
 - `session_request` providers and `mcp_call` servers are capabilities. Providers
-  must resolve through an explicit config alias or programmatic registration;
-  Direct MCP adapters remain programmatic. Static provider, server, and tool names are
+  must use the reserved Codex provider, resolve through an explicit config
+  alias, or come from programmatic registration. Direct MCP adapters remain
+  programmatic. Static provider, server, and tool names are
   required, model budgets are checked before calls, and output paths must be
   normalized repository-contained artifact paths.
 - API provider credentials are read only from the named `api_key_env` variable.
@@ -26,8 +27,10 @@ persisted definition before invoking an adapter or shell.
   existing host sandbox remains unchanged. Other coding CLIs require a custom
   programmatic adapter with a host-enforced filesystem and process boundary.
 - Workflow and session file writes require explicit authority and effective
-  `file_scope` includes. Artifact, prompt, cleanup, archive, and export paths
-  reject absolute, escaping, non-canonical, and unsafe symlink paths.
+  `file_scope` declarations. Agent Flow enforces those scopes for Claude and
+  participating custom adapters; pass-through Codex delegates
+  filesystem enforcement to Codex. Artifact, prompt, cleanup, archive, and
+  export paths reject absolute, escaping, non-canonical, and unsafe symlink paths.
   Custom and Claude adapters retain their existing scope enforcement. Codex
   filesystem authority is enforced by Codex itself.
 - Cleanup is limited by the persisted workflow retention rule. Protected run

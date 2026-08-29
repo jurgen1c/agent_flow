@@ -315,20 +315,17 @@ drivers are artifact-only and non-resumable. `codex-cli` and `claude-code` run
 at the repository root and preserve native context when their workflow session
 declares `resume: true`.
 
-Native read-only sessions use Codex read-only or Claude plan mode. To let a CLI
-edit the checkout, grant `authority.can_modify_files: true` and a non-empty
-`file_scope` on the session. Agent Flow snapshots the checkout before and after
-the process, rejects changes not allowed by every scope layer, and leaves those
-changes in place for inspection rather than attempting an unsafe rollback. Its
-host sandbox keeps `.git` read-only, hides `.agent-flow`, and leaves unrelated
-host paths unmounted. Audited native invocations share a per-repository write
-lock with command steps and file-writing custom adapters
-so concurrent Agent Flow runs cannot be attributed to one another. Native
-agents receive only the selected CLI's authentication/provider
-variables plus basic process, locale, proxy, and certificate variables—not the
-parent process's arbitrary secrets. Only the selected CLI, its required
-read-only interpreter/toolchain files, system runtime files, its own state, and
-the repository are visible.
+Claude read-only sessions use plan mode. Claude writers require
+`authority.can_modify_files: true` and a non-empty `file_scope`; Agent Flow
+then applies its host sandbox, workspace audit, and repository write lock.
+
+Codex is different: Agent Flow invokes the installed `codex exec` with the
+normal environment and does not add an outer filesystem sandbox, workspace
+audit, or `flock` lock. Codex loads its normal user and repository config,
+permissions/sandbox, rules, skills, plugins, and MCP servers. Configure those
+Codex controls for the authority you intend to grant. Workflow authority and
+`file_scope` remain useful declarations and validation inputs, but they are not
+an Agent Flow enforcement boundary around pass-through Codex execution.
 
 If Codex or Claude no longer has a persisted external session, the run pauses
 instead of silently losing context. Start a fresh native session explicitly:
