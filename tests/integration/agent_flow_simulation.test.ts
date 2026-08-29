@@ -1611,6 +1611,37 @@ steps:
       .toContain("does not resolve a published artifact value");
   });
 
+  test("routes nested-workflow input resolution failures through on_failure", () => {
+    for (const input of [
+      "{{ artifacts.missing }}",
+      "{{ artifacts.config.missing }}"
+    ]) {
+      const workflow = parseAgentFlowWorkflowOrThrow(`name: routed-nested-input-failure
+version: 1
+style: pipeline
+maturity: draft
+steps:
+  - id: nested
+    type: workflow
+    workflow: child
+    inputs: { payload: "${input}" }
+    on_failure: { retry: 1, then: continue, allowed: true }
+  - { id: done, type: result, status: completed }
+`);
+      const result = simulateAgentFlowWorkflow(workflow, {
+        artifacts: { "config.json": { present: true } }
+      });
+
+      expect(result.status).toBe("completed");
+      expect(result.visitedSteps).toEqual([
+        { id: "nested", type: "workflow", outcome: "failed" },
+        { id: "nested", type: "workflow", outcome: "failed" },
+        { id: "done", type: "result", outcome: "succeeded" }
+      ]);
+      expect(result.unresolvedBranches).toEqual([]);
+    }
+  });
+
   test("rejects ambiguous artifact aliases in nested-workflow inputs", () => {
     const workflow = parseAgentFlowWorkflowOrThrow(`name: ambiguous-mapped-artifact-input
 version: 1

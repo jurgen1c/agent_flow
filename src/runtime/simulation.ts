@@ -517,10 +517,14 @@ function runStep(step: AgentFlowWorkflowStep, state: SimulationState, insideLoop
     }
   }
   const unresolvedBeforeInputs = state.unresolvedBranches.length;
-  checkInputs(step, id, state);
-  if (type === "workflow" && state.unresolvedBranches.length > unresolvedBeforeInputs) {
-    state.visitedSteps.at(-1)!.outcome = "failed";
-    return { kind: "terminal", status: "unresolved" };
+  const missingStepInputs = checkInputs(step, id, state);
+  if (type === "workflow"
+      && (state.unresolvedBranches.length > unresolvedBeforeInputs || missingStepInputs.length > 0)) {
+    const inputDiagnostics = state.unresolvedBranches.splice(unresolvedBeforeInputs);
+    missingStepInputs.forEach((entry) => state.handledMissingArtifacts.add(missingArtifactKey(entry)));
+    const message = inputDiagnostics[0]?.reason
+      ?? `Fixture does not provide declared workflow input ${missingStepInputs[0]!.artifact}.`;
+    return simulatedTransformFailure(step, stepFixture, id, state, message);
   }
   const evidenceCollision = evidenceBoundOutputCollision(step, id);
   if (evidenceCollision !== undefined) {
@@ -2106,8 +2110,14 @@ function collectSimulationReferencedSensitiveArtifactPaths(
   if (typeof declared === "string") {
     const expression = /^\{\{\s*inputs\.([A-Za-z_][A-Za-z0-9_-]*)\s*}}$/.exec(declared);
     const referencedSensitiveInput = expression !== null && agentFlowInputKeyLooksSensitive(expression[1]!);
-    if (sensitive || referencedSensitiveInput) {
-      collectSimulationRecoveryArtifactPaths(resolved, state, new Set(), sensitivePaths, true);
+    if (expression !== null || sensitive) {
+      collectSimulationRecoveryArtifactPaths(
+        resolved,
+        state,
+        new Set(),
+        sensitivePaths,
+        sensitive || referencedSensitiveInput
+      );
     }
     return;
   }
@@ -2132,7 +2142,11 @@ function collectSimulationReferencedSensitiveArtifactPaths(
   }
 }
 
-function checkInputs(step: AgentFlowWorkflowStep, stepId: string, state: SimulationState): void {
+function checkInputs(
+  step: AgentFlowWorkflowStep,
+  stepId: string,
+  state: SimulationState
+): AgentFlowSimulationMissingArtifact[] {
   const values: string[] = [];
   if (Array.isArray(step.inputs)) values.push(...step.inputs.flatMap((value) => artifactName(value, state)));
   if (isRecord(step.inputs)) {
@@ -2143,9 +2157,11 @@ function checkInputs(step: AgentFlowWorkflowStep, stepId: string, state: Simulat
   if (Array.isArray(step.artifacts)) values.push(...step.artifacts.flatMap((value) => artifactName(value, state)));
   if (step.type === "artifact_transform") values.push(...transformArtifactName(step.input, state));
 
-  for (const artifact of values) {
-    if (!state.artifacts.has(artifact)) addMissingArtifact(state, { stepId, artifact, kind: "input" });
-  }
+  const missing = values
+    .filter((artifact) => !state.artifacts.has(artifact))
+    .map((artifact): AgentFlowSimulationMissingArtifact => ({ stepId, artifact, kind: "input" }));
+  missing.forEach((entry) => addMissingArtifact(state, entry));
+  return missing;
 }
 
 function hasMissingDeclaredArtifacts(step: AgentFlowWorkflowStep, state: SimulationState): boolean {

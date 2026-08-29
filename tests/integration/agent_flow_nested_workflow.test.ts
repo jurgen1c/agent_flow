@@ -1368,6 +1368,61 @@ steps:
     store.close();
   });
 
+  test("preserves nested sensitive provenance in aggregate workflow input values", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-aggregate-sensitive-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: aggregate-sensitive-child
+version: 1
+style: pipeline
+maturity: experimental
+inputs:
+  sources: { required: true }
+steps:
+  - { id: publish, type: command, command: "printf done > done.txt", outputs: [done.txt] }
+`);
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: aggregate-sensitive-parent
+version: 1
+style: pipeline
+maturity: experimental
+policies: { sensitive_inputs: redact }
+inputs:
+  sources: { required: true }
+steps:
+  - id: child
+    type: workflow
+    workflow: aggregate-sensitive-child
+    inputs: { sources: "{{ inputs.sources }}" }
+    outputs: [done.txt]
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register(parent.name, parent)
+      .register(child.name, child);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    const sources = { api_key: "inputs/private.txt", public: "inputs/public.txt" };
+    createAgentFlowLifecycleRun(store, { id: "aggregate-sensitive-parent", workflow: parent, inputs: { sources } });
+    store.writeArtifact({
+      id: "aggregate-secret", runId: "aggregate-sensitive-parent", stepId: "fixture",
+      path: "inputs/private.txt", kind: "fixture", contentType: "text/plain", content: "secret"
+    });
+    store.writeArtifact({
+      id: "aggregate-public", runId: "aggregate-sensitive-parent", stepId: "fixture",
+      path: "inputs/public.txt", kind: "fixture", contentType: "text/plain", content: "public"
+    });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "aggregate-sensitive-parent", parent, undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({ status: "completed" });
+    const childRun = store.listRuns().find((run) => run.parentRunId === "aggregate-sensitive-parent")!;
+    expect(childRun.inputs).toEqual({
+      sources: { api_key: "[REDACTED]", public: "inputs/public.txt" }
+    });
+    expect(store.readArtifact(childRun.id, "inputs/private.txt").content.toString()).toBe("[REDACTED]");
+    expect(store.readArtifact(childRun.id, "inputs/public.txt").content.toString()).toBe("public");
+    store.close();
+  });
+
   test("does not copy literal child input strings that happen to name parent artifacts", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-literal-input-"));
     fs.mkdirSync(path.join(repo, ".git"));

@@ -6239,8 +6239,15 @@ function collectRecoveryReferencedSensitiveArtifactPaths(
   if (typeof declared === "string") {
     const expression = /^\{\{\s*inputs\.([A-Za-z_][A-Za-z0-9_-]*)\s*}}$/.exec(declared);
     const referencedSensitiveInput = expression !== null && agentFlowInputKeyLooksSensitive(expression[1]!);
-    if (sensitive || referencedSensitiveInput) {
-      collectRecoveryArtifactPaths(store, runId, resolved, new Set(), sensitivePaths, true);
+    if (expression !== null || sensitive) {
+      collectRecoveryArtifactPaths(
+        store,
+        runId,
+        resolved,
+        new Set(),
+        sensitivePaths,
+        sensitive || referencedSensitiveInput
+      );
     }
     return;
   }
