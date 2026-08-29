@@ -155,6 +155,50 @@ steps:
 `);
     expect(validateAgentFlowWorkflow(valid).errors).toEqual([]);
 
+    class ProgrammaticContext {
+      ticket_key = "IAN-42";
+    }
+    const nonPlain = parseAgentFlowWorkflowOrThrow(`name: non-plain-session-context
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  reader: { provider: fixture }
+steps:
+  - id: fetch
+    type: session_request
+    session: reader
+    prompt: prompts/fetch.md
+    context: { ticket_key: IAN-42 }
+    inputs: []
+    outputs: [ticket.json]
+`);
+    nonPlain.steps[0]!.context = new ProgrammaticContext() as never;
+    expect(validateAgentFlowWorkflow(nonPlain).errors).toContainEqual({
+      code: "workflow.session_request.context.invalid",
+      message: "Session request context must be a non-empty mapping of scalar values.",
+      path: "steps[0].context",
+      stepId: "fetch"
+    });
+
+    const nullPrototype = parseAgentFlowWorkflowOrThrow(`name: null-prototype-session-context
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  reader: { provider: fixture }
+steps:
+  - id: fetch
+    type: session_request
+    session: reader
+    prompt: prompts/fetch.md
+    context: { ticket_key: IAN-42 }
+    inputs: []
+    outputs: [ticket.json]
+`);
+    nullPrototype.steps[0]!.context = Object.assign(Object.create(null), { ticket_key: "IAN-42" });
+    expect(validateAgentFlowWorkflow(nullPrototype).errors).toEqual([]);
+
     const invalid = parseAgentFlowWorkflowOrThrow(`name: invalid-session-context
 version: 1
 style: pipeline

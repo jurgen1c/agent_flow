@@ -8173,7 +8173,7 @@ function validateSessionRequestStep(step: AgentFlowWorkflowStep): string | undef
   const inputs = Array.isArray(step.inputs)
     && step.inputs.every((value) => typeof value === "string" && value.trim().length > 0);
   const inputCount = Array.isArray(step.inputs) ? step.inputs.length : -1;
-  const context = mapping(step.context);
+  const context = plainMapping(step.context);
   if (typeof step.session !== "string" || step.session.trim().length === 0
       || typeof step.prompt !== "string" || step.prompt.trim().length === 0
       || !inputs || inputCount === 0 && (context === undefined || Object.keys(context).length === 0)
@@ -9671,6 +9671,13 @@ function mapping(value: unknown): AgentFlowYamlMapping | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value) && !(value instanceof Uint8Array)
     ? value as AgentFlowYamlMapping
     : undefined;
+}
+
+function plainMapping(value: unknown): AgentFlowYamlMapping | undefined {
+  const result = mapping(value);
+  if (result === undefined) return undefined;
+  const prototype = Object.getPrototypeOf(result);
+  return prototype === Object.prototype || prototype === null ? result : undefined;
 }
 
 function isWorkflowStep(value: unknown): value is AgentFlowWorkflowStep {

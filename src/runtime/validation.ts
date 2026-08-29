@@ -2125,7 +2125,7 @@ function validateArtifactPaths(contexts: StepContext[], errors: AgentFlowWorkflo
         );
       }
       if (context.step.context !== undefined) {
-        if (!isRecord(context.step.context) || Object.keys(context.step.context).length === 0) {
+        if (!isPlainRecord(context.step.context) || Object.keys(context.step.context).length === 0) {
           addStepIssue(
             errors,
             context,
@@ -4573,4 +4573,10 @@ function isSessionInputReference(value: string): boolean {
 
 function isRecord(value: unknown): value is AgentFlowYamlMapping {
   return typeof value === "object" && value !== null && !Array.isArray(value) && !(value instanceof Uint8Array);
+}
+
+function isPlainRecord(value: unknown): value is AgentFlowYamlMapping {
+  if (!isRecord(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
 }
