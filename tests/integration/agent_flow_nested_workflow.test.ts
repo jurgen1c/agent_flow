@@ -2009,6 +2009,7 @@ style: pipeline
 maturity: experimental
 steps:
   - { id: publish, type: command, command: "touch child-side-effect && printf done > done.txt", outputs: [done.txt] }
+  - { id: fake, type: result, status: completed, output: typo.txt, outputs: [typo.txt], save_as: typo.txt }
 `);
     const workflows = createAgentFlowWorkflowRegistry()
       .register(parent.name, parent)
@@ -2082,7 +2083,8 @@ version: 1
 style: pipeline
 maturity: experimental
 steps:
-  - { id: terminal, type: result, status: failed, output: never.txt }
+  - { id: terminal, type: result, status: failed }
+  - { id: unreachable, type: command, command: "printf never > never.txt", outputs: [never.txt] }
 `);
     const parent = parseAgentFlowWorkflowOrThrow(`
 name: invalid-failure-policy-parent
@@ -2317,7 +2319,8 @@ version: 1
 style: pipeline
 maturity: experimental
 steps:
-  - { id: break, type: command, command: exit 1, outputs: [never.txt], on_failure: { then: fail } }
+  - { id: break, type: command, command: exit 1, on_failure: { then: fail } }
+  - { id: unreachable, type: command, command: "printf never > never.txt", outputs: [never.txt] }
 `);
     const parent = parseAgentFlowWorkflowOrThrow(`
 name: retry-parent
@@ -2361,7 +2364,8 @@ style: pipeline
 maturity: experimental
 steps:
   - { id: approve, type: manual_gate, message: Continue?, options: [approve, cancel] }
-  - { id: break, type: command, command: exit 1, outputs: [never.txt], on_failure: { then: fail } }
+  - { id: break, type: command, command: exit 1, on_failure: { then: fail } }
+  - { id: unreachable, type: command, command: "printf never > never.txt", outputs: [never.txt] }
 `);
     const parent = parseAgentFlowWorkflowOrThrow(`
 name: resumed-retry-parent

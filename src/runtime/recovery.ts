@@ -275,9 +275,14 @@ function workflowDeclaredOutputPaths(workflow: AgentFlowWorkflow): Set<string> {
     const stepId = typeof step.id === "string" ? step.id.trim() : "";
     const type = typeof step.type === "string" ? step.type.trim() : "";
     const candidates: unknown[] = [
-      step.output,
-      step.save_as,
-      ...(Array.isArray(step.outputs) ? step.outputs : []),
+      ...(["approval", "artifact_transform", "challenge", "consult", "decision_record"].includes(type)
+        ? [step.output]
+        : []),
+      ...(type === "input_request" ? [step.save_as] : []),
+      ...(["command", "mcp_call", "review", "session_request", "workflow"].includes(type)
+          && Array.isArray(step.outputs)
+        ? step.outputs
+        : []),
       ...(stepId.length > 0 && type === "approval" && step.output === undefined
         ? [defaultAgentFlowApprovalOutputPath(stepId)]
         : []),

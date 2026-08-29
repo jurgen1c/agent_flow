@@ -44,7 +44,8 @@ version: 1
 style: pipeline
 maturity: experimental
 steps:
-  - { id: terminal, type: result, status: failed, output: never.txt }
+  - { id: terminal, type: result, status: failed }
+  - { id: unreachable, type: command, command: "printf never > never.txt", outputs: [never.txt] }
 `);
     const repair = parseAgentFlowWorkflowOrThrow(`name: repair-child
 version: 1
