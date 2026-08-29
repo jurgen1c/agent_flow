@@ -8580,7 +8580,7 @@ function promoteWorkflowStepOutputs(
   requiredParentStatus: "running" | "paused" = "running"
 ): string[] {
   const stepId = requiredStepId(step);
-  const staleApprovalIds = latestStaleApprovalStepIds(store, childRunId);
+  const staleApprovalIds = staleApprovalStepIdsAcrossDescendants(store, childRunId);
   if (staleApprovalIds.length > 0) {
     throw new AgentFlowRunStateError(
       staleApprovalMessage(staleApprovalIds, `accepting child workflow ${childRunId}`),
@@ -8634,6 +8634,30 @@ function promoteWorkflowStepOutputs(
     payload: { childRunId, artifacts: outputs }
   });
   return outputs;
+}
+
+function staleApprovalStepIdsAcrossDescendants(
+  store: AgentFlowRunStateStore,
+  rootRunId: string
+): string[] {
+  const stale = new Set<string>();
+  const visited = new Set<string>();
+  const pending = [rootRunId];
+  const childrenByParent = new Map<string, string[]>();
+  for (const run of store.listRuns()) {
+    if (run.parentRunId === null) continue;
+    const children = childrenByParent.get(run.parentRunId) ?? [];
+    children.push(run.id);
+    childrenByParent.set(run.parentRunId, children);
+  }
+  while (pending.length > 0) {
+    const runId = pending.pop()!;
+    if (visited.has(runId)) continue;
+    visited.add(runId);
+    latestStaleApprovalStepIds(store, runId).forEach((approvalId) => stale.add(approvalId));
+    pending.push(...(childrenByParent.get(runId) ?? []));
+  }
+  return [...stale].sort();
 }
 
 function linkedParentWorkflowPromotion(

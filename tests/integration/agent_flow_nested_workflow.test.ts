@@ -628,6 +628,74 @@ steps:
     store.close();
   });
 
+  test("rejects a completed child when a descendant approval becomes stale", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-stale-descendant-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    const grandchild = parseAgentFlowWorkflowOrThrow(`
+name: stale-grandchild
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: evidence, type: command, command: "printf original > evidence.txt", outputs: [evidence.txt] }
+  - { id: approve, type: approval, reviewer: human, subject: Check, artifacts: [evidence.txt] }
+  - { id: publish, type: command, command: "printf result > result.txt", outputs: [result.txt] }
+`);
+    const child = parseAgentFlowWorkflowOrThrow(`
+name: stale-middle
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - { id: grandchild, type: workflow, workflow: stale-grandchild, inputs: {}, outputs: [result.txt] }
+`);
+    const parent = parseAgentFlowWorkflowOrThrow(`
+name: stale-root
+version: 1
+style: pipeline
+maturity: experimental
+steps:
+  - id: child
+    type: workflow
+    workflow: stale-middle
+    inputs: {}
+    outputs: [result.txt]
+    on_failure: { then: fail }
+`);
+    const workflows = createAgentFlowWorkflowRegistry()
+      .register(parent.name, parent)
+      .register(child.name, child)
+      .register(grandchild.name, grandchild);
+    const store = await openAgentFlowRunState({ cwd: repo });
+    createAgentFlowLifecycleRun(store, { id: "stale-root", workflow: parent });
+
+    expect(await executeAgentFlowCommandPipeline(
+      store, "stale-root", parent, undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({ status: "paused" });
+    const childRunId = (store.getRun("stale-root")!.context.waiting as { childRunId: string }).childRunId;
+    const grandchildRunId = (store.getRun(childRunId)!.context.waiting as { childRunId: string }).childRunId;
+    expect(await resumeAgentFlowCommandPipeline(
+      store, grandchildRunId, grandchild, { outcome: "approve" },
+      undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({ status: "completed" });
+    expect(await resumeAgentFlowCommandPipeline(
+      store, childRunId, child, { outcome: "continue" },
+      undefined, undefined, undefined, undefined, workflows
+    )).toMatchObject({ status: "completed" });
+    const evidence = store.getArtifact(grandchildRunId, "evidence.txt")!;
+    fs.writeFileSync(path.join(repo, evidence.storagePath), "changed");
+
+    const result = await resumeAgentFlowCommandPipeline(
+      store, "stale-root", parent, { outcome: "continue" },
+      undefined, undefined, undefined, undefined, workflows
+    );
+    expect(result).toMatchObject({ status: "failed", failedStep: "child" });
+    expect(result.message).toContain("Stale approval approve must be rerun");
+    expect(store.listApprovals(grandchildRunId).find((approval) => approval.stepId === "approve")?.status)
+      .toBe("stale");
+    store.close();
+  });
+
   test("promotes retained outputs when a paused child is registered under an alias", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-alias-"));
     fs.mkdirSync(path.join(repo, ".git"));
