@@ -182,8 +182,7 @@ function cancelNonterminalChildRuns(
   parentRunId: string,
   notifications: AgentFlowNotificationRegistry
 ): void {
-  const children = store.listRuns().filter((run) => run.parentRunId === parentRunId
-    && ["pending", "running", "waiting", "paused"].includes(run.status));
+  const children = store.listRuns().filter((run) => run.parentRunId === parentRunId);
   for (const child of children) {
     const current = store.getRun(child.id);
     if (current === null || ["completed", "failed", "cancelled"].includes(current.status)) {

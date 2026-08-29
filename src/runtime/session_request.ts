@@ -1938,6 +1938,15 @@ function requiredCodexProfile(value: unknown): string {
 
 function descriptorForExplicitProviderName(name: string): AgentFlowSessionProviderDescriptor {
   if (name === "fixture") return { name, kind: "fixture" };
+  if (name === "codex") {
+    return {
+      name,
+      kind: "frontier",
+      target: "codex",
+      driver: "codex-cli",
+      fingerprint: "native-codex-config"
+    };
+  }
   return { name, kind: "custom" };
 }
 

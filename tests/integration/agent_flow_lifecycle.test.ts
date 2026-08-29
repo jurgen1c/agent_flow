@@ -127,6 +127,34 @@ describe("Agent Flow run lifecycle", () => {
     store.close();
   });
 
+  test("cancels active descendants beneath an already-terminal child", async () => {
+    const repoRoot = temporaryRepo();
+    const workflow = parseAgentFlowWorkflowOrThrow(WORKFLOW_SOURCE);
+    const store = await openAgentFlowRunState({ cwd: repoRoot });
+    createAgentFlowLifecycleRun(store, { id: "cancel-tree-parent", workflow });
+    createAgentFlowLifecycleRun(store, {
+      id: "cancel-tree-terminal-child",
+      workflow,
+      parentRunId: "cancel-tree-parent"
+    });
+    createAgentFlowLifecycleRun(store, {
+      id: "cancel-tree-active-grandchild",
+      workflow,
+      parentRunId: "cancel-tree-terminal-child"
+    });
+    store.transitionRunWithEvent("cancel-tree-terminal-child", {
+      status: "completed",
+      allowedFrom: ["pending"],
+      event: { type: "run.completed", payload: {} }
+    });
+
+    expect(transitionAgentFlowLifecycleRun(store, "cancel-tree-parent", "cancel"))
+      .toMatchObject({ run: { status: "cancelled" } });
+    expect(store.getRun("cancel-tree-terminal-child")?.status).toBe("completed");
+    expect(store.getRun("cancel-tree-active-grandchild")?.status).toBe("cancelled");
+    store.close();
+  });
+
   test("requires initial lifecycle context to match when reusing a run ID", async () => {
     const repoRoot = temporaryRepo();
     const workflow = parseAgentFlowWorkflowOrThrow(WORKFLOW_SOURCE);

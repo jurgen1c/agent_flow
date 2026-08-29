@@ -32,6 +32,24 @@ import {
 import { nativeExecutableMountPaths } from "../../src/runtime/provider_drivers";
 
 describe("Agent Flow configured providers", () => {
+  test("classifies the built-in Codex provider as a frontier CLI provider", () => {
+    const registry = createAgentFlowConfiguredProviderRegistry({
+      globalConfigPath: "global.yml",
+      repoConfigPath: ".agent-flow.yml",
+      targets: {},
+      providers: {},
+      bindings: {}
+    });
+
+    expect(registry.describe("codex")).toEqual({
+      name: "codex",
+      kind: "frontier",
+      target: "codex",
+      driver: "codex-cli",
+      fingerprint: "native-codex-config"
+    });
+  });
+
   test("fails closed when programmatic bindings contain an unsupported driver", () => {
     expect(() => createAgentFlowConfiguredProviderAdapter({
       alias: "future",
