@@ -121,6 +121,7 @@ import {
 import {
   AgentFlowWorkflowRegistry,
   createAgentFlowWorkflowRegistry,
+  validateAgentFlowWorkflowStepInputExpressions,
   type AgentFlowRecoveryStatus
 } from "./recovery";
 import {
@@ -3639,6 +3640,18 @@ function validateRuntimeRecoveryTargets(
 ): void {
   for (const step of steps) {
     const stepId = requiredStepId(step);
+    if (normalizedTarget(step.type) === "workflow") {
+      const issue = validateAgentFlowWorkflowStepInputExpressions(
+        mapping(step.inputs) ?? {},
+        new Set(Object.keys(mapping(workflow.inputs) ?? {}))
+      );
+      if (issue !== undefined) {
+        throw new AgentFlowRunStateError(
+          `Workflow step ${stepId} ${issue}`,
+          "AGENT_FLOW_WORKFLOW_INVALID"
+        );
+      }
+    }
     const onFailure = mapping(step.on_failure);
     const routeValue = onFailure?.route_to;
     if (routeValue === undefined && (onFailure?.on_remediated !== undefined || onFailure?.on_unresolved !== undefined)) {
@@ -8643,19 +8656,21 @@ function staleApprovalStepIdsAcrossDescendants(
   const stale = new Set<string>();
   const visited = new Set<string>();
   const pending = [rootRunId];
-  const childrenByParent = new Map<string, string[]>();
-  for (const run of store.listRuns()) {
-    if (run.parentRunId === null || run.status !== "completed") continue;
-    const children = childrenByParent.get(run.parentRunId) ?? [];
-    children.push(run.id);
-    childrenByParent.set(run.parentRunId, children);
-  }
   while (pending.length > 0) {
     const runId = pending.pop()!;
     if (visited.has(runId)) continue;
     visited.add(runId);
     latestStaleApprovalStepIds(store, runId).forEach((approvalId) => stale.add(approvalId));
-    pending.push(...(childrenByParent.get(runId) ?? []));
+    const latestPromotedChildByStep = new Map<string, string>();
+    for (const event of store.listEvents(runId)) {
+      if (event.type !== "workflow.outputs.promoted" || event.stepId === null) continue;
+      const childRunId = normalizedTarget(mapping(event.payload)?.childRunId);
+      if (childRunId !== undefined) latestPromotedChildByStep.set(event.stepId, childRunId);
+    }
+    for (const childRunId of latestPromotedChildByStep.values()) {
+      const child = store.getRun(childRunId);
+      if (child?.parentRunId === runId && child.status === "completed") pending.push(childRunId);
+    }
   }
   return [...stale].sort();
 }

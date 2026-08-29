@@ -272,7 +272,9 @@ The optional `workflows` path is relative to the repository root. A
 `type: workflow` step names a workflow found there (or, when omitted, beside
 the entry workflow), supplies its declared inputs, and lists the exact child
 artifacts to promote after completion. Child approvals and input requests pause
-the parent and continue when the parent run is resumed.
+the parent and continue when the parent run is resumed. A child input expression
+occupies its complete value and uses `step.id`, `inputs.<name>`, or
+`artifacts.<path>`; strings without `{{ ... }}` are passed literally.
 
 Use aliases in workflow sessions. Each step selects its session, so one step
 can use Claude, another Codex, and local steps can use Qwen and Gemma:

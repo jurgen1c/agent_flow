@@ -230,7 +230,9 @@ file or directory. The child receives the declared `inputs`, pauses and resumes
 through its parent, and promotes only the paths declared by the parent step's
 `outputs` after the child completes. Missing, duplicate, and recursive workflow
 references fail before execution. Programmatic hosts pass the workflow registry
-as the final `executeAgentFlowCommandPipeline` argument.
+as the final `executeAgentFlowCommandPipeline` argument. Child input expressions
+must occupy the whole value and may use only `step.id`, `inputs.<name>`, or
+`artifacts.<path>`; plain values without expression delimiters remain literal.
 
 Recovery session providers
 report `metadata.recovery_status` as `remediated` or `unresolved`.

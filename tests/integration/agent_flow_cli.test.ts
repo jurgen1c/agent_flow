@@ -166,6 +166,30 @@ name: registry-parent
 version: 1
 style: pipeline
 maturity: experimental
+inputs:
+  id: { required: true }
+steps:
+  - { id: before, type: command, command: "touch before-child.txt" }
+  - { id: child, type: workflow, workflow: registry-child, inputs: { ticket: "prefix-{{ inputs.id }}" }, outputs: [out.txt] }
+`);
+    const invalidExpression = dispatch(["validate", parentPath], { cwd: repo });
+    expect(invalidExpression).toMatchObject({ exitCode: 2 });
+    expect(invalidExpression.stderr).toContain("expressions must occupy the whole value");
+    const expressionRun = await captureCli([
+      "run", parentPath, "--id", "invalid-child-expression", "--input", "id=AF-1"
+    ], repo);
+    expect(expressionRun).toMatchObject({ exitCode: 1 });
+    expect(expressionRun.stderr).toContain("expressions must occupy the whole value");
+    expect(fs.existsSync(path.join(repo, "before-child.txt"))).toBe(false);
+    const expressionStore = await openAgentFlowRunState({ cwd: repo });
+    expect(expressionStore.getRun("invalid-child-expression")).toBeNull();
+    expressionStore.close();
+
+    fs.writeFileSync(parentPath, `
+name: registry-parent
+version: 1
+style: pipeline
+maturity: experimental
 steps:
   - { id: child, type: workflow, workflow: registry-child, inputs: { ticket: value }, outputs: [out.txt] }
 `);

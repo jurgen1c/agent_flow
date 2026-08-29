@@ -201,6 +201,15 @@ function assertWorkflowStepInputContracts(
       if (child === undefined) continue;
       const inputs = step.inputs;
       if (inputs === null || typeof inputs !== "object" || Array.isArray(inputs)) continue;
+      const expressionIssue = validateAgentFlowWorkflowStepInputExpressions(
+        inputs,
+        new Set(Object.keys(parent.inputs ?? {}))
+      );
+      if (expressionIssue !== undefined) {
+        throw new Error(
+          `Workflow ${parentName} step ${String(step.id ?? "(unnamed)")} ${expressionIssue}`
+        );
+      }
       const supplied = Object.keys(inputs);
       const unknown = supplied.filter((name) => !Object.hasOwn(child.inputs ?? {}, name)).sort();
       if (unknown.length > 0) {
@@ -219,6 +228,37 @@ function assertWorkflowStepInputContracts(
       }
     }
   }
+}
+
+export function validateAgentFlowWorkflowStepInputExpressions(
+  value: unknown,
+  declaredInputs: ReadonlySet<string>
+): string | undefined {
+  if (typeof value === "string") {
+    if (!value.includes("{{") && !value.includes("}}")) return undefined;
+    const expression = /^\{\{\s*(?:step\.id|inputs\.([A-Za-z_][A-Za-z0-9_-]*)|artifacts\.[A-Za-z0-9_.-]+)\s*}}$/.exec(value);
+    if (expression === null) {
+      return `has unsupported input expression ${JSON.stringify(value)}; expressions must occupy the whole value and use step.id, inputs.<name>, or artifacts.<path>.`;
+    }
+    const inputName = expression[1];
+    return inputName === undefined || declaredInputs.has(inputName)
+      ? undefined
+      : `references undeclared workflow input ${inputName}.`;
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const issue = validateAgentFlowWorkflowStepInputExpressions(entry, declaredInputs);
+      if (issue !== undefined) return issue;
+    }
+    return undefined;
+  }
+  if (value !== null && typeof value === "object") {
+    for (const entry of Object.values(value)) {
+      const issue = validateAgentFlowWorkflowStepInputExpressions(entry, declaredInputs);
+      if (issue !== undefined) return issue;
+    }
+  }
+  return undefined;
 }
 
 function workflowSteps(steps: AgentFlowWorkflowStep[]): AgentFlowWorkflowStep[] {

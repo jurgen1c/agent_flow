@@ -696,46 +696,48 @@ steps:
     store.close();
   });
 
-  test("ignores stale approvals from superseded descendant retry attempts", async () => {
-    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-stale-retry-"));
+  test("ignores stale approvals from superseded completed descendant visits", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-nested-stale-visit-"));
     fs.mkdirSync(path.join(repo, ".git"));
     const grandchild = parseAgentFlowWorkflowOrThrow(`
-name: retry-grandchild
+name: visit-grandchild
 version: 1
 style: pipeline
 maturity: experimental
 sessions:
   reviewer: { provider: fixture, authority: { can_approve: true } }
-policies: { unsafe_operations: allow }
 steps:
   - { id: evidence, type: command, command: "printf original > evidence.txt", outputs: [evidence.txt] }
   - { id: approve, type: approval, reviewer: reviewer, artifacts: [evidence.txt] }
   - id: publish
     type: command
-    command: "if [ ! -f retry-sentinel ]; then touch retry-sentinel; exit 1; else printf result > result.txt; fi"
-    outputs: [result.txt]
-    on_failure: { then: fail }
+    command: >-
+      if [ -f visit-sentinel ]; then printf '{"again":false}' > result.json;
+      else touch visit-sentinel; printf '{"again":true}' > result.json; fi
+    outputs: [result.json]
 `);
     const child = parseAgentFlowWorkflowOrThrow(`
-name: retry-middle
+name: visit-middle
 version: 1
-style: pipeline
+style: recovery_pipeline
 maturity: experimental
+limits: { max_recovery_cycles: 3 }
 steps:
   - id: grandchild
     type: workflow
-    workflow: retry-grandchild
+    workflow: visit-grandchild
     inputs: {}
-    outputs: [result.txt]
-    on_failure: { retry: 1, then: fail }
+    outputs: [result.json]
+    then: decide
+  - { id: decide, type: condition, if: artifacts.result.again == true, then: grandchild, else: completed }
 `);
     const parent = parseAgentFlowWorkflowOrThrow(`
-name: retry-root
+name: visit-root
 version: 1
 style: pipeline
 maturity: experimental
 steps:
-  - { id: child, type: workflow, workflow: retry-middle, inputs: {}, outputs: [result.txt], on_failure: { then: fail } }
+  - { id: child, type: workflow, workflow: visit-middle, inputs: {}, outputs: [result.json], on_failure: { then: fail } }
 `);
     const workflows = createAgentFlowWorkflowRegistry()
       .register(parent.name, parent)
@@ -754,10 +756,10 @@ steps:
       }
       return { outputs: { [request.outputs[0]!]: JSON.stringify({ status: "approved", decision: "ok" }) } };
     });
-    createAgentFlowLifecycleRun(store, { id: "retry-root", workflow: parent });
+    createAgentFlowLifecycleRun(store, { id: "visit-root", workflow: parent });
 
     expect(await executeAgentFlowCommandPipeline(
-      store, "retry-root", parent, undefined, providers, undefined, undefined, workflows
+      store, "visit-root", parent, undefined, providers, undefined, undefined, workflows
     )).toMatchObject({ status: "completed", completedSteps: ["child"] });
     const superseded = store.listRuns().find((run) =>
       run.id.includes(":workflow:grandchild-") && run.id.endsWith(":attempt-1")
@@ -765,7 +767,8 @@ steps:
     store.getArtifact(superseded.id, "evidence.txt");
     expect(store.listApprovals(superseded.id).find((approval) => approval.stepId === "approve")?.status)
       .toBe("stale");
-    expect(store.readArtifact("retry-root", "result.txt").content.toString("utf8")).toBe("result");
+    expect(JSON.parse(store.readArtifact("visit-root", "result.json").content.toString("utf8")))
+      .toEqual({ again: false });
     store.close();
   });
 

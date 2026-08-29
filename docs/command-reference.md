@@ -58,7 +58,9 @@ underscores. Reasoning effort is `minimal`, `low`, `medium`, `high`, or
 The CLI resolves `type: workflow` children beside the entry workflow unless
 repository `.agent-flow.yml` sets a repository-relative `workflows` file or
 directory. Reachable children are validated before execution, run as linked
-children, and resume through the parent run. A direct `mcp_call` requires a
+children, and resume through the parent run. Nested input expressions must be
+whole values using `step.id`, `inputs.<name>`, or `artifacts.<path>`; embedded
+expressions are rejected during preflight. A direct `mcp_call` requires a
 programmatic host adapter; the stock CLI supports `via: codex` with a named,
 resumable Codex session, exactly one output artifact, and the MCP server
 configured in the installed Codex. That artifact is bound to the completed MCP
