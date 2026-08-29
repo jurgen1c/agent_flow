@@ -8580,6 +8580,13 @@ function promoteWorkflowStepOutputs(
   requiredParentStatus: "running" | "paused" = "running"
 ): string[] {
   const stepId = requiredStepId(step);
+  const staleApprovalIds = latestStaleApprovalStepIds(store, childRunId);
+  if (staleApprovalIds.length > 0) {
+    throw new AgentFlowRunStateError(
+      staleApprovalMessage(staleApprovalIds, `accepting child workflow ${childRunId}`),
+      "AGENT_FLOW_APPROVAL_STALE"
+    );
+  }
   const outputs = normalizedStringList(step.outputs).map(normalizeAgentFlowArtifactPath);
   const writes: WriteAgentFlowArtifactInput[] = outputs.flatMap((outputPath) => {
     const existing = store.getArtifact(parentRunId, outputPath);
