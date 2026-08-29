@@ -91,8 +91,7 @@ export function loadAgentFlowWorkflowRegistry(
     };
     registerReachable(entryWorkflow);
   }
-  assertAcyclicWorkflowRegistry(registry, [entryWorkflow.name]);
-  assertWorkflowStepInputContracts(registry, [entryWorkflow.name]);
+  assertAgentFlowWorkflowRegistryContracts(registry, [entryWorkflow.name]);
   return registry;
 }
 
@@ -129,8 +128,7 @@ export function createAgentFlowWorkflowRegistryFromSnapshot(
     }
     registry.register(name, workflow as AgentFlowWorkflow);
   }
-  assertAcyclicWorkflowRegistry(registry);
-  assertWorkflowStepInputContracts(registry);
+  assertAgentFlowWorkflowRegistryContracts(registry);
   return registry;
 }
 
@@ -166,8 +164,8 @@ function siblingWorkflowFiles(source: string): string[] {
 
 function assertAcyclicWorkflowRegistry(
   registry: AgentFlowWorkflowRegistry,
-  roots: string[] = registry.names(),
-  references: (steps: AgentFlowWorkflowStep[]) => string[] = referencedWorkflowNames
+  roots: string[],
+  references: (steps: AgentFlowWorkflowStep[]) => string[]
 ): void {
   const visiting = new Set<string>();
   const visited = new Set<string>();

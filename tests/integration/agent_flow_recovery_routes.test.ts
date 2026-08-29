@@ -11,7 +11,9 @@ import {
   createAgentFlowNotificationRegistry,
   createAgentFlowSessionProviderRegistry,
   createAgentFlowWorkflowRegistry,
+  createAgentFlowWorkflowRegistryFromSnapshot,
   executeAgentFlowCommandPipeline,
+  loadAgentFlowWorkflowRegistry,
   openAgentFlowRunState,
   parseAgentFlowWorkflowOrThrow,
   transitionAgentFlowLifecycleRun,
@@ -20,6 +22,39 @@ import {
 import { preflightAgentFlowSessionProviderEvidence } from "../../src/runtime/session_request";
 
 describe("Agent Flow recovery routes", () => {
+  test("loads registries whose only cycle is formed by recovery routes", () => {
+    const root = temporaryRepo();
+    fs.writeFileSync(path.join(root, "repair-a.yml"), `name: repair-a
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - id: check-a
+    type: command
+    command: exit 1
+    on_failure:
+      route_to: { workflow: repair-b }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+    fs.writeFileSync(path.join(root, "repair-b.yml"), `name: repair-b
+version: 1
+style: recovery_pipeline
+maturity: experimental
+steps:
+  - id: check-b
+    type: command
+    command: exit 1
+    on_failure:
+      route_to: { workflow: repair-a }
+      on_remediated: { then: complete }
+      on_unresolved: { then: pause }
+`);
+
+    expect(loadAgentFlowWorkflowRegistry("repair-a.yml", { cwd: root }).names())
+      .toEqual(["repair-a", "repair-b"]);
+  });
+
   test("validates recovery targets, outcome handlers, and result statuses", () => {
     const workflow = parseAgentFlowWorkflowOrThrow(`name: invalid-recovery
 version: 1
@@ -2051,6 +2086,10 @@ steps:
     const workflows = createAgentFlowWorkflowRegistry()
       .register("repair-a", parent)
       .register("repair-b", child);
+    expect(createAgentFlowWorkflowRegistryFromSnapshot({
+      "repair-a": parent,
+      "repair-b": child
+    }).names()).toEqual(["repair-a", "repair-b"]);
     const store = await openAgentFlowRunState({ cwd: root });
     createAgentFlowLifecycleRun(store, { id: "recursive-recovery", workflow: parent });
 
