@@ -457,6 +457,7 @@ export async function executeAgentFlowRunAction(
           runtime.mcpCalls ?? createAgentFlowMcpCallRegistry(),
           runtime.notifications ?? createAgentFlowNotificationRegistry(),
           workflows,
+          undefined,
           () => {
             store.withRunStateTransaction(runId, () => {
               assertCurrent();
@@ -466,8 +467,7 @@ export async function executeAgentFlowRunAction(
                 event: { type: "run.resume", payload: { status: "pending" } }
               });
             });
-          },
-          assertCurrent
+          }
         );
     completedSteps = execution.completedSteps;
     message = execution.message ?? null;
