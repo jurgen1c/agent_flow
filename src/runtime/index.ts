@@ -116,6 +116,7 @@ export {
   AgentFlowSessionProviderRegistry,
   AgentFlowSessionRequestError,
   AgentFlowSessionRequestInterruptedError,
+  MAX_AGENT_FLOW_SESSION_CONTEXT_ENTRIES,
   MAX_AGENT_FLOW_SESSION_INPUT_BYTES,
   MAX_AGENT_FLOW_SESSION_INPUTS,
   MAX_AGENT_FLOW_SESSION_METADATA_BYTES,

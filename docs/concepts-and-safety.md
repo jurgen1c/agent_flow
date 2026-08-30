@@ -59,6 +59,12 @@ approved decision receive stronger retention treatment than ordinary transient
 logs. Each workflow still needs an explicit retention policy appropriate to its
 data and audit requirements.
 
+Workflow inputs are persisted run values. Within `session_request`, `inputs`
+has a narrower meaning: it is only the list of artifact paths read by that
+step. Use the step's scalar `context` mapping to carry values such as a ticket
+key into the provider prompt. Context is bounded, sensitivity-checked, and
+checksum-audited without persisting its resolved values in request evidence.
+
 ## Safety model
 
 Agent Flow validates a workflow before execution and fails closed on malformed

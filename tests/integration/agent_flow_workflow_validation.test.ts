@@ -16,6 +16,7 @@ const curatedWorkflowFiles = [
   "ci-triage.yml",
   "content-review-collab.yml",
   "implement-review-collab.yml",
+  "jira-ticket-session.yml",
   "jira-ticket-spec.yml",
   "multi-provider.yml",
   "native-cli-session.yml",
@@ -29,6 +30,7 @@ const curatedPromptFiles = [
   "classify-pr-comments.md",
   "create-spec.md",
   "draft-feature-copy.md",
+  "fetch-jira-ticket-session.md",
   "fix-ci-failure.md",
   "implement-ticket.md",
   "resolve-pr-comments.md",
@@ -124,6 +126,130 @@ steps:
       "workflow.session_request.prompt.invalid",
       "workflow.artifact.output.collision"
     ]);
+  });
+
+  test("accepts scalar session context and rejects ambiguous context shapes", () => {
+    const valid = parseAgentFlowWorkflowOrThrow(`name: valid-session-context
+version: 1
+style: pipeline
+maturity: experimental
+inputs:
+  ticket_key: { required: true }
+  priority: { required: true }
+sessions:
+  reader: { provider: fixture }
+steps:
+  - id: fetch
+    type: session_request
+    session: reader
+    prompt: prompts/fetch.md
+    context:
+      ticket_key: "{{ inputs.ticket_key }}"
+      summary: "Ticket {{ inputs.ticket_key }}"
+      priority: "{{ inputs.priority }}"
+      enabled: true
+      attempts: 2
+      optional: null
+    inputs: [request.md]
+    outputs: [ticket.json]
+`);
+    expect(validateAgentFlowWorkflow(valid).errors).toEqual([]);
+
+    class ProgrammaticContext {
+      ticket_key = "IAN-42";
+    }
+    const nonPlain = parseAgentFlowWorkflowOrThrow(`name: non-plain-session-context
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  reader: { provider: fixture }
+steps:
+  - id: fetch
+    type: session_request
+    session: reader
+    prompt: prompts/fetch.md
+    context: { ticket_key: IAN-42 }
+    inputs: []
+    outputs: [ticket.json]
+`);
+    nonPlain.steps[0]!.context = new ProgrammaticContext() as never;
+    expect(validateAgentFlowWorkflow(nonPlain).errors).toContainEqual({
+      code: "workflow.session_request.context.invalid",
+      message: "Session request context must be a non-empty mapping of scalar values.",
+      path: "steps[0].context",
+      stepId: "fetch"
+    });
+
+    const nullPrototype = parseAgentFlowWorkflowOrThrow(`name: null-prototype-session-context
+version: 1
+style: pipeline
+maturity: experimental
+sessions:
+  reader: { provider: fixture }
+steps:
+  - id: fetch
+    type: session_request
+    session: reader
+    prompt: prompts/fetch.md
+    context: { ticket_key: IAN-42 }
+    inputs: []
+    outputs: [ticket.json]
+`);
+    nullPrototype.steps[0]!.context = Object.assign(Object.create(null), { ticket_key: "IAN-42" });
+    expect(validateAgentFlowWorkflow(nullPrototype).errors).toEqual([]);
+
+    const invalid = parseAgentFlowWorkflowOrThrow(`name: invalid-session-context
+version: 1
+style: pipeline
+maturity: experimental
+inputs:
+  ticket_key: { required: true }
+sessions:
+  reader: { provider: fixture }
+steps:
+  - id: fetch
+    type: session_request
+    session: reader
+    prompt: prompts/fetch.md
+    context:
+      "bad key": value
+      nested: { key: value }
+      unsupported: "{{ artifacts.ticket }}"
+    inputs: []
+    outputs: [ticket.json]
+`);
+    expect(validateAgentFlowWorkflow(invalid).errors.map((issue) => issue.code)).toEqual([
+      "workflow.session_request.context.key.invalid",
+      "workflow.session_request.context.value.invalid",
+      "workflow.session_request.context.expression.invalid"
+    ]);
+
+    invalid.steps[0]!.context = { invalid_number: Number.NaN };
+    expect(validateAgentFlowWorkflow(invalid).errors).toContainEqual({
+      code: "workflow.session_request.context.value.invalid",
+      message: 'Session request context value "invalid_number" must be a string, finite number, boolean, or null.',
+      path: "steps[0].context.invalid_number",
+      stepId: "fetch"
+    });
+
+    const schema = JSON.parse(fs.readFileSync(path.join(repoRoot, "schemas/workflow.schema.json"), "utf8")) as {
+      $defs: {
+        scalarContext: unknown;
+        step: { allOf: unknown[] };
+      };
+    };
+    expect(schema.$defs.scalarContext).toEqual({
+      type: "object",
+      minProperties: 1,
+      maxProperties: 64,
+      propertyNames: { pattern: "^[A-Za-z_][A-Za-z0-9_-]*$" },
+      additionalProperties: { type: ["string", "number", "boolean", "null"] }
+    });
+    expect(schema.$defs.step.allOf).toContainEqual({
+      if: { properties: { type: { const: "session_request" } }, required: ["type"] },
+      then: { properties: { context: { $ref: "#/$defs/scalarContext" } } }
+    });
   });
 
   test("requires positive finite command timeouts", () => {

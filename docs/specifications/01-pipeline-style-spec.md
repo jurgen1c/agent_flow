@@ -126,13 +126,18 @@ request must declare:
 
 - A static session name that resolves to a session with a static `provider`.
 - A repo-relative prompt file.
-- One or more input artifacts and one or more output artifacts.
+- A list of input artifact paths, which may be empty when non-empty scalar
+  `context` is present, and one or more output artifacts.
+- Optional scalar `context` containing at most 64 named string, finite-number,
+  boolean, or `null` values. Input references resolve from persisted run inputs.
 - A boolean session `resume` setting when resumability is enabled.
 
 The runtime selects an explicitly registered provider adapter, reads prompts
-and input artifacts with size limits, and requires the adapter to return every
+and input artifacts with size limits, appends resolved context as deterministic
+JSON after sensitive-input handling, and requires the adapter to return every
 declared output and no undeclared outputs. It records a deterministic request
-metadata artifact under `session-requests/<step-id>-<hash>.json`, writes provider
+metadata artifact with prompt, artifact, and context checksums under
+`session-requests/<step-id>-<hash>.json`, writes provider
 outputs through the artifact registry, and leaves the session in `waiting`
 state with its external session ID so a later request can resume it.
 Each adapter receives an abort signal, lifecycle cancellation interrupts a

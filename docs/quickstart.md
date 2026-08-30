@@ -139,8 +139,9 @@ Use the `planner` provider to turn the feature request into plan.md.
 Use `implementer` to turn the plan into implementation-design.md.
 Use `local-reviewer` to review the result and produce review.md.
 Make implementation depend on planning and review depend on implementation.
-Keep every configured model session artifact-only, declare every input and
-output explicitly, and add appropriate timeouts and retry limits.
+Keep every configured model session bounded: use artifact `inputs` for files,
+use scalar `context` only for run values, declare every output explicitly, and
+add appropriate timeouts and retry limits.
 
 Validate the workflow with Agent Flow and show me the commands to explain,
 simulate, and run it. Do not start the run.
@@ -315,7 +316,7 @@ or permission drift. Credential rotation does not change the fingerprint.
 All built-in drivers accept UTF-8 text inputs and require one structured JSON
 response with exactly the declared output paths. Provider retries are not
 hidden: the workflow's retry policy remains authoritative. The three HTTP
-drivers are artifact-only and non-resumable. `codex-cli` and `claude-code` run
+drivers are prompt/artifact/context-only and non-resumable. `codex-cli` and `claude-code` run
 at the repository root and preserve native context when their workflow session
 declares `resume: true`.
 
@@ -424,6 +425,24 @@ limits:
   max_model_calls: 2
   max_frontier_calls: 1
 ```
+
+`session_request.inputs` always names artifacts. To pass a scalar run input,
+add a `context` mapping instead:
+
+```yaml
+- id: fetch_ticket
+  type: session_request
+  session: reviewer
+  prompt: prompts/fetch-ticket.md
+  context: { ticket_key: "{{ inputs.ticket_key }}" }
+  inputs: []
+  outputs: [ticket.json]
+```
+
+Artifact inputs and scalar context can be combined. Agent Flow appends resolved
+context as deterministic, sensitivity-checked JSON to the provider prompt. A
+Codex-backed session can therefore use MCP servers from the user's existing
+Codex configuration based on prompt instructions and scalar context.
 
 Use `provider: fixture`, `provider: frontier`, or
 `provider: private-control-plane` the same way when the corresponding adapter is

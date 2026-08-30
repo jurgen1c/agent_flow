@@ -394,6 +394,52 @@ steps:
     expect(missing.stderr).toContain("missing required inputs: ticket");
   });
 
+  test("passes repeatable CLI inputs into scalar session context without treating them as artifacts", async () => {
+    const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-context-"));
+    fs.mkdirSync(path.join(repo, ".git"));
+    fs.mkdirSync(path.join(repo, "prompts"));
+    fs.writeFileSync(path.join(repo, "prompts", "fetch.md"), "Fetch the requested ticket.\n");
+    fs.writeFileSync(path.join(repo, "workflow.yml"), `
+name: cli-session-context
+version: 1
+style: pipeline
+maturity: experimental
+inputs:
+  ticket_key: { required: true }
+sessions:
+  reader: { provider: fixture }
+steps:
+  - id: fetch
+    type: session_request
+    session: reader
+    prompt: prompts/fetch.md
+    context: { ticket_key: "{{ inputs.ticket_key }}" }
+    inputs: []
+    outputs: [jira/ticket.json]
+`);
+    fs.writeFileSync(path.join(repo, "fixture.json"), JSON.stringify({
+      steps: { fetch: { outputs: { "jira/ticket.json": "{}" } } }
+    }));
+
+    const result = await captureCli([
+      "run", "workflow.yml", "--id", "context-run", "--fixture", "fixture.json",
+      "--input", "ticket_key=IAN-42"
+    ], repo);
+    expect(result).toMatchObject({ exitCode: 0 });
+    const store = await openAgentFlowRunState({ cwd: repo });
+    expect(store.getRun("context-run")).toMatchObject({ status: "completed", inputs: { ticket_key: "IAN-42" } });
+    expect(store.getArtifact("context-run", "IAN-42")).toBeNull();
+    const requestArtifact = store.listArtifacts("context-run")
+      .find((artifact) => artifact.kind === "session_request")!;
+    const requestEvidence = store.readArtifact("context-run", requestArtifact.declaredPath).content.toString("utf8");
+    expect(JSON.parse(requestEvidence)).toMatchObject({
+      inputs: [],
+      context: { checksum: expect.stringMatching(/^sha256:/) }
+    });
+    expect(requestEvidence).not.toContain("IAN-42");
+    store.close();
+  });
+
   test("rejects direct MCP in the stock CLI before creating run state", async () => {
     const repo = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "agent-flow-cli-direct-mcp-"));
     fs.mkdirSync(path.join(repo, ".git"));
