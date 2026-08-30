@@ -2130,8 +2130,7 @@ function requiredSessionContextScalar(
   stepId: string,
   key: string
 ): string | number | boolean | null {
-  if (value === null || typeof value === "string" || typeof value === "boolean"
-      || typeof value === "number" && Number.isFinite(value)) return value;
+  if (isSessionContextScalar(value)) return value;
   throw new AgentFlowSessionRequestError(
     `Session request ${stepId} context ${key} must resolve to a scalar value.`,
     "AGENT_FLOW_SESSION_CONTEXT_UNRESOLVED"
@@ -2139,15 +2138,25 @@ function requiredSessionContextScalar(
 }
 
 function validateSessionContextExpression(value: AgentFlowRunStateValue, stepId: string, key: string): void {
-  requiredSessionContextScalar(value, stepId, key);
+  if (!isSessionContextScalar(value)) {
+    throw new AgentFlowSessionRequestError(
+      `Session request ${stepId} context ${key} must be a scalar value.`,
+      "AGENT_FLOW_SESSION_CONTEXT_INVALID"
+    );
+  }
   if (typeof value !== "string") return;
   const remainder = value.replace(/(?<!\{)\{\{\s*inputs\.([A-Za-z_][A-Za-z0-9_-]*)\s*}}(?!})/g, "");
   if (remainder.includes("{{") || remainder.includes("}}")) {
     throw new AgentFlowSessionRequestError(
       `Session request ${stepId} context ${key} contains an unsupported input expression.`,
-      "AGENT_FLOW_SESSION_CONTEXT_UNRESOLVED"
+      "AGENT_FLOW_SESSION_CONTEXT_INVALID"
     );
   }
+}
+
+function isSessionContextScalar(value: AgentFlowRunStateValue): value is string | number | boolean | null {
+  return value === null || typeof value === "string" || typeof value === "boolean"
+    || typeof value === "number" && Number.isFinite(value);
 }
 
 function collectSessionContextInputReferences(value: Record<string, AgentFlowRunStateValue>): Set<string> {

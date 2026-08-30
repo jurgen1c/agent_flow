@@ -21,11 +21,13 @@ import {
   simulateAgentFlowWorkflow,
   transitionAgentFlowLifecycleRun,
   validateAgentFlowWorkflow,
+  type AgentFlowRunStateValue,
   type AgentFlowSessionProviderRequest
 } from "../../src/runtime";
 import {
   appendAgentFlowSessionContext,
   invokeAgentFlowSessionProvider,
+  prepareAgentFlowSessionContext,
   readAgentFlowSessionPrompt,
   reserveAgentFlowSessionModelCallBudgets
 } from "../../src/runtime/session_request";
@@ -3537,6 +3539,54 @@ steps:
     });
     expect(JSON.stringify(requestEvidence)).not.toContain("IAN-42");
     store.close();
+  });
+
+  test("distinguishes invalid declared context from unresolved input values", () => {
+    const workflow = parseAgentFlowWorkflowOrThrow(`name: context-error-classification
+version: 1
+style: pipeline
+maturity: experimental
+inputs:
+  ticket: { required: true }
+sessions:
+  reader: { provider: fixture }
+steps:
+  - id: fetch
+    type: session_request
+    session: reader
+    prompt: prompts/fetch.md
+    context: { ticket: "{{ inputs.ticket }}" }
+    inputs: []
+    outputs: [ticket.json]
+`);
+
+    const expectContextError = (
+      context: unknown,
+      inputs: Record<string, AgentFlowRunStateValue>,
+      code: string
+    ) => {
+      try {
+        prepareAgentFlowSessionContext(workflow, context, inputs, "fetch");
+        throw new Error("Expected session context preparation to fail.");
+      } catch (error) {
+        expect(error).toBeInstanceOf(AgentFlowSessionRequestError);
+        expect(error).toMatchObject({ code });
+      }
+    };
+
+    for (const declaredContext of [
+      { ticket: Number.NaN },
+      { ticket: { key: "IAN-42" } },
+      { ticket: "{{ artifacts.ticket }}" }
+    ]) {
+      expectContextError(declaredContext, {}, "AGENT_FLOW_SESSION_CONTEXT_INVALID");
+    }
+
+    expectContextError(
+      { ticket: "{{ inputs.ticket }}" },
+      { ticket: { key: "IAN-42" } },
+      "AGENT_FLOW_SESSION_CONTEXT_UNRESOLVED"
+    );
   });
 
   test("redacts sensitive scalar context before provider invocation and evidence persistence", async () => {
