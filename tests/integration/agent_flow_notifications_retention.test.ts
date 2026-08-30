@@ -2425,6 +2425,7 @@ notify:
 
   test("stops an active executor when a required operator-pause notification fails", async () => {
     const repoRoot = temporaryRepo();
+    const startedMarker = path.join(repoRoot, "work-started");
     const marker = path.join(repoRoot, "continued");
     const workflow = parseAgentFlowWorkflowOrThrow(`
 name: operator-pause-failure
@@ -2433,7 +2434,7 @@ style: pipeline
 maturity: experimental
 steps:
   - { id: first, type: command, command: "printf ok" }
-  - { id: work, type: command, command: "sleep 0.25; touch continued" }
+  - { id: work, type: command, command: "touch work-started; sleep 5; touch continued" }
 notify:
   - { on: workflow.paused, channels: [system], required: true }
 retention:
@@ -2456,7 +2457,7 @@ retention:
       undefined,
       notifications
     );
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    await waitForPath(startedMarker);
     const operatorStore = await openAgentFlowRunState({ cwd: repoRoot });
 
     expect(transitionAgentFlowLifecycleRun(
@@ -2479,6 +2480,7 @@ retention:
 
   test("stops an active executor when operator cancellation cannot persist its summary", async () => {
     const repoRoot = temporaryRepo();
+    const startedMarker = path.join(repoRoot, "work-started");
     const marker = path.join(repoRoot, "continued");
     const workflow = parseAgentFlowWorkflowOrThrow(`
 name: operator-cancel-summary-failure
@@ -2486,7 +2488,7 @@ version: 1
 style: pipeline
 maturity: experimental
 steps:
-  - { id: work, type: command, command: "sleep 0.25; touch continued" }
+  - { id: work, type: command, command: "touch work-started; sleep 5; touch continued" }
 retention:
   on_failure:
     delete: [logs/**]
@@ -2510,7 +2512,7 @@ retention:
       "operator-cancel-summary-failure",
       workflow
     );
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    await waitForPath(startedMarker);
     const operatorStore = await openAgentFlowRunState({ cwd: repoRoot });
     expect(transitionAgentFlowLifecycleRun(
       operatorStore,
@@ -3591,6 +3593,14 @@ function temporaryRepo(): string {
   const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agent-flow-notifications-"));
   fs.mkdirSync(path.join(repoRoot, ".git"));
   return repoRoot;
+}
+
+async function waitForPath(target: string): Promise<void> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    if (fs.existsSync(target)) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for ${target}.`);
 }
 
 function notifiedDisagreementWorkflow(name: string, required = false) {
